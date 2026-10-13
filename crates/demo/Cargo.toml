@@ -1,0 +1,15 @@
+[package]
+name = "setsuna-demo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "A local web demo of Setsuna: the fcitx5 frontend's session driven from a browser over a WebSocket, with the engine's timings, scores and alignment on display."
+
+[dependencies]
+setsuna-core = { path = "../ime-core" }
+# The fcitx5 frontend's session and key classification, so the demo behaves
+# exactly as the IME does.
+setsuna-linux = { path = "../linux" }
+serde_json.workspace = true
+tungstenite = "0.24"

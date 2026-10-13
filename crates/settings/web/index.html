@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setsuna 設定</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f3f3f3;
+  --card: #fbfbfb;
+  --card-hover: #f6f6f6;
+  --line: #e5e5e5;
+  --ink: #1b1b1b;
+  --ink-2: #5f5f5f;
+  --ink-3: #8a8a8a;
+  --accent: #b85f00;
+  --accent-ink: #ffffff;
+  --field: #ffffff;
+  --field-line: #d1d1d1;
+  --danger: #c42b1c;
+  --bar: rgba(243, 243, 243, 0.92);
+  --font: "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", "Hiragino Sans",
+          "Noto Sans CJK JP", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, "SF Mono", "Noto Sans Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #202020;
+    --card: #2b2b2b;
+    --card-hover: #323232;
+    --line: #1c1c1c;
+    --ink: #ffffff;
+    --ink-2: #cfcfcf;
+    --ink-3: #9a9a9a;
+    --accent: #ffb03b;
+    --accent-ink: #1b1b1b;
+    --field: #2d2d2d;
+    --field-line: #454545;
+    --danger: #ff99a4;
+    --bar: rgba(32, 32, 32, 0.92);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); }
+body {
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 28px 32px 96px;
+  max-width: 880px;
+  margin: 0 auto;
+}
+h1 { font-size: 28px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+.path { font-family: var(--mono); font-size: 12px; color: var(--ink-3); word-break: break-all; }
+h2 { font-size: 15px; font-weight: 600; margin: 28px 0 8px; }
+.banner {
+  margin-top: 16px; padding: 12px 16px; border-radius: 6px;
+  border: 1px solid var(--danger); color: var(--danger);
+}
+
+/* ---- cards ---------------------------------------------------------- */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.row {
+  display: flex; align-items: center; gap: 24px;
+  padding: 14px 18px; min-height: 64px;
+}
+.row + .row { border-top: 1px solid var(--line); }
+.row .text { flex: 1; min-width: 0; }
+.row .title { font-size: 14px; }
+.row .desc { font-size: 12.5px; color: var(--ink-2); margin-top: 1px; }
+.row .control { flex: none; display: flex; align-items: center; gap: 10px; }
+.row.disabled .text, .row.disabled .control { opacity: 0.45; pointer-events: none; }
+
+/* ---- toggle switch ---------------------------------------------------- */
+.switch { position: relative; display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; pointer-events: none; }
+.switch .track {
+  width: 40px; height: 20px; border-radius: 10px;
+  border: 1px solid var(--ink-2); position: relative; transition: background .12s, border-color .12s;
+}
+.switch .track::after {
+  content: ""; position: absolute; top: 3px; left: 3px;
+  width: 12px; height: 12px; border-radius: 50%; background: var(--ink-2);
+  transition: transform .12s, background .12s;
+}
+.switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(20px); background: var(--accent-ink); }
+.switch input:focus-visible + .track { outline: 2px solid var(--ink); outline-offset: 2px; }
+.switch .state { width: 2.5em; color: var(--ink-2); font-size: 13px; }
+
+/* ---- fields ----------------------------------------------------------- */
+select, input[type=text], button {
+  font: inherit; color: var(--ink);
+}
+select, input[type=text] {
+  background: var(--field); border: 1px solid var(--field-line);
+  border-radius: 4px; padding: 5px 10px; min-height: 32px;
+}
+select:focus, input[type=text]:focus { outline: none; border-bottom: 2px solid var(--accent); }
+button {
+  background: var(--field); border: 1px solid var(--field-line);
+  border-radius: 4px; padding: 5px 14px; min-height: 32px; cursor: pointer;
+}
+button:hover:not(:disabled) { background: var(--card-hover); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.danger { color: var(--danger); }
+
+.segmented { display: inline-flex; border: 1px solid var(--field-line); border-radius: 4px; overflow: hidden; }
+.segmented button { border: 0; border-radius: 0; min-height: 30px; padding: 4px 12px; background: var(--field); }
+.segmented button + button { border-left: 1px solid var(--field-line); }
+.segmented button[aria-pressed=true] { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+
+input[type=range] { width: 180px; accent-color: var(--accent); }
+.value { font-variant-numeric: tabular-nums; width: 3em; text-align: right; color: var(--ink-2); }
+
+/* ---- replacements ------------------------------------------------------- */
+.reps { padding: 6px 18px 14px; }
+.rep { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.rep input[type=text] { flex: 1; min-width: 0; }
+.rep .arrow { color: var(--ink-3); }
+.reps .empty { color: var(--ink-3); padding: 8px 0; }
+
+/* ---- action bar --------------------------------------------------------- */
+.bar {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  background: var(--bar); backdrop-filter: blur(12px);
+  border-top: 1px solid var(--line);
+}
+.bar .inner {
+  max-width: 880px; margin: 0 auto; padding: 12px 32px;
+  display: flex; align-items: center; gap: 10px;
+}
+.bar .status { flex: 1; color: var(--ink-2); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Setsuna 設定</h1>
+<div class="path" id="path"></div>
+<div class="banner" id="error" hidden></div>
+
+<h2>記号・句読点</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">記号の全角・半角</div>
+      <div class="desc">自動：カーソルの前の文章の書き方に合わせます</div>
+    </div>
+    <div class="control"><div class="segmented" id="symbol_width"></div></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">句読点</div>
+      <div class="desc">候補の句読点をこの組にそろえます</div>
+    </div>
+    <div class="control"><select id="punctuation"></select></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">中黒をそろえる</div>
+      <div class="desc">･ · ‧ ⋅ ∙ を「・」にします</div>
+    </div>
+    <div class="control" data-switch="frontend.normalize_middle_dot"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">入力していない記号を含む候補を出さない</div>
+      <div class="desc">句読点や括弧など、読みにない記号が付いた候補を除きます</div>
+    </div>
+    <div class="control" data-switch="frontend.drop_untyped_symbols"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">記号辞書</div>
+      <div class="desc">やじるし → 「→」、かっこ → 「（）」のように記号を候補に出します</div>
+    </div>
+    <div class="control" data-switch="frontend.symbol_dictionary"></div>
+  </div>
+</div>
+
+<h2>日付・時間</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">日付・時間の候補</div>
+      <div class="desc">きょう・いま・1じかんご などから作ります。端末のローカル時刻を使い、曜日は今日を含む次の曜日、週は月曜始まりです</div>
+    </div>
+    <div class="control" data-switch="frontend.date_time_candidates"></div>
+  </div>
+</div>
+
+<h2>任意置換</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">候補の文字列を置き換える</div>
+      <div class="desc">上から順に、すべての候補に適用します</div>
+    </div>
+    <div class="control"><button id="add_rep">追加</button></div>
+  </div>
+  <div class="reps" id="reps"></div>
+</div>
+
+<h2>学習</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">選んだ候補を学習して並べ替える</div>
+    </div>
+    <div class="control" data-switch="learning.enabled"></div>
+  </div>
+  <div class="row" data-learning>
+    <div class="text">
+      <div class="title">強さ</div>
+      <div class="desc">1.0 で、同じ読みで選んだ候補が先頭に来ます</div>
+    </div>
+    <div class="control">
+      <input type="range" id="strength" min="0" max="3" step="0.1">
+      <span class="value" id="strength_value"></span>
+    </div>
+  </div>
+  <div class="row" data-learning>
+    <div class="text">
+      <div class="title">似た読みへの適用</div>
+      <div class="desc">読み全体の文字 bigram のコサイン類似度がこの値以上なら適用します。1.00 で同じ読みのみ</div>
+    </div>
+    <div class="control">
+      <input type="range" id="similarity_threshold" min="0.3" max="1" step="0.05">
+      <span class="value" id="similarity_threshold_value"></span>
+    </div>
+  </div>
+  <div class="row" data-learning>
+    <div class="text">
+      <div class="title">単語単位でも学習する</div>
+      <div class="desc">変えた語を、前後の読みが同じ別の文にも適用します（きしゃ：記者 → 貴社）</div>
+    </div>
+    <div class="control" data-switch="learning.words"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">学習履歴</div>
+      <div class="desc" id="learned"></div>
+    </div>
+    <div class="control" id="clear_controls"></div>
+  </div>
+</div>
+
+<div class="bar">
+  <div class="inner">
+    <div class="status" id="status"></div>
+    <button id="revert">元に戻す</button>
+    <button class="primary" id="save">保存</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const WIDTHS = [["as_typed", "入力どおり"], ["full", "全角"], ["half", "半角"], ["auto", "自動"]];
+const PUNCTUATION = [
+  ["as_is", "変換結果のまま"], ["toten_kuten", "、。"], ["comma_period", "，．"],
+  ["comma_kuten", "，。"], ["toten_period", "、．"],
+];
+
+let cfg = null;        // the config being edited
+let saved = "";        // JSON of the config as last loaded / saved
+let canSave = false;   // false while the file could not be read
+let learned = null;
+let confirmClear = false;
+
+const $ = (id) => document.getElementById(id);
+const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
+const at = (path) => path.split(".").reduce((o, k) => o[k], cfg);
+const setAt = (path, v) => {
+  const keys = path.split(".");
+  const last = keys.pop();
+  keys.reduce((o, k) => o[k], cfg)[last] = v;
+};
+
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  for (const c of children) e.append(c);
+  return e;
+}
+
+function toggle(checked, onChange) {
+  const input = el("input", { type: "checkbox", checked });
+  const state = el("span", { className: "state", textContent: checked ? "オン" : "オフ" });
+  input.addEventListener("change", () => {
+    state.textContent = input.checked ? "オン" : "オフ";
+    onChange(input.checked);
+  });
+  return el("label", { className: "switch" }, state, input, el("span", { className: "track" }));
+}
+
+function render() {
+  for (const slot of document.querySelectorAll("[data-switch]")) {
+    const path = slot.dataset.switch;
+    slot.replaceChildren(toggle(at(path), (v) => { setAt(path, v); changed(); }));
+  }
+
+  const seg = $("symbol_width");
+  seg.replaceChildren(...WIDTHS.map(([value, label]) => {
+    const b = el("button", { textContent: label });
+    b.setAttribute("aria-pressed", cfg.frontend.symbol_width === value);
+    b.addEventListener("click", () => {
+      cfg.frontend.symbol_width = value;
+      for (const o of seg.children) o.setAttribute("aria-pressed", o === b);
+      changed();
+    });
+    return b;
+  }));
+
+  const sel = $("punctuation");
+  sel.replaceChildren(...PUNCTUATION.map(([value, label]) =>
+    el("option", { value, textContent: label, selected: cfg.frontend.punctuation === value })));
+
+  $("strength").value = cfg.learning.strength;
+  $("similarity_threshold").value = cfg.learning.similarity_threshold;
+  renderReplacements();
+  changed();
+}
+
+function renderReplacements() {
+  const list = cfg.frontend.replacements;
+  const box = $("reps");
+  if (list.length === 0) {
+    box.replaceChildren(el("div", { className: "empty", textContent: "置換はありません" }));
+    return;
+  }
+  box.replaceChildren(...list.map((r, i) => {
+    const from = el("input", { type: "text", value: r.from, placeholder: "置換前" });
+    const to = el("input", { type: "text", value: r.to, placeholder: "置換後" });
+    from.addEventListener("input", () => { r.from = from.value; changed(); });
+    to.addEventListener("input", () => { r.to = to.value; changed(); });
+    const del = el("button", { textContent: "削除", className: "danger" });
+    del.addEventListener("click", () => { list.splice(i, 1); renderReplacements(); changed(); });
+    return el("div", { className: "rep" },
+      toggle(r.enabled, (v) => { r.enabled = v; changed(); }),
+      from, el("span", { className: "arrow", textContent: "→" }), to, del);
+  }));
+}
+
+function renderLearned() {
+  $("learned").textContent = learned === null
+    ? "学習履歴の場所が見つかりません"
+    : `学習済み ${learned} 件`;
+  const box = $("clear_controls");
+  if (confirmClear) {
+    const yes = el("button", { textContent: "消去する", className: "danger" });
+    const no = el("button", { textContent: "やめる" });
+    yes.addEventListener("click", () => { confirmClear = false; send({ type: "clear_learning" }); });
+    no.addEventListener("click", () => { confirmClear = false; renderLearned(); });
+    box.replaceChildren(el("span", { textContent: "本当に消去しますか？" }), yes, no);
+  } else {
+    const clear = el("button", { textContent: "学習履歴を消去", disabled: !(learned > 0) });
+    clear.addEventListener("click", () => { confirmClear = true; renderLearned(); });
+    box.replaceChildren(clear);
+  }
+}
+
+// After any edit: the derived labels and the buttons.
+function changed() {
+  $("strength_value").textContent = Number(cfg.learning.strength).toFixed(1);
+  $("similarity_threshold_value").textContent = Number(cfg.learning.similarity_threshold).toFixed(2);
+  for (const row of document.querySelectorAll("[data-learning]")) {
+    row.classList.toggle("disabled", !cfg.learning.enabled);
+  }
+  const dirty = JSON.stringify(cfg) !== saved;
+  $("save").disabled = !(dirty && canSave);
+  $("revert").disabled = !dirty;
+}
+
+$("punctuation").addEventListener("change", (e) => { cfg.frontend.punctuation = e.target.value; changed(); });
+$("strength").addEventListener("input", (e) => { cfg.learning.strength = Number(e.target.value); changed(); });
+$("similarity_threshold").addEventListener("input", (e) => {
+  cfg.learning.similarity_threshold = Number(e.target.value); changed();
+});
+$("add_rep").addEventListener("click", () => {
+  cfg.frontend.replacements.push({ from: "", to: "", enabled: true });
+  renderReplacements();
+  changed();
+  const inputs = $("reps").querySelectorAll("input[type=text]");
+  inputs[inputs.length - 2]?.focus();
+});
+$("save").addEventListener("click", () => send({ type: "save", config: cfg }));
+$("revert").addEventListener("click", () => { cfg = JSON.parse(saved); render(); $("status").textContent = ""; });
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    e.preventDefault();
+    if (!$("save").disabled) $("save").click();
+  }
+});
+
+window.setsuna = {
+  receive(msg) {
+    if (msg.status !== undefined) $("status").textContent = msg.status ?? "";
+    if (msg.type !== "state") return;
+    learned = msg.learned;
+    renderLearned();
+    // Keep unsaved edits unless the file is (re)loaded or they were saved.
+    if (msg.action === "init" || (msg.action === "save" && msg.ok)) {
+      cfg = msg.config;
+      saved = JSON.stringify(cfg);
+      canSave = !msg.load_error && msg.path !== null;
+      $("path").textContent = msg.path ? `設定ファイル: ${msg.path}` : "";
+      const error = $("error");
+      error.hidden = !msg.load_error;
+      error.textContent = msg.load_error ? `設定を読み込めないため保存できません: ${msg.load_error}` : "";
+      render();
+    } else {
+      changed();
+    }
+  },
+};
+
+send({ type: "init" });
+</script>
+</body>
+</html>

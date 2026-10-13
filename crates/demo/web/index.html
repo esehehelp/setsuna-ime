@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setsuna Live</title>
+<style>
+:root {
+  --bg: #090b14;
+  --ink: #ecebf6;
+  --ink-dim: #9a98b4;
+  --ink-faint: #5d5b78;
+  --glass: rgba(255, 255, 255, 0.055);
+  --glass-strong: rgba(22, 24, 40, 0.78);
+  --line: rgba(255, 255, 255, 0.11);
+  --amber: #ffb03b;
+  --coral: #ff7066;
+  --violet: #ab78ff;
+  --cyan: #5ee6ff;
+  --accent: linear-gradient(90deg, var(--amber), var(--coral) 55%, var(--violet));
+  --font: "IBM Plex Sans JP", "Noto Sans CJK JP", "Hiragino Sans", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+canvas.layer { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+#bg { z-index: 0; filter: saturate(1.2); }
+#fx { z-index: 50; }
+
+.app {
+  position: relative; z-index: 1;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100%;
+  padding: 18px 22px 16px;
+  gap: 16px;
+}
+
+/* ---- header ---------------------------------------------------------- */
+header { display: flex; align-items: center; gap: 14px; }
+.logo { display: flex; align-items: baseline; gap: 10px; }
+.logo b {
+  font-size: 26px; font-weight: 700; letter-spacing: -0.02em;
+  background: var(--accent); -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.logo span { color: var(--ink-dim); font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; }
+.chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-radius: 999px;
+  background: var(--glass); border: 1px solid var(--line);
+  font-size: 12.5px; color: var(--ink-dim);
+  backdrop-filter: blur(14px);
+}
+.chip strong { color: var(--ink); font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #666; box-shadow: 0 0 0 0 transparent; }
+.dot.on { background: #5dffa8; box-shadow: 0 0 12px #5dffa8; }
+.dot.off { background: #ff5d7a; box-shadow: 0 0 12px #ff5d7a; }
+.grow { flex: 1; }
+.mode {
+  cursor: pointer; user-select: none;
+  width: 46px; height: 46px; border-radius: 14px;
+  display: grid; place-items: center;
+  font-size: 22px; font-weight: 700;
+  background: var(--accent); color: #fff;
+  box-shadow: 0 6px 24px rgba(255, 112, 102, 0.35), inset 0 1px 0 rgba(255,255,255,0.35);
+  transition: transform .25s cubic-bezier(.2,1.6,.4,1), filter .3s, box-shadow .3s;
+}
+.mode:hover { transform: translateY(-2px) rotate(-4deg); }
+.mode.direct { background: linear-gradient(135deg, #7a8199, #4b5068); box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+#ping.flash { animation: ping .6s ease-out; }
+@keyframes ping { 0% { box-shadow: 0 0 0 0 rgba(94,230,255,.6); } 100% { box-shadow: 0 0 0 14px rgba(94,230,255,0); } }
+
+/* ---- main ------------------------------------------------------------ */
+main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 18px; min-height: 0; }
+.card {
+  position: relative;
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  backdrop-filter: blur(22px) saturate(1.2);
+  box-shadow: 0 24px 60px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.06);
+}
+.card::before {
+  content: ""; position: absolute; left: 22px; right: 22px; top: -1px; height: 2px;
+  background: var(--accent); border-radius: 2px; opacity: .85;
+}
+.card h3 {
+  margin: 0 0 10px; font-size: 11.5px; font-weight: 600; letter-spacing: .2em;
+  color: var(--ink-dim); text-transform: uppercase;
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.card h3 em { font-style: normal; letter-spacing: 0; text-transform: none; color: var(--ink-faint); }
+
+/* the editor */
+.stage { display: grid; grid-template-rows: 1fr auto; min-height: 0; padding: 0; overflow: visible; }
+#doc {
+  position: relative;
+  padding: 38px 44px;
+  font-size: 34px; line-height: 1.75;
+  white-space: pre-wrap; word-break: break-all;
+  overflow-y: auto; min-height: 0;
+  outline: none;
+}
+#doc .placeholder { color: var(--ink-faint); font-size: 22px; line-height: 1.9; }
+#doc .placeholder kbd { font-size: 16px; }
+.fresh { animation: fresh 1.6s ease-out; border-radius: 6px; }
+@keyframes fresh {
+  0% { color: #fff; text-shadow: 0 0 18px var(--amber), 0 0 34px var(--coral); background: rgba(255,176,59,.18); }
+  100% { text-shadow: none; background: transparent; }
+}
+.pre { border-bottom: 2px solid rgba(255,255,255,.55); }
+.pre.seg { border-bottom: 2px solid rgba(255,255,255,.28); margin-right: 3px; }
+.pre.focus {
+  border-bottom: 3px solid transparent;
+  background: linear-gradient(180deg, rgba(255,176,59,.22), rgba(171,120,255,.22));
+  border-image: var(--accent) 1;
+  border-radius: 4px 4px 0 0;
+  color: #fff;
+}
+.pre.kana { color: #fff; }
+.caret {
+  display: inline-block; width: 3px; height: 1.15em; margin: 0 -1.5px;
+  vertical-align: -0.2em; border-radius: 2px;
+  background: linear-gradient(var(--amber), var(--violet));
+  box-shadow: 0 0 12px var(--coral);
+  animation: blink 1.05s steps(1) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+.anchor { display: inline-block; width: 0; height: 1em; vertical-align: -0.1em; }
+
+/* the candidate window */
+#cand {
+  position: absolute; z-index: 20; min-width: 220px; max-width: 520px;
+  padding: 14px 10px 10px;
+  border-radius: 16px;
+  background: var(--glass-strong);
+  border: 1px solid rgba(255,255,255,.14);
+  backdrop-filter: blur(26px) saturate(1.3);
+  box-shadow: 0 28px 70px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.08);
+  font-size: 21px;
+  opacity: 0; transform: translateY(-6px) scale(.98);
+  transition: opacity .16s, transform .22s cubic-bezier(.2,1.2,.4,1), left .12s, top .12s;
+  pointer-events: none;
+}
+#cand.show { opacity: 1; transform: none; pointer-events: auto; }
+#cand::before {
+  content: ""; position: absolute; left: 14px; right: 14px; top: -1px; height: 3px;
+  background: var(--accent); border-radius: 3px;
+}
+#cand .sparkle { position: absolute; right: 12px; top: 8px; width: 22px; opacity: .75; }
+#cand .head { font-size: 13px; color: var(--ink-dim); padding: 0 12px 8px; display: flex; gap: 8px; align-items: center; }
+#cand .head b { color: var(--ink); font-weight: 600; }
+#cand .tag {
+  font-size: 10.5px; letter-spacing: .14em; padding: 2px 8px; border-radius: 999px;
+  background: rgba(171,120,255,.18); color: #d4c2ff; border: 1px solid rgba(171,120,255,.35);
+}
+#cand ul { list-style: none; margin: 0; padding: 0; position: relative; }
+#cand li {
+  position: relative; z-index: 1;
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 6px 14px; border-radius: 10px; cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s;
+}
+#cand li:hover { background: rgba(255,255,255,.05); }
+#cand li .lbl { font-family: var(--mono); font-size: 14px; font-weight: 700; color: var(--ink-faint); width: 14px; }
+#cand li .cm { font-size: 12.5px; color: var(--ink-dim); margin-left: auto; padding-left: 14px; }
+#cand li.sel { color: #fff; }
+#cand li.sel .lbl, #cand li.sel .cm { color: rgba(255,255,255,.85); }
+#cand .hl {
+  position: absolute; left: 0; right: 0; z-index: 0; border-radius: 10px;
+  background: linear-gradient(180deg, #ffbb52, #ec7012);
+  box-shadow: 0 8px 26px rgba(236,112,18,.45), inset 0 1px 0 rgba(255,255,255,.45);
+  transition: top .18s cubic-bezier(.2,1.3,.4,1), height .18s;
+}
+#cand.suggest .hl { display: none; }
+#cand .foot {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 8px; padding: 8px 12px 2px; border-top: 1px solid var(--line);
+  font-size: 12.5px; color: var(--ink-dim);
+}
+#cand .foot b { color: var(--ink); font-family: var(--mono); }
+#cand .pages { margin-left: auto; display: flex; gap: 5px; }
+#cand .pages i { width: 6px; height: 6px; border-radius: 50%; background: rgba(255,255,255,.2); }
+#cand .pages i.on { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+#cand.formmode { padding: 12px 18px; }
+
+/* the hint bar */
+.hints {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
+  padding: 14px 26px; border-top: 1px solid var(--line);
+  font-size: 13px; color: var(--ink-dim);
+}
+.hints .grp { display: flex; align-items: center; gap: 7px; }
+kbd {
+  font-family: var(--mono); font-size: 12px; color: var(--ink);
+  padding: 3px 8px; border-radius: 7px;
+  background: linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.05));
+  border: 1px solid rgba(255,255,255,.16); border-bottom-width: 2px;
+}
+button.key {
+  font: inherit; font-family: var(--mono); font-size: 12px; color: var(--ink); cursor: pointer;
+  padding: 4px 9px; border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,.05));
+  border: 1px solid rgba(255,255,255,.16); border-bottom-width: 2px;
+  transition: transform .1s, background .2s;
+}
+button.key:hover { background: linear-gradient(180deg, rgba(255,176,59,.35), rgba(255,112,102,.18)); }
+button.key:active { transform: translateY(1px); }
+
+/* ---- HUD ------------------------------------------------------------- */
+.hud { display: grid; grid-template-rows: auto auto auto 1fr; gap: 14px; min-height: 0; }
+.hud .card { padding: 16px 18px; }
+.big { display: flex; align-items: baseline; gap: 8px; }
+.big .num {
+  font-family: var(--mono); font-size: 46px; font-weight: 700; letter-spacing: -0.03em;
+  background: linear-gradient(90deg, #fff, #ffd59a); -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.big .unit { color: var(--ink-dim); font-size: 15px; }
+.sub { display: flex; gap: 16px; font-size: 12px; color: var(--ink-dim); margin: 2px 0 8px; }
+.sub b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
+#spark { width: 100%; height: 54px; display: block; }
+#align { width: 100%; height: 150px; display: block; overflow: visible; }
+#align text { font-family: var(--font); fill: var(--ink); }
+#align .rd { fill: var(--ink-dim); font-size: 15px; }
+#align .out { font-size: 22px; font-weight: 600; }
+#align path { fill: none; stroke-width: 1.8; stroke-linecap: round; }
+#align path.draw { animation: draw .7s ease-out forwards; }
+@keyframes draw { from { stroke-dashoffset: 260; } to { stroke-dashoffset: 0; } }
+#align circle { fill: var(--amber); }
+.bars { display: grid; gap: 9px; }
+.bar { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: 14.5px; align-items: center; }
+.bar .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar .p { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); }
+.bar .track { grid-column: 1 / -1; height: 6px; border-radius: 6px; background: rgba(255,255,255,.07); overflow: hidden; }
+.bar .fill { height: 100%; border-radius: 6px; background: var(--accent); width: 0; transition: width .5s cubic-bezier(.2,1,.3,1); box-shadow: 0 0 10px rgba(255,112,102,.5); }
+.bar.top .t { color: #fff; font-weight: 600; }
+#keys { display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; overflow: hidden; height: 100%; }
+#keys kbd { animation: pop .35s cubic-bezier(.2,1.6,.4,1); }
+#keys kbd.taken { border-color: rgba(255,176,59,.6); box-shadow: 0 0 10px rgba(255,176,59,.25); }
+#keys kbd.pass { opacity: .45; }
+@keyframes pop { from { transform: scale(.4) translateY(8px); opacity: 0; } }
+.empty { color: var(--ink-faint); font-size: 13px; }
+
+/* ---- footer ---------------------------------------------------------- */
+footer { display: flex; align-items: center; gap: 12px; font-size: 12.5px; color: var(--ink-faint); }
+.btn {
+  font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+  padding: 9px 18px; border-radius: 12px; border: 0; color: #fff;
+  background: var(--accent);
+  box-shadow: 0 8px 26px rgba(255,112,102,.35), inset 0 1px 0 rgba(255,255,255,.35);
+  transition: transform .15s, filter .2s;
+}
+.btn:hover { transform: translateY(-1px); filter: brightness(1.08); }
+.btn.ghost { background: var(--glass); border: 1px solid var(--line); box-shadow: none; color: var(--ink-dim); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+#flash {
+  position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; pointer-events: none;
+  font-size: 220px; font-weight: 800; opacity: 0;
+  background: var(--accent); -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+#flash.go { animation: flash .9s cubic-bezier(.2,.8,.2,1); }
+@keyframes flash { 0% { opacity: 0; transform: scale(.6); } 25% { opacity: .95; transform: scale(1); } 100% { opacity: 0; transform: scale(1.5); filter: blur(10px); } }
+#warn {
+  position: fixed; left: 50%; top: 84px; transform: translateX(-50%); z-index: 70;
+  padding: 10px 18px; border-radius: 12px; font-size: 14px;
+  background: rgba(255,93,122,.16); border: 1px solid rgba(255,93,122,.5); color: #ffd0d8;
+  backdrop-filter: blur(14px); display: none;
+}
+@media (max-width: 1000px) {
+  main { grid-template-columns: 1fr; }
+  .hud { display: none; }
+}
+</style>
+</head>
+<body>
+<canvas id="bg" class="layer"></canvas>
+<canvas id="fx" class="layer"></canvas>
+<div id="flash">あ</div>
+<div id="warn">システムの IME がオンになっています。<kbd>`</kbd> などでオフにしてから入力してください。</div>
+
+<div class="app">
+  <header>
+    <div class="logo"><b>Setsuna</b><span>live demo</span></div>
+    <span class="chip"><span id="conn" class="dot"></span><span id="connText">connecting…</span></span>
+    <span class="chip">model <strong id="model">—</strong></span>
+    <span class="chip">CTC-NAT · ONNX Runtime · beam <strong id="beam">20</strong></span>
+    <span class="grow"></span>
+    <span class="chip" id="ping">engine <strong id="pingMs">— ms</strong></span>
+    <div class="mode" id="mode" title="` でオン/オフ">あ</div>
+  </header>
+
+  <main>
+    <section class="card stage" id="stage">
+      <div id="doc" tabindex="0"></div>
+      <div class="hints">
+        <span class="grp"><kbd>Space</kbd> 変換</span>
+        <span class="grp"><kbd>Tab</kbd><kbd>↓</kbd> 候補へ</span>
+        <span class="grp"><kbd>1–0</kbd> 選択</span>
+        <span class="grp"><kbd>←</kbd><kbd>→</kbd> 文節</span>
+        <span class="grp"><kbd>`</kbd> オン/オフ</span>
+        <span class="grp"><kbd>Shift</kbd>+英字 英数</span>
+        <span class="grow"></span>
+        <span class="grp">文字種
+          <button class="key" data-key="F6">F6 ひら</button>
+          <button class="key" data-key="F7">F7 カナ</button>
+          <button class="key" data-key="F8">F8 ｶﾅ</button>
+          <button class="key" data-key="F9">F9 ＡＢ</button>
+          <button class="key" data-key="F10">F10 ab</button>
+        </span>
+      </div>
+      <div id="cand"></div>
+    </section>
+
+    <aside class="hud">
+      <div class="card">
+        <h3>Inference <em id="reqs">0 requests</em></h3>
+        <div class="big"><span class="num" id="ms">—</span><span class="unit">ms / conversion</span></div>
+        <div class="sub"><span>round trip <b id="rt">—</b></span><span>average <b id="avg">—</b></span></div>
+        <canvas id="spark"></canvas>
+      </div>
+      <div class="card">
+        <h3>CTC alignment <em id="alignNote">reading → output</em></h3>
+        <svg id="align" viewBox="0 0 340 150"></svg>
+      </div>
+      <div class="card">
+        <h3>Beam <em>top 5 · relative probability</em></h3>
+        <div class="bars" id="bars"><div class="empty">変換するとビームの上位候補が出ます</div></div>
+      </div>
+      <div class="card" style="min-height:0">
+        <h3>Keystrokes <em>to the IME</em></h3>
+        <div id="keys"></div>
+      </div>
+    </aside>
+  </main>
+
+  <footer>
+    <button class="btn" id="play">▶ デモ再生</button>
+    <button class="btn ghost" id="clear">クリア</button>
+    <span class="grow"></span>
+    <span>キー入力はローカルの setsuna-demo を経由して、実際の IME セッションとエンジンで処理されています</span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let FONT = "sans-serif";
+const doc = $("doc"), cand = $("cand"), stage = $("stage");
+
+/* ---------------------------------------------------------------- state */
+let ws = null;
+let view = null;            // the session's last view
+let before = "", after = ""; // committed text around the caret
+let fresh = [];             // ranges of just-committed text to glow
+const pending = [];         // keys sent, waiting for "taken"
+let lastSeq = 0;
+const history = [];         // engine_ms per result
+let autoplay = false;
+
+/* ----------------------------------------------------------- websocket */
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $("conn").className = "dot on"; $("connText").textContent = "connected"; };
+  ws.onclose = () => {
+    $("conn").className = "dot off"; $("connText").textContent = "disconnected — retrying";
+    pending.length = 0;
+    autoplay = false;
+    setTimeout(connect, 1200);
+  };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.t === "hello") {
+      $("model").textContent = msg.model || "(none)";
+      if (msg.beam_width) $("beam").textContent = msg.beam_width;
+      if (!msg.engine) { $("connText").textContent = "connected — engine not found (kana only)"; }
+    } else if (msg.t === "view") {
+      onView(msg);
+    }
+  };
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+/* --------------------------------------------------------------- input */
+const NAMES = { " ": "Space", ArrowLeft: "←", ArrowRight: "→", ArrowUp: "↑", ArrowDown: "↓",
+  Backspace: "⌫", Enter: "⏎", Escape: "Esc", Delete: "Del", PageUp: "PgUp", PageDown: "PgDn" };
+const PASS_THROUGH = new Set(["Shift", "Control", "Alt", "Meta", "CapsLock", "OS"]);
+
+function pressKey(k) {
+  // a key sent while disconnected would wait forever for its reply
+  if (!ws || ws.readyState !== 1) return;
+  const msg = { t: "key", key: k.key, code: k.code || "", shift: !!k.shift, ctrl: !!k.ctrl, alt: !!k.alt, meta: !!k.meta };
+  pending.push(msg);
+  send(msg);
+}
+
+window.addEventListener("keydown", (e) => {
+  if (e.isComposing || e.key === "Process" || e.keyCode === 229) {
+    $("warn").style.display = "block";
+    return;
+  }
+  $("warn").style.display = "none";
+  if (PASS_THROUGH.has(e.key)) return;
+  // leave browser shortcuts alone (reload, devtools, …) unless the IME may want them
+  if ((e.ctrlKey || e.metaKey) && !"uiopt".includes(e.key.toLowerCase())) return;
+  if (e.key === "F5" || e.key === "F11" || e.key === "F12") return;
+  e.preventDefault();
+  pressKey({ key: e.key, code: e.code, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey });
+});
+
+/** What the editor does with a key the IME left alone. */
+function localKey(k) {
+  if (k.ctrl || k.alt || k.meta) return;
+  switch (k.key) {
+    case "Backspace": before = [...before].slice(0, -1).join(""); break;
+    case "Delete": after = [...after].slice(1).join(""); break;
+    case "ArrowLeft": { const b = [...before]; if (b.length) { after = b.pop() + after; before = b.join(""); } break; }
+    case "ArrowRight": { const a = [...after]; if (a.length) { before += a.shift(); after = a.join(""); } break; }
+    case "Home": after = before + after; before = ""; break;
+    case "End": before = before + after; after = ""; break;
+    case "Enter": before += "\n"; break;
+    default:
+      if ([...k.key].length === 1) before += k.key;
+  }
+}
+
+/* ---------------------------------------------------------------- view */
+function onView(msg) {
+  if (msg.taken !== null && msg.taken !== undefined) {
+    const k = pending.shift();
+    if (k) {
+      if (!msg.taken) localKey(k);
+      addKeycap(k, msg.taken);
+    }
+  }
+  const wasEnabled = view ? view.enabled : true;
+  view = msg;
+  if (msg.commits && msg.commits.length) {
+    const text = msg.commits.join("");
+    const start = [...before].length;
+    before += text;
+    fresh.push({ start, len: [...text].length, until: performance.now() + 1600 });
+  }
+  render();
+  if (msg.commits && msg.commits.length) burst(msg.commits.join(""));
+  if (msg.enabled !== wasEnabled) modeFlash(msg.enabled);
+  $("mode").textContent = msg.enabled ? "あ" : "A";
+  $("mode").classList.toggle("direct", !msg.enabled);
+  if (msg.engine && msg.engine.seq !== lastSeq) {
+    lastSeq = msg.engine.seq;
+    onEngine(msg.engine);
+  }
+}
+
+function esc(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+/** Committed text with the fresh ranges wrapped. */
+function committedHTML(text, offset) {
+  const now = performance.now();
+  fresh = fresh.filter((f) => f.until > now);
+  const chars = [...text];
+  let out = "";
+  for (let i = 0; i < chars.length; i++) {
+    const abs = offset + i;
+    const f = fresh.find((r) => abs >= r.start && abs < r.start + r.len);
+    if (f && abs === f.start) out += '<span class="fresh">';
+    out += esc(chars[i]);
+    if (f && abs === f.start + f.len - 1) out += "</span>";
+  }
+  return out;
+}
+
+function render() {
+  const v = view || {};
+  const pre = v.preedit || [];
+  let html = committedHTML(before, 0);
+  if (pre.length) {
+    const converting = v.focus !== null && v.focus !== undefined;
+    const caretAt = v.caret;
+    html += '<span class="anchor" id="anchor"></span>';
+    pre.forEach((seg, i) => {
+      const cls = ["pre"];
+      if (pre.length > 1) cls.push("seg");
+      if (converting && i === v.focus) cls.push("focus");
+      if (!converting) cls.push("kana");
+      const id = converting && i === v.focus ? ' id="focusSeg"' : "";
+      if (caretAt !== null && caretAt !== undefined && pre.length === 1) {
+        const chars = [...seg];
+        html += `<span class="${cls.join(" ")}">${esc(chars.slice(0, caretAt).join(""))}</span>`
+          + '<span class="caret"></span>'
+          + `<span class="${cls.join(" ")}">${esc(chars.slice(caretAt).join(""))}</span>`;
+      } else {
+        html += `<span class="${cls.join(" ")}"${id}>${esc(seg)}</span>`;
+      }
+    });
+    if (caretAt === null || caretAt === undefined) html += converting ? "" : '<span class="caret"></span>';
+  } else {
+    html += '<span class="caret"></span>';
+  }
+  html += committedHTML(after, [...before].length);
+  if (!before && !after && !pre.length) {
+    html = '<span class="caret"></span><span class="placeholder">  ローマ字で入力してみてください。<br>  例: <kbd>kyouhaiitenkidesune</kbd> → <kbd>Tab</kbd> / <kbd>Space</kbd> → <kbd>Enter</kbd></span>';
+  }
+  doc.innerHTML = html;
+  renderCandidates();
+}
+
+const SPARKLE = '<svg class="sparkle" viewBox="0 0 30 30"><defs><linearGradient id="sg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffb03b"/><stop offset=".5" stop-color="#ff7066"/><stop offset="1" stop-color="#ab78ff"/></linearGradient></defs><path fill="url(#sg)" d="M17 2 L19.3 10.7 L28 13 L19.3 15.3 L17 24 L14.7 15.3 L6 13 L14.7 10.7 Z"/><circle cx="6" cy="23" r="1.8" fill="url(#sg)"/><circle cx="25" cy="25" r="1.2" fill="url(#sg)"/></svg>';
+
+function renderCandidates() {
+  const v = view || {};
+  const list = v.candidates || [];
+  const sugg = v.suggestions || [];
+  cand.className = "";
+  if (list.length) {
+    const ps = v.page_size || 10;
+    const page = Math.floor(v.selected / ps);
+    const pages = Math.ceil(list.length / ps);
+    const items = list.slice(page * ps, page * ps + ps);
+    let html = SPARKLE;
+    if (v.reading) html += `<div class="head">「<b>${esc(v.reading)}</b>」</div>`;
+    html += '<ul><div class="hl" id="hl"></div>';
+    items.forEach((c, i) => {
+      const idx = page * ps + i;
+      const cm = (v.comments || [])[idx] || "";
+      html += `<li data-i="${idx}" class="${idx === v.selected ? "sel" : ""}"><span class="lbl">${(i + 1) % 10}</span><span>${esc(c)}</span>${cm ? `<span class="cm">${esc(cm)}</span>` : ""}</li>`;
+    });
+    html += "</ul>";
+    let dots = "";
+    if (pages > 1) { dots = '<span class="pages">' + Array.from({ length: Math.min(pages, 8) }, (_, i) => `<i class="${i === page ? "on" : ""}"></i>`).join("") + "</span>"; }
+    html += `<div class="foot"><b>${v.selected + 1}</b> / ${list.length}${dots}</div>`;
+    cand.innerHTML = html;
+    cand.classList.add("show");
+  } else if (sugg.length) {
+    let html = SPARKLE + '<div class="head"><span class="tag">PREDICT</span>入力中の変換候補</div><ul>';
+    sugg.forEach((c, i) => {
+      const cm = (v.suggestion_comments || [])[i] || "";
+      html += `<li data-i="${i}"><span>${esc(c)}</span>${cm ? `<span class="cm">${esc(cm)}</span>` : ""}</li>`;
+    });
+    html += '</ul><div class="foot"><kbd>Tab</kbd> で選択</div>';
+    cand.innerHTML = html;
+    cand.classList.add("show", "suggest");
+  } else if (v.form) {
+    cand.innerHTML = `<div class="head" style="padding:0"><kbd>${esc(v.form.key)}</kbd> ▸ <b>${esc(v.form.name)}</b>　<span>Enter 確定 · Esc 戻る</span></div>`;
+    cand.classList.add("show", "formmode");
+  } else {
+    return;
+  }
+  cand.querySelectorAll("li").forEach((li) => li.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    send({ t: "select", i: Number(li.dataset.i) });
+  }));
+  placeCandidates();
+  const sel = cand.querySelector("li.sel"), hl = $("hl");
+  if (sel && hl) { hl.style.top = sel.offsetTop + "px"; hl.style.height = sel.offsetHeight + "px"; }
+}
+
+/** Under the composition's start (the focused segment while editing
+ *  segments), above it when it does not fit: one anchor for typing and
+ *  converting, so the window does not jump. */
+function placeCandidates() {
+  const a = $("focusSeg") || $("anchor");
+  if (!a) return;
+  const sr = stage.getBoundingClientRect(), ar = a.getBoundingClientRect();
+  const w = cand.offsetWidth, h = cand.offsetHeight;
+  let left = ar.left - sr.left - 18;
+  left = Math.max(10, Math.min(left, sr.width - w - 10));
+  const lineH = parseFloat(getComputedStyle(doc).fontSize) * 1.2;
+  let top = ar.top - sr.top + lineH + 10;
+  if (top + h > sr.height - 6) top = ar.top - sr.top - h - 12;
+  cand.style.left = left + "px";
+  cand.style.top = Math.max(6, top) + "px";
+}
+
+function addKeycap(k, taken) {
+  const box = $("keys");
+  const el = document.createElement("kbd");
+  let label = NAMES[k.key] || k.key;
+  if (k.ctrl) label = "Ctrl+" + label;
+  el.textContent = label;
+  el.className = taken ? "taken" : "pass";
+  box.append(el);
+  while (box.children.length > 48) box.firstChild.remove();
+}
+
+/* -------------------------------------------------------------- engine */
+function onEngine(e) {
+  $("ms").textContent = e.engine_ms != null ? e.engine_ms.toFixed(1) : "—";
+  $("rt").textContent = e.round_trip_ms.toFixed(1) + " ms";
+  $("avg").textContent = e.avg_engine_ms.toFixed(1) + " ms";
+  $("reqs").textContent = e.seq + " requests";
+  $("pingMs").textContent = (e.engine_ms != null ? e.engine_ms.toFixed(1) : "—") + " ms";
+  const ping = $("ping"); ping.classList.remove("flash"); void ping.offsetWidth; ping.classList.add("flash");
+  history.push(e.engine_ms || 0); if (history.length > 60) history.shift();
+  drawSpark();
+  drawAlign(e);
+  drawBars(e);
+}
+
+function drawSpark() {
+  const c = $("spark"), dpr = devicePixelRatio || 1;
+  const W = c.clientWidth, H = c.clientHeight;
+  c.width = W * dpr; c.height = H * dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr);
+  if (history.length < 2) return;
+  const max = Math.max(...history, 5) * 1.2;
+  const x = (i) => (i / (history.length - 1)) * W;
+  const y = (v) => H - (v / max) * (H - 4) - 2;
+  const grad = g.createLinearGradient(0, 0, W, 0);
+  grad.addColorStop(0, "#ffb03b"); grad.addColorStop(.55, "#ff7066"); grad.addColorStop(1, "#ab78ff");
+  g.beginPath();
+  history.forEach((v, i) => (i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v))));
+  g.strokeStyle = grad; g.lineWidth = 2; g.lineJoin = "round"; g.stroke();
+  g.lineTo(W, H); g.lineTo(0, H); g.closePath();
+  const fill = g.createLinearGradient(0, 0, 0, H);
+  fill.addColorStop(0, "rgba(255,112,102,.35)"); fill.addColorStop(1, "rgba(255,112,102,0)");
+  g.fillStyle = fill; g.fill();
+  const lx = x(history.length - 1), ly = y(history[history.length - 1]);
+  g.beginPath(); g.arc(lx, ly, 3.5, 0, Math.PI * 2); g.fillStyle = "#fff"; g.shadowColor = "#ff7066"; g.shadowBlur = 12; g.fill();
+}
+
+function drawAlign(e) {
+  const svg = $("align");
+  const rd = [...(e.reading || "")], out = [...((e.candidates || [])[0] || "")];
+  const al = e.alignment || [];
+  if (!rd.length || !out.length) { svg.innerHTML = ""; return; }
+  const W = 340, pad = 14;
+  const rx = (i) => pad + (rd.length === 1 ? (W - 2 * pad) / 2 : (i / (rd.length - 1)) * (W - 2 * pad));
+  const ox = (i) => pad + (out.length === 1 ? (W - 2 * pad) / 2 : (i / (out.length - 1)) * (W - 2 * pad));
+  const rfs = Math.max(9, Math.min(15, (W - 2 * pad) / rd.length * 0.9));
+  const ofs = Math.max(11, Math.min(24, (W - 2 * pad) / out.length * 0.85));
+  let s = '<defs><linearGradient id="lg" gradientUnits="userSpaceOnUse" x1="0" y1="30" x2="0" y2="112"><stop offset="0" stop-color="#5ee6ff"/><stop offset=".5" stop-color="#ff7066"/><stop offset="1" stop-color="#ffb03b"/></linearGradient></defs>';
+  rd.forEach((ch, i) => { s += `<text class="rd" x="${rx(i)}" y="22" text-anchor="middle" font-size="${rfs}">${esc(ch)}</text>`; });
+  out.forEach((ch, i) => {
+    const j = al[i];
+    if (j !== undefined && j < rd.length) {
+      const x1 = rx(j), x2 = ox(i);
+      s += `<path class="draw" stroke="url(#lg)" stroke-dasharray="260" stroke-dashoffset="260" style="animation-delay:${i * 35}ms" d="M${x1} 30 C ${x1} 75, ${x2} 80, ${x2} 112"/>`;
+      s += `<circle cx="${x1}" cy="30" r="2.2"/>`;
+    }
+  });
+  out.forEach((ch, i) => { s += `<text class="out" x="${ox(i)}" y="138" text-anchor="middle" font-size="${ofs}">${esc(ch)}</text>`; });
+  svg.innerHTML = s;
+  $("alignNote").textContent = `${rd.length} kana → ${out.length} chars`;
+}
+
+function drawBars(e) {
+  const cands = e.candidates || [], scores = e.scores || [];
+  if (!cands.length) return;
+  const n = Math.min(cands.length, scores.length || cands.length);
+  const mx = Math.max(...scores.slice(0, n));
+  const ex = scores.slice(0, n).map((s) => Math.exp(s - mx));
+  const sum = ex.reduce((a, b) => a + b, 0) || 1;
+  const box = $("bars");
+  box.innerHTML = cands.slice(0, n).map((c, i) => {
+    const p = scores.length ? ex[i] / sum : 0;
+    return `<div class="bar ${i === 0 ? "top" : ""}"><span class="t">${esc(c)}</span><span class="p">${(p * 100).toFixed(1)}%</span><div class="track"><div class="fill" data-w="${(p * 100).toFixed(1)}"></div></div></div>`;
+  }).join("");
+  requestAnimationFrame(() => box.querySelectorAll(".fill").forEach((f) => (f.style.width = f.dataset.w + "%")));
+}
+
+/* ------------------------------------------------------------- effects */
+const fx = $("fx"), fxg = fx.getContext("2d");
+const parts = [];
+function sizeFx() { const d = devicePixelRatio || 1; fx.width = innerWidth * d; fx.height = innerHeight * d; fxg.setTransform(d, 0, 0, d, 0, 0); }
+function burst(text) {
+  const caret = doc.querySelector(".fresh") || doc.querySelector(".caret");
+  if (!caret) return;
+  const r = caret.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const cols = ["#ffb03b", "#ff7066", "#ab78ff", "#5ee6ff", "#ffffff"];
+  for (let i = 0; i < 46; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 6;
+    parts.push({ x: cx, y: cy, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 2.5, life: 1, decay: .012 + Math.random() * .02,
+      r: 1.5 + Math.random() * 2.5, c: cols[i % cols.length] });
+  }
+  for (const ch of [...text].slice(0, 12)) {
+    const a = -Math.PI / 2 + (Math.random() - .5) * 1.6, sp = 3 + Math.random() * 4;
+    parts.push({ x: cx, y: cy, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, decay: .012, glyph: ch,
+      size: 18 + Math.random() * 16, c: cols[Math.floor(Math.random() * 4)], rot: (Math.random() - .5) * .3 });
+  }
+}
+function modeFlash(on) {
+  const f = $("flash");
+  f.textContent = on ? "あ" : "A";
+  f.classList.remove("go"); void f.offsetWidth; f.classList.add("go");
+}
+function tickFx() {
+  fxg.clearRect(0, 0, innerWidth, innerHeight);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.14; p.vx *= 0.985; p.life -= p.decay;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    fxg.globalAlpha = Math.max(0, p.life);
+    if (p.glyph) {
+      fxg.save(); fxg.translate(p.x, p.y); fxg.rotate(p.rot * (1 - p.life) * 6);
+      fxg.font = `700 ${p.size}px ${FONT}`;
+      fxg.fillStyle = p.c; fxg.shadowColor = p.c; fxg.shadowBlur = 16; fxg.textAlign = "center";
+      fxg.fillText(p.glyph, 0, 0); fxg.restore();
+    } else {
+      fxg.beginPath(); fxg.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      fxg.fillStyle = p.c; fxg.shadowColor = p.c; fxg.shadowBlur = 10; fxg.fill();
+    }
+  }
+  fxg.globalAlpha = 1; fxg.shadowBlur = 0;
+  requestAnimationFrame(tickFx);
+}
+
+/* background: drifting aurora and glyphs, drawn small and scaled up */
+const bg = $("bg"), bgg = bg.getContext("2d");
+const GLYPHS = "あいうえおかきくけこさしすせそ日本語入力変換漢字仮名候補文節予測神経網".split("");
+const floaters = Array.from({ length: 34 }, () => newFloater(true));
+function newFloater(anywhere) {
+  return { x: Math.random(), y: anywhere ? Math.random() : 1.1, s: 14 + Math.random() * 40, v: .00012 + Math.random() * .0004,
+    g: GLYPHS[Math.floor(Math.random() * GLYPHS.length)], a: .03 + Math.random() * .07 };
+}
+function sizeBg() { bg.width = innerWidth / 2; bg.height = innerHeight / 2; }
+function tickBg(t) {
+  const W = bg.width, H = bg.height;
+  bgg.fillStyle = "#090b14"; bgg.fillRect(0, 0, W, H);
+  const blobs = [
+    [0.12 + 0.08 * Math.sin(t / 7000), 0.15 + 0.1 * Math.cos(t / 9000), "255,176,59", .11],
+    [0.8 + 0.1 * Math.cos(t / 8000), 0.25 + 0.12 * Math.sin(t / 6000), "171,120,255", .16],
+    [0.45 + 0.15 * Math.sin(t / 11000), 0.95 + 0.05 * Math.cos(t / 7000), "255,112,102", .10],
+    [0.95 + 0.04 * Math.sin(t / 5000), 0.95, "94,230,255", .08],
+  ];
+  bgg.globalCompositeOperation = "lighter";
+  for (const [x, y, c, a] of blobs) {
+    const r = Math.max(W, H) * 0.42;
+    const gr = bgg.createRadialGradient(x * W, y * H, 0, x * W, y * H, r);
+    gr.addColorStop(0, `rgba(${c},${a})`); gr.addColorStop(1, `rgba(${c},0)`);
+    bgg.fillStyle = gr; bgg.fillRect(0, 0, W, H);
+  }
+  bgg.globalCompositeOperation = "source-over";
+  bgg.textAlign = "center";
+  for (let i = 0; i < floaters.length; i++) {
+    const f = floaters[i];
+    f.y -= f.v * 16;
+    if (f.y < -0.1) floaters[i] = newFloater(false);
+    bgg.font = `600 ${f.s / 2}px ${FONT}`;
+    bgg.fillStyle = `rgba(255,255,255,${f.a})`;
+    bgg.fillText(f.g, f.x * W, f.y * H);
+  }
+  // faint grid
+  bgg.strokeStyle = "rgba(255,255,255,0.025)"; bgg.lineWidth = 1;
+  for (let gx = 0; gx < W; gx += 24) { bgg.beginPath(); bgg.moveTo(gx, 0); bgg.lineTo(gx, H); bgg.stroke(); }
+  for (let gy = 0; gy < H; gy += 24) { bgg.beginPath(); bgg.moveTo(0, gy); bgg.lineTo(W, gy); bgg.stroke(); }
+  requestAnimationFrame(tickBg);
+}
+
+/* ------------------------------------------------------------ autoplay */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function typeText(s, gap = 85) {
+  for (const ch of s) {
+    if (!autoplay) return;
+    pressKey({ key: ch, shift: ch !== ch.toLowerCase() });
+    await sleep(gap + Math.random() * 40);
+  }
+}
+async function key(k, wait = 450, extra = {}) { if (!autoplay) return; pressKey({ key: k, ...extra }); await sleep(wait); }
+const SCRIPT = [
+  async () => { await typeText("kyouhaiitenkidesune"); await sleep(700); await key("Tab", 700); await key("Enter", 900); },
+  async () => { await key("Enter", 300); await typeText("kishanokishagakishashita"); await sleep(600); await key(" ", 900);
+    await key("ArrowRight", 600); await key("ArrowRight", 600); await key("ArrowRight", 700); await key(" ", 700); await key("Enter", 900); },
+  async () => { await key("Enter", 300); await typeText("demo"); await sleep(500); await key("F7", 900); await key("Enter", 600);
+    await typeText("wo"); await typeText("tsukuru"); await sleep(600); await key("Tab", 600); await key("Enter", 900); },
+  async () => { await key("Enter", 300); await typeText("tokyo"); await key("F10", 650); await key("F10", 650); await key("F10", 650); await key("Enter", 700);
+    await key("`", 900); await typeText(" is fun"); await key("`", 900); await typeText("dane"); await sleep(600); await key("Tab", 500); await key("Enter", 900); },
+];
+async function play() {
+  if (autoplay) { autoplay = false; return; }
+  autoplay = true;
+  $("play").textContent = "■ 停止";
+  if (view && !view.enabled) await key("`", 600);
+  for (const step of SCRIPT) { if (!autoplay) break; await step(); }
+  autoplay = false;
+  $("play").textContent = "▶ デモ再生";
+}
+
+/* ---------------------------------------------------------------- wire */
+$("play").onclick = play;
+$("clear").onclick = () => { send({ t: "flush" }); setTimeout(() => { before = ""; after = ""; fresh = []; render(); }, 60); };
+$("mode").onclick = () => send({ t: "toggle" });
+document.querySelectorAll("button.key").forEach((b) => b.addEventListener("mousedown", (e) => { e.preventDefault(); pressKey({ key: b.dataset.key }); }));
+addEventListener("resize", () => { sizeFx(); sizeBg(); placeCandidates(); });
+FONT = getComputedStyle(document.body).fontFamily;
+sizeFx(); sizeBg(); requestAnimationFrame(tickBg); requestAnimationFrame(tickFx);
+render();
+connect();
+</script>
+</body>
+</html>

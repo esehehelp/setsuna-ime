@@ -1,0 +1,75 @@
+# Symbol dictionary: readings that name symbols. Embedded by symbol_dict.rs.
+#
+# reading <TAB> place <TAB> symbols separated by spaces
+#
+# place: first  - the reading names only a symbol (なかぐろ, やじるし): the
+#                 symbols go before the model's candidates
+#        after  - the reading is also an ordinary word (まる, かっこ): the
+#                 symbols go after the model's top two and the kana forms
+#
+# きごう is deliberately absent: it must convert to 記号.
+なかぐろ	first	・
+なかてん	first	・
+やじるし	first	→ ← ↑ ↓ ⇒ ⇔ ↔ ⇐
+みぎやじるし	first	→ ⇒
+ひだりやじるし	first	← ⇐
+うえやじるし	first	↑
+したやじるし	first	↓
+こめじるし	first	※
+かぎかっこ	first	「」 「 」
+にじゅうかぎかっこ	first	『』 『 』
+すみつきかっこ	first	【】 【 】
+まるかっこ	first	（） （ ）
+かくかっこ	first	［］ ［ ］
+なみかっこ	first	｛｝ ｛ ｝
+やまかっこ	first	〈〉 《》 〈 〉 《 》
+きっこうかっこ	first	〔〕 〔 〕
+さんてんりーだー	first	…
+にてんりーだー	first	‥
+すらっしゅ	first	／ /
+ばっくすらっしゅ	first	＼ \
+ころん	first	： :
+せみころん	first	； ;
+あっとまーく	first	＠ @
+のっといこーる	first	≠
+にありーいこーる	first	≒
+ぷらすまいなす	first	±
+だいなり	first	＞ ≧ ≫
+しょうなり	first	＜ ≦ ≪
+ゆうびんきごう	first	〒
+くえすちょんまーく	first	？ ?
+えくすくらめーしょんまーく	first	！ !
+ちょうおん	first	ー
+なみだっしゅ	first	～ 〜
+かっこ	after	（） 「」 『』 【】 ［］ ｛｝ 〈〉 《》 （ ） 「 」
+まる	after	○ ● ◎ ◯
+しかく	after	□ ■ ◇ ◆
+さんかく	after	△ ▲ ▽ ▼
+ほし	after	☆ ★
+はーと	after	♡ ♥
+おんぷ	after	♪ ♫ ♬
+ばつ	after	× ✕
+かける	after	×
+わる	after	÷
+いこーる	after	＝ ≒ ≠
+ぷらす	after	＋
+まいなす	after	－ ±
+ぱーせんと	after	％
+あっと	after	＠
+あんど	after	＆
+しゃーぷ	after	＃ ♯
+から	after	～ 〜
+てん	after	、 ・ …
+てんてん	after	… ‥
+えん	after	￥
+どる	after	＄
+ゆーろ	after	€
+ぽんど	after	£
+ど	after	° ℃
+むげんだい	after	∞
+ゆうびん	after	〒
+でんわ	after	℡ ☎
+おなじ	after	々 〃
+しめ	after	〆
+かぶしきがいしゃ	after	㈱
+ゆうげんがいしゃ	after	㈲

@@ -1,0 +1,24 @@
+[package]
+name = "setsuna-core"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Platform-neutral IME logic shared by the Setsuna frontends: romaji composition, the conversion state machine, candidate post-processing, learning, config and the engine daemon client."
+
+[lib]
+name = "setsuna_core"
+path = "src/lib.rs"
+
+[dependencies]
+# No setsuna-engine dependency: the frontends never link the engine. They
+# talk to a separate `setsuna-engine daemon` child process over a stdio
+# JSONL protocol (see src/child_daemon.rs).
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit = "0.22"
+unicode-normalization = "0.1"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0.00" stop-color="#ffb03b"/>
+      <stop offset="0.50" stop-color="#ff7066"/>
+      <stop offset="1.00" stop-color="#ab78ff"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="15" fill="url(#g)"/>
+  <rect x="3" y="3" width="58" height="58" rx="15" fill="url(#gloss)"/>
+  <text x="32" y="45" text-anchor="middle" font-family="IBM Plex Sans JP, Noto Sans CJK JP, sans-serif"
+        font-size="34" font-weight="700" fill="#ffffff">あ</text>
+</svg>

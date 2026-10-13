@@ -1,0 +1,19 @@
+[package]
+name = "setsuna-linux"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Linux IME frontend for Setsuna: the Rust half of the fcitx5 addon (fcitx5/), linked into it as a static library through a C ABI (include/setsuna.h)."
+
+[lib]
+name = "setsuna_linux"
+path = "src/lib.rs"
+# staticlib: linked into the fcitx5 addon module by fcitx5/CMakeLists.txt.
+# rlib: for the unit tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The shared IME logic. The engine is never linked: setsuna-core talks to a
+# `setsuna-engine daemon` child process over its stdio protocol.
+setsuna-core = { path = "../ime-core" }

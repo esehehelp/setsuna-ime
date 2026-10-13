@@ -1,0 +1,26 @@
+{
+  "schema": "neo-ime-ctc-nat-export-v1",
+  "model_family": "ctc_nat",
+  "proposal": {
+    "path": "model.int4.onnx",
+    "precision": "int4"
+  },
+  "vocab": "model.fp32.tokenizer.json.vocab.hex.tsv",
+  "special_ids": {
+    "pad": 0,
+    "unk": 1,
+    "cls": 3,
+    "sep": 2,
+    "blank": 4,
+    "mask": 5
+  },
+  "max_seq_len": 128,
+  "decode_defaults": {
+    "beam_width": 20,
+    "vocab_blacklist": [
+      724,
+      730
+    ],
+    "symbol_split": true
+  }
+}

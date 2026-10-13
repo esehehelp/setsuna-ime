@@ -1,0 +1,18 @@
+{
+  "schema": "neo-ime-lm-scorer-export-v1",
+  "model_family": "causal_lm",
+  "weights": {
+    "path": "model.q8_0.gguf",
+    "format": "gguf",
+    "precision": "q8_0"
+  },
+  "special_ids": {
+    "bos": 1,
+    "eos": 2
+  },
+  "score_defaults": {
+    "max_context_chars": 40,
+    "lambda": 0.3,
+    "max_candidates": 20
+  }
+}

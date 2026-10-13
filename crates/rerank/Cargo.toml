@@ -1,0 +1,28 @@
+[package]
+name = "setsuna-rerank"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version = "0.1.0"
+description = "Reranks conversion candidates with a causal LM (llama.cpp), loaded through an LM scorer manifest."
+
+[lib]
+name = "setsuna_rerank"
+path = "src/lib.rs"
+
+[[bin]]
+name = "setsuna-rerank"
+path = "src/bin/main.rs"
+
+[dependencies]
+setsuna-artifact = { path = "../artifact" }
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+# llama.cpp with every x86 CPU variant built and the best one picked at run
+# time (GGML_BACKEND_DL): fast without building for this machine's CPU only.
+llama-cpp-2 = { version = "=0.1.158", default-features = false, features = ["openmp", "dynamic-backends"] }
+# Only for its build metadata (DEP_LLAMA_BACKENDS_DIR): build.rs puts the
+# shared libraries next to the executable.
+llama-cpp-sys-2 = { version = "=0.1.158", default-features = false }

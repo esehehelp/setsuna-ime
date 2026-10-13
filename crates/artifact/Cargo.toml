@@ -1,0 +1,16 @@
+[package]
+name = "setsuna-artifact"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Model artifact manifests shared by the export pipeline and the runtime."
+
+[lib]
+name = "setsuna_artifact"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

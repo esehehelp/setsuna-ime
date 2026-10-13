@@ -1,0 +1,44 @@
+# Full-width share of each ASCII symbol in Japanese text, for
+# symbol_width = "auto" (postprocess::auto_width) when the text before the
+# caret does not show it. Embedded by postprocess.rs.
+#
+# symbol <TAB> none <TAB> one <TAB> both: the percentage written full-width
+# (＂ rather than ") with no / one / two ASCII or full-width digits or
+# letters right beside it, counting only symbols with kana or kanji within
+# three chars. Over 50 is full-width. A case seen under 100 times takes the
+# one before it (one <- none, both <- one); a symbol seen under 100 times
+# with nothing beside it is half-width.
+#
+# Counted over 301M chars of raw text: fineweb2_edu 120M, hplt3 120M, whitepaper 51M, livedoor 10M.
+!	89	67	26
+"	1	0	0
+#	13	23	23
+$	15	21	21
+%	77	71	60
+&	80	65	20
+'	0	0	0
+(	83	74	88
+)	83	71	74
+*	50	48	22
++	61	37	36
+,	82	65	5
+-	3	35	18
+.	7	28	6
+/	49	24	8
+:	78	83	36
+;	33	35	35
+<	82	54	54
+=	79	73	49
+>	66	50	50
+?	74	21	2
+@	57	20	20
+[	14	12	8
+\	71	19	19
+]	14	13	13
+^	36	11	11
+_	25	9	1
+`	61	61	61
+{	11	4	4
+|	14	13	13
+}	7	7	7
+~	97	96	95

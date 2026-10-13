@@ -1,0 +1,275 @@
+# Mixed Japanese / English romaji input: what the IME should commit when the
+# keys are typed and then Enter is pressed (no conversion: the Japanese part
+# stays hiragana). Columns: category, typed, expected, text before the caret.
+# An uppercase letter is typed with Shift. `-` in Japanese is ー, `,` `.` are
+# 、。 in Japanese. A space at the end of the text before the caret is
+# written ␣.
+#
+# ja: Japanese that only looks English in places (made, kite, tame, home …).
+ja	ashitamadenikite	あしたまでにきて
+ja	kokomadekitekudasai	ここまできてください
+ja	sonotamenibenkyousuru	そのためにべんきょうする
+ja	kanojohahomeraretai	かのじょはほめられたい
+ja	osakewonomu	おさけをのむ
+ja	yamanominewomiru	やまのみねをみる
+ja	demosorehamuridesu	でもそれはむりです
+ja	namerarenaiyouni	なめられないように
+ja	hatenakutsuduku	はてなくつづく
+ja	moretenaika	もれてないか
+ja	tsumetaiomizu	つめたいおみず
+ja	urenokorinoshouhin	うれのこりのしょうひん
+ja	anatanoikenwokikitai	あなたのいけんをききたい
+ja	korehapendesu	これはぺんです
+ja	tenkigaiinode	てんきがいいので
+ja	menwotabeta	めんをたべた
+ja	kinounoban	きのうのばん
+ja	sonnnakotohanai	そんなことはない
+ja	hontounikawaii	ほんとうにかわいい
+ja	toukyouniikimasu	とうきょうにいきます
+ja	karaokeniikou	からおけにいこう
+ja	sushiwotabetai	すしをたべたい
+ja	ra-menwotabeniiku	らーめんをたべにいく
+ja	animewomiru	あにめをみる
+ja	mangawoyomu	まんがをよむ
+ja	kimononokitsukewonarau	きもののきつけをならう
+ja	karatenoshiai	からてのしあい
+ja	obentouwotsukuru	おべんとうをつくる
+ja	kaigihasanjikaradesu	かいぎはさんじからです
+ja	kawaiinekogairu	かわいいねこがいる
+ja	tabetemiru	たべてみる
+ja	nemuinode	ねむいので
+ja	sakihodonoken	さきほどのけん
+ja	hanasuto	はなすと
+ja	mitemite	みてみて
+ja	kitekite	きてきて
+ja	daremoinai	だれもいない
+ja	sorede	それで
+ja	tatoeba	たとえば
+ja	kotoshimoyoroshiku	ことしもよろしく
+ja	shitemoii	してもいい
+ja	omoshiroi	おもしろい
+ja	sugoine	すごいね
+ja	tonarinohito	となりのひと
+ja	puremiamukaiin	ぷれみあむかいいん
+ja	gakkoudesaisho	がっこうでさいしょ
+ja	okaasantoissho	おかあさんといっしょ
+ja	kiteiru	きている
+ja	hoshiimono	ほしいもの
+ja	anitoane	あにとあね
+ja	kudamonowokaini	くだものをかいに
+ja	kaishanimukau	かいしゃにむかう
+ja	sorehamousuguowaru	それはもうすぐおわる
+ja	anohitohadare	あのひとはだれ
+ja	tonkatsuwotabeta	とんかつをたべた
+ja	ichibansuki	いちばんすき
+ja	mainichihashiru	まいにちはしる
+ja	tokidoki	ときどき
+ja	shinpaishinaide	しんぱいしないで
+ja	benrinadougu	べんりなどうぐ
+ja	nanimonai	なにもない
+ja	usowotsukanai	うそをつかない
+ja	are	あれ
+ja	kore	これ
+ja	made	まで
+ja	tame	ため
+ja	mono	もの
+ja	no	の
+ja	to	と
+ja	ai	あい
+ja	sake	さけ
+ja	tenisuwosuru	てにすをする
+ja	shiteitadakemasuka	していただけますか
+ja	ikanaito	いかないと
+ja	semete	せめて
+ja	daitaionaji	だいたいおなじ
+ja	ninjanoeiga	にんじゃのえいが
+ja	torinonamae	とりのなまえ
+ja	homerumadematsu	ほめるまでまつ
+#
+# ja-punct: Japanese with symbols typed in the same composition.
+ja-punct	hai,wakarimashita.	はい、わかりました。
+ja-punct	sounandesune.	そうなんですね。
+ja-punct	ashita,ikimasu.	あした、いきます。
+ja-punct	ko-hi-wonomu	こーひーをのむ
+ja-punct	kaigiha3jikara	かいぎは3じから
+ja-punct	2026nen10gatsu	2026ねん10がつ
+#
+# en-word: an English word typed on its own.
+en-word	google	google
+en-word	github	github
+en-word	youtube	youtube
+en-word	twitter	twitter
+en-word	slack	slack
+en-word	discord	discord
+en-word	zoom	zoom
+en-word	python	python
+en-word	rust	rust
+en-word	linux	linux
+en-word	windows	windows
+en-word	chrome	chrome
+en-word	docker	docker
+en-word	kubernetes	kubernetes
+en-word	javascript	javascript
+en-word	typescript	typescript
+en-word	hello	hello
+en-word	thanks	thanks
+en-word	meeting	meeting
+en-word	keyboard	keyboard
+en-word	update	update
+en-word	download	download
+en-word	camera	camera
+en-word	coffee	coffee
+en-word	server	server
+en-word	cloud	cloud
+en-word	issue	issue
+en-word	commit	commit
+en-word	merge	merge
+en-word	deploy	deploy
+en-word	branch	branch
+en-word	apple	apple
+en-word	amazon	amazon
+en-word	netflix	netflix
+en-word	react	react
+en-word	excel	excel
+en-word	test	test
+en-word	debug	debug
+en-word	error	error
+en-word	password	password
+en-word	email	email
+en-word	online	online
+en-word	ok	ok
+en-word	pc	pc
+#
+# en-in-ja: English words inside Japanese.
+en-in-ja	kyouhagoogledekensakushita	きょうはgoogleでけんさくした
+en-in-ja	githubnipushshita	githubにpushした
+en-in-ja	slackderenrakushita	slackでれんらくした
+en-in-ja	zoomdekaigiwosuru	zoomでかいぎをする
+en-in-ja	pythondekaita	pythonでかいた
+en-in-ja	dockerwotsukatte	dockerをつかって
+en-in-ja	windowsnoupdategaowaranai	windowsのupdateがおわらない
+en-in-ja	chromenotabwotojiru	chromeのtabをとじる
+en-in-ja	youtubedemita	youtubeでみた
+en-in-ja	netflixnodorama	netflixのどらま
+en-in-ja	discordnisankasuru	discordにさんかする
+en-in-ja	linuxdeugokanai	linuxでうごかない
+en-in-ja	commitshitekudasai	commitしてください
+en-in-ja	mergeshitemoii	mergeしてもいい
+en-in-ja	deployhaashita	deployはあした
+en-in-ja	branchwokiru	branchをきる
+en-in-ja	servergaochita	serverがおちた
+en-in-ja	cloudnihozon	cloudにほぞん
+en-in-ja	excelnoshiryou	excelのしりょう
+en-in-ja	iphonewokaikaeta	iphoneをかいかえた
+en-in-ja	amazondekatta	amazonでかった
+en-in-ja	applenoshinseihin	appleのしんせいひん
+en-in-ja	kinoutwitterdemita	きのうtwitterでみた
+en-in-ja	ashitanomeetingnitsuite	あしたのmeetingについて
+en-in-ja	kanojohacoffeegasuki	かのじょはcoffeeがすき
+en-in-ja	sorehabugdesu	それはbugです
+en-in-ja	testgatooranai	testがとおらない
+en-in-ja	errorgadeta	errorがでた
+en-in-ja	passwordwowasureta	passwordをわすれた
+en-in-ja	emailwookuru	emailをおくる
+en-in-ja	javascriptnobunpou	javascriptのぶんぽう
+en-in-ja	typescriptnikakikaeru	typescriptにかきかえる
+en-in-ja	kubernetesnosettei	kubernetesのせってい
+en-in-ja	konofolderniireru	このfolderにいれる
+en-in-ja	kyouhaonlinedesankasuru	きょうはonlineでさんかする
+en-in-ja	downloadgaowatta	downloadがおわった
+en-in-ja	keyboardwokatta	keyboardをかった
+en-in-ja	debugchuu	debugちゅう
+en-in-ja	hellotoitta	helloといった
+en-in-ja	thankstoitteta	thanksといってた
+en-in-ja	okdesu	okです
+en-in-ja	pcgakowareta	pcがこわれた
+en-in-ja	reactdetsukutta	reactでつくった
+en-in-ja	rustnokonpaira	rustのこんぱいら
+#
+# capital: words typed with Shift (proper nouns, acronyms).
+capital	Tokyonisumu	Tokyoにすむ
+capital	GitHubnipush	GitHubにpush
+capital	iPhonewokatta	iPhoneをかった
+capital	macOSnoupdate	macOSのupdate
+capital	Pythondekaku	Pythonでかく
+capital	Applenoseihin	Appleのせいひん
+capital	ChatGPTnikiita	ChatGPTにきいた
+capital	OpenAInoAPI	OpenAIのAPI
+capital	PCgakowareta	PCがこわれた
+capital	AIgatsukutta	AIがつくった
+capital	USBwosasu	USBをさす
+capital	Microsoftnoshain	Microsoftのしゃいん
+capital	NHKnonyu-su	NHKのにゅーす
+capital	JRdeiku	JRでいく
+capital	SNSdebazutta	SNSでばずった
+#
+# alnum-symbol: digits and symbols around English.
+alnum-symbol	win11nikoushin	win11にこうしん
+alnum-symbol	ps5womotteru	ps5をもってる
+alnum-symbol	example.comniakusesu	example.comにあくせす
+alnum-symbol	https://example.com	https://example.com
+alnum-symbol	user@example.com	user@example.com
+alnum-symbol	e-mailwookuru	e-mailをおくる
+alnum-symbol	v2.0wodashita	v2.0をだした
+alnum-symbol	node.jsdeugokasu	node.jsでうごかす
+alnum-symbol	README.mdwoyomu	README.mdをよむ
+alnum-symbol	gpt-4wotsukau	gpt-4をつかう
+alnum-symbol	100kmhashiru	100kmはしる
+#
+# context: words that read both ways, decided by the text before the caret.
+context	sushi	sushi	I love␣
+context	sushigatabetai	すしがたべたい	今日は
+context	karaoke	karaoke	We went to␣
+context	go	go	Let's␣
+context	go	ご	日本
+context	made	made	I␣
+context	pen	pen	This is a␣
+context	pendesu	ぺんです	これは
+context	fine	fine	This is␣
+context	home	home	I am␣
+context	hate	hate	I␣
+context	game	game	The␣
+context	same	same	The␣
+context	to	to	Nice␣
+context	to	と	東京
+context	time	time	Good␣
+context	sale	sale	On␣
+context	care	care	Take␣
+context	mite	みて	これを
+context	kore	これ	見て、
+context	tomorrow	tomorrow	See you␣
+context	issue	issue	Open an␣
+context	sake	さけ	お
+context	note	note	Release␣
+#
+# en-sentence: English typed with spaces.
+en-sentence	see you tomorrow	see you tomorrow
+en-sentence	thank you	thank you
+en-sentence	good morning	good morning
+en-sentence	how are you	how are you
+en-sentence	nice to meet you	nice to meet you
+en-sentence	this is a pen	this is a pen
+en-sentence	open the door	open the door
+en-sentence	I want to go home	I want to go home
+en-sentence	let me know	let me know
+en-sentence	pull request	pull request
+#
+# new-word: names a word list would not have (new products, projects).
+new-word	setsuna-enginetomeltype	setsuna-engineとmeltype
+new-word	meltypewotsukau	meltypeをつかう
+new-word	meltypenohikaku	meltypeのひかく
+new-word	Meltypetohikaku	Meltypeとひかく
+new-word	zylqanosettei	zylqaのせってい
+new-word	frobnicatewoyobu	frobnicateをよぶ
+new-word	qwiklynitouroku	qwiklyにとうろく
+new-word	vexorademitsuketa	vexoraでみつけた
+new-word	gplv3noraisensu	gplv3のらいせんす
+new-word	sudachipydebunkatsu	sudachipyでぶんかつ
+new-word	bazelisknoinsuto-ru	bazeliskのいんすとーる
+new-word	dotnetdebirudo	dotnetでびるど
+new-word	ripgrepdekensaku	ripgrepでけんさく
+new-word	fcitx5noaddon	fcitx5のaddon
+new-word	llama.cppwobirudo	llama.cppをびるど
+new-word	kubectldedepuroi	kubectlででぷろい
+new-word	wezterm	wezterm
+new-word	neovimnosettei	neovimのせってい

@@ -1,0 +1,22 @@
+[package]
+name = "setsuna-settings"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Cross-platform settings GUI for the Setsuna frontends: a web page in the system webview that edits config.toml and the learned choices."
+
+[[bin]]
+name = "setsuna-settings"
+path = "src/main.rs"
+
+[dependencies]
+setsuna-core = { path = "../ime-core" }
+serde_json.workspace = true
+# The system webview (WebView2 / WKWebView / WebKitGTK), so the text is drawn
+# by the platform's font rendering.
+wry = "=0.57.0"
+tao = "=0.37.1"
+
+[dev-dependencies]
+toml.workspace = true
