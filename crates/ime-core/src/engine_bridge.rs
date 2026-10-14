@@ -425,7 +425,7 @@ impl EngineBridge {
                 if !self.live_conversion
                     && !candidates.is_empty()
                     && self.composing.cursor_at_end()
-                    && self.list_reading == self.composing.hiragana() =>
+                    && self.list_reading == self.composing.live_reading() =>
             {
                 candidates
             }
@@ -662,10 +662,10 @@ impl EngineBridge {
         let list = self.finish_list(&result.reading, raw.clone(), true);
         let starts = self.list_starts_of(&result.reading, &raw, &result.reading_pos, &list);
         result.candidates = list;
-        let current_hira = self.composing.hiragana().to_string();
+        let current_hira = self.composing.live_reading();
 
         // Live typing: accept the result while its reading is still a prefix
-        // of the current hiragana; the freshly-typed tail then shows as raw
+        // of the current reading; the freshly-typed tail then shows as raw
         // kana after the cached prefix.
         if matches!(self.phase, Phase::Composing { .. }) {
             if !current_hira.starts_with(&result.reading) {
@@ -1101,6 +1101,9 @@ impl EngineBridge {
                 let candidates = if self.force_convert_on_space {
                     self.dispatch_live_forced()
                 } else {
+                    // typing is done for this conversion, as in the forced
+                    // dispatch (a pending n is ん)
+                    self.composing.commit_reading();
                     self.dispatch_live()
                 };
                 // the engine has the list of this reading already
@@ -1231,26 +1234,16 @@ impl EngineBridge {
                     .filter(|_| {
                         self.live_conversion
                             && self.composing.cursor_at_end()
-                            && self.list_reading == self.composing.hiragana()
+                            && self.list_reading == self.composing.live_reading()
                             && !done_otherwise
                     })
                     .cloned();
                 let text = match cand_top {
                     _ if done_otherwise => self.composing.commit(),
-                    Some(t) if !t.is_empty() => {
-                        // The candidate replaces the hiragana reading; append
-                        // any un-converted romaji tail so it isn't dropped.
-                        let tail = self.composing.commit_tail();
-                        if tail.is_empty() {
-                            t
-                        } else {
-                            format!("{t}{tail}")
-                        }
-                    }
+                    Some(t) if !t.is_empty() => format!("{t}{}", self.composing.commit_live_tail()),
                     _ if self.live_conversion && self.composing.cursor_at_end() => {
                         let text = self.provisional_conversion();
-                        let tail = self.composing.commit_tail();
-                        format!("{text}{tail}")
+                        format!("{text}{}", self.composing.commit_live_tail())
                     }
                     _ => self.composing.commit(),
                 };
@@ -1862,7 +1855,7 @@ impl EngineBridge {
             return Vec::new();
         }
         match &mut self.phase {
-            Phase::Composing { candidates } if self.composing.hiragana() == reading => {
+            Phase::Composing { candidates } if self.composing.live_reading() == reading => {
                 *candidates = list.clone();
             }
             Phase::Converting {
@@ -2425,7 +2418,7 @@ impl EngineBridge {
         let hira = if force {
             self.composing.commit_reading()
         } else {
-            self.composing.hiragana().to_string()
+            self.composing.live_reading()
         };
         if hira.is_empty() {
             self.last_applied_reading.clear();
@@ -2483,8 +2476,8 @@ impl EngineBridge {
         if !self.composing.cursor_at_end() || !self.live_conversion {
             return self.composing.preedit();
         }
-        let hira = self.composing.hiragana();
-        let pending = self.composing.pending_romaji();
+        let hira = self.composing.live_reading();
+        let pending = self.composing.live_pending();
         if hira.is_empty() {
             return pending.to_string();
         }
@@ -2495,7 +2488,7 @@ impl EngineBridge {
                 let tail = &hira[cached_r.len()..];
                 return format!("{}{}{}", cached_k, tail, pending);
             }
-            if cached_r.starts_with(hira) {
+            if cached_r.starts_with(hira.as_str()) {
                 let shrink_chars = cached_r
                     .chars()
                     .count()
@@ -2506,7 +2499,12 @@ impl EngineBridge {
                 return format!("{}{}", trimmed, pending);
             }
         }
-        format!("{}{}", hira, pending)
+        // nothing converted yet: as typed (けっこn)
+        format!(
+            "{}{}",
+            self.composing.hiragana(),
+            self.composing.pending_romaji()
+        )
     }
 
     fn invalidate_engine_results(&mut self) {
@@ -2524,7 +2522,7 @@ impl EngineBridge {
     /// A provisional whole reading, never a stale candidate for a different
     /// reading. Only a matching converted prefix may replace its raw kana.
     fn provisional_conversion(&self) -> String {
-        let reading = self.composing.hiragana();
+        let reading = self.composing.live_reading();
         if self.live_conversion
             && self.composing.cursor_at_end()
             && !self.cached_prefix_reading.is_empty()
@@ -3108,6 +3106,22 @@ mod tests {
         assert_eq!(preedit(&out.actions).as_deref(), Some("hello "));
         // the next key commits it, as between English words
         assert_eq!(commits(&bridge.handle_char('w').actions), vec!["hello "]);
+    }
+
+    #[test]
+    fn live_conversion_reads_a_pending_n_as_n_kana() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "kekkon");
+        // the engine converts けっこん, not けっこ
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "けっこん");
+        mock.set_result("けっこん", &["結婚"]);
+        let out = bridge.apply_async_result();
+        assert_eq!(preedit(&out).as_deref(), Some("結婚"));
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["結婚"]);
+        // a vowel after it converts again
+        type_str(&mut bridge, "kekkona");
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "けっこな");
     }
 
     #[test]
