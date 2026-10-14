@@ -104,6 +104,8 @@ impl View {
                 self.comments.clear();
                 self.selected = 0;
             }
+            // only the TSF frontend has rewrite mode (and its status) yet
+            Action::Status { .. } => {}
         }
     }
 }

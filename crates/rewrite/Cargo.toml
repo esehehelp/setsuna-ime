@@ -1,0 +1,35 @@
+[package]
+name = "setsuna-rewrite"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Rewrites the IME's conversion into natural Japanese with an OpenAI model (ChatGPT plan through Sign in with ChatGPT, an API key, or an OpenAI-compatible API)."
+
+[lib]
+name = "setsuna_rewrite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "setsuna-rewrite"
+path = "src/bin/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+getrandom = "0.2"
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
+ureq = "3"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

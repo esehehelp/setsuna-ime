@@ -388,7 +388,8 @@ pub(crate) fn apply_actions(
             match a {
                 Action::ShowCandidates { .. }
                 | Action::ShowSegmentCandidates { .. }
-                | Action::HideCandidates => window_actions.push(a),
+                | Action::HideCandidates
+                | Action::Status { .. } => window_actions.push(a),
                 Action::UpdatePreedit { ref text } if preedit_key(text) == running_last => {
                     // No-op — skip.
                 }
@@ -491,6 +492,9 @@ pub(crate) fn apply_actions(
                 }
                 Action::HideCandidates => {
                     cw.borrow_mut().hide();
+                }
+                Action::Status { text } => {
+                    cw.borrow_mut().set_status(&text);
                 }
                 _ => {}
             }

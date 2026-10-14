@@ -68,7 +68,8 @@ impl ITfEditSession_Impl for ActionEditSession_Impl {
                 // in key_event_sink after the edit session returns; no-op here.
                 Action::ShowCandidates { .. }
                 | Action::ShowSegmentCandidates { .. }
-                | Action::HideCandidates => {}
+                | Action::HideCandidates
+                | Action::Status { .. } => {}
             }
         }
         Ok(())

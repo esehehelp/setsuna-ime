@@ -44,6 +44,7 @@ pub struct Config {
     pub frontend: FrontendCfg,
     pub learning: LearningCfg,
     pub rerank: RerankCfg,
+    pub rewriter: RewriterCfg,
 }
 
 impl Default for Config {
@@ -54,6 +55,7 @@ impl Default for Config {
             frontend: FrontendCfg::default(),
             learning: LearningCfg::default(),
             rerank: RerankCfg::default(),
+            rewriter: RewriterCfg::default(),
         }
     }
 }
@@ -463,6 +465,94 @@ impl Default for RerankCfg {
     }
 }
 
+/// The rewriter (`setsuna-rewrite daemon`): an OpenAI model, or one behind
+/// an OpenAI-compatible API, rewriting the conversion into natural Japanese.
+/// While it is on, the conversion key also asks for a rewrite and puts it
+/// first among the candidates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RewriterCfg {
+    /// Rewrite on the conversion key.
+    pub enabled: bool,
+    pub provider: RewriteProvider,
+    /// The API's base URL (openai / compatible). Empty = OpenAI's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// The API requests go to. Empty = responses for OpenAI,
+    /// chat_completions for a compatible server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<RewriteApi>,
+    pub model: String,
+    /// What the model is told. Empty = the built-in instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// `reasoning.effort` (Responses API), e.g. "low". Empty = the model's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Send the text before the caret along as context.
+    pub send_context: bool,
+    /// Longest a rewrite may take (ms).
+    pub timeout_ms: u64,
+    /// Optional explicit `setsuna-rewrite.exe`. Empty = next to the module.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<PathBuf>,
+}
+
+impl Default for RewriterCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: RewriteProvider::Chatgpt,
+            base_url: None,
+            api: None,
+            model: String::new(),
+            instructions: None,
+            reasoning_effort: None,
+            send_context: true,
+            timeout_ms: 20_000,
+            exe: None,
+        }
+    }
+}
+
+/// Who serves (and pays for) the rewrites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteProvider {
+    /// The ChatGPT plan, signed in with ChatGPT.
+    Chatgpt,
+    /// OpenAI with an API key.
+    Openai,
+    /// An OpenAI-compatible server.
+    Compatible,
+}
+
+impl RewriteProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chatgpt => "chatgpt",
+            Self::Openai => "openai",
+            Self::Compatible => "compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteApi {
+    Responses,
+    ChatCompletions,
+}
+
+impl RewriteApi {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
+        }
+    }
+}
+
 impl Config {
     /// Load from `<config_dir>/config.toml`. On any error (missing file,
     /// parse error, IO error), returns `Default::default()` so the IME
@@ -666,7 +756,27 @@ impl Config {
              # Weight of the LM score against the converter's (default: the manifest's).\n\
              # lambda = 0.3\n\
              # Typing pause (ms) before reranking; the conversion key reranks at once.\n\
-             idle_ms = {rerank_idle}\n",
+             idle_ms = {rerank_idle}\n\
+             \n\
+             [rewriter]\n\
+             # Rewriting: the conversion key also asks a model to rewrite the\n\
+             # input into natural Japanese and puts the result first. Sign in,\n\
+             # keys and models: the settings GUI.\n\
+             enabled = {rewriter_enabled}\n\
+             # chatgpt (your ChatGPT plan, signed in), openai (an API key) or\n\
+             # compatible (an OpenAI-compatible server at base_url).\n\
+             provider = \"{rewriter_provider}\"\n\
+             # base_url = \"http://127.0.0.1:8080/v1\"\n\
+             # responses or chat_completions (default: responses for OpenAI,\n\
+             # chat_completions for a compatible server).\n\
+             # api = \"chat_completions\"\n\
+             model = \"\"\n\
+             # What the model is told (default: the built-in instructions).\n\
+             # instructions = \"...\"\n\
+             # reasoning_effort = \"low\"\n\
+             # Send the text before the caret along as context.\n\
+             send_context = {rewriter_context}\n\
+             timeout_ms = {rewriter_timeout}\n",
             theme = d.ui.candidate_window.theme,
             font_face = d.ui.candidate_window.font_face,
             font_pt = d.ui.candidate_window.font_pt,
@@ -682,6 +792,10 @@ impl Config {
             learning_words = d.learning.words,
             rerank_first = d.rerank.first_candidates,
             rerank_idle = d.rerank.idle_ms,
+            rewriter_enabled = d.rewriter.enabled,
+            rewriter_provider = d.rewriter.provider.as_str(),
+            rewriter_context = d.rewriter.send_context,
+            rewriter_timeout = d.rewriter.timeout_ms,
         )
     }
 

@@ -67,7 +67,7 @@ function Restart-AsAdmin {
 
 function Stop-InputHosts {
     param([string]$Reason = 'reload')
-    foreach ($name in @('setsuna-engine', 'setsuna-rerank', 'ctfmon', 'TextInputHost')) {
+    foreach ($name in @('setsuna-engine', 'setsuna-rerank', 'setsuna-rewrite', 'ctfmon', 'TextInputHost')) {
         $procs = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
         foreach ($p in $procs) {
             try {
@@ -290,7 +290,7 @@ if (-not (Test-Path -LiteralPath $Manifest)) {
 }
 
 if (-not $SkipBuild) {
-    $packages = @('-p', 'setsuna-tsf', '-p', 'setsuna-engine', '-p', 'setsuna-settings')
+    $packages = @('-p', 'setsuna-tsf', '-p', 'setsuna-engine', '-p', 'setsuna-settings', '-p', 'setsuna-rewrite')
     if ($RerankManifest) {
         $packages += @('-p', 'setsuna-rerank')
         # bindgen (llama.cpp's bindings) needs libclang

@@ -46,6 +46,10 @@ pub trait CandidateUi {
 
     /// Called with a candidate's index in the list when the user clicks it.
     fn set_on_select(&mut self, _on_select: Box<dyn Fn(usize)>) {}
+
+    /// A line about the list beside its position (empty: none). `hide`
+    /// clears it.
+    fn set_status(&mut self, _status: &str) {}
 }
 
 /// Construct the default impl for the running platform. Today this is

@@ -4,18 +4,21 @@
 //! (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux), so the text
 //! is drawn by the system's own font rendering. The page edits the candidate
 //! post-processing (symbol width, touten / kuten, middle dot, literal
-//! replacements), the date / time candidates and the learning of
-//! `config.toml`, and clears the learned choices. Saving keeps the file's
-//! comments and every key the page does not show. The IME reads the file
-//! when it is activated, so a change applies from the next activation
-//! (Win+Space twice on Windows, switching the input method away and back on
-//! fcitx5).
+//! replacements), the date / time candidates, the learning and the
+//! rewriter of `config.toml`, clears the learned choices, and signs the
+//! rewriter in (`rewriter`). Saving keeps the file's comments and every key
+//! the page does not show. The IME reads the file when it is activated, so
+//! a change applies from the next activation (Win+Space twice on Windows,
+//! switching the input method away and back on fcitx5).
 //!
 //! The page and this process talk in JSON messages: the page posts
-//! `{"type": "init" | "save" | "clear_learning", ...}` through `window.ipc`,
-//! and each reply goes back as `setsuna.receive(<message>)`.
+//! `{"type": "init" | "save" | "clear_learning", ...}` (and the rewriter's)
+//! through `window.ipc`, and each reply goes back as
+//! `setsuna.receive(<message>)`.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod rewriter;
 
 use std::path::PathBuf;
 
@@ -29,8 +32,15 @@ use wry::WebViewBuilder;
 
 const INDEX: &str = include_str!("../web/index.html");
 
+/// What reaches the event loop: a message from the page, or a reply a
+/// thread finished.
+pub enum UserEvent {
+    Ipc(String),
+    Reply(Value),
+}
+
 fn main() -> wry::Result<()> {
-    let event_loop = EventLoopBuilder::<String>::with_user_event().build();
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title("Setsuna 設定")
         .with_inner_size(tao::dpi::LogicalSize::new(720.0, 820.0))
@@ -44,7 +54,7 @@ fn main() -> wry::Result<()> {
     let builder = WebViewBuilder::new()
         .with_html(INDEX)
         .with_ipc_handler(move |req| {
-            let _ = proxy.send_event(req.into_body());
+            let _ = proxy.send_event(UserEvent::Ipc(req.into_body()));
         });
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let webview = builder.build(&window)?;
@@ -56,18 +66,34 @@ fn main() -> wry::Result<()> {
     };
 
     let mut app = Settings::load();
+    let mut rewriter = rewriter::Rewriter::new(event_loop.create_proxy());
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
-        match event {
-            Event::UserEvent(message) => {
-                let reply = app.handle(&message);
-                let _ = webview.evaluate_script(&format!("setsuna.receive({reply})"));
+        let reply = match event {
+            Event::UserEvent(UserEvent::Ipc(message)) => {
+                let message: Value = serde_json::from_str(&message).unwrap_or(Value::Null);
+                let action = message["type"].as_str().unwrap_or_default();
+                if matches!(action, "init" | "save" | "clear_learning") {
+                    Some(app.handle(action, &message))
+                } else {
+                    rewriter.handle(action, &message)
+                }
             }
+            Event::UserEvent(UserEvent::Reply(reply)) if reply["type"] == "rewriter_refresh" => {
+                Some(rewriter.refreshed(&reply))
+            }
+            Event::UserEvent(UserEvent::Reply(reply)) => Some(reply),
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
-            _ => {}
+            } => {
+                *control_flow = ControlFlow::Exit;
+                None
+            }
+            _ => None,
+        };
+        if let Some(reply) = reply {
+            let _ = webview.evaluate_script(&format!("setsuna.receive({reply})"));
         }
     });
 }
@@ -105,10 +131,8 @@ impl Settings {
         Config::learning_path().map(|p| Learning::at(p, &self.cfg.learning).len())
     }
 
-    /// The reply to one message from the page.
-    fn handle(&mut self, message: &str) -> Value {
-        let message: Value = serde_json::from_str(message).unwrap_or(Value::Null);
-        let action = message["type"].as_str().unwrap_or_default();
+    /// The reply to one of the config's messages from the page.
+    fn handle(&mut self, action: &str, message: &Value) -> Value {
         let (ok, status) = match action {
             "init" => (true, None),
             "save" => match self.save(&message["config"]) {
@@ -130,6 +154,7 @@ impl Settings {
             "load_error": self.load_error,
             "config": self.cfg,
             "learned": self.learned(),
+            "default_instructions": setsuna_rewrite::DEFAULT_INSTRUCTIONS,
         })
     }
 
@@ -165,7 +190,9 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setsuna_core::config::{PunctuationStyle, Replacement, SymbolWidth};
+    use setsuna_core::config::{
+        PunctuationStyle, Replacement, RewriteApi, RewriteProvider, SymbolWidth,
+    };
 
     /// The page edits the config as JSON: the round trip must not change it.
     #[test]
@@ -180,11 +207,26 @@ mod tests {
         });
         cfg.learning.strength = 0.7;
         cfg.learning.similarity_threshold = 0.65;
+        cfg.rewriter.enabled = true;
+        cfg.rewriter.provider = RewriteProvider::Compatible;
+        cfg.rewriter.base_url = Some("http://127.0.0.1:8080/v1".into());
+        cfg.rewriter.api = Some(RewriteApi::ChatCompletions);
+        cfg.rewriter.model = "local".into();
         let json = serde_json::to_value(&cfg).unwrap();
         let back: Config = serde_json::from_value(json).unwrap();
         assert_eq!(
             toml::to_string(&back).unwrap(),
             toml::to_string(&cfg).unwrap()
         );
+    }
+
+    /// The page sends `null` for an unset optional key.
+    #[test]
+    fn nulls_from_the_page_are_unset_keys() {
+        let mut json = serde_json::to_value(Config::default()).unwrap();
+        json["rewriter"]["base_url"] = Value::Null;
+        json["rewriter"]["instructions"] = Value::Null;
+        let back: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(back.rewriter.base_url, None);
     }
 }

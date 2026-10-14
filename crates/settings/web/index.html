@@ -42,6 +42,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); }
 body {
   font-family: var(--font);
@@ -139,6 +140,47 @@ input[type=range] { width: 180px; accent-color: var(--accent); }
   display: flex; align-items: center; gap: 10px;
 }
 .bar .status { flex: 1; color: var(--ink-2); font-size: 13px; }
+
+/* ---- rewriter ------------------------------------------------------------ */
+input[type=password] {
+  font: inherit; color: var(--ink);
+  background: var(--field); border: 1px solid var(--field-line);
+  border-radius: 4px; padding: 5px 10px; min-height: 32px; width: 240px;
+}
+input[type=password]:focus { outline: none; border-bottom: 2px solid var(--accent); }
+input.wide { width: 300px; }
+textarea {
+  font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--field); border: 1px solid var(--field-line);
+  border-radius: 4px; padding: 8px 10px; width: 100%; min-height: 96px; resize: vertical;
+}
+textarea:focus { outline: none; border-bottom: 2px solid var(--accent); }
+.row.stack { flex-direction: column; align-items: stretch; gap: 8px; }
+.note { font-size: 12.5px; color: var(--ink-2); padding: 12px 18px; }
+.row + .note { border-top: 1px solid var(--line); }
+.link { background: none; border: 0; padding: 0; min-height: 0; color: var(--accent); text-decoration: underline; cursor: pointer; }
+.link:hover:not(:disabled) { background: none; }
+.pill {
+  display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid var(--field-line); color: var(--ink-2); margin-left: 8px;
+}
+button.chatgpt { background: #0d0d0d; border-color: #0d0d0d; color: #fff; font-weight: 600; }
+button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
+@media (prefers-color-scheme: dark) {
+  button.chatgpt { background: #fff; border-color: #fff; color: #0d0d0d; }
+  button.chatgpt:hover:not(:disabled) { background: #e6e6e6; }
+}
+.modal {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.4);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.modal[hidden] { display: none; }
+.modal .box {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 22px 24px; max-width: 440px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+.modal h3 { margin: 0 0 8px; font-size: 18px; }
+.modal .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 </style>
 </head>
 <body>
@@ -252,6 +294,99 @@ input[type=range] { width: 180px; accent-color: var(--accent); }
   </div>
 </div>
 
+<h2>書き直し</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">書き直し</div>
+      <div class="desc">Space で変換すると、入力を自然な日本語に書き直した候補を先頭に出します。オンの間、タスクバーの表示は「直」になります</div>
+    </div>
+    <div class="control" data-switch="rewriter.enabled"></div>
+  </div>
+  <div class="row" data-rw>
+    <div class="text">
+      <div class="title">接続先</div>
+      <div class="desc" id="provider_desc"></div>
+    </div>
+    <div class="control"><select id="provider"></select></div>
+  </div>
+  <div class="row" data-rw data-provider="chatgpt">
+    <div class="text">
+      <div class="title">ChatGPT アカウント<span class="pill" id="plan_pill" hidden>Using ChatGPT plan</span></div>
+      <div class="desc" id="account_desc"></div>
+    </div>
+    <div class="control" id="account_controls"></div>
+  </div>
+  <div class="row" data-rw data-provider="compatible">
+    <div class="text">
+      <div class="title">ベース URL</div>
+      <div class="desc">OpenAI 互換 API の URL（例: http://127.0.0.1:8080/v1）</div>
+    </div>
+    <div class="control"><input type="text" class="wide" id="base_url" placeholder="http://127.0.0.1:8080/v1"></div>
+  </div>
+  <div class="row" data-rw data-provider="compatible">
+    <div class="text">
+      <div class="title">API 形式</div>
+    </div>
+    <div class="control"><select id="api"></select></div>
+  </div>
+  <div class="row" data-rw data-provider="openai compatible">
+    <div class="text">
+      <div class="title">API キー</div>
+      <div class="desc" id="key_desc"></div>
+    </div>
+    <div class="control">
+      <input type="password" id="api_key" placeholder="sk-..." autocomplete="off">
+      <button id="save_key">保存</button>
+      <button id="delete_key" class="danger">削除</button>
+    </div>
+  </div>
+  <div class="row" data-rw>
+    <div class="text">
+      <div class="title">モデル</div>
+      <div class="desc" id="models_desc">一覧を取得して選ぶか、モデル名を入力します</div>
+    </div>
+    <div class="control">
+      <input type="text" id="model" list="model_list" placeholder="モデル名">
+      <datalist id="model_list"></datalist>
+      <button id="list_models">一覧を取得</button>
+    </div>
+  </div>
+  <div class="row" data-rw data-api="responses">
+    <div class="text">
+      <div class="title">推論の強さ</div>
+      <div class="desc">推論するモデルで、低いほど速く返ります</div>
+    </div>
+    <div class="control"><select id="reasoning_effort"></select></div>
+  </div>
+  <div class="row" data-rw>
+    <div class="text">
+      <div class="title">カーソルの前の文章も送る</div>
+      <div class="desc">文脈に合わせて書き直せますが、送る内容が増えます</div>
+    </div>
+    <div class="control" data-switch="rewriter.send_context"></div>
+  </div>
+  <div class="row stack" data-rw>
+    <div class="text">
+      <div class="title">指示</div>
+      <div class="desc">空欄なら既定の指示を使います</div>
+    </div>
+    <textarea id="instructions"></textarea>
+  </div>
+  <div class="note">書き直しモードで変換すると、読み・変換結果（と、オンならカーソルの前の文章）が選んだ接続先に送られます。</div>
+</div>
+
+<div class="modal" id="plan_notice" hidden>
+  <div class="box">
+    <h3>You're using your ChatGPT plan</h3>
+    <p>書き直しのリクエストには、ChatGPT プランの使用量（またはクレジット残高）が使われます。使用量は ChatGPT の設定で確認・管理できます。この使用量は Setsuna IME の料金とは関係ありません（Setsuna IME は無料です）。</p>
+    <div class="actions">
+      <button class="link" data-open="https://chatgpt.com/settings/usage">Manage usage</button>
+      <button class="primary" id="plan_ok">Got it</button>
+    </div>
+  </div>
+</div>
+
 <div class="bar">
   <div class="inner">
     <div class="status" id="status"></div>
@@ -326,6 +461,7 @@ function render() {
   $("strength").value = cfg.learning.strength;
   $("similarity_threshold").value = cfg.learning.similarity_threshold;
   renderReplacements();
+  renderRewriter();
   changed();
 }
 
@@ -391,6 +527,155 @@ $("add_rep").addEventListener("click", () => {
   const inputs = $("reps").querySelectorAll("input[type=text]");
   inputs[inputs.length - 2]?.focus();
 });
+// ---- rewriter ---------------------------------------------------------------
+
+const PROVIDERS = [
+  ["chatgpt", "ChatGPT プラン（サインイン）"],
+  ["openai", "OpenAI API キー"],
+  ["compatible", "OpenAI 互換 API"],
+];
+const PROVIDER_DESC = {
+  chatgpt: "ChatGPT にサインインし、ChatGPT プランの使用量で書き直します",
+  openai: "OpenAI の API キーで書き直します（API の利用料金がかかります）",
+  compatible: "OpenAI 互換の API を持つサーバー（ローカルの LLM など）で書き直します",
+};
+const APIS = [["chat_completions", "Chat Completions"], ["responses", "Responses"]];
+const EFFORTS = [["", "モデルの既定"], ["minimal", "minimal"], ["low", "low"], ["medium", "medium"], ["high", "high"]];
+
+let rw = { account: null, api_key_set: false, signing_in: false };
+
+// An optional key: absent when empty, as the config writes it.
+function setOpt(obj, key, value) {
+  if (value) obj[key] = value; else delete obj[key];
+}
+
+function endpoint(type, extra = {}) {
+  const r = cfg.rewriter;
+  return { type, provider: r.provider, base_url: r.base_url ?? null, api: r.api ?? null, ...extra };
+}
+
+function effectiveApi() {
+  const r = cfg.rewriter;
+  if (r.provider === "chatgpt") return "responses";
+  return r.api ?? (r.provider === "openai" ? "responses" : "chat_completions");
+}
+
+function options(select, list, value) {
+  select.replaceChildren(...list.map(([v, label]) =>
+    el("option", { value: v, textContent: label, selected: (value ?? "") === v })));
+}
+
+function renderRewriter() {
+  const r = cfg.rewriter;
+  options($("provider"), PROVIDERS, r.provider);
+  options($("api"), APIS, effectiveApi());
+  options($("reasoning_effort"), EFFORTS, r.reasoning_effort);
+  $("base_url").value = r.base_url ?? "";
+  $("model").value = r.model ?? "";
+  $("instructions").value = r.instructions ?? "";
+  layoutRewriter();
+  renderAccount();
+}
+
+// Rows for the chosen provider and API only.
+function layoutRewriter() {
+  const r = cfg.rewriter;
+  $("provider_desc").textContent = PROVIDER_DESC[r.provider] ?? "";
+  for (const row of document.querySelectorAll("[data-provider]")) {
+    row.hidden = !row.dataset.provider.split(" ").includes(r.provider);
+  }
+  for (const row of document.querySelectorAll("[data-api]")) {
+    row.hidden = effectiveApi() !== row.dataset.api;
+  }
+}
+
+function openButton(label, url, className = "link") {
+  const b = el("button", { textContent: label, className });
+  b.addEventListener("click", () => send({ type: "open_url", url }));
+  return b;
+}
+
+function renderAccount() {
+  const a = rw.account;
+  const desc = $("account_desc");
+  const box = $("account_controls");
+  $("plan_pill").hidden = !(a && a.signed_in && a.plan_usage);
+  if (rw.signing_in) {
+    desc.textContent = "ブラウザでサインインを待っています…";
+    const cancel = el("button", { textContent: "中止" });
+    cancel.addEventListener("click", () => send(endpoint("cancel_sign_in")));
+    box.replaceChildren(cancel);
+  } else if (a && a.signed_in) {
+    desc.replaceChildren(
+      `${a.label} ・ `,
+      a.plan_usage ? "ChatGPT プランの使用量で書き直します " : "ChatGPT プランの利用が許可されていません ",
+      openButton("Manage usage", "https://chatgpt.com/settings/usage"));
+    const out = el("button", { textContent: "サインアウト" });
+    out.addEventListener("click", () => send(endpoint("sign_out")));
+    const other = el("button", { textContent: "別のアカウント" });
+    other.addEventListener("click", () => send(endpoint("sign_in", { new_account: true })));
+    box.replaceChildren(other, out);
+  } else {
+    desc.textContent = a ? `${a.label}（サインアウト中）` : "サインインしていません";
+    const go = el("button", { textContent: "Continue with ChatGPT", className: "chatgpt" });
+    go.addEventListener("click", () => send(endpoint("sign_in")));
+    const buttons = [go];
+    if (a) {
+      const other = el("button", { textContent: "別のアカウント" });
+      other.addEventListener("click", () => send(endpoint("sign_in", { new_account: true })));
+      buttons.unshift(other);
+    }
+    box.replaceChildren(...buttons);
+  }
+  const optional = cfg.rewriter.provider === "compatible" ? "（不要なサーバーもあります）" : "";
+  $("key_desc").textContent =
+    (rw.api_key_set ? "保存済み（この PC のこのユーザーだけが読める形で保存）" : "未設定") + optional;
+  $("delete_key").disabled = !rw.api_key_set;
+}
+
+$("provider").addEventListener("change", (e) => {
+  cfg.rewriter.provider = e.target.value;
+  $("model_list").replaceChildren();
+  options($("api"), APIS, effectiveApi());
+  layoutRewriter();
+  changed();
+  send(endpoint("rewriter_state"));
+});
+$("base_url").addEventListener("input", (e) => { setOpt(cfg.rewriter, "base_url", e.target.value.trim()); changed(); });
+$("base_url").addEventListener("change", () => send(endpoint("rewriter_state")));
+$("api").addEventListener("change", (e) => {
+  setOpt(cfg.rewriter, "api", e.target.value);
+  layoutRewriter();
+  changed();
+});
+$("model").addEventListener("input", (e) => { cfg.rewriter.model = e.target.value.trim(); changed(); });
+$("reasoning_effort").addEventListener("change", (e) => {
+  setOpt(cfg.rewriter, "reasoning_effort", e.target.value);
+  changed();
+});
+$("instructions").addEventListener("input", (e) => {
+  setOpt(cfg.rewriter, "instructions", e.target.value.trim() ? e.target.value : "");
+  changed();
+});
+$("save_key").addEventListener("click", () => {
+  const key = $("api_key").value.trim();
+  if (!key) return;
+  send(endpoint("set_api_key", { key }));
+  $("api_key").value = "";
+});
+$("delete_key").addEventListener("click", () => send(endpoint("set_api_key", { key: "" })));
+$("list_models").addEventListener("click", () => {
+  $("models_desc").textContent = "取得しています…";
+  send(endpoint("list_models"));
+});
+for (const b of document.querySelectorAll("[data-open]")) {
+  b.addEventListener("click", () => send({ type: "open_url", url: b.dataset.open }));
+}
+$("plan_ok").addEventListener("click", () => {
+  $("plan_notice").hidden = true;
+  send({ type: "ack_plan_notice" });
+});
+
 $("save").addEventListener("click", () => send({ type: "save", config: cfg }));
 $("revert").addEventListener("click", () => { cfg = JSON.parse(saved); render(); $("status").textContent = ""; });
 document.addEventListener("keydown", (e) => {
@@ -402,7 +687,21 @@ document.addEventListener("keydown", (e) => {
 
 window.setsuna = {
   receive(msg) {
-    if (msg.status !== undefined) $("status").textContent = msg.status ?? "";
+    if (msg.status !== undefined && msg.status !== null) $("status").textContent = msg.status;
+    if (msg.type === "rewriter") {
+      rw = msg;
+      if (cfg) renderAccount();
+      if (msg.show_plan_notice) $("plan_notice").hidden = false;
+      return;
+    }
+    if (msg.type === "models") {
+      const models = msg.models ?? [];
+      $("model_list").replaceChildren(...models.map((m) =>
+        el("option", { value: m.id, textContent: m.label === m.id ? "" : m.label })));
+      $("models_desc").textContent = msg.error
+        ?? (models.length ? `${models.length} 件のモデルから選べます` : "モデルがありません");
+      return;
+    }
     if (msg.type !== "state") return;
     learned = msg.learned;
     renderLearned();
@@ -415,7 +714,9 @@ window.setsuna = {
       const error = $("error");
       error.hidden = !msg.load_error;
       error.textContent = msg.load_error ? `設定を読み込めないため保存できません: ${msg.load_error}` : "";
+      $("instructions").placeholder = msg.default_instructions ?? "";
       render();
+      if (msg.action === "init") send(endpoint("rewriter_state"));
     } else {
       changed();
     }

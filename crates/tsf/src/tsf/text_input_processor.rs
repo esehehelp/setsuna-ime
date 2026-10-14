@@ -28,6 +28,7 @@ use setsuna_core::config::Config;
 use setsuna_core::engine_bridge::EngineBridge;
 use setsuna_core::engine_client::EngineClient;
 use setsuna_core::rerank_client::{self, RerankClient};
+use setsuna_core::rewrite_client::{self, RewriteClient};
 
 #[implement(
     ITfTextInputProcessorEx,
@@ -85,6 +86,8 @@ pub(crate) struct Inner {
     /// when a conversion result is ready. Destroyed FIRST in Deactivate so
     /// stray async callbacks can't reach a half-torn service.
     pub(crate) notify_hwnd: HWND,
+    /// What the running rewriter was started with.
+    pub(crate) rewriter_started: Option<setsuna_core::config::RewriterCfg>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -111,6 +114,7 @@ impl SetsunaTextService {
                 candidate_window: None,
                 symbols: setsuna_core::config::default_symbol_map(),
                 notify_hwnd: HWND::default(),
+                rewriter_started: None,
             }),
         }
     }
@@ -626,6 +630,39 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
             inner.symbols = cfg.frontend.symbols.clone();
             inner.notify_hwnd = notify_hwnd;
         }
+        // The rewriter: started when on, again when its settings changed;
+        // with it, the conversion key also asks for a rewrite.
+        let needs_rewriter = cfg.rewriter.enabled && {
+            let inner = self.inner.borrow();
+            !inner.engine.has_rewriter() || inner.rewriter_started.as_ref() != Some(&cfg.rewriter)
+        };
+        if needs_rewriter || !cfg.rewriter.enabled {
+            let rewriter = needs_rewriter
+                .then(|| {
+                    let hwnd_raw = notify_hwnd.0 as isize;
+                    let notify = Box::new(move |req_id: u64| unsafe {
+                        let _ = PostMessageW(
+                            HWND(hwnd_raw as *mut core::ffi::c_void),
+                            WM_APP_CONVERT_DONE,
+                            WPARAM(req_id as usize),
+                            LPARAM(0),
+                        );
+                    });
+                    rewrite_client::spawn_with_config(&cfg, dll_dir().as_deref(), notify)
+                })
+                .flatten();
+            let mut inner = self.inner.borrow_mut();
+            inner.rewriter_started = rewriter.as_ref().map(|_| cfg.rewriter.clone());
+            inner
+                .engine
+                .set_rewriter(rewriter.map(|c| Box::new(c) as Box<dyn RewriteClient>));
+        }
+        let rewriting = {
+            let mut inner = self.inner.borrow_mut();
+            inner.engine.set_rewrite_mode(true);
+            inner.engine.rewrite_mode()
+        };
+        setsuna_core::diagnostics::log(format!("rewriter on={rewriting}"));
 
         unsafe {
             let key_sink: ITfKeyEventSink = self.cast_interface()?;
@@ -693,6 +730,7 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
                 );
             }),
         );
+        state.rewrite.set(rewriting);
         let item: ITfLangBarItemButton = ModeItem::new(state.clone()).into();
         let added = unsafe {
             thread_mgr

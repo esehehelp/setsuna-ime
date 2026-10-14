@@ -4,7 +4,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
-description = "Cross-platform settings GUI for the Setsuna frontends: a web page in the system webview that edits config.toml and the learned choices."
+description = "Cross-platform settings GUI for the Setsuna frontends: a web page in the system webview that edits config.toml and the learned choices, and signs the rewriter in to its model server."
 
 [[bin]]
 name = "setsuna-settings"
@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 setsuna-core = { path = "../ime-core" }
+setsuna-rewrite = { path = "../rewrite" }
 serde_json.workspace = true
 # The system webview (WebView2 / WKWebView / WebKitGTK), so the text is drawn
 # by the platform's font rendering.

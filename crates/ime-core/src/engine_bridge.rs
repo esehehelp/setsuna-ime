@@ -21,6 +21,10 @@
 //!     the conversion is cut into segments by the engine's alignment, ← / →
 //!     move the focused one, Shift+← / Shift+→ resize it, Space / ↑ / ↓ pick
 //!     its candidate, Enter commits them all.
+//!
+//! Rewrite mode (with a rewriter, as the frontend sets it): the conversion key also
+//! asks the rewriter (`rewrite_client`) to turn the input into natural
+//! Japanese; the rewrite comes first in the open list once it is in.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +38,7 @@ use crate::engine_client::{EngineClient, EngineResult};
 use crate::learning::Learning;
 use crate::postprocess::CharRules;
 use crate::rerank_client::RerankClient;
+use crate::rewrite_client::RewriteClient;
 use crate::segmented::Segmented;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +66,11 @@ pub enum Action {
         list: Vec<String>,
         selected: usize,
         at: usize,
+    },
+    /// A line about the open list (a rewrite in progress or why it
+    /// failed); empty clears it. Hiding the candidates clears it too.
+    Status {
+        text: String,
     },
 }
 
@@ -220,6 +230,20 @@ pub struct EngineBridge {
     rerank: Option<RerankJob>,
     /// Mixed input: the other reading of the conversion open.
     alt: Option<AltList>,
+    /// The rewriter; `None` when rewriting is off.
+    rewriter: Option<Box<dyn RewriteClient>>,
+    /// Rewrite mode: the conversion key also asks for a rewrite.
+    rewrite_mode: bool,
+    /// The rewrite of the conversion open, asked for or in.
+    rewrite: Option<RewriteJob>,
+}
+
+/// A rewrite of the whole reading's conversion.
+struct RewriteJob {
+    req_id: u64,
+    reading: String,
+    /// The rewrite, once in.
+    text: Option<String>,
 }
 
 /// A whole-reading conversion under rerank: the engine's candidates as it
@@ -289,6 +313,9 @@ impl EngineBridge {
             rerank_cfg: crate::config::RerankCfg::default(),
             rerank: None,
             alt: None,
+            rewriter: None,
+            rewrite_mode: false,
+            rewrite: None,
         };
         let mixed = frontend
             .mixed_model
@@ -330,6 +357,45 @@ impl EngineBridge {
 
     pub fn has_reranker(&self) -> bool {
         self.reranker.is_some()
+    }
+
+    /// Rewrite with `rewriter` in rewrite mode (`None`: off, and the mode
+    /// with it).
+    pub fn set_rewriter(&mut self, rewriter: Option<Box<dyn RewriteClient>>) {
+        self.stop_rewrite();
+        self.rewriter = rewriter;
+        self.rewrite_mode &= self.rewriter.is_some();
+    }
+
+    pub fn has_rewriter(&self) -> bool {
+        self.rewriter.is_some()
+    }
+
+    pub fn rewrite_mode(&self) -> bool {
+        self.rewrite_mode
+    }
+
+    /// Turn rewrite mode on or off (on only with a rewriter). Turned on
+    /// with a conversion open, it asks for that conversion's rewrite. A
+    /// rewrite already asked for still lands.
+    pub fn set_rewrite_mode(&mut self, on: bool) -> Vec<Action> {
+        self.rewrite_mode = on && self.rewriter.is_some();
+        if !self.rewrite_mode || !self.window_open() {
+            return Vec::new();
+        }
+        let Phase::Converting {
+            candidates,
+            seg: None,
+            ..
+        } = &self.phase
+        else {
+            return Vec::new();
+        };
+        let Some(source) = candidates.first().cloned() else {
+            return Vec::new();
+        };
+        let reading = self.composing.hiragana().to_string();
+        self.start_rewrite(&reading, &source).into_iter().collect()
     }
 
     /// The frontend's candidate window: `page_size` candidates per page,
@@ -426,6 +492,8 @@ impl EngineBridge {
         let client = self.client.take();
         let reranker = self.reranker.take();
         let rerank_cfg = self.rerank_cfg.clone();
+        let rewriter = self.rewriter.take();
+        let rewrite_mode = self.rewrite_mode;
         let (page_size, digit_select, live) =
             (self.page_size, self.digit_select, self.live_conversion);
         *self = Self::with_frontend(client, frontend);
@@ -433,6 +501,8 @@ impl EngineBridge {
         self.invalidate_engine_results();
         self.set_candidate_paging(page_size, digit_select);
         self.set_reranker(reranker, &rerank_cfg);
+        self.rewriter = rewriter;
+        self.rewrite_mode = rewrite_mode && self.rewriter.is_some();
         if frontend.live_conversion.is_none() {
             self.live_conversion = live;
         }
@@ -458,6 +528,7 @@ impl EngineBridge {
         self.cached_prefix_reading.clear();
         self.cached_prefix_kanji.clear();
         self.stop_rerank();
+        self.stop_rewrite();
         self.forget_context();
         if was_active {
             vec![Action::HideCandidates, Action::EndComposition]
@@ -555,6 +626,7 @@ impl EngineBridge {
     pub fn apply_async_result(&mut self) -> Vec<Action> {
         let mut actions = self.apply_engine_result();
         actions.extend(self.apply_rerank_result());
+        actions.extend(self.apply_rewrite_result());
         actions
     }
 
@@ -639,7 +711,7 @@ impl EngineBridge {
         if current_hira != result.reading || result.candidates.is_empty() {
             return Vec::new();
         }
-        let candidates = self.with_alt(result.candidates.clone());
+        let candidates = self.shown_list(result.candidates.clone());
         // Locally generated candidates may move when the model arrives.
         // Keep a deliberate choice on its text rather than its old index.
         let sel = chosen
@@ -696,10 +768,29 @@ impl EngineBridge {
         })
     }
 
+    /// The list to show for the engine's list `main` of the reading open:
+    /// with mixed input's other candidates, and the rewrite first.
+    fn shown_list(&mut self, main: Vec<String>) -> Vec<String> {
+        let mut list = self.mixed_list(main);
+        if let Some(text) = self.rewrite_shown() {
+            list.retain(|c| *c != text);
+            list.insert(0, text);
+        }
+        list
+    }
+
+    /// The rewrite of the reading typed, once it is in.
+    fn rewrite_shown(&self) -> Option<String> {
+        self.rewrite
+            .as_ref()
+            .filter(|j| j.reading == self.composing.hiragana())
+            .and_then(|j| j.text.clone())
+    }
+
     /// The list to show for the engine's list `main` of the mixed reading:
     /// with the other reading's candidates and the input as typed (see
     /// `AltList`). Unchanged without one.
-    fn with_alt(&mut self, main: Vec<String>) -> Vec<String> {
+    fn mixed_list(&mut self, main: Vec<String>) -> Vec<String> {
         let Some(alt) = self.alt.as_mut() else {
             return main;
         };
@@ -768,7 +859,7 @@ impl EngineBridge {
             } => candidates.get(*selected).cloned(),
             _ => return Vec::new(),
         };
-        let list = self.with_alt(main);
+        let list = self.shown_list(main);
         let sel = shown
             .and_then(|t| list.iter().position(|c| *c == t))
             .unwrap_or(0);
@@ -1028,20 +1119,20 @@ impl EngineBridge {
                     } else {
                         String::new()
                     };
-                    let list = self.with_alt(list);
+                    let source = list[0].clone();
+                    let list = self.shown_list(list);
                     let first = self.with_pending(list[0].clone());
                     self.phase = Phase::Converting {
                         candidates: list.clone(),
                         selected: 0,
                         seg: None,
                     };
-                    return KeyOutcome {
-                        consumed: true,
-                        actions: vec![
-                            Action::UpdatePreedit { text: first },
-                            Action::ShowCandidates { list, selected: 0 },
-                        ],
-                    };
+                    let mut actions = vec![
+                        Action::UpdatePreedit { text: first },
+                        Action::ShowCandidates { list, selected: 0 },
+                    ];
+                    actions.extend(self.start_rewrite(&reading, &source));
+                    return consumed(actions);
                 }
                 if dynamic && self.cached_prefix_reading == reading {
                     self.cached_prefix_kanji = candidates.first().cloned().unwrap_or_default();
@@ -1051,7 +1142,8 @@ impl EngineBridge {
                 for (text, starts) in self.list_starts_of(&reading, &[], &[], &candidates) {
                     self.list_starts.entry(text).or_insert(starts);
                 }
-                let candidates = self.with_alt(candidates);
+                let source = candidates[0].clone();
+                let candidates = self.shown_list(candidates);
                 if ready {
                     self.request_alt();
                 }
@@ -1063,16 +1155,15 @@ impl EngineBridge {
                 };
                 // the conversion key: a rerank waiting for the typing pause goes now
                 self.rerank_now();
-                KeyOutcome {
-                    consumed: true,
-                    actions: vec![
-                        Action::UpdatePreedit { text: first },
-                        Action::ShowCandidates {
-                            list: candidates,
-                            selected: 0,
-                        },
-                    ],
-                }
+                let mut actions = vec![
+                    Action::UpdatePreedit { text: first },
+                    Action::ShowCandidates {
+                        list: candidates,
+                        selected: 0,
+                    },
+                ];
+                actions.extend(self.start_rewrite(&reading, &source));
+                consumed(actions)
             }
         }
     }
@@ -1138,6 +1229,7 @@ impl EngineBridge {
                     _ => self.composing.commit(),
                 };
                 self.stop_rerank();
+                self.stop_rewrite();
                 self.phase = Phase::Empty;
                 self.last_applied_reading.clear();
                 self.cached_prefix_reading.clear();
@@ -1182,6 +1274,7 @@ impl EngineBridge {
                 self.invalidate_engine_results();
                 self.composing.reset();
                 self.stop_rerank();
+                self.stop_rewrite();
                 self.phase = Phase::Empty;
                 self.last_applied_reading.clear();
                 self.cached_prefix_reading.clear();
@@ -1572,6 +1665,114 @@ impl EngineBridge {
         }
     }
 
+    /// Rewrite mode, a conversion just opened: ask for the rewrite of
+    /// `reading`'s conversion `text` (once per reading) and say so.
+    fn start_rewrite(&mut self, reading: &str, text: &str) -> Option<Action> {
+        if !self.rewrite_mode || text.trim().is_empty() {
+            return None;
+        }
+        if let Some(job) = self.rewrite.as_ref().filter(|j| j.reading == reading) {
+            // asked already: in, or still on its way
+            return job.text.is_none().then(rewriting);
+        }
+        let client = self.rewriter.as_ref()?;
+        let req_id = self.req_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        client.dispatch(req_id, &self.context, reading, text.trim_end());
+        self.rewrite = Some(RewriteJob {
+            req_id,
+            reading: reading.to_string(),
+            text: None,
+        });
+        Some(rewriting())
+    }
+
+    /// The conversion is committed or dropped: no rewrite for it.
+    fn stop_rewrite(&mut self) {
+        if self.rewrite.take().is_some() {
+            if let Some(r) = &self.rewriter {
+                r.cancel();
+            }
+        }
+    }
+
+    /// A rewrite came back: first in the list open for its reading,
+    /// selected unless the user moved off the top; or why it failed.
+    fn apply_rewrite_result(&mut self) -> Vec<Action> {
+        let Some(result) = self.rewriter.as_ref().and_then(|r| r.take_latest()) else {
+            return Vec::new();
+        };
+        let Some(reading) = self
+            .rewrite
+            .as_ref()
+            .filter(|j| j.req_id == result.req_id)
+            .map(|j| j.reading.clone())
+        else {
+            return Vec::new();
+        };
+        let open = self.composing.hiragana() == reading
+            && self.form_shown().is_none()
+            && matches!(self.phase, Phase::Converting { seg: None, .. });
+        let Some(text) = result.text.filter(|t| !t.is_empty()) else {
+            self.rewrite = None;
+            let code = result.code.unwrap_or_default();
+            return if open {
+                vec![Action::Status {
+                    text: crate::rewrite_client::failure_message(&code).to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
+        };
+        if let Some(job) = self.rewrite.as_mut() {
+            job.text = Some(text.clone());
+        }
+        crate::diagnostics::log(format!("rewrite applied ms={:.0}", result.ms));
+        if !open {
+            return Vec::new();
+        }
+        // segment editing cuts the rewrite too, as best the kana allow
+        if let Some(starts) = crate::segments::char_starts(&reading, &text, None) {
+            self.list_starts.insert(text.clone(), starts);
+        }
+        let Phase::Converting {
+            candidates,
+            selected,
+            ..
+        } = &self.phase
+        else {
+            return Vec::new();
+        };
+        let shown = candidates.get(*selected).cloned();
+        let at_top = *selected == 0;
+        let mut list = candidates.clone();
+        list.retain(|c| *c != text);
+        list.insert(0, text);
+        let sel = if at_top {
+            0
+        } else {
+            shown
+                .and_then(|t| list.iter().position(|c| *c == t))
+                .unwrap_or(0)
+        };
+        self.phase = Phase::Converting {
+            candidates: list.clone(),
+            selected: sel,
+            seg: None,
+        };
+        vec![
+            Action::UpdatePreedit {
+                text: self.with_pending(list[sel].clone()),
+            },
+            Action::ShowCandidates {
+                list,
+                selected: sel,
+            },
+            Action::Status {
+                text: String::new(),
+            },
+        ]
+    }
+
     /// A rerank result: the scored candidates reordered by `converter +
     /// lambda * LM` (the rest kept after them), the list rebuilt and shown,
     /// then more candidates asked for while the user stays idle.
@@ -1645,7 +1846,7 @@ impl EngineBridge {
             } => {
                 let shown = candidates.get(*selected).cloned();
                 let at_top = *selected == 0;
-                let list = self.with_alt(list);
+                let list = self.shown_list(list);
                 let sel = if at_top {
                     0
                 } else {
@@ -1932,10 +2133,15 @@ impl EngineBridge {
     /// Leave Converting for typing, keeping the reading's candidates (Enter
     /// then commits the conversion the preedit shows).
     fn back_to_composing(&mut self) {
-        let list = match self.form_shown() {
+        let mut list = match self.form_shown() {
             Some(f) => f.list.clone(),
             None => self.current_list(),
         };
+        // typing shows (and Enter commits) the engine's conversion; the
+        // rewrite stays for the next conversion of the same reading
+        if let Some(text) = self.rewrite_shown() {
+            list.retain(|c| *c != text);
+        }
         self.form = None;
         self.seg_requests.clear();
         self.phase = Phase::Composing {
@@ -2322,8 +2528,13 @@ impl EngineBridge {
             }
             None => {
                 let text = candidates.get(*selected).cloned().unwrap_or_default();
-                let learn = (*selected > 0 && !self.list_reading.is_empty())
-                    .then(|| (self.list_reading.clone(), candidates[0].clone()));
+                // over a rewrite first, the engine's top is what was passed over
+                let top = match self.rewrite_shown() {
+                    Some(r) if candidates.first() == Some(&r) => 1,
+                    _ => 0,
+                };
+                let learn = (*selected > top && !self.list_reading.is_empty())
+                    .then(|| (self.list_reading.clone(), candidates[top].clone()));
                 (text, learn)
             }
         };
@@ -2342,6 +2553,7 @@ impl EngineBridge {
         self.invalidate_engine_results();
         self.seg_requests.clear();
         self.stop_rerank();
+        self.stop_rewrite();
         self.list_reading.clear();
         self.last_applied_reading.clear();
         self.cached_prefix_reading.clear();
@@ -2366,6 +2578,13 @@ fn rerank_order(scores: &[f32], logp: &[f64], lambda: f32) -> Vec<usize> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     order
+}
+
+/// The status while a rewrite is on its way.
+fn rewriting() -> Action {
+    Action::Status {
+        text: "書き直し中…".to_string(),
+    }
 }
 
 fn consumed(actions: Vec<Action>) -> KeyOutcome {
@@ -2547,6 +2766,210 @@ mod tests {
         };
         bridge.set_reranker(Some(Box::new(reranker.clone())), &cfg);
         (bridge, mock, reranker)
+    }
+
+    #[derive(Default)]
+    struct RewriteState {
+        /// (request id, context, reading, text)
+        dispatched: RefCell<Vec<(u64, String, String, String)>>,
+        next: RefCell<Option<crate::rewrite_client::RewriteResult>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockRewriter {
+        state: Rc<RewriteState>,
+    }
+
+    impl MockRewriter {
+        /// Answer the last request with `text`, or fail it with `code`.
+        fn answer(&self, text: Result<&str, &str>) {
+            let req_id = self.state.dispatched.borrow().last().unwrap().0;
+            *self.state.next.borrow_mut() = Some(crate::rewrite_client::RewriteResult {
+                req_id,
+                text: text.ok().map(str::to_string),
+                code: text.err().map(str::to_string),
+                ms: 1.0,
+            });
+        }
+        fn requests(&self) -> usize {
+            self.state.dispatched.borrow().len()
+        }
+    }
+
+    impl RewriteClient for MockRewriter {
+        fn dispatch(&self, req_id: u64, context: &str, reading: &str, text: &str) {
+            self.state.dispatched.borrow_mut().push((
+                req_id,
+                context.to_string(),
+                reading.to_string(),
+                text.to_string(),
+            ));
+        }
+        fn cancel(&self) {}
+        fn take_latest(&self) -> Option<crate::rewrite_client::RewriteResult> {
+            self.state.next.borrow_mut().take()
+        }
+    }
+
+    /// `kasano` typed and converted by the engine, with a rewriter in
+    /// rewrite mode.
+    fn rewriting_bridge() -> (EngineBridge, MockClient, MockRewriter) {
+        let (mut bridge, mock) = bridge_with_mock();
+        let rewriter = MockRewriter::default();
+        bridge.set_rewriter(Some(Box::new(rewriter.clone())));
+        assert!(bridge.set_rewrite_mode(true).is_empty());
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        (bridge, mock, rewriter)
+    }
+
+    fn status(actions: &[Action]) -> Option<&str> {
+        actions.iter().find_map(|a| match a {
+            Action::Status { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    fn shown(actions: &[Action]) -> Option<(Vec<String>, usize)> {
+        actions.iter().rev().find_map(|a| match a {
+            Action::ShowCandidates { list, selected } => Some((list.clone(), *selected)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn rewrite_mode_needs_a_rewriter() {
+        let (mut bridge, _mock) = bridge_with_mock();
+        bridge.set_rewrite_mode(true);
+        assert!(!bridge.rewrite_mode());
+    }
+
+    #[test]
+    fn the_conversion_key_asks_for_a_rewrite_that_comes_first() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        let out = bridge.handle_space();
+        assert_eq!(status(&out.actions), Some("書き直し中…"));
+        {
+            let sent = rewriter.state.dispatched.borrow();
+            assert_eq!((sent[0].2.as_str(), sent[0].3.as_str()), ("かさの", "傘の"));
+        }
+        rewriter.answer(Ok("傘の"));
+        // the same text as the engine's top: it moves first, once
+        let actions = bridge.apply_async_result();
+        let (list, selected) = shown(&actions).unwrap();
+        assert_eq!(
+            (list[0].as_str(), list[1].as_str(), selected),
+            ("傘の", "笠の", 0)
+        );
+        assert_eq!(status(&actions), Some(""));
+    }
+
+    #[test]
+    fn a_rewrite_keeps_a_selection_off_the_top() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.handle_space();
+        bridge.handle_down();
+        rewriter.answer(Ok("傘をさして"));
+        let actions = bridge.apply_async_result();
+        let (list, selected) = shown(&actions).unwrap();
+        assert_eq!(list[0], "傘をさして");
+        assert_eq!(list[selected], "笠の");
+        assert!(actions.contains(&Action::UpdatePreedit {
+            text: "笠の".into()
+        }));
+        // Enter commits the selection, the context grows by it
+        let out = bridge.handle_enter();
+        assert!(out.actions.contains(&Action::Commit {
+            text: "笠の".into()
+        }));
+    }
+
+    #[test]
+    fn enter_commits_the_rewrite() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.handle_space();
+        rewriter.answer(Ok("傘をさして"));
+        bridge.apply_async_result();
+        let out = bridge.handle_enter();
+        assert!(out.actions.contains(&Action::Commit {
+            text: "傘をさして".into()
+        }));
+        assert_eq!(bridge.context(), "傘をさして");
+    }
+
+    #[test]
+    fn escape_leaves_the_rewrite_out_of_typing() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.handle_space();
+        rewriter.answer(Ok("傘をさして"));
+        bridge.apply_async_result();
+        // back to typing: Enter commits the engine's conversion
+        bridge.handle_escape();
+        let out = bridge.handle_enter();
+        assert!(out.actions.contains(&Action::Commit {
+            text: "傘の".into()
+        }));
+    }
+
+    #[test]
+    fn the_same_reading_is_rewritten_once() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.handle_space();
+        rewriter.answer(Ok("傘をさして"));
+        bridge.apply_async_result();
+        bridge.handle_escape();
+        let out = bridge.handle_space();
+        assert_eq!(rewriter.requests(), 1);
+        assert_eq!(status(&out.actions), None);
+        assert_eq!(shown(&out.actions).unwrap().0[0], "傘をさして");
+    }
+
+    #[test]
+    fn a_failed_rewrite_says_why() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.handle_space();
+        rewriter.answer(Err("usage_limit"));
+        let actions = bridge.apply_async_result();
+        assert_eq!(
+            status(&actions),
+            Some(crate::rewrite_client::failure_message("usage_limit"))
+        );
+        assert!(shown(&actions).is_none());
+    }
+
+    #[test]
+    fn rewrite_mode_turned_on_over_an_open_conversion_asks_at_once() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.set_rewrite_mode(false);
+        bridge.handle_space();
+        assert_eq!(rewriter.requests(), 0);
+        let actions = bridge.set_rewrite_mode(true);
+        assert_eq!(status(&actions), Some("書き直し中…"));
+        assert_eq!(rewriter.requests(), 1);
+    }
+
+    #[test]
+    fn picking_the_engines_second_over_a_rewrite_learns_against_its_top() {
+        let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        let dir = std::env::temp_dir().join(format!(
+            "setsuna-bridge-rewrite-learn-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = crate::config::LearningCfg::default();
+        bridge.set_learning(Some(Learning::at(dir.join("learning.jsonl"), &cfg)));
+        bridge.handle_space();
+        rewriter.answer(Ok("傘をさして"));
+        bridge.apply_async_result();
+        // the rewrite, 傘の, 笠の: pick 笠の
+        bridge.handle_down();
+        bridge.handle_down();
+        bridge.handle_enter();
+        let log = std::fs::read_to_string(dir.join("learning.jsonl")).unwrap();
+        assert!(log.contains("笠の") && log.contains("傘の"), "{log}");
+        assert!(!log.contains("傘をさして"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The engine's answer to the last request, with converter scores.

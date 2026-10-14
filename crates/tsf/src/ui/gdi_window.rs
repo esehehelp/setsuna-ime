@@ -34,6 +34,7 @@ impl CandidateUi for GdiCandidateUi {
 
     fn hide(&mut self) {
         self.inner.hide();
+        self.inner.set_status("");
         self.visible = false;
     }
 
@@ -43,5 +44,9 @@ impl CandidateUi for GdiCandidateUi {
 
     fn set_on_select(&mut self, on_select: Box<dyn Fn(usize)>) {
         self.inner.set_on_select(on_select);
+    }
+
+    fn set_status(&mut self, status: &str) {
+        self.inner.set_status(status);
     }
 }

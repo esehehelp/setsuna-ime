@@ -15,13 +15,16 @@ Dependencies point one way: artifact -> runtime -> platform.
 |----------|----------------------------------------|---------------------------------------------------------|
 | artifact | `crates/artifact`                      | manifest schemas only                                   |
 | runtime  | `crates/engine`, `crates/rerank`       | `crates/artifact`; models load only through a manifest  |
-| platform | `crates/ime-core`, `crates/tsf`, `crates/linux`, `crates/settings`, `crates/demo` | the engine and reranker daemons' stdio protocol |
+| platform | `crates/ime-core`, `crates/tsf`, `crates/linux`, `crates/rewrite`, `crates/settings`, `crates/demo` | the engine, reranker and rewriter daemons' stdio protocol; `crates/settings` also links `crates/rewrite` (sign-in, keys, models) |
 
 The engine does inference only (proposal -> CTC beam -> candidates), and so
 does the reranker (an LM's log-probability of each candidate). IME-level
 behaviour (romaji composition, which kana candidates to show and where, when
 to rerank and how to combine the scores) lives in `crates/ime-core` and
-`crates/tsf`. The manifest schema is shared with the research repository
+`crates/tsf`. The rewriter (`crates/rewrite`) only talks to a model server
+(OpenAI with Sign in with ChatGPT or an API key, or an OpenAI-compatible
+API); when to ask it and where its rewrite goes is `crates/ime-core`'s.
+Credentials never go into logs. The manifest schema is shared with the research repository
 `neo-ime` (`src/neo_ime/artifact`); change both together.
 `tests/fixtures/ctc_nat_manifest` is the same fixture as `neo-ime`'s (the
 Python writer test reproduces it byte for byte); keep the two copies identical.

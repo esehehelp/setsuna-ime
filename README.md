@@ -41,6 +41,10 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 - **英日混在入力（任意）** — ローマ字の中の英単語を打ったまま残す
   （kana / Latin の n-gram モデルによる分割）。
 - **日付・時間候補**、**記号辞書**（`やじるし` → `→` など）。
+- **書き直し（任意、Windows）** — Space で変換すると、OpenAI のモデルが入力を
+  自然な日本語に書き直した候補を先頭に出す。
+  ChatGPT プラン（Sign in with ChatGPT）、OpenAI の API キー、OpenAI 互換 API
+  のどれでも使える（[書き直し](#書き直し)）。
 
 ## 構成
 
@@ -54,11 +58,12 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 | `crates/ime-core` | platform | 各 frontend 共通の IME ロジック（ローマ字合成、状態遷移、後処理、学習、設定、daemon client） |
 | `crates/tsf` | platform | Windows TSF IME（DLL） |
 | `crates/linux` | platform | fcitx5 addon（Rust 部分 + `fcitx5/` の C++ shim） |
+| `crates/rewrite` | platform | 書き直し（`setsuna-rewrite`、Sign in with ChatGPT、OpenAI / 互換 API の client） |
 | `crates/settings` | platform | 設定 GUI `setsuna-settings`（システムの WebView に出す HTML 画面。Windows / macOS / Linux） |
 | `crates/demo` | platform | ブラウザで IME を動かすローカルデモ |
 
 frontend はエンジンをリンクせず、`setsuna-engine daemon` / `setsuna-rerank
-daemon` を子プロセスとして起動し stdio で話す。
+daemon` / `setsuna-rewrite daemon` を子プロセスとして起動し stdio で話す。
 
 ## ビルド
 
@@ -155,6 +160,27 @@ Windows TSF / Linux fcitx5 共通で、モデル未起動でも Space で利用�
 Space ごとに時計を読み直し、開いている候補の日時は後から届くモデル結果や
 リランク結果で変わらない。既定で有効。設定 GUI、または
 `[frontend]` の `date_time_candidates = false` で無効にできる。
+
+## 書き直し
+
+書き直しがオンなら、Space で変換すると、読み・変換結果（と、設定でオンなら
+カーソルの前の文章）をモデルに送り、自然な日本語に書き直した文を候補の先頭に
+出す（変換候補の窓の上に「書き直し中…」と出て、届くと先頭が入れ替わる）。
+Enter で確定、↓ でいつもの変換候補を選べる。変換のたびに送るので、そのぶん
+使用量や料金がかかる。
+
+- **有効にする** — 設定 GUI の「書き直し」をオンにし、接続先とモデルを選んで
+  保存する（`[rewriter]`）。IME を有効にし直すと使える（タスクバーの表示が
+  「直」になる）。Windows のみ。
+- **ChatGPT プラン** — 「Continue with ChatGPT」でブラウザからサインインし、
+  ChatGPT プランの使用量で書き直す（OpenAI の Sign in with ChatGPT。ローカルで
+  動くオープンソースのアプリとして登録する）。使用量は ChatGPT の設定で管理する。
+- **API キー / 互換 API** — OpenAI の API キー、または OpenAI 互換 API（ローカルの
+  LLM サーバーなど）のベース URL と、必要ならその API キー。互換 API は
+  Chat Completions と Responses のどちらでも話せる。
+- **資格情報** — サインインのトークンと API キーは設定と同じディレクトリの
+  `credentials.bin` に、Windows の DPAPI でこのユーザーだけが読める形で保存する
+  （Linux / macOS では権限 0600 の `credentials.json`）。`config.toml` には入らない。
 
 ## License
 

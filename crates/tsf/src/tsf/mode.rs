@@ -1,5 +1,6 @@
 //! The input mode on the taskbar: あ while the IME is on, A while it is off,
-//! as fcitx5's status area shows it (`crates/linux/fcitx5`).
+//! as fcitx5's status area shows it (`crates/linux/fcitx5`), and 直 while
+//! on with the rewriter.
 //!
 //! Windows 8 and later show one language bar item of an IME in the input
 //! indicator: the one whose `guidItem` is `GUID_LBI_INPUTMODE` (the IME is
@@ -30,6 +31,8 @@ use crate::globals::CLSID_SETSUNA_TEXT_SERVICE;
 /// What the item shows, shared with the service that changes it.
 pub(crate) struct ModeState {
     pub on: Cell<bool>,
+    /// Rewriting is on (`[rewriter] enabled`), shown while the IME is.
+    pub rewrite: Cell<bool>,
     sink: RefCell<Option<ITfLangBarItemSink>>,
     /// A click on the item: the service toggles the mode.
     on_click: Box<dyn Fn()>,
@@ -39,9 +42,19 @@ impl ModeState {
     pub fn new(on: bool, on_click: Box<dyn Fn()>) -> Rc<Self> {
         Rc::new(Self {
             on: Cell::new(on),
+            rewrite: Cell::new(false),
             sink: RefCell::new(None),
             on_click,
         })
+    }
+
+    /// What the item shows: あ on, 直 on and rewriting, A off.
+    pub fn glyph(&self) -> &'static str {
+        match (self.on.get(), self.rewrite.get()) {
+            (false, _) => "A",
+            (true, true) => "直",
+            (true, false) => "あ",
+        }
     }
 
     /// Show `on`: the language bar asks for the icon and text again.
@@ -162,10 +175,10 @@ impl ITfLangBarItem_Impl for ModeItem_Impl {
     }
 
     fn GetTooltipString(&self) -> Result<BSTR> {
-        Ok(BSTR::from(if self.state.on.get() {
-            "ひらがな (半角/全角 で直接入力)"
-        } else {
-            "直接入力 (半角/全角 でひらがな)"
+        Ok(BSTR::from(match self.state.glyph() {
+            "A" => "直接入力 (半角/全角 でひらがな)",
+            "直" => "ひらがな・書き直し (半角/全角 で直接入力)",
+            _ => "ひらがな (半角/全角 で直接入力)",
         }))
     }
 }
@@ -209,11 +222,11 @@ impl ITfLangBarItemButton_Impl for ModeItem_Impl {
 
     fn GetIcon(&self) -> Result<HICON> {
         // the caller destroys it
-        mode_icon(self.state.on.get()).ok_or_else(|| E_FAIL.into())
+        mode_icon(self.state.glyph()).ok_or_else(|| E_FAIL.into())
     }
 
     fn GetText(&self) -> Result<BSTR> {
-        Ok(BSTR::from(if self.state.on.get() { "あ" } else { "A" }))
+        Ok(BSTR::from(self.state.glyph()))
     }
 }
 
@@ -284,22 +297,22 @@ fn light_taskbar() -> bool {
     status.is_ok() && value != 0
 }
 
-/// The mode icon at the small-icon size: あ or A in the taskbar's text color
-/// with an outline of the other color at half opacity.
-pub(crate) fn mode_icon(on: bool) -> Option<HICON> {
+/// The mode icon at the small-icon size: `text` (あ, 直 or A) in the
+/// taskbar's text color with an outline of the other color at half opacity.
+pub(crate) fn mode_icon(text: &str) -> Option<HICON> {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-    let bgra = icon_pixels(on, size, light_taskbar())?;
+    let bgra = icon_pixels(text, size, light_taskbar())?;
     unsafe { icon_from_bgra(&bgra, size) }
 }
 
 /// The icon's straight-alpha BGRA pixels, top row first.
-fn icon_pixels(on: bool, size: i32, light: bool) -> Option<Vec<u8>> {
+fn icon_pixels(text: &str, size: i32, light: bool) -> Option<Vec<u8>> {
     let (glyph, outline) = if light {
         ([0x1f, 0x1f, 0x1f], [0xff, 0xff, 0xff])
     } else {
         ([0xff, 0xff, 0xff], [0x00, 0x00, 0x00])
     };
-    let coverage = glyph_coverage(if on { "あ" } else { "A" }, size)?;
+    let coverage = glyph_coverage(text, size)?;
     let n = size as usize;
     // the outline: the glyph grown by a pixel
     let mut grown = vec![0f32; n * n];
@@ -469,7 +482,7 @@ mod tests {
     use super::*;
 
     /// Writes the icons, 4x enlarged on the taskbar's color, into
-    /// `local/mode-icon-<on|off>-<light|dark>.bmp` to look at:
+    /// `local/mode-icon-<on|rewrite|off>-<light|dark>.bmp` to look at:
     /// `cargo test -p setsuna-tsf -- --ignored icon_preview`.
     #[test]
     #[ignore]
@@ -484,8 +497,8 @@ mod tests {
             } else {
                 [32.0, 32.0, 32.0]
             };
-            for on in [true, false] {
-                let px = icon_pixels(on, size, light).unwrap();
+            for (mode, text) in [("on", "あ"), ("rewrite", "直"), ("off", "A")] {
+                let px = icon_pixels(text, size, light).unwrap();
                 let n = (size * zoom) as usize;
                 let mut rows = Vec::with_capacity(n * n * 3);
                 // BMP rows bottom-up, BGR
@@ -512,8 +525,7 @@ mod tests {
                 file.extend_from_slice(&[0u8; 24]);
                 file.extend_from_slice(&rows);
                 let name = format!(
-                    "mode-icon-{}-{}.bmp",
-                    if on { "on" } else { "off" },
+                    "mode-icon-{mode}-{}.bmp",
                     if light { "light" } else { "dark" }
                 );
                 std::fs::write(out.join(name), file).unwrap();

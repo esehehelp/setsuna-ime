@@ -78,10 +78,10 @@ if ((Test-Path -LiteralPath $RegisteredDllPath) -and -not $NoElevate) {
     Write-Log INFO "regsvr32 exit: $($p.ExitCode)"
 }
 
-# 3. Stop any leftover daemon process: the stable engine and its
-# content-addressed fallbacks (`setsuna-engine_<hash>.exe`), and the reranker,
-# only those running from the install dir.
-Get-Process -Name 'setsuna-engine*', 'setsuna-rerank' -ErrorAction SilentlyContinue |
+# 3. Stop any leftover daemon process: the stable engine and rewriter and
+# their content-addressed fallbacks (`setsuna-engine_<hash>.exe`), and the
+# reranker, only those running from the install dir.
+Get-Process -Name 'setsuna-engine*', 'setsuna-rewrite*', 'setsuna-rerank' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) } |
     ForEach-Object {
     Write-Log INFO "stopping daemon pid=$($_.Id)"

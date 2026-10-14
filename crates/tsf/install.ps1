@@ -27,6 +27,8 @@
 #                                           a content-addressed fallback when locked,
 #                                           config ort_dylib points at it)
 #   %LOCALAPPDATA%\setsuna-ime\setsuna-settings.exe  (settings GUI, when built)
+#   %LOCALAPPDATA%\setsuna-ime\setsuna-rewrite.exe  (rewriter, when built; a content-addressed
+#                                            fallback when locked, config [rewriter] exe follows)
 #   %LOCALAPPDATA%\setsuna-ime\uninstall.ps1
 #   %LOCALAPPDATA%\setsuna-ime\models\onnx\<manifest> + the files it lists
 #   %LOCALAPPDATA%\setsuna-ime\rerank\setsuna-rerank.exe + llama.cpp's DLLs (with -RerankManifest;
@@ -62,6 +64,7 @@ $DllName    = 'setsuna_tsf.dll'
 $EngineExe  = 'setsuna-engine.exe'
 $OrtDll     = 'onnxruntime.dll'
 $SettingsExe = 'setsuna-settings.exe'
+$RewriteExe = 'setsuna-rewrite.exe'
 $RerankExe  = 'setsuna-rerank.exe'
 $UninstReg  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
 
@@ -212,7 +215,8 @@ function Update-ExistingConfig {
         [string]$EnginePath,
         [string]$OrtPath,
         [string]$RerankManifestPath,
-        [string]$RerankExePath
+        [string]$RerankExePath,
+        [string]$RewriteExePath
     )
 
     $lines = @(Get-Content -LiteralPath $ConfigPath -ErrorAction Stop)
@@ -233,6 +237,13 @@ function Update-ExistingConfig {
         $qRerankExe = '"' + ($RerankExePath.Replace('\','/').Replace('"','\"')) + '"'
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rerank' -Key 'manifest' -Value $qRerankManifest
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rerank' -Key 'exe' -Value $qRerankExe
+    }
+    # The rewriter is found next to the DLL; a locked one's fallback is named.
+    if ($RewriteExePath -and ($RewriteExePath -ne (Join-Path $InstallDir $RewriteExe))) {
+        $qRewriteExe = '"' + ($RewriteExePath.Replace('\','/').Replace('"','\"')) + '"'
+        $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rewriter' -Key 'exe' -Value $qRewriteExe
+    } elseif ($RewriteExePath) {
+        $lines = Remove-ConfigValue -Lines $lines -Section 'rewriter' -Key 'exe'
     }
     Set-Content -LiteralPath $ConfigPath -Value $lines -Encoding utf8
 }
@@ -373,6 +384,21 @@ if (Test-Path -LiteralPath $SettingsSrc) {
     Write-Log WARN "settings GUI not found: $SettingsSrc"
 }
 
+# The rewriter is optional too. Running ones (one per app that used rewrite
+# mode) lock it: a new build then goes next to it under a content-addressed
+# name and config [rewriter] exe follows.
+$RewriteInstalled = $null
+$RewriteSrc = Join-Path $SourceDir $RewriteExe
+if (Test-Path -LiteralPath $RewriteSrc) {
+    try {
+        $RewriteInstalled = Copy-InstallFile -Source $RewriteSrc -Destination (Join-Path $InstallDir $RewriteExe) -AllowLockedFallback
+    } catch {
+        Write-Log WARN "copy failed $RewriteSrc`: $_"
+    }
+} else {
+    Write-Log WARN "rewriter not found: $RewriteSrc"
+}
+
 foreach ($c in $copies) {
     try {
         Copy-InstallFile -Source $c.src -Destination $c.dst | Out-Null
@@ -466,8 +492,8 @@ yen = "￥"
 shift_8 = "（"
 shift_9 = "）"
 "@ | Set-Content -LiteralPath $ConfigPath -Encoding utf8
-    if ($RerankInstalled) {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled
+    if ($RerankInstalled -or $RewriteInstalled) {
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
@@ -476,7 +502,7 @@ shift_9 = "）"
         Write-Log WARN "NoElevate with fallback DLL: config preserved because registered DLL was not updated"
     } else {
         try {
-            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled
+            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled
             Write-Log INFO "updated engine config: $ConfigPath"
         } catch {
             Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"

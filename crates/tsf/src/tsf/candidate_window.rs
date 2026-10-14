@@ -106,6 +106,8 @@ pub(crate) fn palette(cfg: &CandidateWindowCfg) -> Palette {
 struct RenderData {
     candidates: Vec<String>,
     notes: Vec<String>,
+    /// A line about the list after its position (a rewrite in progress).
+    status: String,
     selected: usize,
     page_size: usize,
     font_face: Vec<u16>,
@@ -141,6 +143,7 @@ impl CandidateWindow {
             let data = Box::new(RenderData {
                 candidates: Vec::new(),
                 notes: Vec::new(),
+                status: String::new(),
                 selected: 0,
                 page_size: page_size.max(1),
                 font_face: face,
@@ -211,6 +214,25 @@ impl CandidateWindow {
             );
             let _ = InvalidateRect(hwnd, None, false);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    /// Show `status` after the list's position, while the window is open;
+    /// empty clears it.
+    pub fn set_status(&mut self, status: &str) {
+        let hwnd = self.hwnd;
+        let visible = hwnd.0 as usize != 0 && unsafe { IsWindowVisible(hwnd) }.as_bool();
+        let Some(d) = self.data() else {
+            return;
+        };
+        let status = if visible { status } else { "" };
+        if d.status == status {
+            return;
+        }
+        d.status = status.to_string();
+        if visible {
+            let (list, selected) = (d.candidates.clone(), d.selected);
+            self.show(&list, selected);
         }
     }
 
@@ -344,8 +366,18 @@ pub(crate) unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
     size.cx
 }
 
+/// The line above the list: the selection's position, then the status.
+fn heading(d: &RenderData) -> String {
+    let mut h = format!("[{}/{}]", d.selected + 1, d.candidates.len());
+    if !d.status.is_empty() {
+        h.push_str("  ");
+        h.push_str(&d.status);
+    }
+    h
+}
+
 /// Size the window for `d`'s list: as wide as the widest candidate of the
-/// list with its note, always a full page high.
+/// list with its note (or the line above it), always a full page high.
 unsafe fn layout(hwnd: HWND, d: &RenderData) -> Layout {
     let s = dpi_scale(hwnd);
     unsafe {
@@ -371,6 +403,7 @@ unsafe fn layout(hwnd: HWND, d: &RenderData) -> Layout {
             .unwrap_or(0);
         let mut stm = TEXTMETRICW::default();
         let _ = GetTextMetricsW(hdc, &mut stm);
+        let heading_w = text_width(hdc, &heading(d));
         SelectObject(hdc, old);
         let _ = DeleteObject(big);
         let _ = DeleteObject(small);
@@ -378,7 +411,9 @@ unsafe fn layout(hwnd: HWND, d: &RenderData) -> Layout {
 
         let pad_x = sc(PAD_X, s);
         let note_x = pad_x + label_w + text_w + sc(NOTE_GAP, s);
-        let width = (note_x + note_w + pad_x).max(sc(MIN_WIDTH, s));
+        let width = (note_x + note_w + pad_x)
+            .max(pad_x + heading_w + pad_x)
+            .max(sc(MIN_WIDTH, s));
         let accent = if d.palette.accent.is_some() {
             sc(ACCENT, s)
         } else {
@@ -569,8 +604,7 @@ unsafe fn render(hdc: HDC, d: &RenderData) {
         // where the selection is, as fcitx5's aux line
         let old = SelectObject(hdc, small);
         if !d.candidates.is_empty() {
-            let heading = format!("[{}/{}]", d.selected + 1, d.candidates.len());
-            draw_text(hdc, &heading, pad_x, accent + sc(PAD_TOP, s), p.muted);
+            draw_text(hdc, &heading(d), pad_x, accent + sc(PAD_TOP, s), p.muted);
         }
 
         let mut tm = TEXTMETRICW::default();
