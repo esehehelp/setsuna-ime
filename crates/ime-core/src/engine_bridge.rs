@@ -1049,6 +1049,18 @@ impl EngineBridge {
             // Space after F6–F10 converts the reading as usual.
             self.back_to_composing();
         }
+        // Mixed input: Space after an English word types a space (`Hello
+        // world`); Space again, or after Japanese, converts.
+        if self.composing.is_mixed()
+            && matches!(self.phase, Phase::Composing { .. })
+            && self.composing.cursor_at_end()
+        {
+            if self.composing.ends_with_space() {
+                self.composing.trim_end_spaces();
+            } else if self.composing.ends_in_english() {
+                return self.type_char(' ');
+            }
+        }
         let mut previous_dates = Vec::new();
         if matches!(self.phase, Phase::Composing { .. }) {
             self.alt = self.alt_for_space();
@@ -2296,6 +2308,18 @@ impl EngineBridge {
     }
 
     pub fn handle_punctuation(&mut self, kana: &str) -> KeyOutcome {
+        // The period key right after a digit types `.` (3.5, and 3. before
+        // the 5): a 。 there is next to never meant. Mixed input shows it so
+        // itself (`mixed::render_parts`).
+        let kana = if kana == "。"
+            && !self.composing.is_mixed()
+            && matches!(self.phase, Phase::Composing { .. })
+            && self.composing.digit_before_cursor()
+        {
+            "."
+        } else {
+            kana
+        };
         if matches!(
             self.phase,
             Phase::Empty | Phase::Alphabet { .. } | Phase::Converting { .. }
@@ -3043,19 +3067,57 @@ mod tests {
     }
 
     #[test]
-    fn mixed_space_after_english_offers_it_with_a_space() {
+    fn mixed_space_after_english_types_a_space() {
         let (mut bridge, _mock) = mixed_bridge();
         type_str(&mut bridge, "hello");
         let out = bridge.handle_space();
+        assert_eq!(preedit(&out.actions).as_deref(), Some("hello "));
+        assert!(!bridge.is_converting());
+        type_str(&mut bridge, "google");
+        assert_eq!(
+            preedit(&bridge.handle_space().actions).as_deref(),
+            Some("hello google ")
+        );
+        assert_eq!(
+            commits(&bridge.handle_enter().actions),
+            vec!["hello google "]
+        );
+    }
+
+    #[test]
+    fn mixed_space_twice_after_english_offers_it_with_a_space() {
+        let (mut bridge, _mock) = mixed_bridge();
+        type_str(&mut bridge, "hello");
+        bridge.handle_space();
+        let out = bridge.handle_space();
+        assert!(bridge.is_converting());
         assert_eq!(preedit(&out.actions).as_deref(), Some("hello "));
         // the next key commits it, as between English words
         assert_eq!(commits(&bridge.handle_char('w').actions), vec!["hello "]);
     }
 
     #[test]
+    fn period_after_a_digit_types_a_point() {
+        let (mut bridge, _mock) = bridge_with_mock();
+        type_str(&mut bridge, "3");
+        let out = bridge.handle_punctuation("。");
+        assert_eq!(preedit(&out.actions).as_deref(), Some("3."));
+        type_str(&mut bridge, "desu");
+        let out = bridge.handle_punctuation("。");
+        assert_eq!(preedit(&out.actions).as_deref(), Some("3.です。"));
+
+        let (mut bridge, _mock) = mixed_bridge();
+        type_str(&mut bridge, "3");
+        let out = bridge.handle_punctuation("。");
+        assert_eq!(preedit(&out.actions).as_deref(), Some("3."));
+    }
+
+    #[test]
     fn mixed_conversion_offers_the_reading_without_english() {
         let (mut bridge, mock) = mixed_bridge();
         type_str(&mut bridge, "hello");
+        // the first Space types a space
+        bridge.handle_space();
         bridge.handle_space();
         mock.answer_last(&["hello"]);
         bridge.apply_async_result();

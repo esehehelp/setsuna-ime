@@ -319,6 +319,29 @@ impl ComposingText {
             .is_some_and(|span| span.lang == Lang::En && span.end == self.raw.chars().count())
     }
 
+    /// Whether the composition ends in a space (one typed after English).
+    pub fn ends_with_space(&self) -> bool {
+        self.raw.ends_with(' ')
+    }
+
+    /// Drop the spaces at the end of the composition, the cursor at its end.
+    pub fn trim_end_spaces(&mut self) {
+        let trimmed = self.raw.trim_end_matches(' ').len();
+        self.raw.truncate(trimmed);
+        self.cursor = self.raw.chars().count();
+        self.recompute(false);
+    }
+
+    /// Whether the char left of the cursor is a digit.
+    pub fn digit_before_cursor(&self) -> bool {
+        self.cursor > 0
+            && self
+                .raw
+                .chars()
+                .nth(self.cursor - 1)
+                .is_some_and(|c| c.is_ascii_digit())
+    }
+
     pub fn input_char(&mut self, c: char) {
         // Mixed input keeps the case: Shift marks English.
         let c = if self.mixed.is_some() {

@@ -187,6 +187,14 @@ pub fn shared(dir: &str) -> Option<Arc<MixedModel>> {
 /// Longest English span considered, in chars.
 const MAX_EN: usize = 40;
 
+/// Particles (and words used like them) that end an English word typed
+/// right before them, as romaji: が を で の に は と も へ から より.
+/// 側 (gawa) starts with が, です with で. Not まで: `Ollamade` would
+/// split before `ma` (Olla + まで).
+const PARTICLES: &[&str] = &[
+    "ga", "wo", "de", "no", "ni", "ha", "to", "mo", "he", "kara", "yori",
+];
+
 impl MixedModel {
     pub fn load(dir: &Path) -> Result<Self> {
         let read = |name: &str| {
@@ -439,7 +447,94 @@ impl MixedModel {
             }
         }
         spans.reverse();
-        spans
+        self.split_particles(&chars, spans, fin)
+    }
+
+    /// An English span the model does not know as a word that ends in a
+    /// particle read as romaji (`Ollamade`, `Qwenno`) is English up to it
+    /// and Japanese from it (Ollama + で): the letter model alone finds
+    /// such a word as likely as the split. Of several splits, the first
+    /// (Ollama + のです, not Ollamano + です); a word it knows (`code`,
+    /// `piano`) stays whole.
+    fn split_particles(&self, chars: &[char], spans: Vec<Span>, fin: bool) -> Vec<Span> {
+        let mut out: Vec<Span> = Vec::with_capacity(spans.len() + 1);
+        let mut it = spans.into_iter().peekable();
+        while let Some(span) = it.next() {
+            if span.lang != Lang::En {
+                out.push(span);
+                continue;
+            }
+            // Japanese right after it reads on from the particle.
+            let next_ja = it
+                .peek()
+                .is_some_and(|n| n.lang == Lang::Ja && n.start == span.end);
+            let rest_end = if next_ja {
+                it.peek().map_or(span.end, |n| n.end)
+            } else {
+                span.end
+            };
+            match self.particle_split(chars, span, rest_end, fin) {
+                Some(at) => {
+                    if next_ja {
+                        it.next();
+                    }
+                    out.push(Span { end: at, ..span });
+                    out.push(Span {
+                        lang: Lang::Ja,
+                        start: at,
+                        end: rest_end,
+                    });
+                }
+                None => out.push(span),
+            }
+        }
+        out
+    }
+
+    /// Where `span` (English) splits before a particle, Japanese running on
+    /// to `rest_end`; see `split_particles`.
+    fn particle_split(
+        &self,
+        chars: &[char],
+        span: Span,
+        rest_end: usize,
+        fin: bool,
+    ) -> Option<usize> {
+        let word: String = chars[span.start..span.end].iter().collect();
+        // the last run of letters: `Wi-Fino` splits in `Fino`
+        let run_start = chars[span.start..span.end]
+            .iter()
+            .rposition(|c| !c.is_ascii_alphabetic())
+            .map_or(span.start, |k| span.start + k + 1);
+        let run: String = chars[run_start..span.end].iter().collect();
+        if self.knows(&word) || self.knows(&run) {
+            return None;
+        }
+        let rest_fin = fin && rest_end == chars.len();
+        // at least two letters stay English
+        (run_start + 2..span.end.saturating_sub(1)).find(|&at| {
+            let rest = &chars[at..rest_end];
+            let lower: String = chars[at..span.end]
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            if !PARTICLES.iter().any(|p| lower.starts_with(p)) {
+                return false;
+            }
+            // the rest reads as kana, but for romaji still being typed
+            let units = romaji_units(rest, rest_fin);
+            let reads = units.iter().enumerate().all(|(i, u)| match u.kind {
+                UnitKind::Kana(_) => true,
+                UnitKind::Pending => !rest_fin && i + 1 == units.len() && rest_end == chars.len(),
+                UnitKind::Char(_) => false,
+            });
+            // and what stays is English (no joiner at its end)
+            reads
+                && self
+                    .en_costs(&chars[span.start..at], false)
+                    .last()
+                    .is_some_and(|(len, _)| span.start + len == at)
+        })
     }
 
     /// For every `end` (1..=len): the cost of `chars[..end]` as Japanese,
@@ -675,12 +770,10 @@ impl Piece {
     }
 }
 
-/// Whether `chars[at]` is a `.` between digits (2.8).
+/// Whether `chars[at]` is a `.` right after a digit (2.8, and 2. before the
+/// next digit is typed): a 。 there is next to never meant.
 fn is_decimal_point(chars: &[char], at: usize) -> bool {
-    chars[at] == '.'
-        && at > 0
-        && chars[at - 1].is_ascii_digit()
-        && chars.get(at + 1).is_some_and(|c| c.is_ascii_digit())
+    chars[at] == '.' && at > 0 && chars[at - 1].is_ascii_digit()
 }
 
 /// Symbols an English span may have between its pieces.
@@ -1021,12 +1114,30 @@ pub(crate) mod tests {
     fn decimals_and_pending_romaji() {
         let m = model();
         assert_eq!(shown(&m, "2.8baininaru", None), "2.8ばいになる");
+        // a period after a digit stays one before the next digit is typed
+        assert_eq!(shown(&m, "2.", None), "2.");
+        assert_eq!(shown(&m, "desu.", None), "です。");
         let chars: Vec<char> = "kyouk".chars().collect();
         let spans = m.segment("kyouk", None, false);
         assert_eq!(
             render_parts(&chars, &spans, false, &HashMap::new()),
             ("きょう".to_string(), "k".to_string())
         );
+    }
+
+    #[test]
+    fn a_particle_ends_an_unknown_english_word() {
+        let m = model();
+        assert_eq!(shown(&m, "Ollamade", None), "Ollamaで");
+        assert_eq!(shown(&m, "Qwenwotsukau", None), "Qwenをつかう");
+        // the first split: Ollama + のです, not Ollamano + です
+        assert_eq!(shown(&m, "Ollamanodesu", None), "Ollamaのです");
+        assert_eq!(shown(&m, "Wi-Fino", None), "Wi-Fiの");
+        // a known word stays whole
+        assert_eq!(shown(&m, "Made", None), "Made");
+        // romaji still being typed after it: not yet
+        let spans = m.segment("Ollamad", None, false);
+        assert_eq!(render("Ollamad", &spans, false), "Ollamad");
     }
 
     #[test]
