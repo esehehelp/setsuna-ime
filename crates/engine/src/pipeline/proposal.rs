@@ -91,9 +91,11 @@ fn fixed_input_seq_len(session: &Session) -> Option<usize> {
 }
 
 /// Build (input_ids, attention_mask, actual_len) for the proposal graph.
-/// Layout: `[CLS] context[-max_context:] [SEP] reading`, padded to seq_len
-/// with [PAD] / 0. (No trailing [SEP] after reading — matches the training
-/// data tokenizer.)
+/// Layout: `[CLS] context [SEP] reading`, padded to seq_len with [PAD] / 0
+/// (no trailing [SEP] after reading), as the training rows are laid out:
+/// the context's last `max_context` tokens (tokens, not chars: a
+/// byte-spelled char counts each of its bytes), the reading reserved first
+/// and the context left-trimmed to the room left in `seq_len`.
 pub fn encode(
     tokenizer: &SharedCharTokenizer,
     seq_len: usize,
@@ -102,8 +104,6 @@ pub fn encode(
     reading: &str,
 ) -> Result<(Vec<i64>, Vec<i64>, usize)> {
     anyhow::ensure!(seq_len >= 2, "model sequence must hold [CLS] and [SEP]");
-    let ctx_chars: Vec<String> = chars(context);
-    let take_ctx = ctx_chars.len().saturating_sub(max_context);
     let reading_chars = chars(reading);
 
     // Byte-level fallback for OOV chars, matching the Python tokenizer
@@ -128,18 +128,16 @@ pub fn encode(
         reading_ids.len(),
         seq_len - 2
     );
-    let ctx_iter = &ctx_chars[take_ctx..];
-    let mut ctx_ids: Vec<u32> = Vec::with_capacity(ctx_iter.len());
-    for ch in ctx_iter {
+    // every char is at least one token: the last max_context chars hold the
+    // last max_context tokens
+    let ctx_chars = chars(context);
+    let mut ctx_ids: Vec<u32> = Vec::new();
+    for ch in &ctx_chars[ctx_chars.len().saturating_sub(max_context)..] {
         ctx_ids.extend(tokenizer.encode_with_byte_fallback(ch));
     }
-    // Left-trim context to fit the remaining budget after [CLS] +
-    // reading + [SEP]. Byte fallback can produce more tokens than
-    // chars, so we may still need to trim after expansion.
-    let ctx_room = seq_len.saturating_sub(2 + reading_ids.len());
-    if ctx_ids.len() > ctx_room {
-        let drop = ctx_ids.len() - ctx_room;
-        ctx_ids.drain(..drop);
+    let keep = max_context.min(seq_len - 2 - reading_ids.len());
+    if ctx_ids.len() > keep {
+        ctx_ids.drain(..ctx_ids.len() - keep);
     }
     let mut ids: Vec<i64> = Vec::with_capacity(seq_len);
     ids.push(tokenizer.cls_id as i64);
@@ -546,6 +544,10 @@ mod tests {
         assert_eq!(ids, vec![2, 6, 3, 6, 0, 0, 0, 0]);
         assert_eq!(mask, vec![1, 1, 1, 1, 0, 0, 0, 0]);
         assert_eq!(actual, 4);
+        // max_context counts tokens: a char the vocabulary lacks takes one a
+        // byte (here [UNK] each, the test vocabulary having no byte tokens)
+        let (ids, _, actual) = encode(&tok, 16, 3, "いあ\u{20B9F}", "あ").unwrap();
+        assert_eq!(&ids[..actual], &[2, 1, 1, 1, 3, 6]);
     }
 
     #[test]

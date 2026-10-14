@@ -83,7 +83,7 @@ struct EngineArgs {
     #[arg(long)]
     top_k_per_step: Option<usize>,
 
-    /// Maximum left-context characters fed to the model. Default 64.
+    /// Maximum left-context tokens fed to the model (a char the vocabulary lacks takes one a byte). Default 64.
     #[arg(long)]
     max_context: Option<usize>,
 
