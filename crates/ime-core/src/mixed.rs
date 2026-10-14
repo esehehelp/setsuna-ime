@@ -835,7 +835,8 @@ impl MixedModel {
     pub fn cased(&self, typed: &str, before: Option<&str>, fin: bool) -> (Vec<char>, Vec<Span>) {
         let mut chars: Vec<char> = typed.chars().collect();
         let mut spans = self.segment(typed, before, fin);
-        for span in spans.iter().filter(|s| s.lang == Lang::En) {
+        let sentence = english_sentence(&chars, &spans, before);
+        for (k, span) in spans.iter().enumerate().filter(|(_, s)| s.lang == Lang::En) {
             // a unit after a number stays (100km, 173cm, m2), and so does
             // what follows a dot (sitemap1.xml)
             if span.start > 0 && matches!(chars[span.start - 1], '0'..='9' | '.') {
@@ -849,12 +850,18 @@ impl MixedModel {
             // a word with joiners as a whole only: example.com, not
             // Example.com
             if let Some(name) = self.name_case(&lower) {
-                for (c, n) in word.iter_mut().zip(name.chars()) {
-                    *c = n;
+                // in an English sentence only a name with a capital inside
+                // (iPhone, GitHub): `the word`, `it works` are words
+                let inner = name.chars().skip(1).any(|c| c.is_ascii_uppercase())
+                    && name.chars().any(|c| c.is_ascii_lowercase());
+                if k >= sentence || inner {
+                    for (c, n) in word.iter_mut().zip(name.chars()) {
+                        *c = n;
+                    }
                 }
             }
         }
-        english_sentences(&mut chars, &mut spans, before);
+        english_case(&mut chars, &mut spans[..sentence]);
         (chars, spans)
     }
 }
@@ -934,15 +941,13 @@ impl Piece {
     }
 }
 
-/// An English sentence at the start of `spans`: two English words or more
-/// at the start of the input, the text before it ending a sentence (or
-/// none), with only spaces between them or `.` `,` `!` `?` `;` `:` right
-/// after a word, up to the input's end or to a `.` `!` `?` (English
-/// followed right away by Japanese, `pull request` + を, is no sentence).
-/// Its punctuation becomes English (as typed, not 、。), its words typed in
-/// lowercase start with a capital at its start and after `.` `!` `?`, and
-/// `i` (`i'm`) is `I`.
-fn english_sentences(chars: &mut [char], spans: &mut [Span], before: Option<&str>) {
+/// The spans of an English sentence at the start of `spans` (0: none): two
+/// English words or more at the start of the input, the text before it
+/// ending a sentence (or none), with only spaces between them or `.` `,`
+/// `!` `?` `;` `:` right after a word, up to the input's end or to a `.`
+/// `!` `?` (English followed right away by Japanese, `pull request` + を, is
+/// no sentence).
+fn english_sentence(chars: &[char], spans: &[Span], before: Option<&str>) -> usize {
     let punct = |s: &Span, chars: &[char]| {
         s.lang == Lang::Ja
             && chars[s.start..s.end]
@@ -958,10 +963,10 @@ fn english_sentences(chars: &mut [char], spans: &mut [Span], before: Option<&str
                 .is_none_or(|c| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
     });
     let Some(first) = spans.first() else {
-        return;
+        return 0;
     };
     if !before_ends || first.lang != Lang::En || chars[..first.start].iter().any(|&c| c != ' ') {
-        return;
+        return 0;
     }
     // the run: English words, and punctuation right after one
     let mut end = 1;
@@ -983,10 +988,18 @@ fn english_sentences(chars: &mut [char], spans: &mut [Span], before: Option<&str
     let complete =
         end == spans.len() || last.lang == Lang::Ja && ends_sentence(&chars[last.start..last.end]);
     if words < 2 || !complete {
-        return;
+        return 0;
     }
+    end
+}
+
+/// An English sentence's case (`english_sentence`): its punctuation becomes
+/// English (as typed, not 、。), its words typed in lowercase start with a
+/// capital at its start and after `.` `!` `?`, and `i` (`i'm`) is `I`.
+fn english_case(chars: &mut [char], sentence: &mut [Span]) {
+    let ends_sentence = |s: &[char]| s.iter().any(|c| matches!(c, '.' | '!' | '?'));
     let mut capital = true;
-    for span in &mut spans[..end] {
+    for span in sentence {
         if span.lang == Lang::Ja {
             span.lang = Lang::En;
             capital |= ends_sentence(&chars[span.start..span.end]);
@@ -1423,8 +1436,11 @@ pub(crate) mod tests {
     #[test]
     fn an_english_sentence_starts_with_a_capital() {
         let mut m = model();
-        m.add_names("world\t1\nnice\t1\n");
+        m.add_names("World\t1\nnice\t1\nGitHub\t1\n");
+        // a name with a capital inside only (`World` is a word here)
         assert_eq!(cased(&m, "hello world", None), "Hello world");
+        assert_eq!(cased(&m, "hello github", None), "Hello GitHub");
+        assert_eq!(cased(&m, "worldwotsukau", None), "Worldをつかう");
         assert_eq!(
             cased(&m, "hello world. nice world", None),
             "Hello world. Nice world"
@@ -1435,11 +1451,8 @@ pub(crate) mod tests {
         // one word is no sentence, nor English inside Japanese
         assert_eq!(cased(&m, "hello", None), "hello");
         assert_eq!(cased(&m, "hello.", None), "hello。");
-        assert_eq!(cased(&m, "hello world", Some("きょうは")), "hello world");
-        assert_eq!(
-            cased(&m, "hello worldwotsukau", None),
-            "hello worldをつかう"
-        );
+        assert_eq!(cased(&m, "hello nice", Some("きょうは")), "hello nice");
+        assert_eq!(cased(&m, "hello nicewotsukau", None), "hello niceをつかう");
         // a sentence and then Japanese
         assert_eq!(
             cased(&m, "hello world. kyouhaiitenkidesune", None),
