@@ -24,10 +24,8 @@ to rerank and how to combine the scores) lives in `crates/ime-core` and
 `crates/tsf`. The rewriter (`crates/rewrite`) only talks to a model server
 (OpenAI with Sign in with ChatGPT or an API key, or an OpenAI-compatible
 API); when to ask it and where its rewrite goes is `crates/ime-core`'s.
-Credentials never go into logs. The manifest schema is shared with the research repository
-`neo-ime` (`src/neo_ime/artifact`); change both together.
-`tests/fixtures/ctc_nat_manifest` is the same fixture as `neo-ime`'s (the
-Python writer test reproduces it byte for byte); keep the two copies identical.
+Credentials never go into logs. The manifest schema names (`*-export-v1`) are
+the identifiers the existing model artifacts carry: keep them.
 
 ## Checks
 
