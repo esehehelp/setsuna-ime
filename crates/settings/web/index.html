@@ -238,6 +238,24 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
 </div>
 
+<h2>英日混在入力</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">小文字で打った英語の表記</div>
+      <div class="desc">固有名詞：名前の辞書の表記にします（github → GitHub、iphone → iPhone）。略語：英単語として読めないつづり（pc → PC、sns → SNS、usb → USB）と ok・api・id なども大文字にします。word や apple のように普通の語でもある名前はそのままです（混在入力のモデルを使うとき）</div>
+    </div>
+    <div class="control"><div class="segmented" id="name_case"></div></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">英文の文頭を大文字にする</div>
+      <div class="desc">2 語以上の英文の文頭と . ! ? の後を大文字にし、i を I に、文中の . , を英文のまま残します</div>
+    </div>
+    <div class="control" data-switch="frontend.sentence_case"></div>
+  </div>
+</div>
+
 <h2>任意置換</h2>
 <div class="card">
   <div class="row">
@@ -399,6 +417,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 "use strict";
 
 const WIDTHS = [["as_typed", "入力どおり"], ["full", "全角"], ["half", "半角"], ["auto", "自動"]];
+const NAME_CASES = [["off", "オフ"], ["proper", "固有名詞"], ["acronyms", "固有名詞と略語"]];
 const PUNCTUATION = [
   ["as_is", "変換結果のまま"], ["toten_kuten", "、。"], ["comma_period", "，．"],
   ["comma_kuten", "，。"], ["toten_period", "、．"],
@@ -436,23 +455,29 @@ function toggle(checked, onChange) {
   return el("label", { className: "switch" }, state, input, el("span", { className: "track" }));
 }
 
+// buttons in the element `id`, one per [value, label], for cfg.frontend[id]
+function segmented(id, choices) {
+  const seg = $(id);
+  seg.replaceChildren(...choices.map(([value, label]) => {
+    const b = el("button", { textContent: label });
+    b.setAttribute("aria-pressed", cfg.frontend[id] === value);
+    b.addEventListener("click", () => {
+      cfg.frontend[id] = value;
+      for (const o of seg.children) o.setAttribute("aria-pressed", o === b);
+      changed();
+    });
+    return b;
+  }));
+}
+
 function render() {
   for (const slot of document.querySelectorAll("[data-switch]")) {
     const path = slot.dataset.switch;
     slot.replaceChildren(toggle(at(path), (v) => { setAt(path, v); changed(); }));
   }
 
-  const seg = $("symbol_width");
-  seg.replaceChildren(...WIDTHS.map(([value, label]) => {
-    const b = el("button", { textContent: label });
-    b.setAttribute("aria-pressed", cfg.frontend.symbol_width === value);
-    b.addEventListener("click", () => {
-      cfg.frontend.symbol_width = value;
-      for (const o of seg.children) o.setAttribute("aria-pressed", o === b);
-      changed();
-    });
-    return b;
-  }));
+  segmented("symbol_width", WIDTHS);
+  segmented("name_case", NAME_CASES);
 
   const sel = $("punctuation");
   sel.replaceChildren(...PUNCTUATION.map(([value, label]) =>

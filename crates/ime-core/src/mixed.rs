@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 
 use crate::composing_text::{pending_kana, romaji_units, UnitKind};
+use crate::config::NameCase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -165,9 +166,10 @@ pub struct MixedModel {
     running: Vec<(u64, u64)>,
     ja_total: f64,
     en_total: f64,
-    /// The names dictionary by lowercase form: the name as written and its
-    /// weight.
-    names: FastMap<String, (String, f64)>,
+    /// The names dictionary by lowercase form: the name as written, its
+    /// weight and whether it is a common one (an acronym or an ordinary
+    /// word too: OK, Word).
+    names: FastMap<String, (String, f64, bool)>,
     pub params: MixedParams,
 }
 
@@ -301,8 +303,9 @@ impl MixedModel {
     }
 
     /// Add the names of a names dictionary (`<name as written>\t<weight>`
-    /// lines, `#` comments; a name of one word of ASCII letters, digits and
-    /// joiners). Of two names with one lowercase form the heavier wins. A
+    /// lines, `\tcommon` after a common one, `#` comments; a name of one
+    /// word of ASCII letters, digits and joiners). Of two names with one
+    /// lowercase form the heavier wins. A
     /// name that reads as romaji all through (`sushi`, `toyota`) is left
     /// out: typed in lowercase it is Japanese.
     pub fn add_names(&mut self, tsv: &str) {
@@ -322,12 +325,13 @@ impl MixedModel {
                 continue;
             }
             let weight: f64 = cols.next().and_then(|w| w.parse().ok()).unwrap_or(1.0);
+            let common = cols.next() == Some("common");
             let entry = self
                 .names
                 .entry(name.to_ascii_lowercase())
-                .or_insert_with(|| (name.to_string(), 0.0));
+                .or_insert_with(|| (name.to_string(), 0.0, common));
             if weight > entry.1 {
-                *entry = (name.to_string(), weight);
+                *entry = (name.to_string(), weight, common);
             }
         }
     }
@@ -816,26 +820,38 @@ impl MixedModel {
     fn name_weight(&self, word: &str) -> Option<f64> {
         self.names
             .get(word)
-            .filter(|(name, _)| word.len() >= 4 && name.chars().any(|c| c.is_ascii_lowercase()))
-            .map(|&(_, weight)| weight)
+            .filter(|(name, _, _)| word.len() >= 4 && name.chars().any(|c| c.is_ascii_lowercase()))
+            .map(|&(_, weight, _)| weight)
     }
 
-    /// How `word` (lowercase) is written when typed so: as its name, unless
-    /// the name is lowercase (the dictionary gives an ordinary word, apple,
-    /// its lowercase form when the word is better known than the name).
-    fn name_case(&self, word: &str) -> Option<&str> {
-        let (name, _) = self.names.get(word)?;
-        (name != word).then_some(name.as_str())
+    /// How `word` (lowercase) is written when typed so, as `names` says: as
+    /// its name, unless the name is lowercase (the dictionary gives an
+    /// ordinary word, apple, its lowercase form when the word is better
+    /// known than the name) or a common one (an acronym, a word too: OK,
+    /// Word), which no dictionary decides (`acronym` does the acronyms).
+    fn name_case(&self, word: &str, names: NameCase) -> Option<&str> {
+        let (name, _, common) = self.names.get(word)?;
+        (names != NameCase::Off && !common && name != word).then_some(name.as_str())
     }
 
-    /// `typed` segmented (`segment`) and cased as shown: the English spans'
-    /// letters with their case, and an English sentence's punctuation as
-    /// English (see the module docs). Char for char: a position in it is one
-    /// in `typed`.
-    pub fn cased(&self, typed: &str, before: Option<&str>, fin: bool) -> (Vec<char>, Vec<Span>) {
+    /// `typed` segmented (`segment`) and cased as shown, as `casing` says:
+    /// the English spans' letters with their case, and an English
+    /// sentence's punctuation as English (see the module docs). Char for
+    /// char: a position in it is one in `typed`.
+    pub fn cased(
+        &self,
+        typed: &str,
+        before: Option<&str>,
+        fin: bool,
+        casing: Casing,
+    ) -> (Vec<char>, Vec<Span>) {
         let mut chars: Vec<char> = typed.chars().collect();
         let mut spans = self.segment(typed, before, fin);
-        let sentence = english_sentence(&chars, &spans, before);
+        let sentence = if casing.sentences {
+            english_sentence(&chars, &spans, before)
+        } else {
+            0
+        };
         for (k, span) in spans.iter().enumerate().filter(|(_, s)| s.lang == Lang::En) {
             // a unit after a number stays (100km, 173cm, m2), and so does
             // what follows a dot (sitemap1.xml)
@@ -849,7 +865,7 @@ impl MixedModel {
             let lower: String = word.iter().collect();
             // a word with joiners as a whole only: example.com, not
             // Example.com
-            if let Some(name) = self.name_case(&lower) {
+            if let Some(name) = self.name_case(&lower, casing.names) {
                 // in an English sentence only a name with a capital inside
                 // (iPhone, GitHub): `the word`, `it works` are words
                 let inner = name.chars().skip(1).any(|c| c.is_ascii_uppercase())
@@ -859,10 +875,123 @@ impl MixedModel {
                         *c = n;
                     }
                 }
+            } else if casing.names == NameCase::Acronyms
+                // a name the dictionary writes in lowercase is one (npm, tmux)
+                && self.names.get(&lower).is_none_or(|(name, _, _)| name != &lower)
+                && acronym(word, k < sentence)
+            {
+                word.iter_mut().for_each(|c| c.make_ascii_uppercase());
             }
         }
         english_case(&mut chars, &mut spans[..sentence]);
         (chars, spans)
+    }
+}
+
+/// What `MixedModel::cased` cases (`[frontend] name_case`, `sentence_case`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Casing {
+    pub names: NameCase,
+    pub sentences: bool,
+}
+
+impl Default for Casing {
+    fn default() -> Self {
+        Self {
+            names: NameCase::Acronyms,
+            sentences: true,
+        }
+    }
+}
+
+/// Acronyms that read as words but Japanese text writes in capitals (ok,
+/// api): no spelling tells them from a word.
+const READ_ACRONYMS: &[&str] = &[
+    "ok", "api", "ai", "id", "it", "url", "os", "ui", "ux", "iot", "seo", "gif", "diy", "ip",
+    "ram", "lan",
+];
+
+/// Words of no vowel, or that no rule below reads, that are no acronyms:
+/// interjections, placeholders (xx), and units, written in lowercase (or
+/// as kW, which the typed letters do not tell).
+const NOT_ACRONYMS: &[&str] = &[
+    "hmm", "shh", "nth", "brr", "psst", "pst", "tsk", "zzz", "grr", "hm", "mm", "sh", "ok", "xx",
+    "xxx", "yy", "km", "cm", "mm", "kg", "mg", "ml", "dl", "kl", "kw", "kwh", "mw", "hz", "khz",
+    "mhz", "ghz", "kcal", "kb", "kbps", "mbps", "gbps", "dpi", "fps", "rpm", "ppm", "lx", "db",
+];
+
+/// Consonants an English word may start with (bl, str: `pronounceable`).
+const ONSETS: &[&str] = &[
+    "bl", "br", "ch", "cl", "cr", "dr", "dw", "fl", "fr", "gl", "gn", "gr", "kn", "kr", "ph", "pl",
+    "pr", "ps", "sc", "sh", "sk", "sl", "sm", "sn", "sp", "st", "sw", "th", "tr", "tw", "wh", "wr",
+    "chr", "sch", "scr", "shr", "sph", "spl", "spr", "squ", "str", "thr",
+];
+
+/// Consonants an English word may end with (nd, rst), a plural `s` aside.
+const CODAS: &[&str] = &[
+    "bb", "ch", "ck", "ct", "dd", "ff", "ft", "gh", "gg", "ld", "lf", "lk", "ll", "lm", "ln", "lp",
+    "lt", "lv", "mb", "mn", "mp", "nc", "nd", "ng", "nk", "nn", "nt", "nx", "ph", "pt", "rb", "rc",
+    "rd", "rf", "rg", "rk", "rl", "rm", "rn", "rp", "rr", "rt", "rv", "sh", "sk", "sm", "sp", "ss",
+    "st", "th", "tt", "wd", "wl", "wn", "xt", "zz", "lch", "nch", "rch", "tch", "nth", "rth",
+    "mpt", "rst", "dth", "ght", "nct", "lth",
+];
+
+/// Whether a run of lowercase letters can be read as an English word: a
+/// vowel (y but at the start), the consonants before the first and after
+/// the last a word may start and end with, and no q but before u.
+fn pronounceable(w: &[char]) -> bool {
+    let vowel = |i: usize| matches!(w[i], 'a' | 'e' | 'i' | 'o' | 'u') || w[i] == 'y' && i > 0;
+    let (Some(first), Some(last)) = (
+        (0..w.len()).find(|&i| vowel(i)),
+        (0..w.len()).rev().find(|&i| vowel(i)),
+    ) else {
+        return false;
+    };
+    if w.iter()
+        .enumerate()
+        .any(|(i, &c)| c == 'q' && w.get(i + 1) != Some(&'u'))
+    {
+        return false;
+    }
+    let onset: String = w[..first].iter().collect();
+    let mut coda: String = w[last + 1..].iter().collect();
+    if coda.len() >= 2 && coda.ends_with('s') {
+        coda.pop();
+    }
+    (onset.len() <= 1 || ONSETS.contains(&onset.as_str()))
+        && (coda.len() <= 1 || CODAS.contains(&coda.as_str()))
+}
+
+/// Whether `word` (an English span typed in lowercase) is an acronym: two
+/// to four letters (five with no vowel: https), a number after them or not
+/// (mp3, gpt-4), that cannot be read as an English word (pc, sns, kpi,
+/// usb, faq) or are a written one (`READ_ACRONYMS`: ok, api; not in an
+/// English sentence, where it, id are words). A longer word that cannot be
+/// read is a name more often (ctags, zylqa).
+pub fn acronym(word: &[char], in_sentence: bool) -> bool {
+    let letters = word.iter().take_while(|c| c.is_ascii_lowercase()).count();
+    let rest = &word[letters..];
+    let number = rest.strip_prefix(&['-']).unwrap_or(rest);
+    let vowelless = || !word[..letters].iter().any(|c| "aeiouy".contains(*c));
+    if !(2..=5).contains(&letters)
+        || letters == 5 && !vowelless()
+        || !number.iter().all(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    let w: String = word[..letters].iter().collect();
+    if NOT_ACRONYMS.contains(&w.as_str()) {
+        return !in_sentence && READ_ACRONYMS.contains(&w.as_str());
+    }
+    !pronounceable(&word[..letters]) || !in_sentence && READ_ACRONYMS.contains(&w.as_str())
+}
+
+impl Casing {
+    pub fn of(frontend: &crate::config::FrontendCfg) -> Self {
+        Self {
+            names: frontend.name_case,
+            sentences: frontend.sentence_case,
+        }
     }
 }
 
@@ -1405,7 +1534,7 @@ pub(crate) mod tests {
 
     /// What `typed` shows, cased (`MixedModel::cased`).
     fn cased(model: &MixedModel, typed: &str, before: Option<&str>) -> String {
-        let (chars, spans) = model.cased(typed, before, true);
+        let (chars, spans) = model.cased(typed, before, true, Casing::default());
         let (text, pending) = render_parts(&chars, &spans, true, &HashMap::new());
         text + &pending
     }
@@ -1421,16 +1550,71 @@ pub(crate) mod tests {
         // typed with Shift: as typed
         assert_eq!(cased(&m, "Githubwotsukau", None), "Githubをつかう");
         // an ordinary word better known than the name
-        assert_eq!(m.name_case("hello"), None);
-        assert_eq!(m.name_case("github"), Some("GitHub"));
+        assert_eq!(m.name_case("hello", NameCase::Proper), None);
+        assert_eq!(m.name_case("github", NameCase::Proper), Some("GitHub"));
         // romaji all through: Japanese
         assert!(!m.knows("sushi"));
         // a name is an English word
         assert_eq!(cased(&m, "kubectlwotsukau", None), "kubectlをつかう");
         assert_eq!(cased(&m, "node.jsnosettei", None), "Node.jsのせってい");
         // the case is shown, the input is as typed
-        assert_eq!(m.cased("github", None, true).0.len(), 6);
+        assert_eq!(m.cased("github", None, true, Casing::default()).0.len(), 6);
         assert!(m.knows("NODE.JS") && !m.knows("visual"));
+    }
+
+    #[test]
+    fn the_name_case_level_picks_the_names() {
+        let mut m = model();
+        m.add_names("GitHub\t1\nGOOGLE\t0.5\tcommon\n");
+        // a common name stays as typed at every level; acronyms by rule
+        let at = |names: NameCase| {
+            let casing = Casing {
+                names,
+                ..Casing::default()
+            };
+            let (chars, spans) = m.cased("githubtogooglewotsukau", None, true, casing);
+            let (text, pending) = render_parts(&chars, &spans, true, &HashMap::new());
+            text + &pending
+        };
+        assert_eq!(at(NameCase::Acronyms), "GitHubとgoogleをつかう");
+        assert_eq!(at(NameCase::Proper), "GitHubとgoogleをつかう");
+        assert_eq!(at(NameCase::Off), "githubとgoogleをつかう");
+        // a name is an English word whatever the level
+        assert!(m.knows("github"));
+    }
+
+    #[test]
+    fn acronyms_by_their_spelling() {
+        let a = |w: &str, s: bool| acronym(&w.chars().collect::<Vec<_>>(), s);
+        for w in [
+            "pc", "sns", "css", "pdf", "kpi", "usb", "etf", "atm", "faq", "gpt-4", "mp3",
+        ] {
+            assert!(a(w, false) && a(w, true), "{w}");
+        }
+        for w in ["ok", "api", "id", "it", "url"] {
+            assert!(a(w, false) && !a(w, true), "{w}");
+        }
+        for w in [
+            "word", "apple", "hmm", "test", "branch", "strength", "win11", "x", "google", "km",
+            "kwh", "ctags",
+        ] {
+            assert!(!a(w, false), "{w}");
+        }
+        assert!(a("https", false));
+        let mut m = model();
+        assert_eq!(cased(&m, "pcwokatta", None), "PCをかった");
+        // a name in lowercase stays
+        m.add_names("npm\t1\n");
+        assert_eq!(cased(&m, "npmwotsukau", None), "npmをつかう");
+        let proper = Casing {
+            names: NameCase::Proper,
+            ..Casing::default()
+        };
+        let (chars, spans) = m.cased("pcwokatta", None, true, proper);
+        assert_eq!(
+            render_parts(&chars, &spans, true, &HashMap::new()).0,
+            "pcをかった"
+        );
     }
 
     #[test]
@@ -1441,6 +1625,16 @@ pub(crate) mod tests {
         assert_eq!(cased(&m, "hello world", None), "Hello world");
         assert_eq!(cased(&m, "hello github", None), "Hello GitHub");
         assert_eq!(cased(&m, "worldwotsukau", None), "Worldをつかう");
+        // off: as typed, punctuation as Japanese
+        let off = Casing {
+            sentences: false,
+            ..Casing::default()
+        };
+        let (chars, spans) = m.cased("hello nice.", None, true, off);
+        assert_eq!(
+            render_parts(&chars, &spans, true, &HashMap::new()).0,
+            "hello nice。"
+        );
         assert_eq!(
             cased(&m, "hello world. nice world", None),
             "Hello world. Nice world"
