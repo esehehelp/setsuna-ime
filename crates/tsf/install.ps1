@@ -5,6 +5,8 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NoElevate  # files-only (CI)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Force      # overwrite even if same
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -RerankManifest <r>  # also the reranker
+#   pwsh -File crates\tsf\install.ps1 -Manifest <m> -MixedModel <dir> -NameDictionary <tsv>
+#                                                  # also mixed input and its names
 #
 # <m> is the model's `*.manifest.json` written by export. The manifest and
 # every file it lists are copied, keeping their relative paths.
@@ -34,6 +36,8 @@
 #   %LOCALAPPDATA%\setsuna-ime\rerank\setsuna-rerank.exe + llama.cpp's DLLs (with -RerankManifest;
 #                                  rerank_<sha256>\ when a running reranker locks them)
 #   %LOCALAPPDATA%\setsuna-ime\models\rerank\<rerank manifest> + its weights
+#   %LOCALAPPDATA%\setsuna-ime\models\mixed\kana.tsv, latin.tsv, params.txt  (with -MixedModel)
+#   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
@@ -50,6 +54,11 @@ param(
     [string]$Manifest,
     # LM scorer manifest (neo-ime-lm-scorer-export-v1): install the reranker too.
     [string]$RerankManifest,
+    # Mixed input model directory (kana.tsv, latin.tsv, params.txt): English
+    # words typed in romaji stay English ([frontend] mixed_model).
+    [string]$MixedModel,
+    # Latin names dictionary for mixed input ([frontend] name_dictionary_file).
+    [string]$NameDictionary,
     [switch]$Force,
     [switch]$NoElevate
 )
@@ -216,7 +225,9 @@ function Update-ExistingConfig {
         [string]$OrtPath,
         [string]$RerankManifestPath,
         [string]$RerankExePath,
-        [string]$RewriteExePath
+        [string]$RewriteExePath,
+        [string]$MixedModelPath,
+        [string]$NameDictionaryPath
     )
 
     $lines = @(Get-Content -LiteralPath $ConfigPath -ErrorAction Stop)
@@ -237,6 +248,14 @@ function Update-ExistingConfig {
         $qRerankExe = '"' + ($RerankExePath.Replace('\','/').Replace('"','\"')) + '"'
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rerank' -Key 'manifest' -Value $qRerankManifest
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rerank' -Key 'exe' -Value $qRerankExe
+    }
+    if ($MixedModelPath) {
+        $q = '"' + ($MixedModelPath.Replace('\','/').Replace('"','\"')) + '"'
+        $lines = Set-OrAppendConfigValue -Lines $lines -Section 'frontend' -Key 'mixed_model' -Value $q
+    }
+    if ($NameDictionaryPath) {
+        $q = '"' + ($NameDictionaryPath.Replace('\','/').Replace('"','\"')) + '"'
+        $lines = Set-OrAppendConfigValue -Lines $lines -Section 'frontend' -Key 'name_dictionary_file' -Value $q
     }
     # The rewriter is found next to the DLL; a locked one's fallback is named.
     if ($RewriteExePath -and ($RewriteExePath -ne (Join-Path $InstallDir $RewriteExe))) {
@@ -313,6 +332,25 @@ if ($RerankManifest) {
     Write-Log INFO "using rerank manifest: $($RerankItem.FullName)"
 }
 
+# Mixed input: the model's three files, and the names dictionary.
+$MixedFiles = @('kana.tsv', 'latin.tsv', 'params.txt')
+if ($MixedModel) {
+    $MixedModel = Resolve-Path-Safe $MixedModel
+    foreach ($f in $MixedFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $MixedModel $f))) {
+            Write-Log ERROR "mixed model file not found: $(Join-Path $MixedModel $f)"; exit 30
+        }
+    }
+    Write-Log INFO "using mixed model: $MixedModel"
+}
+if ($NameDictionary) {
+    $NameDictionary = Resolve-Path-Safe $NameDictionary
+    if (-not (Test-Path -LiteralPath $NameDictionary)) {
+        Write-Log ERROR "names dictionary not found: $NameDictionary"; exit 30
+    }
+    Write-Log INFO "using names dictionary: $NameDictionary"
+}
+
 # ---- elevate when regsvr32 needed ----
 if (-not (Test-IsAdmin) -and -not $NoElevate) {
     Write-Log INFO 'elevating for regsvr32'
@@ -321,6 +359,8 @@ if (-not (Test-IsAdmin) -and -not $NoElevate) {
         '-SourceDir',("`"$SourceDir`""),'-Manifest',("`"$Manifest`"")
     )
     if ($RerankManifest) { $argv += @('-RerankManifest', ("`"$RerankManifest`"")) }
+    if ($MixedModel) { $argv += @('-MixedModel', ("`"$MixedModel`"")) }
+    if ($NameDictionary) { $argv += @('-NameDictionary', ("`"$NameDictionary`"")) }
     if ($Force) { $argv += '-Force' }
     try {
         $p = Start-Process pwsh -ArgumentList $argv -Verb RunAs -Wait -PassThru
@@ -445,6 +485,27 @@ if ($RerankItem) {
     }
 }
 
+# Mixed input: read when the IME activates, so a file in use is not locked.
+$MixedInstalled = $null
+$NamesInstalled = $null
+try {
+    if ($MixedModel) {
+        $MixedInstalled = Join-Path $InstallDir 'models\mixed'
+        New-Item -ItemType Directory -Force -Path $MixedInstalled | Out-Null
+        foreach ($f in $MixedFiles) {
+            Copy-InstallFile -Source (Join-Path $MixedModel $f) -Destination (Join-Path $MixedInstalled $f) | Out-Null
+        }
+    }
+    if ($NameDictionary) {
+        $NamesDir = Join-Path $InstallDir 'models\names'
+        New-Item -ItemType Directory -Force -Path $NamesDir | Out-Null
+        $NamesInstalled = Join-Path $NamesDir (Split-Path -Leaf $NameDictionary)
+        Copy-InstallFile -Source $NameDictionary -Destination $NamesInstalled | Out-Null
+    }
+} catch {
+    Write-Log ERROR "copy failed (mixed input): $_"; exit 50
+}
+
 # ---- config.toml ----
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 $ConfigPath = Join-Path $ConfigDir 'config.toml'
@@ -492,8 +553,8 @@ yen = "￥"
 shift_8 = "（"
 shift_9 = "）"
 "@ | Set-Content -LiteralPath $ConfigPath -Encoding utf8
-    if ($RerankInstalled -or $RewriteInstalled) {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled
+    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled) {
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
@@ -502,7 +563,7 @@ shift_9 = "）"
         Write-Log WARN "NoElevate with fallback DLL: config preserved because registered DLL was not updated"
     } else {
         try {
-            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled
+            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled
             Write-Log INFO "updated engine config: $ConfigPath"
         } catch {
             Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"
