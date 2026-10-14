@@ -408,7 +408,9 @@ impl MixedModel {
                 .iter()
                 .position(|&c| c == ' ')
                 .map_or(n, |k| start + k);
-            let seg_fin = fin && seg_end == n;
+            // Romaji before a space is done (`think so`: no kana is coming
+            // for the k).
+            let seg_fin = fin || seg_end < n;
             let mut update = |end: usize, state: usize, cost: f64, prev: Option<usize>| {
                 if cost < best[end][state] {
                     best[end][state] = cost;
@@ -513,6 +515,7 @@ impl MixedModel {
             }
         }
         spans.reverse();
+        lone_i(&chars, &mut spans);
         self.split_particles(&chars, spans, fin)
     }
 
@@ -1068,6 +1071,33 @@ impl Piece {
         self.letters += model.letters.cost(self.ctx[0], self.ctx[1], class);
         self.ctx = [self.ctx[1], class];
     }
+}
+
+/// A lone `i` (at the input's start or after a space) is English when a space
+/// and English follow it (`i think so`, `and i love it`): い before an
+/// English word is next to never meant. Followed by nothing or by Japanese
+/// it stays い.
+fn lone_i(chars: &[char], spans: &mut [Span]) {
+    for k in 0..spans.len().saturating_sub(1) {
+        let (span, next) = (spans[k], spans[k + 1]);
+        if span.lang == Lang::Ja
+            && chars[span.start..span.end] == ['i']
+            && (span.start == 0 || chars[span.start - 1] == ' ')
+            && chars.get(span.end) == Some(&' ')
+            && next.lang == Lang::En
+        {
+            spans[k].lang = Lang::En;
+        }
+    }
+}
+
+/// Whether `typed` ends in a lone `i` (at its start or after a space): Space
+/// there types a space, as after English, for the word after it to tell
+/// whether it is I (`lone_i`); Space again converts い.
+pub fn ends_in_lone_i(typed: &str) -> bool {
+    typed
+        .strip_suffix('i')
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with(' '))
 }
 
 /// The spans of an English sentence at the start of `spans` (0: none): two
@@ -1651,6 +1681,32 @@ pub(crate) mod tests {
         assert_eq!(
             cased(&m, "hello world. kyouhaiitenkidesune", None),
             "Hello world. きょうはいいてんきですね"
+        );
+    }
+
+    #[test]
+    fn a_lone_i_before_english_is_i() {
+        let m = model();
+        assert_eq!(cased(&m, "i hello google", None), "I hello google");
+        assert_eq!(cased(&m, "hello i google", None), "Hello I google");
+        // before Japanese, or nothing, it is い
+        assert_eq!(cased(&m, "i", None), "い");
+        assert_eq!(cased(&m, "i kyouha", None), "い きょうは");
+        assert!(ends_in_lone_i("i") && ends_in_lone_i("hello i"));
+        assert!(!ends_in_lone_i("kai") && !ends_in_lone_i("i ") && !ends_in_lone_i("I"));
+    }
+
+    #[test]
+    fn the_shipped_model_reads_english_after_i() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        assert_eq!(cased(&m, "i think so", None), "I think so");
+        assert_eq!(cased(&m, "i love you", None), "I love you");
+        // romaji before a space is done: no kana is coming for its k
+        assert_eq!(cased(&m, "they think so", None), "They think so");
+        assert_eq!(
+            cased(&m, "kyouhaiitenkidesune", None),
+            "きょうはいいてんきですね"
         );
     }
 
