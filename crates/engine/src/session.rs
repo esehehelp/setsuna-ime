@@ -99,7 +99,8 @@ pub struct DecodeConfig {
     pub top_k_per_step: usize,
     /// Maximum returned candidates.
     pub max_candidates: usize,
-    /// Maximum left-context characters fed to the model.
+    /// Maximum left-context tokens fed to the model (a char the vocabulary
+    /// lacks takes one a byte).
     pub max_context: usize,
     /// Token ids whose log-prob is forced to -inf before decoding.
     pub vocab_blacklist: Vec<u32>,
