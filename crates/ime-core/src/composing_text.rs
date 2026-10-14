@@ -481,6 +481,21 @@ impl ComposingText {
         out
     }
 
+    /// Whether mixed input reads the composition otherwise once typing is
+    /// done than while it is typed (`ok`: お and a pending k while typed,
+    /// OK when done), a pending `n` read as ん either way: the candidates
+    /// of the reading typed so far are then not what Enter commits.
+    pub fn reads_otherwise_when_done(&self) -> bool {
+        if self.mixed.is_none() {
+            return false;
+        }
+        let read = |c: Converted| {
+            let pending = if c.pending == "n" { "ん" } else { &c.pending };
+            c.text + pending
+        };
+        read(self.convert(&self.raw, true)) != read(self.convert(&self.raw, false))
+    }
+
     /// Commit flushes a pending raw `n` as ん, appends any other pending
     /// partial romaji verbatim, then resets.
     pub fn commit(&mut self) -> String {
