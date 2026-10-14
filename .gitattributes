@@ -1,2 +1,2 @@
-# shared with neo-ime and compared byte for byte: keep LF on every checkout
+# test fixtures: the same bytes on every checkout
 tests/fixtures/lm_scorer_manifest/*.json text eol=lf
