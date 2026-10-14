@@ -42,6 +42,10 @@ pub trait RewriteClient {
     fn cancel(&self);
     /// Take the most recent finished rewrite, if any.
     fn take_latest(&self) -> Option<RewriteResult>;
+    /// False once the backend has gone; see `EngineClient::is_alive`.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Serialize)]
@@ -228,6 +232,10 @@ impl RewriteClient for ChildRewriteClient {
 
     fn take_latest(&self) -> Option<RewriteResult> {
         self.shared.latest.lock().ok()?.take()
+    }
+
+    fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::SeqCst)
     }
 }
 

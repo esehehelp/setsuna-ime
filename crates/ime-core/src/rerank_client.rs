@@ -53,6 +53,10 @@ pub trait RerankClient {
     fn take_latest(&self) -> Option<RerankResult>;
     /// The reranker's limits, once it is up.
     fn info(&self) -> Option<RerankInfo>;
+    /// False once the backend has gone; see `EngineClient::is_alive`.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Serialize)]
@@ -223,6 +227,10 @@ impl RerankClient for ChildRerankClient {
 
     fn info(&self) -> Option<RerankInfo> {
         *self.shared.info.lock().ok()?
+    }
+
+    fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::SeqCst)
     }
 }
 

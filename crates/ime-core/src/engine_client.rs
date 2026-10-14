@@ -65,4 +65,11 @@ pub trait EngineClient {
     /// Whether the backend has finished loading and is serving requests.
     /// Dispatches before this is true are still accepted (buffered).
     fn is_ready(&self) -> bool;
+
+    /// False once the backend has gone (its process exited or was killed):
+    /// nothing dispatched is answered any more, and the frontend starts a
+    /// new one on its next activation.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }

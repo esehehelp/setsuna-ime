@@ -254,6 +254,10 @@ impl EngineClient for ChildDaemonClient {
     fn is_ready(&self) -> bool {
         self.shared.ready.load(Ordering::SeqCst)
     }
+
+    fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for ChildDaemonClient {

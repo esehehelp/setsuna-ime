@@ -355,8 +355,9 @@ impl EngineBridge {
         self.rerank = None;
     }
 
+    /// A reranker whose backend is still up.
     pub fn has_reranker(&self) -> bool {
-        self.reranker.is_some()
+        self.reranker.as_ref().is_some_and(|r| r.is_alive())
     }
 
     /// Rewrite with `rewriter` in rewrite mode (`None`: off, and the mode
@@ -367,8 +368,9 @@ impl EngineBridge {
         self.rewrite_mode &= self.rewriter.is_some();
     }
 
+    /// A rewriter whose backend is still up.
     pub fn has_rewriter(&self) -> bool {
-        self.rewriter.is_some()
+        self.rewriter.as_ref().is_some_and(|r| r.is_alive())
     }
 
     pub fn rewrite_mode(&self) -> bool {
@@ -483,8 +485,11 @@ impl EngineBridge {
         !matches!(self.phase, Phase::Empty)
     }
 
+    /// An engine client whose backend is still up: false after the daemon
+    /// exited (killed by an install, crashed), so that the frontend starts
+    /// a new one instead of dispatching to it forever.
     pub fn has_client(&self) -> bool {
-        self.client.is_some()
+        self.client.as_ref().is_some_and(|c| c.is_alive())
     }
 
     pub fn reset_preserving_client(&mut self, frontend: &crate::config::FrontendCfg) {
@@ -2614,6 +2619,8 @@ mod tests {
         /// (request id, continue_beam) of the `dispatch_more` requests.
         continued: RefCell<Vec<(u64, u32)>>,
         next: RefCell<Option<EngineResult>>,
+        /// The backend has exited.
+        gone: std::cell::Cell<bool>,
     }
 
     /// In-memory `EngineClient` for phase-machine tests. Cloning shares the
@@ -2702,6 +2709,9 @@ mod tests {
         }
         fn is_ready(&self) -> bool {
             true
+        }
+        fn is_alive(&self) -> bool {
+            !self.state.gone.get()
         }
     }
 
@@ -2988,6 +2998,17 @@ mod tests {
         let mock = MockClient::default();
         let bridge = EngineBridge::new(Some(Box::new(mock.clone())));
         (bridge, mock)
+    }
+
+    #[test]
+    fn a_client_whose_daemon_exited_counts_as_none() {
+        // the frontend starts a new daemon when `has_client` is false; a dead
+        // one kept counting as a client left the IME converting nothing
+        let (bridge, mock) = bridge_with_mock();
+        assert!(bridge.has_client());
+        mock.state.gone.set(true);
+        assert!(!bridge.has_client());
+        assert!(!EngineBridge::new(None).has_client());
     }
 
     fn type_str(bridge: &mut EngineBridge, s: &str) {
