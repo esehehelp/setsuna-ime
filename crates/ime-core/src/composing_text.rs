@@ -258,6 +258,35 @@ impl ComposingText {
         &self.pending
     }
 
+    /// The reading live conversion converts: the kana typed and a pending
+    /// `n` as ん (`kekkon` is けっこん, not けっこ: a word typed to its end
+    /// ends in ん, and a vowel after it converts again).
+    pub fn live_reading(&self) -> String {
+        if self.pending == "n" {
+            format!("{}ん", self.hiragana)
+        } else {
+            self.hiragana.clone()
+        }
+    }
+
+    /// The romaji shown after the conversion of `live_reading`: the pending
+    /// romaji but an `n` the reading holds.
+    pub fn live_pending(&self) -> &str {
+        if self.pending == "n" {
+            ""
+        } else {
+            &self.pending
+        }
+    }
+
+    /// `live_pending`, to append after a conversion of `live_reading` that
+    /// is committed, then reset (`kekkon`: 結婚, not 結婚ん).
+    pub fn commit_live_tail(&mut self) -> String {
+        let tail = self.live_pending().to_string();
+        self.reset();
+        tail
+    }
+
     /// Split the input with `model` (`None`: every letter is romaji);
     /// `symbols` is `[frontend.symbols]`, what ASCII symbols show in
     /// Japanese, `casing` what the English is cased.
