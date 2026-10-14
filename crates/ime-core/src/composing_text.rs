@@ -230,6 +230,7 @@ struct MixedInput {
     model: Arc<MixedModel>,
     symbols: HashMap<char, String>,
     before: String,
+    casing: crate::mixed::Casing,
 }
 
 /// Chars of the text before the caret the mixed model looks at.
@@ -259,11 +260,12 @@ impl ComposingText {
 
     /// Split the input with `model` (`None`: every letter is romaji);
     /// `symbols` is `[frontend.symbols]`, what ASCII symbols show in
-    /// Japanese.
+    /// Japanese, `casing` what the English is cased.
     pub fn set_mixed(
         &mut self,
         model: Option<Arc<MixedModel>>,
         symbols: &BTreeMap<String, String>,
+        casing: crate::mixed::Casing,
     ) {
         self.mixed = model.map(|model| MixedInput {
             model,
@@ -272,6 +274,7 @@ impl ComposingText {
                 .filter_map(|(name, c)| symbols.get(*name).map(|s| (*c, s.clone())))
                 .collect(),
             before: String::new(),
+            casing,
         });
         self.recompute(false);
     }
@@ -314,7 +317,7 @@ impl ComposingText {
         };
         mixed
             .model
-            .cased(&self.raw, Some(&mixed.before), true)
+            .cased(&self.raw, Some(&mixed.before), true, mixed.casing)
             .1
             .last()
             .is_some_and(|span| span.lang == Lang::En && span.end == self.raw.chars().count())
@@ -544,7 +547,10 @@ impl ComposingText {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };
-        let (chars, spans) = mixed.model.cased(raw, Some(&mixed.before), flush_final_n);
+        let (chars, spans) =
+            mixed
+                .model
+                .cased(raw, Some(&mixed.before), flush_final_n, mixed.casing);
         let (text, pending) =
             crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
         Converted { text, pending }
@@ -1013,7 +1019,11 @@ mod tests {
             "how", "made", "hello", "google", "github", "k", "go", "Tokyo",
         ] {
             let mut c = ComposingText::new();
-            c.set_mixed(Some(model.clone()), &crate::config::default_symbol_map());
+            c.set_mixed(
+                Some(model.clone()),
+                &crate::config::default_symbol_map(),
+                crate::mixed::Casing::default(),
+            );
             for ch in word.chars() {
                 c.input_char(ch);
             }

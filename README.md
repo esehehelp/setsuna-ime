@@ -41,9 +41,13 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 - **英日混在入力（任意）** — ローマ字の中の英単語を打ったまま残す
   （kana / Latin の n-gram モデルによる分割）。英単語の後ろの助詞
   （`Ollamade` → Ollamaで）から日本語に戻る。英単語が 2 語以上の英文は
-  文頭を大文字にし、`.` `,` も英文のまま残す。英字の名前の辞書
-  （`[frontend] name_dictionary_file`）があれば、小文字で打った名前を
-  その表記にする（`github` → GitHub、`iphone` → iPhone）。
+  文頭を大文字にし、`.` `,` も英文のまま残す（`sentence_case`）。小文字で
+  打った英語の表記は `name_case` で選ぶ：`proper` は英字の名前の辞書
+  （`name_dictionary_file`）の固有名詞をその表記に（`github` → GitHub、
+  `iphone` → iPhone）、`acronyms`（既定）はさらに、英単語として読めない
+  つづりの略語を大文字に（`pc` → PC、`usb` → USB、`ok` → OK）。`word` や
+  `apple` のように普通の語でもある名前はどちらでもそのまま。設定 GUI の
+  「英日混在入力」でも変えられる。
 - **日付・時間候補**、**記号辞書**（`やじるし` → `→` など）。
 - **書き直し（任意、Windows）** — Space で変換すると、OpenAI のモデルが入力を
   自然な日本語に書き直した候補を先頭に出す。

@@ -6,6 +6,7 @@
 //!                     [--mixed <reading jsonl> --mixed-n 1500] [--vocab <latin.tsv>]
 //! mixed_input run --cases <cases.jsonl> --out <predictions.jsonl>
 //!                 [--model <dir> [--names <latin-names.tsv>] [--param name=value]... [--bridge]]
+//!                 [--name-case acronyms|proper|off] [--no-sentence-case]
 //! mixed_input tune --cases <dev cases.jsonl> --model <dir> [--names <tsv>] [--fix name]... [--write]
 //! mixed_input live --cases <cases.jsonl> --model <dir> [--names <tsv>] [--show 20]
 //! mixed_input trace <typed> [--before <text>] [--no-mixed | --model <dir>]
@@ -83,9 +84,16 @@ impl Case {
     }
 }
 
+/// What the bench cases (`--name-case`, `--no-sentence-case`), set once.
+static CASING: std::sync::OnceLock<mixed::Casing> = std::sync::OnceLock::new();
+
+fn casing() -> mixed::Casing {
+    CASING.get().copied().unwrap_or_default()
+}
+
 /// What `model` shows for `typed` once typing is done, cased.
 fn shown(model: &MixedModel, typed: &str, before: Option<&str>) -> String {
-    let (chars, spans) = model.cased(typed, before, true);
+    let (chars, spans) = model.cased(typed, before, true, casing());
     let (text, pending) = mixed::render_parts(&chars, &spans, true, &HashMap::new());
     text + &pending
 }
@@ -104,6 +112,16 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1).cloned())
     };
     let need = |name: &str| flag(name).ok_or_else(|| anyhow!("{name} is required"));
+    let names = match flag("--name-case").as_deref() {
+        None | Some("acronyms") => setsuna_core::config::NameCase::Acronyms,
+        Some("proper") => setsuna_core::config::NameCase::Proper,
+        Some("off") => setsuna_core::config::NameCase::Off,
+        Some(other) => bail!("--name-case {other}: acronyms, proper or off"),
+    };
+    let _ = CASING.set(mixed::Casing {
+        names,
+        sentences: !args.iter().any(|a| a == "--no-sentence-case"),
+    });
     match args.first().map(String::as_str) {
         Some("prepare") => {
             let mut cases = hand_made()?;
@@ -137,6 +155,8 @@ fn main() -> Result<()> {
             if bridge {
                 frontend.mixed_model = Some(need("--model")?);
                 frontend.name_dictionary_file = flag("--names");
+                frontend.name_case = casing().names;
+                frontend.sentence_case = casing().sentences;
             }
             let model = flag("--model")
                 .filter(|_| !bridge)

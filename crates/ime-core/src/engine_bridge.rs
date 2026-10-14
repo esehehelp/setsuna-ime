@@ -321,16 +321,18 @@ impl EngineBridge {
             .mixed_model
             .as_deref()
             .and_then(|dir| crate::mixed::shared(dir, frontend.name_dictionary_file.as_deref()));
-        bridge.set_mixed(mixed, &frontend.symbols);
+        bridge.set_mixed(mixed, &frontend.symbols, crate::mixed::Casing::of(frontend));
         bridge
     }
 
     /// Mixed Japanese / English input with `model` (`None`: off);
-    /// `symbols` is `[frontend.symbols]`.
+    /// `symbols` is `[frontend.symbols]`, `casing` what the English is
+    /// cased.
     fn set_mixed(
         &mut self,
         model: Option<std::sync::Arc<crate::mixed::MixedModel>>,
         symbols: &std::collections::BTreeMap<String, String>,
+        casing: crate::mixed::Casing,
     ) {
         self.mixed_symbols = if model.is_some() {
             crate::config::SYMBOL_CHARS
@@ -340,7 +342,7 @@ impl EngineBridge {
         } else {
             HashMap::new()
         };
-        self.composing.set_mixed(model, symbols);
+        self.composing.set_mixed(model, symbols, casing);
         self.composing.set_before(&self.context);
     }
 
@@ -3045,7 +3047,11 @@ mod tests {
     fn mixed_bridge() -> (EngineBridge, MockClient) {
         let (mut bridge, mock) = bridge_with_mock();
         let model = std::sync::Arc::new(crate::mixed::tests::model());
-        bridge.set_mixed(Some(model), &crate::config::default_symbol_map());
+        bridge.set_mixed(
+            Some(model),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
         (bridge, mock)
     }
 

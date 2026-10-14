@@ -216,11 +216,36 @@ pub struct FrontendCfg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_model: Option<String>,
     /// With `mixed_model`: the Latin names dictionary (the distributed
-    /// `latin-names.tsv`, `<name as written>\t<weight>` lines). Its names
-    /// count as English words, and one typed in lowercase takes its case
-    /// (github -> GitHub). Unset: the model's words only.
+    /// `latin-names.tsv`, `<name as written>\t<weight>[\tcommon]` lines).
+    /// Its names count as English words, and one typed in lowercase takes
+    /// its case as `name_case` says (github -> GitHub). Unset: the model's
+    /// words only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_dictionary_file: Option<String>,
+    /// What English typed in lowercase takes its case: the names of the
+    /// names dictionary, and acronyms.
+    pub name_case: NameCase,
+    /// With `mixed_model`: an English sentence (two words or more) starts
+    /// with a capital, `i` is `I` and its `.` `,` stay as typed.
+    pub sentence_case: bool,
+}
+
+/// How far mixed input cases English typed in lowercase
+/// (`mixed::MixedModel::cased`). A name that is an ordinary word too (word,
+/// apple: the dictionary marks it `common`) stays as typed at every level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameCase {
+    /// As typed.
+    Off,
+    /// Proper nouns of the names dictionary (github -> GitHub, iphone ->
+    /// iPhone, twitter -> Twitter).
+    Proper,
+    /// Those, and acronyms by rule (`mixed::acronym`): a word that cannot
+    /// be read as English (pc, sns, kpi, usb -> PC, SNS, KPI, USB) and the
+    /// few that can but are written so (ok, api, id -> OK, API, ID).
+    #[default]
+    Acronyms,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -308,6 +333,8 @@ impl Default for FrontendCfg {
             preedit_cursor_at_start: true,
             mixed_model: None,
             name_dictionary_file: None,
+            name_case: NameCase::Acronyms,
+            sentence_case: true,
         }
     }
 }
@@ -725,6 +752,13 @@ impl Config {
              # With it, the Latin names dictionary: names typed in lowercase\n\
              # take their case (github -> GitHub). Unset: off.\n\
              # name_dictionary_file = \"C:/path/to/latin-names.tsv\"\n\
+             # What English typed in lowercase takes its case: \"acronyms\"\n\
+             # (proper nouns and acronyms: github -> GitHub, pc -> PC),\n\
+             # \"proper\" (proper nouns only) or \"off\".\n\
+             name_case = \"acronyms\"\n\
+             # An English sentence starts with a capital (hello world -> Hello\n\
+             # world) and keeps its . and , as typed.\n\
+             sentence_case = true\n\
              # Literal replacements applied to every candidate, in order:\n\
              # [[frontend.replacements]]\n\
              # from = \"～\"\n\
@@ -938,6 +972,16 @@ mod tests {
         assert_eq!(c.engine.digit_split, None);
         assert_eq!(c.engine.vocab_blacklist, None);
         assert_eq!(c.ui.candidate_window.font_face, "Meiryo UI");
+    }
+
+    #[test]
+    fn name_case_parses() {
+        let cfg =
+            Config::load_from_str("[frontend]\nname_case = \"proper\"\nsentence_case = false")
+                .unwrap();
+        assert_eq!(cfg.frontend.name_case, NameCase::Proper);
+        assert!(!cfg.frontend.sentence_case);
+        assert_eq!(Config::default().frontend.name_case, NameCase::Acronyms);
     }
 
     #[test]
