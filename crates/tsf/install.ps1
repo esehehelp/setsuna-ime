@@ -106,6 +106,16 @@ function Get-ContentAddressedName {
     "$([IO.Path]::GetFileNameWithoutExtension($leaf))_$hash$([IO.Path]::GetExtension($leaf))"
 }
 
+# Whether $Destination exists with the content of $Source. By hash: a rebuilt
+# binary often keeps its size.
+function Test-SameContent {
+    param([string]$Source, [string]$Destination)
+    (Test-Path -LiteralPath $Destination) -and
+        ((Get-Item -LiteralPath $Source).Length -eq (Get-Item -LiteralPath $Destination).Length) -and
+        ((Get-FileHash -Algorithm SHA256 -LiteralPath $Source).Hash -eq
+         (Get-FileHash -Algorithm SHA256 -LiteralPath $Destination).Hash)
+}
+
 function Copy-InstallFile {
     param(
         [string]$Source,
@@ -120,9 +130,7 @@ function Copy-InstallFile {
         return $Destination
     }
 
-    $needCopy = $Force -or -not (Test-Path -LiteralPath $Destination) -or
-                ((Get-Item $Source).Length -ne (Get-Item $Destination -ErrorAction SilentlyContinue).Length)
-    if (-not $needCopy) {
+    if (-not $Force -and (Test-SameContent -Source $Source -Destination $Destination)) {
         Write-Log INFO "skip (unchanged) $Destination"
         return $Destination
     }
@@ -137,9 +145,7 @@ function Copy-InstallFile {
         }
 
         $fallback = Join-Path $InstallDir (Get-ContentAddressedName -Source $Source -Destination $Destination)
-        $fallbackNeedsCopy = -not (Test-Path -LiteralPath $fallback) -or
-                             ((Get-Item $Source).Length -ne (Get-Item $fallback -ErrorAction SilentlyContinue).Length)
-        if ($fallbackNeedsCopy) {
+        if (-not (Test-SameContent -Source $Source -Destination $fallback)) {
             Copy-Item -LiteralPath $Source -Destination $fallback -Force
             Write-Log WARN "$Destination was locked; copied $Source -> $fallback"
         } else {
