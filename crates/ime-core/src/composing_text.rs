@@ -314,7 +314,8 @@ impl ComposingText {
         };
         mixed
             .model
-            .segment(&self.raw, Some(&mixed.before), true)
+            .cased(&self.raw, Some(&mixed.before), true)
+            .1
             .last()
             .is_some_and(|span| span.lang == Lang::En && span.end == self.raw.chars().count())
     }
@@ -543,8 +544,7 @@ impl ComposingText {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };
-        let spans = mixed.model.segment(raw, Some(&mixed.before), flush_final_n);
-        let chars: Vec<char> = raw.chars().collect();
+        let (chars, spans) = mixed.model.cased(raw, Some(&mixed.before), flush_final_n);
         let (text, pending) =
             crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
         Converted { text, pending }

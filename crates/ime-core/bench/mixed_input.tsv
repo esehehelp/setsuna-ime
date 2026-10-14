@@ -94,23 +94,24 @@ ja-punct	ko-hi-wonomu	こーひーをのむ
 ja-punct	kaigiha3jikara	かいぎは3じから
 ja-punct	2026nen10gatsu	2026ねん10がつ
 #
-# en-word: an English word typed on its own.
-en-word	google	google
-en-word	github	github
+# en-word: an English word typed on its own (a name as it is written, with
+# the names dictionary).
+en-word	google	Google
+en-word	github	GitHub
 en-word	youtube	youtube
-en-word	twitter	twitter
-en-word	slack	slack
-en-word	discord	discord
-en-word	zoom	zoom
-en-word	python	python
-en-word	rust	rust
-en-word	linux	linux
-en-word	windows	windows
-en-word	chrome	chrome
-en-word	docker	docker
-en-word	kubernetes	kubernetes
-en-word	javascript	javascript
-en-word	typescript	typescript
+en-word	twitter	Twitter
+en-word	slack	Slack
+en-word	discord	Discord
+en-word	zoom	Zoom
+en-word	python	Python
+en-word	rust	Rust
+en-word	linux	Linux
+en-word	windows	Windows
+en-word	chrome	Chrome
+en-word	docker	Docker
+en-word	kubernetes	Kubernetes
+en-word	javascript	JavaScript
+en-word	typescript	TypeScript
 en-word	hello	hello
 en-word	thanks	thanks
 en-word	meeting	meeting
@@ -128,42 +129,42 @@ en-word	deploy	deploy
 en-word	branch	branch
 en-word	apple	apple
 en-word	amazon	amazon
-en-word	netflix	netflix
-en-word	react	react
-en-word	excel	excel
+en-word	netflix	Netflix
+en-word	react	React
+en-word	excel	Excel
 en-word	test	test
 en-word	debug	debug
 en-word	error	error
 en-word	password	password
 en-word	email	email
 en-word	online	online
-en-word	ok	ok
-en-word	pc	pc
+en-word	ok	OK
+en-word	pc	PC
 #
 # en-in-ja: English words inside Japanese.
-en-in-ja	kyouhagoogledekensakushita	きょうはgoogleでけんさくした
-en-in-ja	githubnipushshita	githubにpushした
-en-in-ja	slackderenrakushita	slackでれんらくした
-en-in-ja	zoomdekaigiwosuru	zoomでかいぎをする
-en-in-ja	pythondekaita	pythonでかいた
-en-in-ja	dockerwotsukatte	dockerをつかって
-en-in-ja	windowsnoupdategaowaranai	windowsのupdateがおわらない
-en-in-ja	chromenotabwotojiru	chromeのtabをとじる
+en-in-ja	kyouhagoogledekensakushita	きょうはGoogleでけんさくした
+en-in-ja	githubnipushshita	GitHubにpushした
+en-in-ja	slackderenrakushita	Slackでれんらくした
+en-in-ja	zoomdekaigiwosuru	Zoomでかいぎをする
+en-in-ja	pythondekaita	Pythonでかいた
+en-in-ja	dockerwotsukatte	Dockerをつかって
+en-in-ja	windowsnoupdategaowaranai	Windowsのupdateがおわらない
+en-in-ja	chromenotabwotojiru	Chromeのtabをとじる
 en-in-ja	youtubedemita	youtubeでみた
-en-in-ja	netflixnodorama	netflixのどらま
-en-in-ja	discordnisankasuru	discordにさんかする
-en-in-ja	linuxdeugokanai	linuxでうごかない
+en-in-ja	netflixnodorama	Netflixのどらま
+en-in-ja	discordnisankasuru	Discordにさんかする
+en-in-ja	linuxdeugokanai	Linuxでうごかない
 en-in-ja	commitshitekudasai	commitしてください
 en-in-ja	mergeshitemoii	mergeしてもいい
 en-in-ja	deployhaashita	deployはあした
 en-in-ja	branchwokiru	branchをきる
 en-in-ja	servergaochita	serverがおちた
 en-in-ja	cloudnihozon	cloudにほぞん
-en-in-ja	excelnoshiryou	excelのしりょう
-en-in-ja	iphonewokaikaeta	iphoneをかいかえた
+en-in-ja	excelnoshiryou	Excelのしりょう
+en-in-ja	iphonewokaikaeta	iPhoneをかいかえた
 en-in-ja	amazondekatta	amazonでかった
 en-in-ja	applenoshinseihin	appleのしんせいひん
-en-in-ja	kinoutwitterdemita	きのうtwitterでみた
+en-in-ja	kinoutwitterdemita	きのうTwitterでみた
 en-in-ja	ashitanomeetingnitsuite	あしたのmeetingについて
 en-in-ja	kanojohacoffeegasuki	かのじょはcoffeeがすき
 en-in-ja	sorehabugdesu	それはbugです
@@ -171,9 +172,9 @@ en-in-ja	testgatooranai	testがとおらない
 en-in-ja	errorgadeta	errorがでた
 en-in-ja	passwordwowasureta	passwordをわすれた
 en-in-ja	emailwookuru	emailをおくる
-en-in-ja	javascriptnobunpou	javascriptのぶんぽう
-en-in-ja	typescriptnikakikaeru	typescriptにかきかえる
-en-in-ja	kubernetesnosettei	kubernetesのせってい
+en-in-ja	javascriptnobunpou	JavaScriptのぶんぽう
+en-in-ja	typescriptnikakikaeru	TypeScriptにかきかえる
+en-in-ja	kubernetesnosettei	Kubernetesのせってい
 en-in-ja	konofolderniireru	このfolderにいれる
 en-in-ja	kyouhaonlinedesankasuru	きょうはonlineでさんかする
 en-in-ja	downloadgaowatta	downloadがおわった
@@ -181,10 +182,10 @@ en-in-ja	keyboardwokatta	keyboardをかった
 en-in-ja	debugchuu	debugちゅう
 en-in-ja	hellotoitta	helloといった
 en-in-ja	thankstoitteta	thanksといってた
-en-in-ja	okdesu	okです
-en-in-ja	pcgakowareta	pcがこわれた
-en-in-ja	reactdetsukutta	reactでつくった
-en-in-ja	rustnokonpaira	rustのこんぱいら
+en-in-ja	okdesu	OKです
+en-in-ja	pcgakowareta	PCがこわれた
+en-in-ja	reactdetsukutta	Reactでつくった
+en-in-ja	rustnokonpaira	Rustのこんぱいら
 #
 # capital: words typed with Shift (proper nouns, acronyms).
 capital	Tokyonisumu	Tokyoにすむ
@@ -205,15 +206,15 @@ capital	SNSdebazutta	SNSでばずった
 #
 # alnum-symbol: digits and symbols around English.
 alnum-symbol	win11nikoushin	win11にこうしん
-alnum-symbol	ps5womotteru	ps5をもってる
+alnum-symbol	ps5womotteru	PS5をもってる
 alnum-symbol	example.comniakusesu	example.comにあくせす
 alnum-symbol	https://example.com	https://example.com
 alnum-symbol	user@example.com	user@example.com
 alnum-symbol	e-mailwookuru	e-mailをおくる
 alnum-symbol	v2.0wodashita	v2.0をだした
-alnum-symbol	node.jsdeugokasu	node.jsでうごかす
+alnum-symbol	node.jsdeugokasu	Node.jsでうごかす
 alnum-symbol	README.mdwoyomu	README.mdをよむ
-alnum-symbol	gpt-4wotsukau	gpt-4をつかう
+alnum-symbol	gpt-4wotsukau	GPT-4をつかう
 alnum-symbol	100kmhashiru	100kmはしる
 #
 # context: words that read both ways, decided by the text before the caret.
@@ -242,17 +243,18 @@ context	issue	issue	Open an␣
 context	sake	さけ	お
 context	note	note	Release␣
 #
-# en-sentence: English typed with spaces.
-en-sentence	see you tomorrow	see you tomorrow
-en-sentence	thank you	thank you
-en-sentence	good morning	good morning
-en-sentence	how are you	how are you
-en-sentence	nice to meet you	nice to meet you
-en-sentence	this is a pen	this is a pen
-en-sentence	open the door	open the door
+# en-sentence: English typed with spaces (an English sentence: a capital at
+# its start).
+en-sentence	see you tomorrow	See you tomorrow
+en-sentence	thank you	Thank you
+en-sentence	good morning	Good morning
+en-sentence	how are you	How are you
+en-sentence	nice to meet you	Nice to meet you
+en-sentence	this is a pen	This is a pen
+en-sentence	open the door	Open the door
 en-sentence	I want to go home	I want to go home
-en-sentence	let me know	let me know
-en-sentence	pull request	pull request
+en-sentence	let me know	Let me know
+en-sentence	pull request	Pull request
 #
 # new-word: names a word list would not have (new products, projects).
 new-word	setsuna-enginetomeltype	setsuna-engineとmeltype
@@ -272,4 +274,4 @@ new-word	fcitx5noaddon	fcitx5のaddon
 new-word	llama.cppwobirudo	llama.cppをびるど
 new-word	kubectldedepuroi	kubectlででぷろい
 new-word	wezterm	wezterm
-new-word	neovimnosettei	neovimのせってい
+new-word	neovimnosettei	Neovimのせってい
