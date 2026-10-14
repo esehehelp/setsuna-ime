@@ -1222,16 +1222,21 @@ impl EngineBridge {
             }
             Phase::Composing { candidates } => {
                 // with the caret moved the preedit is the kana, and so is
-                // the commit
+                // the commit; so it is when mixed input reads the whole
+                // otherwise than what was typed so far (`ok`: OK, not お
+                // and k)
+                let done_otherwise = self.composing.reads_otherwise_when_done();
                 let cand_top = candidates
                     .first()
                     .filter(|_| {
                         self.live_conversion
                             && self.composing.cursor_at_end()
                             && self.list_reading == self.composing.hiragana()
+                            && !done_otherwise
                     })
                     .cloned();
                 let text = match cand_top {
+                    _ if done_otherwise => self.composing.commit(),
                     Some(t) if !t.is_empty() => {
                         // The candidate replaces the hiragana reading; append
                         // any un-converted romaji tail so it isn't dropped.
@@ -3103,6 +3108,23 @@ mod tests {
         assert_eq!(preedit(&out.actions).as_deref(), Some("hello "));
         // the next key commits it, as between English words
         assert_eq!(commits(&bridge.handle_char('w').actions), vec!["hello "]);
+    }
+
+    #[test]
+    fn mixed_enter_commits_what_the_whole_reads_as() {
+        // the shipped model knows ok
+        let (mut bridge, _mock) = bridge_with_mock();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        bridge.set_mixed(
+            Some(std::sync::Arc::new(
+                crate::mixed::MixedModel::load(&dir).unwrap(),
+            )),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "ok");
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["OK"]);
     }
 
     #[test]
