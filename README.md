@@ -16,11 +16,13 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 
 研究段階のプロジェクトで、**学習済みモデルと辞書はまだ配布していない**。
 
-- 現在のエンジンの機能（記号トークンなど）に対応するモデルは研究中の
-  Aster-v1.x-small 系のみで、公開の予定が決まり次第ここに書く。
-- 辞書データ（記号辞書、読みの辞書）は、生成元は公開せず辞書ファイルとして
-  配布し、エンジンと IME はそれを読んで使う予定。今読むのは記号辞書
-  （`[frontend] symbol_dictionary_file`）だけで、読みの辞書はこれから使う。
+- エンジンと IME は変換モデル Aster-v1.2 を前提に調整している（記号分割、
+  前の文脈 64 トークン、長い読みは 80 文字ごとに区切って変換）。配布の予定が
+  決まり次第ここに書く。
+- 辞書データは、生成元は公開せず辞書ファイルとして配布し、エンジンと IME は
+  それを読んで使う予定。今読むのは記号辞書（`[frontend] symbol_dictionary_file`）
+  と英字の名前の辞書（`name_dictionary_file`）で、読みの辞書はこれから使う。
+- 英日混在入力の kana / Latin の n-gram モデル（`mixed_model`）も同じく未配布。
 
 モデルが無くてもビルドとテストは通り、日付・時間候補のようにモデルを使わない
 部分は動く。
@@ -39,7 +41,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 - **候補の後処理** — 記号の全角半角、句読点の種類、中黒の統一、任意置換、
   読みに無い記号を含む候補の除外。
 - **英日混在入力（任意）** — ローマ字の中の英単語を打ったまま残す
-  （kana / Latin の n-gram モデルによる分割）。英単語の後ろの助詞
+  （kana / Latin の n-gram モデル `mixed_model` による分割）。英単語の後ろの助詞
   （`Ollamade` → Ollamaで）から日本語に戻る。英単語が 2 語以上の英文は
   文頭を大文字にし、`.` `,` も英文のまま残す（`sentence_case`）。小文字で
   打った英語の表記は `name_case` で選ぶ：`proper` は英字の名前の辞書
@@ -102,6 +104,7 @@ cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
 pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 # リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
+# 英日混在入力も入れる場合: -MixedModel <dir> -NameDictionary <names tsv>
 ```
 
 `%LOCALAPPDATA%\setsuna-ime` に DLL・エンジン・モデルを置き、`regsvr32` で登録する
