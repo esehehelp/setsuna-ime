@@ -5,9 +5,9 @@
 //! mixed_input prepare --out <cases.jsonl> [--corpus <reading jsonl> --corpus-n 2000]
 //!                     [--mixed <reading jsonl> --mixed-n 1500] [--vocab <latin.tsv>]
 //! mixed_input run --cases <cases.jsonl> --out <predictions.jsonl>
-//!                 [--model <dir> [--param name=value]... [--bridge]]
-//! mixed_input tune --cases <dev cases.jsonl> --model <dir> [--fix name]... [--write]
-//! mixed_input live --cases <cases.jsonl> --model <dir> [--show 20]
+//!                 [--model <dir> [--names <latin-names.tsv>] [--param name=value]... [--bridge]]
+//! mixed_input tune --cases <dev cases.jsonl> --model <dir> [--names <tsv>] [--fix name]... [--write]
+//! mixed_input live --cases <cases.jsonl> --model <dir> [--names <tsv>] [--show 20]
 //! mixed_input trace <typed> [--before <text>] [--no-mixed | --model <dir>]
 //! mixed_input score --cases <cases.jsonl> --predictions <predictions.jsonl> [--show 20]
 //! ```
@@ -46,7 +46,10 @@
 //! With both, `multi-*` cases type two sentences in one composition: two
 //! Japanese ones, and a Japanese one and a mixed one either way round.
 //! `score` compares any system's `{"id", "actual"}` lines with the cases,
-//! per category.
+//! per category: with the case (a lowercase case's `cased`, its English as
+//! written, as a names dictionary would give it) and ignoring it (where the
+//! English is, whatever its case). `--names` adds a names dictionary to the
+//! model.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -67,6 +70,24 @@ struct Case {
     expected: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before: Option<String>,
+    /// A case typed in lowercase: what it should show, its English cased as
+    /// written (`expected` is the same in lowercase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cased: Option<String>,
+}
+
+impl Case {
+    /// What the case should show, case and all.
+    fn truth(&self) -> &str {
+        self.cased.as_deref().unwrap_or(&self.expected)
+    }
+}
+
+/// What `model` shows for `typed` once typing is done, cased.
+fn shown(model: &MixedModel, typed: &str, before: Option<&str>) -> String {
+    let (chars, spans) = model.cased(typed, before, true);
+    let (text, pending) = mixed::render_parts(&chars, &spans, true, &HashMap::new());
+    text + &pending
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +136,7 @@ fn main() -> Result<()> {
             let bridge = args.iter().any(|a| a == "--bridge");
             if bridge {
                 frontend.mixed_model = Some(need("--model")?);
+                frontend.name_dictionary_file = flag("--names");
             }
             let model = flag("--model")
                 .filter(|_| !bridge)
@@ -126,10 +148,7 @@ fn main() -> Result<()> {
                 .map(|c| Prediction {
                     id: c.id.clone(),
                     actual: match &model {
-                        Some(model) => {
-                            let spans = model.segment(&c.typed, c.before.as_deref(), true);
-                            mixed::render(&c.typed, &spans, true)
-                        }
+                        Some(model) => shown(model, &c.typed, c.before.as_deref()),
                         None => type_line(&c.typed, c.before.as_deref(), &frontend),
                     },
                 })
@@ -164,6 +183,7 @@ fn main() -> Result<()> {
             let show = flag("--show").map_or(Ok(20), |s| s.parse())?;
             let mut frontend = setsuna_core::config::FrontendCfg::default();
             frontend.mixed_model = Some(need("--model")?);
+            frontend.name_dictionary_file = flag("--names");
             live(&cases, &frontend, show);
         }
         Some("timing") => {
@@ -227,6 +247,7 @@ fn hand_made() -> Result<Vec<Case>> {
             typed: cols[1].to_string(),
             expected: cols[2].to_string(),
             before: cols.get(3).map(|s| s.replace('␣', " ")),
+            cased: None,
         });
     }
     Ok(cases)
@@ -268,6 +289,7 @@ fn corpus_cases(path: &str, n: usize) -> Result<Vec<Case>> {
             typed,
             expected: reading,
             before: None,
+            cased: None,
         });
     }
     eprintln!("corpus: {} cases, {skipped} skipped", cases.len());
@@ -309,6 +331,7 @@ fn multi_cases(corpus: &[Case], mixed: &[Case]) -> Vec<Case> {
         typed: format!("{}{}", a.typed, b.typed),
         expected: format!("{}{}", a.expected, b.expected),
         before: None,
+        cased: None,
     };
     let mut out = Vec::new();
     for (k, pair) in japanese.chunks(2).take(500).enumerate() {
@@ -375,6 +398,7 @@ fn mixed_cases(path: &str, n: usize) -> Result<Vec<Case>> {
                 typed: typed.to_ascii_lowercase(),
                 expected: reading.to_ascii_lowercase(),
                 before: None,
+                cased: Some(reading.clone()),
             });
         }
         written.push(Case {
@@ -383,6 +407,7 @@ fn mixed_cases(path: &str, n: usize) -> Result<Vec<Case>> {
             typed,
             expected: reading,
             before: None,
+            cased: None,
         });
     }
     eprintln!(
@@ -758,6 +783,10 @@ fn live(cases: &[Case], frontend: &setsuna_core::config::FrontendCfg, show: usiz
 fn load_model(dir: &str, args: &[String]) -> Result<MixedModel> {
     let mut model = MixedModel::load(std::path::Path::new(dir))?;
     for (i, a) in args.iter().enumerate() {
+        if a == "--names" {
+            let path = args.get(i + 1).map_or("", String::as_str);
+            model.add_names(&std::fs::read_to_string(path).with_context(|| path.to_string())?);
+        }
         if a == "--param" {
             model
                 .params
@@ -779,8 +808,7 @@ fn objective(model: &MixedModel, cases: &[Case]) -> f64 {
                 scope.spawn(move || {
                     let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
                     for c in part {
-                        let spans = model.segment(&c.typed, c.before.as_deref(), true);
-                        let ok = mixed::render(&c.typed, &spans, true) == c.expected;
+                        let ok = shown(model, &c.typed, c.before.as_deref()) == c.truth();
                         let e = counts.entry(c.cat.clone()).or_default();
                         e.0 += ok as usize;
                         e.1 += 1;
@@ -863,8 +891,8 @@ fn score(cases: &[Case], predictions: &[Prediction], show: usize) {
         .iter()
         .map(|p| (p.id.as_str(), p.actual.as_str()))
         .collect();
-    // per category: (pass, total)
-    let mut by_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    // per category: (pass, total, pass ignoring case)
+    let mut by_cat: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
     let mut missing = 0;
     for case in cases {
@@ -874,7 +902,9 @@ fn score(cases: &[Case], predictions: &[Prediction], show: usize) {
         };
         let entry = by_cat.entry(case.cat.as_str()).or_default();
         entry.1 += 1;
-        if got == case.expected {
+        entry.2 += (got.to_ascii_lowercase() == case.truth().to_ascii_lowercase()
+            || got == case.expected) as usize;
+        if got == case.truth() {
             entry.0 += 1;
         } else {
             let before = case
@@ -883,23 +913,29 @@ fn score(cases: &[Case], predictions: &[Prediction], show: usize) {
                 .map_or(String::new(), |b| format!("「{b}」+ "));
             failures.push(format!(
                 "[{}] {before}{} → {got} (expected {})",
-                case.cat, case.typed, case.expected
+                case.cat,
+                case.typed,
+                case.truth()
             ));
         }
     }
-    let (pass, total) = by_cat
-        .values()
-        .fold((0, 0), |(p, t), (cp, ct)| (p + cp, t + ct));
-    for (cat, (p, t)) in &by_cat {
+    let (pass, total, pass_ci) = by_cat.values().fold((0, 0, 0), |(p, t, c), (cp, ct, cc)| {
+        (p + cp, t + ct, c + cc)
+    });
+    println!("{:<22} {:>11} {:>7}  ignoring case", "", "", "");
+    let pct = |p: usize, t: usize| 100.0 * p as f64 / t.max(1) as f64;
+    for (cat, &(p, t, c)) in &by_cat {
         println!(
-            "{cat:<22} {p:>5}/{t:<5} {:>6.1}%",
-            100.0 * *p as f64 / *t as f64
+            "{cat:<22} {p:>5}/{t:<5} {:>6.1}%  {:>6.1}%",
+            pct(p, t),
+            pct(c, t)
         );
     }
     println!(
-        "{:<22} {pass:>5}/{total:<5} {:>6.1}%",
+        "{:<22} {pass:>5}/{total:<5} {:>6.1}%  {:>6.1}%",
         "all",
-        100.0 * pass as f64 / total.max(1) as f64
+        pct(pass, total),
+        pct(pass_ci, total)
     );
     if missing > 0 {
         println!("{missing} cases have no prediction");

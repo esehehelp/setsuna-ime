@@ -320,7 +320,7 @@ impl EngineBridge {
         let mixed = frontend
             .mixed_model
             .as_deref()
-            .and_then(crate::mixed::shared);
+            .and_then(|dir| crate::mixed::shared(dir, frontend.name_dictionary_file.as_deref()));
         bridge.set_mixed(mixed, &frontend.symbols);
         bridge
     }
@@ -3074,13 +3074,14 @@ mod tests {
         assert_eq!(preedit(&out.actions).as_deref(), Some("hello "));
         assert!(!bridge.is_converting());
         type_str(&mut bridge, "google");
+        // two words: an English sentence, with its capital
         assert_eq!(
             preedit(&bridge.handle_space().actions).as_deref(),
-            Some("hello google ")
+            Some("Hello google ")
         );
         assert_eq!(
             commits(&bridge.handle_enter().actions),
-            vec!["hello google "]
+            vec!["Hello google "]
         );
     }
 

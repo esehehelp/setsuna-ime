@@ -17,10 +17,17 @@
 //!   `switch_out`. The text before the caret sets the language the input
 //!   starts in.
 //!
+//! `MixedModel::cased` then gives the English its case: a name of the names
+//! dictionary typed in lowercase as the name is written (github → GitHub),
+//! and an English sentence (two words or more) a capital at its start, `I`
+//! as `I` and its `.` `,` `!` `?` as typed.
+//!
 //! The model files are counts: `kana.tsv` (`<n-gram>\t<count>`, n = 1..3,
 //! `^` a reading's start, `0` any digit, `#` any other character) and
 //! `latin.tsv` (`<word>\t<count in Japanese text>\t<count in English text>`),
-//! with `params.txt` (`name=value` lines) overriding [`MixedParams`].
+//! with `params.txt` (`name=value` lines) overriding [`MixedParams`]. The
+//! names dictionary (`<name as written>\t<weight>` lines, the weight in
+//! (0, 1], 1 for the best known) is a file of its own.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -64,6 +71,9 @@ pub struct MixedParams {
     /// An English word going from two capitals to lowercase (`SCmo`: an
     /// acronym, then romaji).
     pub case_break: f64,
+    /// The frequency of a name of the names dictionary of weight 1 among
+    /// Latin words (its weight scales it).
+    pub name: f64,
 }
 
 impl Default for MixedParams {
@@ -80,12 +90,13 @@ impl Default for MixedParams {
             symbol: 3.0,
             digit: 1.0,
             case_break: 8.0,
+            name: 1e-4,
         }
     }
 }
 
 impl MixedParams {
-    pub const NAMES: [&'static str; 11] = [
+    pub const NAMES: [&'static str; 12] = [
         "switch_in",
         "switch_out",
         "en_en",
@@ -97,6 +108,7 @@ impl MixedParams {
         "symbol",
         "digit",
         "case_break",
+        "name",
     ];
 
     pub fn field(&mut self, name: &str) -> Option<&mut f64> {
@@ -112,6 +124,7 @@ impl MixedParams {
             "symbol" => &mut self.symbol,
             "digit" => &mut self.digit,
             "case_break" => &mut self.case_break,
+            "name" => &mut self.name,
             _ => return None,
         })
     }
@@ -152,6 +165,9 @@ pub struct MixedModel {
     running: Vec<(u64, u64)>,
     ja_total: f64,
     en_total: f64,
+    /// The names dictionary by lowercase form: the name as written and its
+    /// weight.
+    names: FastMap<String, (String, f64)>,
     pub params: MixedParams,
 }
 
@@ -159,23 +175,34 @@ impl std::fmt::Debug for MixedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MixedModel")
             .field("words", &self.words.len())
+            .field("names", &self.names.len())
             .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
 
-/// The model in `dir`, loaded once per process; `None` (logged) when it
-/// cannot be read.
-pub fn shared(dir: &str) -> Option<Arc<MixedModel>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<MixedModel>>>>> = OnceLock::new();
+/// The model in `dir` with the names dictionary `names`, loaded once per
+/// process; `None` (logged) when the model cannot be read (a names
+/// dictionary that cannot be read is logged and left out).
+pub fn shared(dir: &str, names: Option<&str>) -> Option<Arc<MixedModel>> {
+    type Cache = HashMap<(String, Option<String>), Option<Arc<MixedModel>>>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     cache
-        .entry(dir.to_string())
+        .entry((dir.to_string(), names.map(str::to_string)))
         .or_insert_with(|| match MixedModel::load(Path::new(dir)) {
-            Ok(model) => Some(Arc::new(model)),
+            Ok(mut model) => {
+                if let Some(path) = names {
+                    match std::fs::read_to_string(path) {
+                        Ok(tsv) => model.add_names(&tsv),
+                        Err(e) => crate::diagnostics::log(format!("names {path}: {e}")),
+                    }
+                }
+                Some(Arc::new(model))
+            }
             Err(e) => {
                 crate::diagnostics::log(format!("mixed model {dir}: {e:#}"));
                 None
@@ -188,11 +215,13 @@ pub fn shared(dir: &str) -> Option<Arc<MixedModel>> {
 const MAX_EN: usize = 40;
 
 /// Particles (and words used like them) that end an English word typed
-/// right before them, as romaji: が を で の に は と も へ から より.
-/// 側 (gawa) starts with が, です with で. Not まで: `Ollamade` would
-/// split before `ma` (Olla + まで).
+/// right before them, as romaji: が を で の に は と も へ から より, and ら
+/// before one (Judd + らは). 側 (gawa) starts with が, です with で. Not
+/// まで: `Ollamade` would split before `ma` (Olla + まで); not ら alone:
+/// `Sakura` would.
 const PARTICLES: &[&str] = &[
-    "ga", "wo", "de", "no", "ni", "ha", "to", "mo", "he", "kara", "yori",
+    "ga", "wo", "de", "no", "ni", "ha", "to", "mo", "he", "kara", "yori", "raga", "rawo", "rade",
+    "rano", "rani", "raha", "rato", "ramo",
 ];
 
 impl MixedModel {
@@ -266,8 +295,41 @@ impl MixedModel {
             running,
             ja_total: ja_total.max(1.0),
             en_total: en_total.max(1.0),
+            names: FastMap::default(),
             params,
         })
+    }
+
+    /// Add the names of a names dictionary (`<name as written>\t<weight>`
+    /// lines, `#` comments; a name of one word of ASCII letters, digits and
+    /// joiners). Of two names with one lowercase form the heavier wins. A
+    /// name that reads as romaji all through (`sushi`, `toyota`) is left
+    /// out: typed in lowercase it is Japanese.
+    pub fn add_names(&mut self, tsv: &str) {
+        for line in tsv.lines().filter(|l| !l.starts_with('#')) {
+            let mut cols = line.split('\t');
+            let Some(name) = cols.next().filter(|n| {
+                n.chars().any(|c| c.is_ascii_alphabetic())
+                    && n.chars().all(|c| c.is_ascii_alphanumeric() || is_joiner(c))
+            }) else {
+                continue;
+            };
+            let lower: Vec<char> = name.chars().map(|c| c.to_ascii_lowercase()).collect();
+            if romaji_units(&lower, true)
+                .iter()
+                .all(|u| matches!(u.kind, UnitKind::Kana(_)))
+            {
+                continue;
+            }
+            let weight: f64 = cols.next().and_then(|w| w.parse().ok()).unwrap_or(1.0);
+            let entry = self
+                .names
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| (name.to_string(), 0.0));
+            if weight > entry.1 {
+                *entry = (name.to_string(), weight);
+            }
+        }
     }
 
     /// The spans of `typed` (a space separates spans and belongs to none).
@@ -458,31 +520,45 @@ impl MixedModel {
     /// `piano`) stays whole.
     fn split_particles(&self, chars: &[char], spans: Vec<Span>, fin: bool) -> Vec<Span> {
         let mut out: Vec<Span> = Vec::with_capacity(spans.len() + 1);
-        let mut it = spans.into_iter().peekable();
-        while let Some(span) = it.next() {
+        let mut todo: std::collections::VecDeque<Span> = spans.into();
+        while let Some(span) = todo.pop_front() {
             if span.lang != Lang::En {
                 out.push(span);
                 continue;
             }
             // Japanese right after it reads on from the particle.
-            let next_ja = it
-                .peek()
+            let next_ja = todo
+                .front()
                 .is_some_and(|n| n.lang == Lang::Ja && n.start == span.end);
             let rest_end = if next_ja {
-                it.peek().map_or(span.end, |n| n.end)
+                todo.front().map_or(span.end, |n| n.end)
             } else {
                 span.end
             };
             match self.particle_split(chars, span, rest_end, fin) {
-                Some(at) => {
+                Some((at, None)) => {
                     if next_ja {
-                        it.next();
+                        todo.pop_front();
                     }
                     out.push(Span { end: at, ..span });
                     out.push(Span {
                         lang: Lang::Ja,
                         start: at,
                         end: rest_end,
+                    });
+                }
+                // a capital after the particle starts English again
+                // (Tealium + の + CDP), which may split in turn
+                Some((at, Some(capital))) => {
+                    out.push(Span { end: at, ..span });
+                    out.push(Span {
+                        lang: Lang::Ja,
+                        start: at,
+                        end: capital,
+                    });
+                    todo.push_front(Span {
+                        start: capital,
+                        ..span
                     });
                 }
                 None => out.push(span),
@@ -492,14 +568,15 @@ impl MixedModel {
     }
 
     /// Where `span` (English) splits before a particle, Japanese running on
-    /// to `rest_end`; see `split_particles`.
+    /// to `rest_end` or to a capital in the span (where English starts
+    /// again, also returned); see `split_particles`.
     fn particle_split(
         &self,
         chars: &[char],
         span: Span,
         rest_end: usize,
         fin: bool,
-    ) -> Option<usize> {
+    ) -> Option<(usize, Option<usize>)> {
         let word: String = chars[span.start..span.end].iter().collect();
         // the last run of letters: `Wi-Fino` splits in `Fino`
         let run_start = chars[span.start..span.end]
@@ -510,30 +587,46 @@ impl MixedModel {
         if self.knows(&word) || self.knows(&run) {
             return None;
         }
-        let rest_fin = fin && rest_end == chars.len();
         // at least two letters stay English
-        (run_start + 2..span.end.saturating_sub(1)).find(|&at| {
-            let rest = &chars[at..rest_end];
-            let lower: String = chars[at..span.end]
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-            if !PARTICLES.iter().any(|p| lower.starts_with(p)) {
-                return false;
+        (run_start + 2..span.end.saturating_sub(1)).find_map(|at| {
+            // a particle typed in lowercase (Shift marks English)
+            let typed: String = chars[at..span.end].iter().collect();
+            if !PARTICLES.iter().any(|p| typed.starts_with(p)) {
+                return None;
             }
+            let capital = (at + 1..span.end).find(|&k| chars[k].is_ascii_uppercase());
+            let end = capital.unwrap_or(rest_end);
+            let rest_fin = capital.is_some() || fin && rest_end == chars.len();
             // the rest reads as kana, but for romaji still being typed
-            let units = romaji_units(rest, rest_fin);
+            let units = romaji_units(&chars[at..end], rest_fin);
             let reads = units.iter().enumerate().all(|(i, u)| match u.kind {
                 UnitKind::Kana(_) => true,
-                UnitKind::Pending => !rest_fin && i + 1 == units.len() && rest_end == chars.len(),
+                UnitKind::Pending => !rest_fin && i + 1 == units.len() && end == chars.len(),
                 UnitKind::Char(_) => false,
             });
-            // and what stays is English (no joiner at its end)
-            reads
-                && self
-                    .en_costs(&chars[span.start..at], false)
-                    .last()
-                    .is_some_and(|(len, _)| span.start + len == at)
+            // what stays is English (no joiner at its end) and, before a
+            // capital, the word up to it is no word as a whole (Photo +
+            // Shop is not Pho + と + Shop) and what follows is English
+            let stays = self
+                .en_costs(&chars[span.start..at], false)
+                .last()
+                .is_some_and(|(len, _)| span.start + len == at);
+            let ok = match capital {
+                None => true,
+                Some(capital) => {
+                    let from = (run_start..at)
+                        .rev()
+                        .find(|&k| chars[k].is_ascii_uppercase())
+                        .unwrap_or(run_start);
+                    let whole: String = chars[from..capital].iter().collect();
+                    !self.knows(&whole)
+                        && self
+                            .en_costs(&chars[capital..span.end], !fin && span.end == chars.len())
+                            .last()
+                            .is_some_and(|(len, _)| capital + len == span.end)
+                }
+            };
+            (reads && stays && ok).then_some((at, capital))
         })
     }
 
@@ -611,10 +704,11 @@ impl MixedModel {
         let mut piece = Piece::default();
         for (k, &c) in chars.iter().enumerate() {
             if is_joiner(c) {
-                // Joiners stand alone, but for a URL's `://`.
+                // Joiners stand alone, but for a URL's `://` and `++`.
                 if k > 0 && is_joiner(chars[k - 1]) {
                     let url = matches!(&chars[k - 1..], [':', '/', '/', ..])
-                        || chars[k - 1] == '/' && c == '/';
+                        || chars[k - 1] == '/' && c == '/'
+                        || chars[k - 1] == '+' && c == '+';
                     if !url {
                         break;
                     }
@@ -625,7 +719,21 @@ impl MixedModel {
                 }
                 joiners += 1;
                 whole.push(c);
+                // `+` may end a word (NAD+, C++)
+                if c == '+' && has_letter {
+                    let mut cost = done + p.symbol * joiners as f64;
+                    if let Some(known) = self.known(&whole) {
+                        cost = cost.min(-(p.known * known).ln());
+                    }
+                    out.push((k + 1, cost));
+                }
                 continue;
+            }
+            // and `#` after a letter (C#, F#)
+            if c == '#' && !piece.is_empty() && has_letter {
+                let cost = done + self.piece_cost(&piece, false) + p.symbol * (joiners + 1) as f64;
+                out.push((k + 1, cost));
+                break;
             }
             if !c.is_ascii_alphanumeric() {
                 break;
@@ -681,17 +789,73 @@ impl MixedModel {
         p.ja_text * ja as f64 / self.ja_total + (1.0 - p.ja_text) * en as f64 / self.en_total
     }
 
-    /// Whether `word` (any case) is a Latin word of the model's text.
+    /// Whether `word` (any case) is a Latin word of the model's text or a
+    /// name of its names dictionary.
     pub fn knows(&self, word: &str) -> bool {
-        self.words.contains_key(&word.to_ascii_lowercase())
+        let lower = word.to_ascii_lowercase();
+        self.words.contains_key(&lower) || self.name_weight(&lower).is_some()
     }
 
-    /// The frequency of a lowercase word among Latin words, if seen.
+    /// The frequency of a lowercase word among Latin words, if seen; else
+    /// a name's (`name_weight`).
     fn known(&self, word: &str) -> Option<f64> {
         let p = &self.params;
-        self.words.get(word).map(|&(ja, en)| {
-            p.ja_text * ja as f64 / self.ja_total + (1.0 - p.ja_text) * en as f64 / self.en_total
-        })
+        match self.words.get(word) {
+            Some(&(ja, en)) => Some(
+                p.ja_text * ja as f64 / self.ja_total
+                    + (1.0 - p.ja_text) * en as f64 / self.en_total,
+            ),
+            None => self.name_weight(word).map(|weight| p.name * weight),
+        }
+    }
+
+    /// The weight of a name (lowercase) that tells English from romaji: of
+    /// four chars or more and not an acronym (UIC, RAAD, Py would make
+    /// English of the romaji around them: かんとUIC); the others only give
+    /// their case.
+    fn name_weight(&self, word: &str) -> Option<f64> {
+        self.names
+            .get(word)
+            .filter(|(name, _)| word.len() >= 4 && name.chars().any(|c| c.is_ascii_lowercase()))
+            .map(|&(_, weight)| weight)
+    }
+
+    /// How `word` (lowercase) is written when typed so: as its name, unless
+    /// the name is lowercase (the dictionary gives an ordinary word, apple,
+    /// its lowercase form when the word is better known than the name).
+    fn name_case(&self, word: &str) -> Option<&str> {
+        let (name, _) = self.names.get(word)?;
+        (name != word).then_some(name.as_str())
+    }
+
+    /// `typed` segmented (`segment`) and cased as shown: the English spans'
+    /// letters with their case, and an English sentence's punctuation as
+    /// English (see the module docs). Char for char: a position in it is one
+    /// in `typed`.
+    pub fn cased(&self, typed: &str, before: Option<&str>, fin: bool) -> (Vec<char>, Vec<Span>) {
+        let mut chars: Vec<char> = typed.chars().collect();
+        let mut spans = self.segment(typed, before, fin);
+        for span in spans.iter().filter(|s| s.lang == Lang::En) {
+            // a unit after a number stays (100km, 173cm, m2), and so does
+            // what follows a dot (sitemap1.xml)
+            if span.start > 0 && matches!(chars[span.start - 1], '0'..='9' | '.') {
+                continue;
+            }
+            let word = &mut chars[span.start..span.end];
+            if word.iter().any(|c| c.is_ascii_uppercase()) {
+                continue;
+            }
+            let lower: String = word.iter().collect();
+            // a word with joiners as a whole only: example.com, not
+            // Example.com
+            if let Some(name) = self.name_case(&lower) {
+                for (c, n) in word.iter_mut().zip(name.chars()) {
+                    *c = n;
+                }
+            }
+        }
+        english_sentences(&mut chars, &mut spans, before);
+        (chars, spans)
     }
 }
 
@@ -767,6 +931,75 @@ impl Piece {
         let class = letter_class(lower);
         self.letters += model.letters.cost(self.ctx[0], self.ctx[1], class);
         self.ctx = [self.ctx[1], class];
+    }
+}
+
+/// An English sentence at the start of `spans`: two English words or more
+/// at the start of the input, the text before it ending a sentence (or
+/// none), with only spaces between them or `.` `,` `!` `?` `;` `:` right
+/// after a word, up to the input's end or to a `.` `!` `?` (English
+/// followed right away by Japanese, `pull request` + を, is no sentence).
+/// Its punctuation becomes English (as typed, not 、。), its words typed in
+/// lowercase start with a capital at its start and after `.` `!` `?`, and
+/// `i` (`i'm`) is `I`.
+fn english_sentences(chars: &mut [char], spans: &mut [Span], before: Option<&str>) {
+    let punct = |s: &Span, chars: &[char]| {
+        s.lang == Lang::Ja
+            && chars[s.start..s.end]
+                .iter()
+                .all(|c| matches!(c, '.' | ',' | '!' | '?' | ';' | ':'))
+    };
+    let ends_sentence = |s: &[char]| s.iter().any(|c| matches!(c, '.' | '!' | '?'));
+    let before_ends = before.is_none_or(|b| {
+        b.ends_with('\n')
+            || b.trim_end()
+                .chars()
+                .last()
+                .is_none_or(|c| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
+    });
+    let Some(first) = spans.first() else {
+        return;
+    };
+    if !before_ends || first.lang != Lang::En || chars[..first.start].iter().any(|&c| c != ' ') {
+        return;
+    }
+    // the run: English words, and punctuation right after one
+    let mut end = 1;
+    while end < spans.len() {
+        let (prev, next) = (spans[end - 1], spans[end]);
+        let gap = &chars[prev.end..next.start];
+        let joined = match next.lang {
+            // a word after a space (`a.b` is no sentence)
+            Lang::En => !gap.is_empty() && gap.iter().all(|&c| c == ' '),
+            Lang::Ja => gap.is_empty() && prev.lang == Lang::En && punct(&next, chars),
+        };
+        if !joined {
+            break;
+        }
+        end += 1;
+    }
+    let words = spans[..end].iter().filter(|s| s.lang == Lang::En).count();
+    let last = spans[end - 1];
+    let complete =
+        end == spans.len() || last.lang == Lang::Ja && ends_sentence(&chars[last.start..last.end]);
+    if words < 2 || !complete {
+        return;
+    }
+    let mut capital = true;
+    for span in &mut spans[..end] {
+        if span.lang == Lang::Ja {
+            span.lang = Lang::En;
+            capital |= ends_sentence(&chars[span.start..span.end]);
+            continue;
+        }
+        let word = &mut chars[span.start..span.end];
+        if !word.iter().any(|c| c.is_ascii_uppercase()) {
+            let i = word[0] == 'i' && (word.len() == 1 || word.get(1) == Some(&'\''));
+            if capital || i {
+                word[0] = word[0].to_ascii_uppercase();
+            }
+        }
+        capital = false;
     }
 }
 
@@ -1138,6 +1371,80 @@ pub(crate) mod tests {
         // romaji still being typed after it: not yet
         let spans = m.segment("Ollamad", None, false);
         assert_eq!(render("Ollamad", &spans, false), "Ollamad");
+        // up to a capital, where English starts again
+        assert_eq!(
+            shown(&m, "TealiumnoCDPwotsukau", None),
+            "TealiumのCDPをつかう"
+        );
+        assert_eq!(shown(&m, "Juddraha", None), "Juddらは");
+        let mut m = m;
+        m.add_names("photo\t1\n");
+        assert_eq!(shown(&m, "PhotoShop", None), "PhotoShop");
+    }
+
+    #[test]
+    fn a_word_may_end_in_plus_or_sharp() {
+        let m = model();
+        assert_eq!(shown(&m, "NAD+nohokyuu", None), "NAD+のほきゅう");
+        assert_eq!(shown(&m, "C++wotsukau", None), "C++をつかう");
+        assert_eq!(shown(&m, "C#wotsukau", None), "C#をつかう");
+    }
+
+    /// What `typed` shows, cased (`MixedModel::cased`).
+    fn cased(model: &MixedModel, typed: &str, before: Option<&str>) -> String {
+        let (chars, spans) = model.cased(typed, before, true);
+        let (text, pending) = render_parts(&chars, &spans, true, &HashMap::new());
+        text + &pending
+    }
+
+    #[test]
+    fn a_name_typed_in_lowercase_takes_its_case() {
+        let mut m = model();
+        m.add_names(
+            "# names\nGitHub\t1\nGithub\t0.1\nHello\t0.4\nhello\t0.6\nkubectl\t0.2\n\
+             Node.js\t0.5\nVisual Studio\t1\nSushi\t1\n",
+        );
+        assert_eq!(cased(&m, "githubwotsukau", None), "GitHubをつかう");
+        // typed with Shift: as typed
+        assert_eq!(cased(&m, "Githubwotsukau", None), "Githubをつかう");
+        // an ordinary word better known than the name
+        assert_eq!(m.name_case("hello"), None);
+        assert_eq!(m.name_case("github"), Some("GitHub"));
+        // romaji all through: Japanese
+        assert!(!m.knows("sushi"));
+        // a name is an English word
+        assert_eq!(cased(&m, "kubectlwotsukau", None), "kubectlをつかう");
+        assert_eq!(cased(&m, "node.jsnosettei", None), "Node.jsのせってい");
+        // the case is shown, the input is as typed
+        assert_eq!(m.cased("github", None, true).0.len(), 6);
+        assert!(m.knows("NODE.JS") && !m.knows("visual"));
+    }
+
+    #[test]
+    fn an_english_sentence_starts_with_a_capital() {
+        let mut m = model();
+        m.add_names("world\t1\nnice\t1\n");
+        assert_eq!(cased(&m, "hello world", None), "Hello world");
+        assert_eq!(
+            cased(&m, "hello world. nice world", None),
+            "Hello world. Nice world"
+        );
+        assert_eq!(cased(&m, "hello, world!", None), "Hello, world!");
+        assert_eq!(cased(&m, "hello world", Some("Fine. ")), "Hello world");
+        assert_eq!(cased(&m, "hello.world", None), "hello.world");
+        // one word is no sentence, nor English inside Japanese
+        assert_eq!(cased(&m, "hello", None), "hello");
+        assert_eq!(cased(&m, "hello.", None), "hello。");
+        assert_eq!(cased(&m, "hello world", Some("きょうは")), "hello world");
+        assert_eq!(
+            cased(&m, "hello worldwotsukau", None),
+            "hello worldをつかう"
+        );
+        // a sentence and then Japanese
+        assert_eq!(
+            cased(&m, "hello world. kyouhaiitenkidesune", None),
+            "Hello world. きょうはいいてんきですね"
+        );
     }
 
     #[test]

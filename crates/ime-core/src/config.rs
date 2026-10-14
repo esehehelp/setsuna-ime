@@ -215,6 +215,12 @@ pub struct FrontendCfg {
     /// the composition. Unset: every letter is romaji.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_model: Option<String>,
+    /// With `mixed_model`: the Latin names dictionary (the distributed
+    /// `latin-names.tsv`, `<name as written>\t<weight>` lines). Its names
+    /// count as English words, and one typed in lowercase takes its case
+    /// (github -> GitHub). Unset: the model's words only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_dictionary_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -301,6 +307,7 @@ impl Default for FrontendCfg {
             live_conversion: None,
             preedit_cursor_at_start: true,
             mixed_model: None,
+            name_dictionary_file: None,
         }
     }
 }
@@ -715,6 +722,9 @@ impl Config {
              # Directory of the mixed Japanese / English input model: English\n\
              # words typed among the romaji stay as typed. Unset: off.\n\
              # mixed_model = \"C:/path/to/mixed-model\"\n\
+             # With it, the Latin names dictionary: names typed in lowercase\n\
+             # take their case (github -> GitHub). Unset: off.\n\
+             # name_dictionary_file = \"C:/path/to/latin-names.tsv\"\n\
              # Literal replacements applied to every candidate, in order:\n\
              # [[frontend.replacements]]\n\
              # from = \"～\"\n\
