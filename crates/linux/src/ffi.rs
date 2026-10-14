@@ -126,7 +126,8 @@ fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
 
 /// Start a session: load `config.toml` and spawn the engine daemon.
 /// `module_dir` (may be null) is where the engine and models are looked for
-/// last. Never returns null.
+/// last, and the mixed input model (`mixed`, installed with the addon) when
+/// `[frontend] mixed_model` is not set. Never returns null.
 ///
 /// # Safety
 /// `module_dir` is null or a NUL-terminated string. `notify` may be called
@@ -141,7 +142,14 @@ pub unsafe extern "C" fn setsuna_session_new(
     let module_dir = (!module_dir.is_null())
         .then(|| PathBuf::from(CStr::from_ptr(module_dir).to_string_lossy().into_owned()));
     let session = guard(None, move || {
-        let cfg = Config::load_default();
+        let mut cfg = Config::load_default();
+        if cfg.frontend.mixed_model.is_none() {
+            cfg.frontend.mixed_model = module_dir
+                .as_deref()
+                .map(|d| d.join("mixed"))
+                .filter(|d| d.join("kana.tsv").is_file())
+                .map(|d| d.to_string_lossy().into_owned());
+        }
         let user = UserPtr(user);
         let wake = Box::new(move |_req_id: u64| {
             let user = &user;

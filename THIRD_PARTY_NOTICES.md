@@ -32,3 +32,20 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Mixed input model data
+
+`crates/ime-core/data/mixed` (kana n-gram and Latin word counts, no text) is
+derived from:
+
+- FineWeb2-edu-japanese, <https://huggingface.co/datasets/hotchpotch/fineweb-2-edu-japanese>,
+  derived from FineWeb-2, <https://huggingface.co/datasets/HuggingFaceFW/fineweb-2>:
+  Open Data Commons Attribution License (ODC-By) v1.0; its use is also
+  subject to the Common Crawl Terms of Use, <https://commoncrawl.org/terms-of-use>.
+- FineWeb, <https://huggingface.co/datasets/HuggingFaceFW/fineweb> (`sample/10BT`):
+  ODC-By v1.0; Common Crawl Terms of Use.
+- The readings were made with Sudachi and SudachiDict
+  (<https://github.com/WorksApplications/SudachiDict>, Apache-2.0).
+
+The counts are distributed under ODC-By v1.0,
+<https://opendatacommons.org/licenses/by/1-0/>.

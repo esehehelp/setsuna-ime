@@ -320,6 +320,7 @@ impl EngineBridge {
         let mixed = frontend
             .mixed_model
             .as_deref()
+            .filter(|dir| !dir.is_empty())
             .and_then(|dir| crate::mixed::shared(dir, frontend.name_dictionary_file.as_deref()));
         bridge.set_mixed(mixed, &frontend.symbols, crate::mixed::Casing::of(frontend));
         bridge
