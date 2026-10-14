@@ -33,6 +33,13 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## ChatGPT logo
+
+The settings GUI's "Continue with ChatGPT" button carries OpenAI's ChatGPT
+logo as OpenAI provides it for Sign in with ChatGPT buttons
+(<https://developers.openai.com/siwc/website>). ChatGPT and its logo are
+trademarks of OpenAI; they are used only to mark that button.
+
 ## Mixed input model data
 
 `crates/ime-core/data/mixed` (kana n-gram and Latin word counts, no text) is
