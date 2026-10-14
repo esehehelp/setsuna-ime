@@ -5,8 +5,7 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NoElevate  # files-only (CI)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Force      # overwrite even if same
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -RerankManifest <r>  # also the reranker
-#   pwsh -File crates\tsf\install.ps1 -Manifest <m> -MixedModel <dir> -NameDictionary <tsv>
-#                                                  # also mixed input and its names
+#   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NameDictionary <tsv>  # also mixed input's names
 #
 # <m> is the model's `*.manifest.json` written by export. The manifest and
 # every file it lists are copied, keeping their relative paths.
@@ -36,7 +35,8 @@
 #   %LOCALAPPDATA%\setsuna-ime\rerank\setsuna-rerank.exe + llama.cpp's DLLs (with -RerankManifest;
 #                                  rerank_<sha256>\ when a running reranker locks them)
 #   %LOCALAPPDATA%\setsuna-ime\models\rerank\<rerank manifest> + its weights
-#   %LOCALAPPDATA%\setsuna-ime\models\mixed\kana.tsv, latin.tsv, params.txt  (with -MixedModel)
+#   %LOCALAPPDATA%\setsuna-ime\models\mixed\kana.tsv, latin.tsv, params.txt  (crates\ime-core\data\mixed,
+#                                  or -MixedModel <dir>)
 #   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
@@ -55,8 +55,9 @@ param(
     # LM scorer manifest (neo-ime-lm-scorer-export-v1): install the reranker too.
     [string]$RerankManifest,
     # Mixed input model directory (kana.tsv, latin.tsv, params.txt): English
-    # words typed in romaji stay English ([frontend] mixed_model).
-    [string]$MixedModel,
+    # words typed in romaji stay English ([frontend] mixed_model). Default:
+    # the one of this repository.
+    [string]$MixedModel = (Join-Path $PSScriptRoot '..\ime-core\data\mixed'),
     # Latin names dictionary for mixed input ([frontend] name_dictionary_file).
     [string]$NameDictionary,
     [switch]$Force,
@@ -255,7 +256,8 @@ function Update-ExistingConfig {
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rerank' -Key 'manifest' -Value $qRerankManifest
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'rerank' -Key 'exe' -Value $qRerankExe
     }
-    if ($MixedModelPath) {
+    # mixed_model = "" is mixed input turned off: kept
+    if ($MixedModelPath -and -not ($lines -match '^\s*mixed_model\s*=\s*""\s*$')) {
         $q = '"' + ($MixedModelPath.Replace('\','/').Replace('"','\"')) + '"'
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'frontend' -Key 'mixed_model' -Value $q
     }
@@ -498,8 +500,11 @@ try {
     if ($MixedModel) {
         $MixedInstalled = Join-Path $InstallDir 'models\mixed'
         New-Item -ItemType Directory -Force -Path $MixedInstalled | Out-Null
-        foreach ($f in $MixedFiles) {
-            Copy-InstallFile -Source (Join-Path $MixedModel $f) -Destination (Join-Path $MixedInstalled $f) | Out-Null
+        # its README carries the sources' attribution
+        foreach ($f in $MixedFiles + @('README.md')) {
+            if (Test-Path -LiteralPath (Join-Path $MixedModel $f)) {
+                Copy-InstallFile -Source (Join-Path $MixedModel $f) -Destination (Join-Path $MixedInstalled $f) | Out-Null
+            }
         }
     }
     if ($NameDictionary) {

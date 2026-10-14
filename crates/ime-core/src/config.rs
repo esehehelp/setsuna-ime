@@ -210,9 +210,11 @@ pub struct FrontendCfg {
     /// and moving between segments; some draw the caret there too. A caret
     /// moved with ← / → is still shown. fcitx5 only.
     pub preedit_cursor_at_start: bool,
-    /// Directory of the mixed-input model (`setsuna_core::mixed`): English
-    /// words typed among the romaji stay as typed, Shift+letter types into
-    /// the composition. Unset: every letter is romaji.
+    /// Directory of the mixed-input model (`setsuna_core::mixed`; the IME
+    /// ships one, `data/mixed`, which the Windows installer sets here and
+    /// fcitx5 takes when this is unset): English words typed among the
+    /// romaji stay as typed, Shift+letter types into the composition. Unset
+    /// (Windows) or empty: every letter is romaji.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mixed_model: Option<String>,
     /// With `mixed_model`: the Latin names dictionary (the distributed
@@ -747,7 +749,8 @@ impl Config {
              # so the candidate window stays put.\n\
              preedit_cursor_at_start = true\n\
              # Directory of the mixed Japanese / English input model: English\n\
-             # words typed among the romaji stay as typed. Unset: off.\n\
+             # words typed among the romaji stay as typed. The installer sets\n\
+             # the one it installs; \"\" turns mixed input off.\n\
              # mixed_model = \"C:/path/to/mixed-model\"\n\
              # With it, the Latin names dictionary: names typed in lowercase\n\
              # take their case (github -> GitHub). Unset: off.\n\

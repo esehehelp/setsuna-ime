@@ -22,7 +22,6 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 - 辞書データは、生成元は公開せず辞書ファイルとして配布し、エンジンと IME は
   それを読んで使う予定。今読むのは記号辞書（`[frontend] symbol_dictionary_file`）
   と英字の名前の辞書（`name_dictionary_file`）で、読みの辞書はこれから使う。
-- 英日混在入力の kana / Latin の n-gram モデル（`mixed_model`）も同じく未配布。
 
 モデルが無くてもビルドとテストは通り、日付・時間候補のようにモデルを使わない
 部分は動く。
@@ -41,7 +40,9 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 - **候補の後処理** — 記号の全角半角、句読点の種類、中黒の統一、任意置換、
   読みに無い記号を含む候補の除外。
 - **英日混在入力（任意）** — ローマ字の中の英単語を打ったまま残す
-  （kana / Latin の n-gram モデル `mixed_model` による分割）。英単語の後ろの助詞
+  （kana / Latin の n-gram モデルによる分割。モデルは IME に同梱：
+  `crates/ime-core/data/mixed`、インストールで有効になり、`mixed_model = ""`
+  でオフ）。英単語の後ろの助詞
   （`Ollamade` → Ollamaで）から日本語に戻る。英単語が 2 語以上の英文は
   文頭を大文字にし、`.` `,` も英文のまま残す（`sentence_case`）。小文字で
   打った英語の表記は `name_case` で選ぶ：`proper` は英字の名前の辞書
@@ -104,7 +105,7 @@ cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
 pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 # リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
-# 英日混在入力も入れる場合: -MixedModel <dir> -NameDictionary <names tsv>
+# 英日混在入力の名前の辞書も入れる場合: -NameDictionary <names tsv>
 ```
 
 `%LOCALAPPDATA%\setsuna-ime` に DLL・エンジン・モデルを置き、`regsvr32` で登録する
@@ -201,6 +202,9 @@ MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）か�
 実行時に読む / build 時に取り込む外部コンポーネントはそれぞれのライセンスに従う:
 [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、
 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）、
-その他の Rust crate は `Cargo.lock` を参照。辞書データとモデルの重みは
+その他の Rust crate は `Cargo.lock` を参照。英日混在入力のモデル
+（`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
+出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と
+THIRD_PARTY_NOTICES.md）。辞書データとかな漢字変換モデルの重みは
 このリポジトリに含まない。配布する辞書ファイルのライセンスと出典表示は、
 それぞれの辞書ファイルに同梱する。

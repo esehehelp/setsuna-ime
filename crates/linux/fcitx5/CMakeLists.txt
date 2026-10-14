@@ -70,3 +70,5 @@ install(DIRECTORY themes/setsuna themes/setsuna-dark
     DESTINATION "${FCITX_INSTALL_PKGDATADIR}/themes")
 install(FILES icons/setsuna.svg icons/setsuna-hiragana.svg icons/setsuna-direct.svg
     DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
+# The mixed input model, used when config.toml sets no [frontend] mixed_model.
+install(DIRECTORY ../../ime-core/data/mixed/ DESTINATION "${SETSUNA_MODULE_DIR}/mixed")
