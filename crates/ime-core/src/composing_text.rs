@@ -323,6 +323,12 @@ impl ComposingText {
             .is_some_and(|span| span.lang == Lang::En && span.end == self.raw.chars().count())
     }
 
+    /// Whether the composition ends in a lone `i`, which the word after it
+    /// may make English (`i think`: `mixed::ends_in_lone_i`).
+    pub fn ends_in_lone_i(&self) -> bool {
+        self.mixed.is_some() && crate::mixed::ends_in_lone_i(&self.raw)
+    }
+
     /// Whether the composition ends in a space (one typed after English).
     pub fn ends_with_space(&self) -> bool {
         self.raw.ends_with(' ')

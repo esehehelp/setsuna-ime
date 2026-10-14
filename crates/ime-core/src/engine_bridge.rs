@@ -1052,15 +1052,16 @@ impl EngineBridge {
             // Space after F6–F10 converts the reading as usual.
             self.back_to_composing();
         }
-        // Mixed input: Space after an English word types a space (`Hello
-        // world`); Space again, or after Japanese, converts.
+        // Mixed input: Space after an English word, or a lone `i` (`i
+        // think`), types a space (`Hello world`); Space again, or after
+        // Japanese, converts.
         if self.composing.is_mixed()
             && matches!(self.phase, Phase::Composing { .. })
             && self.composing.cursor_at_end()
         {
             if self.composing.ends_with_space() {
                 self.composing.trim_end_spaces();
-            } else if self.composing.ends_in_english() {
+            } else if self.composing.ends_in_english() || self.composing.ends_in_lone_i() {
                 return self.type_char(' ');
             }
         }
@@ -3102,6 +3103,21 @@ mod tests {
         assert_eq!(preedit(&out.actions).as_deref(), Some("hello "));
         // the next key commits it, as between English words
         assert_eq!(commits(&bridge.handle_char('w').actions), vec!["hello "]);
+    }
+
+    #[test]
+    fn mixed_space_after_a_lone_i_waits_for_the_next_word() {
+        let (mut bridge, _mock) = mixed_bridge();
+        type_str(&mut bridge, "i");
+        bridge.handle_space();
+        assert!(!bridge.is_converting());
+        type_str(&mut bridge, "hello");
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["I hello"]);
+        // Space again converts い
+        type_str(&mut bridge, "i");
+        bridge.handle_space();
+        bridge.handle_space();
+        assert!(bridge.is_converting());
     }
 
     #[test]
