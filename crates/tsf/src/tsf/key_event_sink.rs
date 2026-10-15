@@ -83,7 +83,11 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
         }
 
         if let Some(context) = pic {
-            self.read_app_context(context, &kind);
+            // a field for direct input (a URL, a number, a password)
+            if self.read_app_context(context, &kind) {
+                self.note_passthrough(vk);
+                return Ok(FALSE);
+            }
         }
 
         let outcome = {
@@ -265,23 +269,28 @@ impl SetsunaTextService_Impl {
 
     /// `kind` starts a composition: take the left context from the app's
     /// text before the caret (kept as it is when the app does not expose
-    /// its text).
-    fn read_app_context(&self, context: &ITfContext, kind: &KeyKind) {
+    /// its text), and the kind of field. True when the field takes direct
+    /// input: the key goes to the app.
+    fn read_app_context(&self, context: &ITfContext, kind: &KeyKind) -> bool {
         let client_id = {
             let inner = self.inner.borrow();
             if inner.engine.is_active() || !inner.engine.would_consume(kind) {
-                return;
+                return false;
             }
             inner.client_id
         };
-        let (text, private) = text_before_caret(context, client_id);
+        let (text, field) = text_before_caret(context, client_id);
         setsuna_core::diagnostics::log(match &text {
-            Some(t) => format!("app context len={} private={private}", t.chars().count()),
-            None => format!("app context unavailable private={private}"),
+            Some(t) => format!("app context len={} field={field:?}", t.chars().count()),
+            None => format!("app context unavailable field={field:?}"),
         });
+        if field == Field::Direct {
+            return true;
+        }
         let mut inner = self.inner.borrow_mut();
-        inner.engine.set_private_field(private);
+        inner.engine.set_private_field(field == Field::Private);
         inner.engine.set_app_context(text.as_deref());
+        false
     }
 
     /// Turn the IME on or off: through the on / off compartment when there
@@ -690,25 +699,53 @@ unsafe fn input_scopes(context: &ITfContext, ec: u32, range: &ITfRange) -> Vec<I
     out
 }
 
-/// Whether the field's input scopes make it private: a password, a PIN,
-/// or one marked private (no context, no rewrite, nothing learned).
-fn private_scope(scopes: &[InputScope]) -> bool {
-    scopes.iter().any(|s| {
+/// What a field's input scopes make it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Normal,
+    /// Marked private: no context, no rewrite, nothing learned.
+    Private,
+    /// Direct input, as Mozc's `tip_input_mode_manager`: a URL, an e-mail
+    /// address, a number, a phone number, a time, half-width alphanumerics,
+    /// a password or a PIN.
+    Direct,
+}
+
+fn field_of(scopes: &[InputScope]) -> Field {
+    let direct = scopes.iter().any(|s| {
         matches!(
             *s,
-            IS_PASSWORD | IS_NUMERIC_PASSWORD | IS_NUMERIC_PIN | IS_ALPHANUMERIC_PIN | IS_PRIVATE
+            IS_URL
+                | IS_EMAIL_USERNAME
+                | IS_EMAIL_SMTPEMAILADDRESS
+                | IS_NUMBER
+                | IS_DIGITS
+                | IS_TELEPHONE_FULLTELEPHONENUMBER
+                | IS_TIME_FULLTIME
+                | IS_ALPHANUMERIC_HALFWIDTH
+                | IS_PASSWORD
+                | IS_NUMERIC_PASSWORD
+                | IS_NUMERIC_PIN
+                | IS_ALPHANUMERIC_PIN
         )
-    })
+    });
+    if direct {
+        Field::Direct
+    } else if scopes.contains(&IS_PRIVATE) {
+        Field::Private
+    } else {
+        Field::Normal
+    }
 }
 
 /// The app's text before the caret, at most `CONTEXT_UNITS` UTF-16 units
-/// of it (`None` when the app does not let us read it), and whether the
-/// field is private (`private_scope`).
-fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, bool) {
+/// of it (`None` when the app does not let us read it), and what the field
+/// is (`field_of`).
+fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, Field) {
     struct ReadBefore {
         context: ITfContext,
         result: Rc<RefCell<Option<String>>>,
-        private: Rc<RefCell<bool>>,
+        field: Rc<RefCell<Field>>,
     }
     #[implement(ITfEditSession)]
     struct Sess(ReadBefore);
@@ -723,8 +760,7 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, b
                 let Some(range) = core::mem::ManuallyDrop::take(&mut sel[0].range) else {
                     return Ok(());
                 };
-                *self.0.private.borrow_mut() =
-                    private_scope(&input_scopes(&self.0.context, ec, &range));
+                *self.0.field.borrow_mut() = field_of(&input_scopes(&self.0.context, ec, &range));
                 range.Collapse(ec, TF_ANCHOR_START)?;
                 let mut moved = 0i32;
                 range.ShiftStart(ec, -CONTEXT_UNITS, &mut moved, core::ptr::null())?;
@@ -741,19 +777,19 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, b
     }
 
     let result: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let private = Rc::new(RefCell::new(false));
+    let field = Rc::new(RefCell::new(Field::Normal));
     let session: ITfEditSession = Sess(ReadBefore {
         context: context.clone(),
         result: result.clone(),
-        private: private.clone(),
+        field: field.clone(),
     })
     .into();
     let hr = unsafe { context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READ) };
     if !hr.is_ok_and(|hr| hr.is_ok()) {
-        return (None, false);
+        return (None, Field::Normal);
     }
-    let private = private.take();
-    (result.take(), private)
+    let field = *field.borrow();
+    (result.take(), field)
 }
 
 #[cfg(test)]

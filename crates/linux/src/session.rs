@@ -178,6 +178,11 @@ impl Session {
         };
     }
 
+    /// Turn the IME on or off without committing (a new input context).
+    pub fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
     pub fn has_client(&self) -> bool {
         self.bridge.has_client()
     }
