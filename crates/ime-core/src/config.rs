@@ -202,6 +202,10 @@ pub struct FrontendCfg {
     /// Emoji and kaomoji candidates (`emoji`): にこにこ -> 😊 …, えもじ /
     /// かおもじ list them all.
     pub emoji_candidates: bool,
+    /// Prediction from what was committed (`predict`): typing a reading's
+    /// start offers the longer conversions committed for it, beside the
+    /// preedit; Tab opens them.
+    pub prediction: bool,
     /// Space with nothing composed types a full-width space (U+3000), as
     /// MS-IME and Mozc do in hiragana mode; false leaves it to the app (a
     /// half-width space). Shift+Space types the other width.
@@ -339,6 +343,7 @@ impl Default for FrontendCfg {
             date_time_candidates: true,
             number_candidates: true,
             emoji_candidates: true,
+            prediction: true,
             full_width_space: false,
             live_conversion: None,
             preedit_cursor_at_start: true,
@@ -650,6 +655,11 @@ impl Config {
         config_dir().map(|d| d.join("hidden.jsonl"))
     }
 
+    /// What prediction learns from: the conversions committed.
+    pub fn prediction_path() -> Option<PathBuf> {
+        config_dir().map(|d| d.join("prediction.jsonl"))
+    }
+
     /// The user dictionary (Mozc / Google Japanese Input text format).
     pub fn user_dictionary_path() -> Option<PathBuf> {
         config_dir().map(|d| d.join("user_dictionary.txt"))
@@ -762,6 +772,8 @@ impl Config {
              number_candidates = true\n\
              # Emoji and kaomoji candidates (にこにこ, えもじ, かおもじ).\n\
              emoji_candidates = true\n\
+             # Prediction from what was committed (Tab picks).\n\
+             prediction = true\n\
              # Space with nothing composed types a full-width space (U+3000);\n\
              # Shift+Space types the other width.\n\
              full_width_space = false\n\

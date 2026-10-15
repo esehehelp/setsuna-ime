@@ -407,6 +407,7 @@ pub(crate) fn apply_actions(
                 Action::ShowCandidates { .. }
                 | Action::ShowSegmentCandidates { .. }
                 | Action::HideCandidates
+                | Action::ShowSuggestions { .. }
                 | Action::Status { .. } => window_actions.push(a),
                 Action::UpdatePreedit { ref text } if preedit_key(text) == running_last => {
                     // No-op — skip.
@@ -488,6 +489,28 @@ pub(crate) fn apply_actions(
         }
     }
 
+    // typing: the predictions beside the preedit, or none (unless the list
+    // was opened or closed just now)
+    let typing = {
+        let inner = service.inner.borrow();
+        inner.engine.is_active() && !inner.engine.is_converting()
+    };
+    if typing
+        && !window_actions
+            .iter()
+            .any(|a| matches!(a, Action::ShowCandidates { .. } | Action::HideCandidates))
+    {
+        let list = service.inner.borrow().engine.suggestions();
+        if !list.is_empty() {
+            window_actions.push(Action::ShowSuggestions { list });
+        } else if candidate_window
+            .as_ref()
+            .is_some_and(|cw| cw.borrow().is_suggesting())
+        {
+            window_actions.push(Action::HideCandidates);
+        }
+    }
+
     if let Some(cw) = candidate_window {
         for a in window_actions {
             match a {
@@ -510,6 +533,12 @@ pub(crate) fn apply_actions(
                 }
                 Action::HideCandidates => {
                     cw.borrow_mut().hide();
+                }
+                Action::ShowSuggestions { list } => {
+                    let anchor = current_caret_screen_pos(context, client_id, &composition_cell, 0)
+                        .map(|(x, y)| crate::ui::ScreenPos { x, y })
+                        .unwrap_or_default();
+                    cw.borrow_mut().show_suggestions(&list, anchor);
                 }
                 Action::Status { text } => {
                     cw.borrow_mut().set_status(&text);

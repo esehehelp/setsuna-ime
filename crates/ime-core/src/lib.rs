@@ -22,6 +22,7 @@ pub mod learning;
 pub mod mixed;
 pub mod numbers;
 pub mod postprocess;
+pub mod predict;
 pub mod privacy;
 mod reading_align;
 pub mod rerank_client;

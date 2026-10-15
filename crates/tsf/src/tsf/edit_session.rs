@@ -69,6 +69,7 @@ impl ITfEditSession_Impl for ActionEditSession_Impl {
                 Action::ShowCandidates { .. }
                 | Action::ShowSegmentCandidates { .. }
                 | Action::HideCandidates
+                | Action::ShowSuggestions { .. }
                 | Action::Status { .. } => {}
             }
         }
