@@ -516,7 +516,8 @@ impl MixedModel {
         }
         spans.reverse();
         lone_i(&chars, &mut spans);
-        self.split_particles(&chars, spans, fin)
+        let spans = self.split_particles(&chars, spans, fin);
+        protect(&chars, spans)
     }
 
     /// An English span the model does not know as a word that ends in a
@@ -1107,6 +1108,106 @@ fn lone_i(chars: &[char], spans: &mut [Span]) {
             spans[k].lang = Lang::En;
         }
     }
+}
+
+/// The ranges of `chars` never read as romaji (Meltype's protected spans, as
+/// an idea): a URL (`https://…`, `www.…`), an e-mail address, a `@mention`,
+/// a path (`C:\…`, `C:/…`, `\\host`, `~/…`, `./…`, `../…`, `/a/b`), each
+/// from a word's start to the next space.
+pub fn protected_ranges(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ' ' {
+            i += 1;
+            continue;
+        }
+        let end = chars[i..]
+            .iter()
+            .position(|&c| c == ' ')
+            .map_or(chars.len(), |k| i + k);
+        let word: String = chars[i..end].iter().collect();
+        let lower = word.to_ascii_lowercase();
+        // a URL from its scheme on, romaji before it or not (詳細はhttps://…)
+        let scheme_at = lower.find("://").and_then(|k| {
+            ["https", "http", "ftp", "file", "ssh", "git"]
+                .iter()
+                .find(|s| lower[..k].ends_with(*s))
+                .map(|s| lower[..k - s.len()].chars().count())
+        });
+        if let Some(at) = scheme_at {
+            out.push((i + at, end));
+            i = end;
+            continue;
+        }
+        let email = word.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+        });
+        let mention = word.len() > 1
+            && word.starts_with('@')
+            && word[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        let b = word.as_bytes();
+        let drive = b.len() > 2
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'\\' | b'/');
+        let path = drive
+            || word.starts_with("\\\\")
+            || word.starts_with("~/")
+            || word.starts_with("./")
+            || word.starts_with("../")
+            || (word.starts_with('/') && word[1..].contains('/'));
+        if lower.starts_with("www.") || email || mention || path {
+            out.push((i, end));
+        }
+        i = end;
+    }
+    out
+}
+
+/// `spans` with each protected range (`protected_ranges`) one English span
+/// of its own: never cut, never romaji.
+fn protect(chars: &[char], spans: Vec<Span>) -> Vec<Span> {
+    let ranges = protected_ranges(chars);
+    if ranges.is_empty() {
+        return spans;
+    }
+    let mut out: Vec<Span> = Vec::new();
+    for s in spans {
+        // the parts of `s` outside every range
+        let mut start = s.start;
+        for &(a, b) in &ranges {
+            if b <= start || a >= s.end {
+                continue;
+            }
+            if a > start {
+                out.push(Span {
+                    lang: s.lang,
+                    start,
+                    end: a,
+                });
+            }
+            start = start.max(b);
+        }
+        if start < s.end {
+            out.push(Span {
+                lang: s.lang,
+                start,
+                end: s.end,
+            });
+        }
+    }
+    for &(a, b) in &ranges {
+        out.push(Span {
+            lang: Lang::En,
+            start: a,
+            end: b,
+        });
+    }
+    out.sort_by_key(|s| s.start);
+    out
 }
 
 /// Whether `typed` ends in a lone `i` (at its start or after a space): Space
@@ -1725,6 +1826,29 @@ pub(crate) mod tests {
         assert_eq!(
             cased(&m, "kyouhaiitenkidesune", None),
             "きょうはいいてんきですね"
+        );
+    }
+
+    #[test]
+    fn urls_addresses_and_paths_stay_as_typed() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        assert_eq!(
+            shown(&m, "shousaihahttps://example.com/a wo mite", None),
+            "しょうさいはhttps://example.com/a を みて"
+        );
+        assert_eq!(
+            shown(&m, "renrakusaki foo.bar@example.co.jp", None),
+            "れんらくさき foo.bar@example.co.jp"
+        );
+        assert_eq!(
+            shown(&m, "~/projects/setsuna niaru", None),
+            "~/projects/setsuna にある"
+        );
+        assert_eq!(shown(&m, "@kasano san", None), "@kasano さん");
+        assert_eq!(
+            protected_ranges(&"kasano".chars().collect::<Vec<_>>()),
+            vec![]
         );
     }
 

@@ -307,6 +307,11 @@ pub struct FrontendCfg {
     /// reading one edit away (a neighbouring key, a key too many, two keys
     /// swapped) is converted too, its candidates after the first ones.
     pub typo_correction: bool,
+    /// `/`, `$` or `@` typed at a line's start or after a space, and the
+    /// name after it, go to the app as typed (an AI agent's `/command`,
+    /// `$skill`, `@file`, whose completion the app offers). Only where the
+    /// text before the caret can be read.
+    pub pass_through_commands: bool,
     /// Space with nothing composed types a full-width space (U+3000), as
     /// MS-IME and Mozc do in hiragana mode; false leaves it to the app (a
     /// half-width space). Shift+Space types the other width.
@@ -447,6 +452,7 @@ impl Default for FrontendCfg {
             prediction: true,
             romaji_table: "standard".to_string(),
             typo_correction: true,
+            pass_through_commands: false,
             full_width_space: false,
             live_conversion: None,
             preedit_cursor_at_start: true,
@@ -892,6 +898,9 @@ impl Config {
              romaji_table = \"standard\"\n\
              # Typo correction where a letter reads as no kana (kaisga: かいしゃ).\n\
              typo_correction = true\n\
+             # /command, $skill, @file typed at a line's start or after a space\n\
+             # go to the app as typed.\n\
+             pass_through_commands = false\n\
              # Space with nothing composed types a full-width space (U+3000);\n\
              # Shift+Space types the other width.\n\
              full_width_space = false\n\

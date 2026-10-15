@@ -252,6 +252,13 @@ pub struct EngineBridge {
     prediction: Option<Vec<crate::predict::Prediction>>,
     /// The engine's top waiting for the reranked one.
     deferred: Option<Deferred>,
+    /// `/command` and the like go to the app (`pass_through_commands`).
+    pass_commands: bool,
+    /// Whether the caret is at a line's start or after a space, when the
+    /// app's text says (`None`: unknown).
+    at_word_start: Option<bool>,
+    /// A command's name being typed through to the app.
+    passing: bool,
     /// Reading the current candidate list (Composing / Converting) was
     /// produced for; empty for a provisional list. A choice is learned
     /// against it.
@@ -367,6 +374,9 @@ impl EngineBridge {
             last_commit: String::new(),
             prediction: None,
             deferred: None,
+            pass_commands: frontend.pass_through_commands,
+            at_word_start: None,
+            passing: false,
             list_reading: String::new(),
             list_starts: HashMap::new(),
             seg_requests: Vec::new(),
@@ -712,6 +722,8 @@ impl EngineBridge {
     /// toggled). An empty context is what the model sees at the start of a
     /// document; a stale one is text from elsewhere.
     pub fn forget_context(&mut self) {
+        self.at_word_start = None;
+        self.passing = false;
         self.raw_context.clear();
         self.context.clear();
         self.composing.set_before(&self.context);
@@ -728,8 +740,10 @@ impl EngineBridge {
             return;
         }
         let Some(text) = text else {
+            self.at_word_start = None;
             return;
         };
+        self.at_word_start = Some(text.chars().last().is_none_or(char::is_whitespace));
         let text: String = text
             .chars()
             .filter(|&c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{FFFC}'))
@@ -771,6 +785,8 @@ impl EngineBridge {
 
     pub fn would_consume(&self, kind: &KeyKind) -> bool {
         match kind {
+            // a command's name goes to the app
+            KeyKind::Char(_) if self.passing && !self.is_active() => false,
             KeyKind::Char(c) => {
                 c.is_ascii_alphabetic()
                     || c.is_ascii_digit()
@@ -1160,7 +1176,21 @@ impl EngineBridge {
         }
     }
 
+    /// Whether `c` goes to the app as part of a command's name being typed
+    /// (`pass_through_commands`).
+    fn passes(&mut self, c: char) -> bool {
+        if !self.passing || !matches!(self.phase, Phase::Empty) {
+            self.passing = false;
+            return false;
+        }
+        self.passing = c.is_ascii_alphanumeric() || "-_:./".contains(c);
+        self.passing
+    }
+
     pub fn handle_char(&mut self, c: char) -> KeyOutcome {
+        if self.passes(c) {
+            return not_consumed();
+        }
         // a key the table reads, or a kana typed by a key of its own
         let table_key =
             crate::romaji_table::active().is_some_and(|t| t.uses(c) || ('ぁ'..='ゖ').contains(&c));
@@ -1279,6 +1309,8 @@ impl EngineBridge {
     }
 
     pub fn handle_space(&mut self) -> KeyOutcome {
+        // a command's name ends
+        self.passing = false;
         if self.form_shown().is_some() {
             // Space after F6–F10 converts the reading as usual.
             self.back_to_composing();
@@ -1424,6 +1456,7 @@ impl EngineBridge {
     }
 
     pub fn handle_enter(&mut self) -> KeyOutcome {
+        self.passing = false;
         self.invalidate_engine_results();
         match &self.phase {
             Phase::Empty => not_consumed(),
@@ -1502,6 +1535,7 @@ impl EngineBridge {
     }
 
     pub fn handle_escape(&mut self) -> KeyOutcome {
+        self.passing = false;
         match &self.phase {
             Phase::Empty => not_consumed(),
             Phase::Alphabet { .. } => {
@@ -2613,6 +2647,27 @@ impl EngineBridge {
     }
 
     pub fn handle_punctuation(&mut self, kana: &str) -> KeyOutcome {
+        // `/command`, `$skill`, `@file` at a line's start or after a space:
+        // to the app as typed, its name too
+        let ascii = |c: char| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '・' => '/',
+            c => c,
+        };
+        let typed: Vec<char> = kana.chars().map(ascii).collect();
+        if let [c] = typed[..] {
+            if self.passes(c) {
+                return not_consumed();
+            }
+            if self.pass_commands
+                && matches!(self.phase, Phase::Empty)
+                && self.at_word_start == Some(true)
+                && matches!(c, '/' | '$' | '@')
+            {
+                self.passing = true;
+                return not_consumed();
+            }
+        }
         // a key the romaji table reads (AZIK's `;`, kana input's `,`) goes
         // into the composition
         if let Some(table) = crate::romaji_table::active() {
@@ -3610,6 +3665,28 @@ mod tests {
         let mut bridge = EngineBridge::new(Some(Box::new(mock.clone())));
         bridge.emoji_enabled = false;
         (bridge, mock)
+    }
+
+    #[test]
+    fn commands_typed_at_a_word_start_go_to_the_app() {
+        let (mut bridge, _mock) = bridge_with_mock();
+        bridge.pass_commands = true;
+        bridge.set_app_context(Some("hello "));
+        assert!(!bridge.handle_punctuation("・").consumed);
+        for c in "review-pr".chars() {
+            assert!(!bridge.handle_char(c).consumed, "{c}");
+        }
+        assert!(!bridge.would_consume(&KeyKind::Char('x')));
+        // the space ends it: romaji again
+        bridge.handle_space();
+        assert!(bridge.handle_char('k').consumed);
+        bridge.handle_escape();
+        // not at a word's start, or the text unknown: a symbol as usual
+        bridge.set_app_context(Some("今日は"));
+        assert!(bridge.handle_punctuation("・").consumed);
+        bridge.handle_escape();
+        bridge.forget_context();
+        assert!(bridge.handle_punctuation("＠").consumed);
     }
 
     #[test]
