@@ -13,6 +13,7 @@ pub mod composing_text;
 pub mod config;
 pub mod date_time;
 pub mod diagnostics;
+pub mod emoji;
 pub mod engine_bridge;
 pub mod engine_client;
 pub mod hidden;

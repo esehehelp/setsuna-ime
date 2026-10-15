@@ -60,7 +60,9 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
   ATOK、Gboard の書き出したファイルを読み込める。
 - **日付・時間候補**、**数字の候補**（1234 → 1,234・千二百三十四・壱阡弐百参拾四・
   12:34、じゅうに → 12、2025ねん → 令和7年、れいわ7ねん → 2025年、`1+2=` → 3、
-  `U+3042` → あ。`number_candidates`）、**記号辞書**（`やじるし` → `→` など）。
+  `U+3042` → あ。`number_candidates`）、**絵文字・顔文字**（にこにこ → 😊、
+  えもじ / かおもじ で一覧。`emoji_candidates`）、**記号辞書**（`やじるし` → `→`
+  など）。
 - **書き直し（任意、Windows）** — Space で変換すると、OpenAI のモデルが入力を
   自然な日本語に書き直した候補を先頭に出す。
   ChatGPT プラン（Sign in with ChatGPT）、OpenAI の API キー、OpenAI 互換 API
