@@ -58,6 +58,9 @@ void setsuna_session_free(SetsunaSession *s);
 
 /* Reload config.toml, dropping any composition. */
 void setsuna_session_configure(SetsunaSession *s);
+/* setsuna_session_configure for the application `program` (its [[apps]]
+ * settings and start state); null or empty when unknown. */
+void setsuna_session_configure_app(SetsunaSession *s, const char *program);
 /* A key press (X keysym, X keycode, SETSUNA_MOD_*); true when taken.
  * ` and Zenkaku_Hankaku turn the IME on or off. */
 bool setsuna_session_key(SetsunaSession *s, uint32_t sym, uint32_t code,

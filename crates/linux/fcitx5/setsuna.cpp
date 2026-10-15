@@ -140,8 +140,13 @@ public:
     }
 
     void activate(const InputMethodEntry &, InputContextEvent &event) override {
-        setsuna_session_configure(session_);
         auto *ic = event.inputContext();
+        // the settings of this application ([[apps]])
+        bool enabled = setsuna_session_enabled(session_);
+        setsuna_session_configure_app(session_, ic->program().c_str());
+        if (enabled != setsuna_session_enabled(session_)) {
+            modeChanged(ic);
+        }
         ic_ = ic->watch();
         ic->statusArea().addAction(StatusGroup::InputMethod, &modeAction_);
     }

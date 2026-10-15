@@ -45,6 +45,8 @@ pub struct Config {
     pub learning: LearningCfg,
     pub rerank: RerankCfg,
     pub rewriter: RewriterCfg,
+    /// Settings for one application each (`[[apps]]`), over the others.
+    pub apps: Vec<AppCfg>,
 }
 
 impl Default for Config {
@@ -56,7 +58,86 @@ impl Default for Config {
             learning: LearningCfg::default(),
             rerank: RerankCfg::default(),
             rewriter: RewriterCfg::default(),
+            apps: Vec::new(),
         }
+    }
+}
+
+/// How the IME starts in an application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStart {
+    /// As the thread's on / off state says.
+    #[default]
+    Keep,
+    /// On (hiragana).
+    On,
+    /// Off (direct input: a game, a terminal).
+    Off,
+}
+
+/// One application's settings (`[[apps]]`): its process (the executable's
+/// name, `code.exe`; case and `.exe` do not matter) and what it changes.
+/// An unset field keeps the setting of the rest of the config.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppCfg {
+    pub process: String,
+    pub start: AppStart,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_conversion: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_input: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<bool>,
+}
+
+impl AppCfg {
+    /// Whether this entry is the application `process` (a path or a name).
+    pub fn matches(&self, process: &str) -> bool {
+        let stem = |s: &str| {
+            let name = s
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(s)
+                .to_ascii_lowercase();
+            name.strip_suffix(".exe")
+                .map(str::to_string)
+                .unwrap_or(name)
+        };
+        !self.process.trim().is_empty() && stem(self.process.trim()) == stem(process)
+    }
+}
+
+impl Config {
+    /// This config as the application `process` uses it: its `[[apps]]`
+    /// entry's settings over the rest, and the entry itself.
+    pub fn for_app(&self, process: &str) -> (Config, Option<AppCfg>) {
+        let Some(app) = self.apps.iter().find(|a| a.matches(process)).cloned() else {
+            return (self.clone(), None);
+        };
+        let mut cfg = self.clone();
+        if let Some(v) = app.live_conversion {
+            cfg.frontend.live_conversion = Some(v);
+        }
+        if let Some(v) = app.learning {
+            cfg.learning.enabled = v;
+        }
+        if let Some(v) = app.rewrite {
+            cfg.rewriter.enabled = v;
+        }
+        if app.mixed_input == Some(false) {
+            // empty is off
+            cfg.frontend.mixed_model = Some(String::new());
+        }
+        if let Some(v) = app.prediction {
+            cfg.frontend.prediction = v;
+        }
+        (cfg, Some(app))
     }
 }
 
@@ -692,6 +773,10 @@ impl Config {
             .parse()
             .context("reparse serialized config")?;
         merge_table(doc.as_table_mut(), new.as_table());
+        // every application's entry removed
+        if self.apps.is_empty() {
+            doc.remove("apps");
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
@@ -951,6 +1036,29 @@ fn merge_table(doc: &mut toml_edit::Table, new: &toml_edit::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_application_takes_its_settings_over_the_rest() {
+        let cfg = Config::load_from_str(
+            "[frontend]\nprediction = true\n\n[[apps]]\nprocess = \"Code.exe\"\nstart = \"off\"\nprediction = false\nmixed_input = false\n",
+        )
+        .unwrap();
+        let (c, app) = cfg.for_app("C:\\Program Files\\VS Code\\code.EXE");
+        assert_eq!(app.unwrap().start, AppStart::Off);
+        assert!(!c.frontend.prediction);
+        assert_eq!(c.frontend.mixed_model.as_deref(), Some(""));
+        let (c, app) = cfg.for_app("notepad.exe");
+        assert!(app.is_none() && c.frontend.prediction);
+        // saved and read back; none left removes them
+        let path = std::env::temp_dir().join(format!("setsuna-apps-{}.toml", std::process::id()));
+        cfg.save_to_path(&path).unwrap();
+        assert_eq!(Config::load_from_path(&path).unwrap().apps, cfg.apps);
+        let mut none = cfg.clone();
+        none.apps.clear();
+        none.save_to_path(&path).unwrap();
+        assert!(Config::load_from_path(&path).unwrap().apps.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn save_keeps_comments_and_unset_knobs() {

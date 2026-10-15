@@ -514,7 +514,12 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
         // Load TOML config so the same instance can flow to both the
         // daemon spawn (engine flags) and the UI factory (font/colors/page).
         // `load_default` already falls back to defaults on parse error.
-        let cfg = Config::load_default();
+        // as this application uses it (`[[apps]]`): the DLL runs in its process
+        let process = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (cfg, app) = Config::load_default().for_app(&process);
+        setsuna_core::diagnostics::log(format!("process {process} app settings={}", app.is_some()));
         setsuna_core::diagnostics::log(format!(
             "config manifest={:?} model_dir={:?} engine={:?}",
             cfg.engine.model_manifest, cfg.engine.model_dir, cfg.engine.engine_exe
@@ -706,12 +711,21 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
         // The mode: the thread's on / off compartment (unset: on, as
         // Microsoft asks of IMEs), the taskbar item showing it, the notice.
         let compartment = mode::open_close(thread_mgr);
-        let on = match compartment.as_ref() {
-            Some(c) => mode::read_open(c).unwrap_or_else(|| {
+        let start = app
+            .as_ref()
+            .map_or(setsuna_core::config::AppStart::Keep, |a| a.start);
+        let on = match (compartment.as_ref(), start) {
+            // the application's start state, `[[apps]] start`
+            (Some(c), setsuna_core::config::AppStart::On | setsuna_core::config::AppStart::Off) => {
+                let on = start == setsuna_core::config::AppStart::On;
+                let _ = mode::write_open(c, tid, on);
+                on
+            }
+            (Some(c), _) => mode::read_open(c).unwrap_or_else(|| {
                 let _ = mode::write_open(c, tid, true);
                 true
             }),
-            None => true,
+            (None, s) => s != setsuna_core::config::AppStart::Off,
         };
         let open_close = compartment.and_then(|c| {
             let sink: ITfCompartmentEventSink = self.cast_interface().ok()?;

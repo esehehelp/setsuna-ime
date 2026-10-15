@@ -226,6 +226,35 @@ pub unsafe extern "C" fn setsuna_session_configure(s: *mut SetsunaSession) {
     with(s, (), |sess| sess.configure(&cfg));
 }
 
+/// `setsuna_session_configure` for the application `program` (the input
+/// context's program, empty when unknown): its `[[apps]]` settings over the
+/// rest, and its start state.
+///
+/// # Safety
+/// `s` is a live session; `program` is null or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn setsuna_session_configure_app(
+    s: *mut SetsunaSession,
+    program: *const c_char,
+) {
+    let program = (!program.is_null())
+        .then(|| CStr::from_ptr(program).to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (cfg, app) = Config::load_default().for_app(&program);
+    setsuna_core::diagnostics::log(format!(
+        "fcitx5 configure for {program:?} app settings={}",
+        app.is_some()
+    ));
+    with(s, (), |sess| {
+        sess.configure(&cfg);
+        match app.map(|a| a.start) {
+            Some(setsuna_core::config::AppStart::On) => sess.set_enabled(true),
+            Some(setsuna_core::config::AppStart::Off) => sess.set_enabled(false),
+            _ => {}
+        }
+    });
+}
+
 /// A key press; true when the IME took it.
 ///
 /// # Safety
