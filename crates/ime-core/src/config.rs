@@ -209,6 +209,10 @@ pub struct FrontendCfg {
     /// The romaji table: "standard" (built in), "azik", "kana_jis" (kana
     /// input on the JIS layout) or the path of a table in Mozc's format.
     pub romaji_table: String,
+    /// Typo correction (`typo`): where a letter reads as no kana, the
+    /// reading one edit away (a neighbouring key, a key too many, two keys
+    /// swapped) is converted too, its candidates after the first ones.
+    pub typo_correction: bool,
     /// Space with nothing composed types a full-width space (U+3000), as
     /// MS-IME and Mozc do in hiragana mode; false leaves it to the app (a
     /// half-width space). Shift+Space types the other width.
@@ -348,6 +352,7 @@ impl Default for FrontendCfg {
             emoji_candidates: true,
             prediction: true,
             romaji_table: "standard".to_string(),
+            typo_correction: true,
             full_width_space: false,
             live_conversion: None,
             preedit_cursor_at_start: true,
@@ -781,6 +786,8 @@ impl Config {
              # The romaji table: \"standard\", \"azik\", \"kana_jis\" (kana input on the\n\
              # JIS layout) or the path of a table in Mozc's format.\n\
              romaji_table = \"standard\"\n\
+             # Typo correction where a letter reads as no kana (kaisga: かいしゃ).\n\
+             typo_correction = true\n\
              # Space with nothing composed types a full-width space (U+3000);\n\
              # Shift+Space types the other width.\n\
              full_width_space = false\n\

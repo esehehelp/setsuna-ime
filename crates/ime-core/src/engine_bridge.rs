@@ -220,6 +220,8 @@ pub struct EngineBridge {
     date_time_enabled: bool,
     /// Number candidates (`numbers`).
     numbers_enabled: bool,
+    /// Typo correction (`typo`).
+    typo_correction: bool,
     /// Emoji and kaomoji candidates (`emoji`).
     emoji_enabled: bool,
     /// Clock snapshot shared by local candidates and delayed model results.
@@ -344,6 +346,7 @@ impl EngineBridge {
                 .then(|| crate::symbol_dict::shared(frontend.symbol_dictionary_file.as_deref())),
             date_time_enabled: frontend.date_time_candidates,
             numbers_enabled: frontend.number_candidates,
+            typo_correction: frontend.typo_correction,
             emoji_enabled: frontend.emoji_candidates,
             date_time_now: None,
             mixed_symbols: HashMap::new(),
@@ -926,14 +929,40 @@ impl EngineBridge {
     /// Mixed input, Space on a composition with English in it: the other
     /// reading to offer (every letter as romaji), or `None`.
     fn alt_for_space(&self) -> Option<AltList> {
+        // a typo: the reading one edit away, when a letter reads as no kana
+        // and nothing was read as English
+        let typo = || {
+            // typed in capitals, English was meant (mixed input reads a
+            // lowercase word it does not know as English too: kais + が)
+            let shifted = self
+                .composing
+                .romaji()
+                .chars()
+                .any(|c| c.is_ascii_uppercase());
+            if !self.typo_correction || shifted {
+                return None;
+            }
+            crate::typo::correct(
+                &self.composing.romaji(),
+                self.composing.mixed_model().as_deref(),
+            )
+        };
         if !self.composing.is_mixed() {
-            return None;
+            return typo().map(|reading| AltList {
+                reading: Some(reading),
+                req_id: None,
+                candidates: Vec::new(),
+                main: Vec::new(),
+                ends_english: false,
+                typed: String::new(),
+                typed_early: false,
+            });
         }
         let reading = self.composing.kana_reading();
         let mixed = self.composing.full_reading();
         let other = reading != mixed && !reading.chars().any(|c| c.is_ascii_alphabetic());
         Some(AltList {
-            reading: other.then_some(reading),
+            reading: if other { Some(reading) } else { typo() },
             req_id: None,
             candidates: Vec::new(),
             main: Vec::new(),
