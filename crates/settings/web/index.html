@@ -208,6 +208,13 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control"><input type="text" id="romaji_path" placeholder="C:/path/to/romaji.tsv"></div>
   </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">打ち間違いの補正</div>
+      <div class="desc">ローマ字として読めない文字があると、隣のキー・余計なキー・入れ替えを直した読みの候補も出します（kaisga → 会社）</div>
+    </div>
+    <div class="control" data-switch="frontend.typo_correction"></div>
+  </div>
 </div>
 
 <h2>記号・句読点</h2>

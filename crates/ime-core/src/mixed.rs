@@ -821,6 +821,24 @@ impl MixedModel {
     /// English of the romaji around them: かんとUIC); the others only give
     /// their case.
     fn name_weight(&self, word: &str) -> Option<f64> {
+        self.name_weight_of(word)
+    }
+
+    /// −ln P of `kana` as a reading by the kana model (start and end
+    /// included): how Japanese-like it reads (typo correction's judge).
+    pub fn kana_cost(&self, kana: &str) -> f64 {
+        let chars: Vec<char> = std::iter::once('^')
+            .chain(std::iter::once('^'))
+            .chain(kana.chars().map(kana_class))
+            .chain(std::iter::once('$'))
+            .collect();
+        chars
+            .windows(3)
+            .map(|w| self.kana.cost(w[0], w[1], w[2]))
+            .sum()
+    }
+
+    fn name_weight_of(&self, word: &str) -> Option<f64> {
         self.names
             .get(word)
             .filter(|(name, _, _)| word.len() >= 4 && name.chars().any(|c| c.is_ascii_lowercase()))

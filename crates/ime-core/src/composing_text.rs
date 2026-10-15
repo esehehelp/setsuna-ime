@@ -308,6 +308,12 @@ impl ComposingText {
         self.recompute(false);
     }
 
+    /// The mixed-input model, if mixed input is on (its kana model judges
+    /// typo corrections).
+    pub fn mixed_model(&self) -> Option<Arc<MixedModel>> {
+        self.mixed.as_ref().map(|m| m.model.clone())
+    }
+
     pub fn is_mixed(&self) -> bool {
         self.mixed.is_some()
     }

@@ -31,4 +31,5 @@ pub mod romaji_table;
 mod segmented;
 pub mod segments;
 pub mod symbol_dict;
+pub mod typo;
 pub mod user_dict;

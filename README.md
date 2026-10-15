@@ -45,6 +45,8 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
   読みに無い記号を含む候補の除外。
 - **入力方式** — ローマ字表を選べる（`romaji_table`）：標準、AZIK、かな入力
   （JIS 配列）、Mozc 形式の表のファイル。設定 GUI の「入力方式」でも変えられる。
+  ローマ字として読めない文字があると、隣のキー・余計なキー・入れ替えを直した
+  読みの候補も出す（kaisga → 会社。`typo_correction`）。
 - **英日混在入力（任意）** — ローマ字の中の英単語を打ったまま残す
   （kana / Latin の n-gram モデルによる分割。モデルは IME に同梱：
   `crates/ime-core/data/mixed`、インストールで有効になり、`mixed_model = ""`
