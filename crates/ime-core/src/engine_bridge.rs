@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -142,6 +143,15 @@ struct AltList {
 const ALT_MAX: usize = 5;
 const ALT_EARLY: usize = 3;
 
+/// Where the user dictionary comes from.
+enum UserDictSource {
+    None,
+    /// Given (tests, the demo).
+    Fixed(Arc<crate::user_dict::UserDict>),
+    /// The file in the config directory, read again when it changes.
+    File,
+}
+
 enum Phase {
     Empty,
     Composing {
@@ -209,6 +219,8 @@ pub struct EngineBridge {
     learning: Option<Learning>,
     /// Candidates hidden with Ctrl+Delete.
     hidden: Option<crate::hidden::Hidden>,
+    /// The user dictionary.
+    user_dict: UserDictSource,
     /// Reading the current candidate list (Composing / Converting) was
     /// produced for; empty for a provisional list. A choice is learned
     /// against it.
@@ -316,6 +328,7 @@ impl EngineBridge {
             mixed_symbols: HashMap::new(),
             learning: None,
             hidden: None,
+            user_dict: UserDictSource::None,
             list_reading: String::new(),
             list_starts: HashMap::new(),
             seg_requests: Vec::new(),
@@ -2061,6 +2074,9 @@ impl EngineBridge {
                 crate::date_time::insert(reading, arranged, self.date_time_candidates(reading));
         }
         let mut list = self.char_rules.apply(arranged);
+        if let Some(dict) = self.user_dict() {
+            list = dict.apply(reading, list);
+        }
         if rerank {
             if let Some(learning) = self.learning.as_mut() {
                 list = learning.rerank(reading, list);
@@ -2070,6 +2086,30 @@ impl EngineBridge {
             list = hidden.filter(reading, list);
         }
         list
+    }
+
+    /// The user dictionary in effect: the file's, read again when it
+    /// changed, or the one given.
+    fn user_dict(&self) -> Option<Arc<crate::user_dict::UserDict>> {
+        match &self.user_dict {
+            UserDictSource::None => None,
+            UserDictSource::Fixed(d) => Some(d.clone()),
+            UserDictSource::File => crate::user_dict::shared(),
+        }
+    }
+
+    /// Use the user dictionary file of the config directory
+    /// (`user_dict::shared`).
+    pub fn use_user_dictionary_file(&mut self) {
+        self.user_dict = UserDictSource::File;
+    }
+
+    /// Use `dict` as the user dictionary (`None`: none).
+    pub fn set_user_dict(&mut self, dict: Option<crate::user_dict::UserDict>) {
+        self.user_dict = match dict {
+            Some(d) => UserDictSource::Fixed(Arc::new(d)),
+            None => UserDictSource::None,
+        };
     }
 
     /// Reading starts of the chars of each candidate in `list`: from the
@@ -3182,6 +3222,25 @@ mod tests {
         let actions = bridge.set_rewrite_mode(true);
         assert_eq!(status(&actions), Some("書き直し中…"));
         assert_eq!(rewriter.requests(), 1);
+    }
+
+    #[test]
+    fn user_words_come_first_and_inside_longer_readings() {
+        let (mut bridge, mock) = bridge_with_mock();
+        let (entries, _) = crate::user_dict::parse("かさ\t笠\t名詞\n");
+        bridge.set_user_dict(Some(crate::user_dict::UserDict::new(&entries)));
+        type_str(&mut bridge, "kasa");
+        mock.set_result("かさ", &["傘", "嵩"]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "笠");
+        bridge.handle_escape();
+        bridge.handle_escape();
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "嵩の"]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "笠の");
     }
 
     #[test]

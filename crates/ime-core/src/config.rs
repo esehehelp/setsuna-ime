@@ -641,6 +641,11 @@ impl Config {
         config_dir().map(|d| d.join("hidden.jsonl"))
     }
 
+    /// The user dictionary (Mozc / Google Japanese Input text format).
+    pub fn user_dictionary_path() -> Option<PathBuf> {
+        config_dir().map(|d| d.join("user_dictionary.txt"))
+    }
+
     /// Write this config to `path`, keeping the comments and layout of the
     /// file already there (or of the default template when there is none).
     /// Every key this config serializes is written; keys it leaves out (an
