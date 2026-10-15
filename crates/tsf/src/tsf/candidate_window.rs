@@ -56,10 +56,35 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
 }
 
+/// Whether Windows' app mode is dark (`AppsUseLightTheme` 0), as Mozkey's
+/// renderer reads it; light when unknown.
+pub(crate) fn dark_apps() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value = 1u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    status.is_ok() && value == 0
+}
+
 pub(crate) fn palette(cfg: &CandidateWindowCfg) -> Palette {
     // amber (the old highlight) through coral to violet, as fcitx5's themes
     let accent = Some([rgb(255, 176, 59), rgb(255, 112, 102), rgb(171, 120, 255)]);
-    match cfg.theme.as_str() {
+    let theme = match cfg.theme.as_str() {
+        "auto" if dark_apps() => "setsuna-dark",
+        "auto" => "setsuna",
+        t => t,
+    };
+    match theme {
         "setsuna-dark" => Palette {
             panel_top: rgb(40, 42, 62),
             panel_bottom: rgb(26, 27, 42),
@@ -114,7 +139,10 @@ struct RenderData {
     page_size: usize,
     font_face: Vec<u16>,
     font_px: i32,
+    font_weight: i32,
     palette: Palette,
+    /// The window's settings: `auto` resolves its palette at each show.
+    cfg: CandidateWindowCfg,
     on_select: Option<Box<dyn Fn(usize)>>,
     /// Laid out by `show` (device pixels).
     layout: Layout,
@@ -151,12 +179,26 @@ impl CandidateWindow {
                 page_size: page_size.max(1),
                 font_face: face,
                 font_px: cfg.font_pt.clamp(8, 48) as i32,
+                font_weight: cfg.font_weight.clamp(100, 900) as i32,
                 palette: palette(cfg),
+                cfg: cfg.clone(),
                 on_select: None,
                 layout: Layout::default(),
             });
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
+                // translucent: a layered window at the opacity asked for
+                let opacity = cfg.opacity_percent.clamp(20, 100);
+                if opacity < 100 {
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+                    let _ = SetLayeredWindowAttributes(
+                        hwnd,
+                        COLORREF(0),
+                        (opacity * 255 / 100) as u8,
+                        LWA_ALPHA,
+                    );
+                }
             }
         }
         Self { hwnd }
@@ -198,6 +240,11 @@ impl CandidateWindow {
         let Some(d) = self.data() else {
             return;
         };
+        // Windows' app mode may have changed since
+        if d.cfg.theme == "auto" {
+            d.palette = palette(&d.cfg);
+        }
+        let radius = d.cfg.corner_radius.min(24) as i32;
         d.candidates = candidates.to_vec();
         d.notes = candidates
             .iter()
@@ -218,8 +265,8 @@ impl CandidateWindow {
                 0,
                 width + 1,
                 height + 1,
-                sc(RADIUS * 2, s),
-                sc(RADIUS * 2, s),
+                sc(radius * 2, s),
+                sc(radius * 2, s),
             );
             SetWindowRgn(hwnd, rgn, false);
             let _ = SetWindowPos(
@@ -347,13 +394,17 @@ pub(crate) fn sc(v: i32, s: f64) -> i32 {
 }
 
 pub(crate) fn font(face: &[u16], px: i32) -> HFONT {
+    font_weighted(face, px, FW_NORMAL.0 as i32)
+}
+
+pub(crate) fn font_weighted(face: &[u16], px: i32, weight: i32) -> HFONT {
     unsafe {
         CreateFontW(
             -px,
             0,
             0,
             0,
-            FW_NORMAL.0 as i32,
+            weight,
             0,
             0,
             0,
@@ -371,7 +422,7 @@ pub(crate) fn font(face: &[u16], px: i32) -> HFONT {
 fn fonts(d: &RenderData, s: f64) -> (HFONT, HFONT) {
     let px = sc(d.font_px, s);
     (
-        font(&d.font_face, px),
+        font_weighted(&d.font_face, px, d.font_weight),
         font(&d.font_face, (px * 3 / 4).max(1)),
     )
 }
@@ -401,7 +452,7 @@ fn heading(d: &RenderData) -> String {
 /// Size the window for `d`'s list: as wide as the widest candidate of the
 /// list with its note (or the line above it), always a full page high.
 unsafe fn layout(hwnd: HWND, d: &RenderData) -> Layout {
-    let s = dpi_scale(hwnd);
+    let s = dpi_scale(hwnd) * d.cfg.size_percent.clamp(80, 200) as f64 / 100.0;
     unsafe {
         let hdc = GetDC(hwnd);
         let (big, small) = fonts(d, s);
@@ -568,8 +619,8 @@ unsafe fn render(hdc: HDC, d: &RenderData) {
             0,
             l.width + 1,
             l.height + 1,
-            sc(RADIUS * 2, s),
-            sc(RADIUS * 2, s),
+            sc(d.cfg.corner_radius.min(24) as i32 * 2, s),
+            sc(d.cfg.corner_radius.min(24) as i32 * 2, s),
         );
         SelectClipRgn(hdc, panel);
         gradient(

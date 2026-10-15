@@ -200,9 +200,18 @@ impl Default for UiCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CandidateWindowCfg {
-    /// `setsuna` (light panel, amber-to-violet accent), `setsuna-dark`, or
-    /// `classic` (flat, in the colors below).
+    /// `auto` (`setsuna` or `setsuna-dark` as Windows' app mode is light or
+    /// dark), `setsuna` (light panel, amber-to-violet accent),
+    /// `setsuna-dark`, or `classic` (flat, in the colors below).
     pub theme: String,
+    /// The window's size, in percent (80-200).
+    pub size_percent: u32,
+    /// The panel's corner radius at 96 DPI (0-24).
+    pub corner_radius: u32,
+    /// The window's opacity, in percent (20-100).
+    pub opacity_percent: u32,
+    /// The candidates' font weight (100-900: 400 normal, 700 bold).
+    pub font_weight: u32,
     pub font_face: String,
     /// Candidate text size in pixels at 96 DPI.
     pub font_pt: u32,
@@ -221,7 +230,11 @@ impl Default for CandidateWindowCfg {
     fn default() -> Self {
         // The colors are the `classic` theme's; the others have their own.
         Self {
-            theme: "setsuna".to_string(),
+            theme: "auto".to_string(),
+            size_percent: 100,
+            corner_radius: 12,
+            opacity_percent: 100,
+            font_weight: 400,
             font_face: "Meiryo UI".to_string(),
             font_pt: 16,
             page_size: 10,
