@@ -199,6 +199,9 @@ pub struct FrontendCfg {
     /// 三十四, 12:34), numbers read in kana, era years, calculations
     /// (`1+2=`), `U+3042`.
     pub number_candidates: bool,
+    /// Emoji and kaomoji candidates (`emoji`): にこにこ -> 😊 …, えもじ /
+    /// かおもじ list them all.
+    pub emoji_candidates: bool,
     /// Space with nothing composed types a full-width space (U+3000), as
     /// MS-IME and Mozc do in hiragana mode; false leaves it to the app (a
     /// half-width space). Shift+Space types the other width.
@@ -335,6 +338,7 @@ impl Default for FrontendCfg {
             symbol_dictionary_file: None,
             date_time_candidates: true,
             number_candidates: true,
+            emoji_candidates: true,
             full_width_space: false,
             live_conversion: None,
             preedit_cursor_at_start: true,
@@ -756,6 +760,8 @@ impl Config {
              # Number candidates: 1,234 / 千二百三十四 / 12:34, じゅうに -> 12,\n\
              # 2025ねん -> 令和7年, 1+2= -> 3, U+3042 -> あ.\n\
              number_candidates = true\n\
+             # Emoji and kaomoji candidates (にこにこ, えもじ, かおもじ).\n\
+             emoji_candidates = true\n\
              # Space with nothing composed types a full-width space (U+3000);\n\
              # Shift+Space types the other width.\n\
              full_width_space = false\n\
