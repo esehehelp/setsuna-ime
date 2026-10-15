@@ -167,6 +167,11 @@ pub struct EngineBridge {
     /// Conversion backend. `None` in hosts where the engine daemon failed
     /// to spawn — live conversion then degrades to a raw-hiragana preedit.
     client: Option<Box<dyn EngineClient>>,
+    /// The text before the caret as read or committed (`CONTEXT_WINDOW`
+    /// chars): what decides whether the rewriter may see it.
+    raw_context: String,
+    /// What the models read of it: the text after anything sensitive in it
+    /// (`privacy::after_last_hit`: a URL, a token, パスワード).
     context: String,
     req_counter: AtomicU64,
     /// Results older than this belong to a previous composition.
@@ -236,6 +241,10 @@ pub struct EngineBridge {
     rewrite_mode: bool,
     /// The rewrite of the conversion open, asked for or in.
     rewrite: Option<RewriteJob>,
+    /// The field typed into is private (a password, a PIN, an input scope
+    /// marked private): its text is no context, nothing is rewritten and
+    /// nothing learned (learned choices still apply).
+    private_field: bool,
 }
 
 /// A rewrite of the whole reading's conversion.
@@ -283,6 +292,7 @@ impl EngineBridge {
             composing: ComposingText::new(),
             phase: Phase::Empty,
             client,
+            raw_context: String::new(),
             context: String::new(),
             req_counter: AtomicU64::new(0),
             result_floor: 1,
@@ -315,6 +325,7 @@ impl EngineBridge {
             alt: None,
             rewriter: None,
             rewrite_mode: false,
+            private_field: false,
             rewrite: None,
         };
         let mixed = frontend
@@ -552,6 +563,7 @@ impl EngineBridge {
     /// toggled). An empty context is what the model sees at the start of a
     /// document; a stale one is text from elsewhere.
     pub fn forget_context(&mut self) {
+        self.raw_context.clear();
         self.context.clear();
         self.composing.set_before(&self.context);
     }
@@ -562,6 +574,10 @@ impl EngineBridge {
     /// of a document) keeps that one. Line breaks and embedded objects are
     /// dropped; the model reads running text.
     pub fn set_app_context(&mut self, text: Option<&str>) {
+        if self.private_field {
+            self.forget_context();
+            return;
+        }
         let Some(text) = text else {
             return;
         };
@@ -572,8 +588,17 @@ impl EngineBridge {
         if text.is_empty() {
             return;
         }
-        self.context.clear();
+        self.raw_context.clear();
         self.append_context(&text);
+    }
+
+    /// The field typed into is private (`private_field`), or no longer is.
+    /// The frontend tells it as a composition starts.
+    pub fn set_private_field(&mut self, private: bool) {
+        self.private_field = private;
+        if private {
+            self.forget_context();
+        }
     }
 
     #[cfg(test)]
@@ -582,15 +607,16 @@ impl EngineBridge {
     }
 
     fn append_context(&mut self, text: &str) {
-        if text.is_empty() {
+        if text.is_empty() || self.private_field {
             return;
         }
-        self.context.push_str(text);
-        let n = self.context.chars().count();
+        self.raw_context.push_str(text);
+        let n = self.raw_context.chars().count();
         if n > Self::CONTEXT_WINDOW {
             let skip = n - Self::CONTEXT_WINDOW;
-            self.context = self.context.chars().skip(skip).collect();
+            self.raw_context = self.raw_context.chars().skip(skip).collect();
         }
+        self.context = crate::privacy::after_last_hit(&self.raw_context).to_string();
         self.composing.set_before(&self.context);
     }
 
@@ -1687,7 +1713,14 @@ impl EngineBridge {
     /// Rewrite mode, a conversion just opened: ask for the rewrite of
     /// `reading`'s conversion `text` (once per reading) and say so.
     fn start_rewrite(&mut self, reading: &str, text: &str) -> Option<Action> {
-        if !self.rewrite_mode || text.trim().is_empty() {
+        // nothing sensitive leaves the machine: no rewrite of a token, a
+        // URL or a password, and no context that holds one
+        if !self.rewrite_mode
+            || self.private_field
+            || text.trim().is_empty()
+            || crate::privacy::is_sensitive(reading)
+            || crate::privacy::is_sensitive(text)
+        {
             return None;
         }
         if let Some(job) = self.rewrite.as_ref().filter(|j| j.reading == reading) {
@@ -1696,7 +1729,12 @@ impl EngineBridge {
         }
         let client = self.rewriter.as_ref()?;
         let req_id = self.req_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        client.dispatch(req_id, &self.context, reading, text.trim_end());
+        let context = if crate::privacy::is_sensitive(&self.raw_context) {
+            ""
+        } else {
+            &self.raw_context
+        };
+        client.dispatch(req_id, context, reading, text.trim_end());
         self.rewrite = Some(RewriteJob {
             req_id,
             reading: reading.to_string(),
@@ -2574,6 +2612,7 @@ impl EngineBridge {
                 (text, learn)
             }
         };
+        let learn = learn.filter(|_| !self.private_field);
         if let (Some((reading, rejected)), Some(learning)) = (learn, self.learning.as_mut()) {
             if let Err(e) = learning.record(&reading, &text, &rejected) {
                 tracing::warn!("learning record failed: {e}");
@@ -2877,6 +2916,68 @@ mod tests {
             Action::ShowCandidates { list, selected } => Some((list.clone(), *selected)),
             _ => None,
         })
+    }
+
+    #[test]
+    fn the_models_read_the_context_after_anything_sensitive() {
+        let (mut bridge, _mock) = bridge_with_mock();
+        bridge.set_app_context(Some("詳細はhttps://example.com/aを見て、"));
+        assert_eq!(bridge.context(), "を見て、");
+        bridge.set_app_context(Some("今日は晴れ。"));
+        assert_eq!(bridge.context(), "今日は晴れ。");
+    }
+
+    #[test]
+    fn a_private_field_has_no_context_and_learns_nothing() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_private_field(true);
+        bridge.set_app_context(Some("今日は"));
+        assert_eq!(bridge.context(), "");
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        bridge.handle_down();
+        bridge.handle_enter();
+        // the commit is no context either
+        assert_eq!(bridge.context(), "");
+        bridge.set_private_field(false);
+        bridge.set_app_context(Some("今日は"));
+        assert_eq!(bridge.context(), "今日は");
+    }
+
+    #[test]
+    fn the_rewriter_gets_no_sensitive_context_nor_text() {
+        let (mut bridge, mock) = bridge_with_mock();
+        let rewriter = MockRewriter::default();
+        bridge.set_rewriter(Some(Box::new(rewriter.clone())));
+        bridge.set_rewrite_mode(true);
+        // the context holds a password word: none of it is sent, not even
+        // the text after it
+        bridge.set_app_context(Some("パスワードは"));
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の"]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        assert_eq!(rewriter.state.dispatched.borrow()[0].1, "");
+        bridge.handle_escape();
+        bridge.handle_escape();
+        bridge.set_app_context(Some("今日は"));
+        type_str(&mut bridge, "kasano");
+        bridge.handle_space();
+        assert_eq!(
+            rewriter.state.dispatched.borrow().last().unwrap().1,
+            "今日は"
+        );
+        // a conversion that is a token itself is not sent at all
+        bridge.handle_escape();
+        bridge.handle_escape();
+        let before = rewriter.state.dispatched.borrow().len();
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["AKIAIOSFODNN7EXAMPLE"]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        assert_eq!(rewriter.state.dispatched.borrow().len(), before);
     }
 
     #[test]

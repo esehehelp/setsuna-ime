@@ -240,6 +240,16 @@ pub unsafe extern "C" fn setsuna_session_key(
     with(s, false, |sess| sess.key(&Key { sym, code, mods }))
 }
 
+/// Whether the field typed into is private (fcitx5's Password or
+/// Sensitive capability): no context, no rewrite, nothing learned.
+///
+/// # Safety
+/// `s` is a live session.
+#[no_mangle]
+pub unsafe extern "C" fn setsuna_session_set_private(s: *mut SetsunaSession, private: bool) {
+    with(s, (), |sess| sess.set_private_field(private))
+}
+
 /// Apply the engine's latest result (after a notify); true when the view
 /// changed.
 ///

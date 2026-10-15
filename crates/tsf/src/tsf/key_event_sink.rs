@@ -249,15 +249,14 @@ impl SetsunaTextService_Impl {
             }
             inner.client_id
         };
-        let text = text_before_caret(context, client_id);
+        let (text, private) = text_before_caret(context, client_id);
         setsuna_core::diagnostics::log(match &text {
-            Some(t) => format!("app context len={}", t.chars().count()),
-            None => "app context unavailable".to_string(),
+            Some(t) => format!("app context len={} private={private}", t.chars().count()),
+            None => format!("app context unavailable private={private}"),
         });
-        self.inner
-            .borrow_mut()
-            .engine
-            .set_app_context(text.as_deref());
+        let mut inner = self.inner.borrow_mut();
+        inner.engine.set_private_field(private);
+        inner.engine.set_app_context(text.as_deref());
     }
 
     /// Turn the IME on or off: through the on / off compartment when there
@@ -615,12 +614,47 @@ fn selection_screen_pos(context: &ITfContext, client_id: u32) -> Option<(i32, i3
 /// keeps the last 80 chars of it.
 const CONTEXT_UNITS: i32 = 160;
 
+/// The input scopes of the field at `range` (`GUID_PROP_INPUTSCOPE`), as
+/// Mozc reads them (`win32/tip/tip_range_util.cc`).
+unsafe fn input_scopes(context: &ITfContext, ec: u32, range: &ITfRange) -> Vec<InputScope> {
+    let Ok(prop) = context.GetAppProperty(&GUID_PROP_INPUTSCOPE) else {
+        return Vec::new();
+    };
+    let Ok(value) = prop.GetValue(ec, range) else {
+        return Vec::new();
+    };
+    let Ok(scope) = IUnknown::try_from(&value).and_then(|u| u.cast::<ITfInputScope>()) else {
+        return Vec::new();
+    };
+    let mut ptr: *mut InputScope = core::ptr::null_mut();
+    let mut count = 0u32;
+    if scope.GetInputScopes(&mut ptr, &mut count).is_err() || ptr.is_null() {
+        return Vec::new();
+    }
+    let out = core::slice::from_raw_parts(ptr, count as usize).to_vec();
+    windows::Win32::System::Com::CoTaskMemFree(Some(ptr as *const core::ffi::c_void));
+    out
+}
+
+/// Whether the field's input scopes make it private: a password, a PIN,
+/// or one marked private (no context, no rewrite, nothing learned).
+fn private_scope(scopes: &[InputScope]) -> bool {
+    scopes.iter().any(|s| {
+        matches!(
+            *s,
+            IS_PASSWORD | IS_NUMERIC_PASSWORD | IS_NUMERIC_PIN | IS_ALPHANUMERIC_PIN | IS_PRIVATE
+        )
+    })
+}
+
 /// The app's text before the caret, at most `CONTEXT_UNITS` UTF-16 units
-/// of it. `None` when the app does not let us read it.
-fn text_before_caret(context: &ITfContext, client_id: u32) -> Option<String> {
+/// of it (`None` when the app does not let us read it), and whether the
+/// field is private (`private_scope`).
+fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, bool) {
     struct ReadBefore {
         context: ITfContext,
         result: Rc<RefCell<Option<String>>>,
+        private: Rc<RefCell<bool>>,
     }
     #[implement(ITfEditSession)]
     struct Sess(ReadBefore);
@@ -635,6 +669,8 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> Option<String> {
                 let Some(range) = core::mem::ManuallyDrop::take(&mut sel[0].range) else {
                     return Ok(());
                 };
+                *self.0.private.borrow_mut() =
+                    private_scope(&input_scopes(&self.0.context, ec, &range));
                 range.Collapse(ec, TF_ANCHOR_START)?;
                 let mut moved = 0i32;
                 range.ShiftStart(ec, -CONTEXT_UNITS, &mut moved, core::ptr::null())?;
@@ -651,16 +687,19 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> Option<String> {
     }
 
     let result: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let private = Rc::new(RefCell::new(false));
     let session: ITfEditSession = Sess(ReadBefore {
         context: context.clone(),
         result: result.clone(),
+        private: private.clone(),
     })
     .into();
     let hr = unsafe { context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READ) };
     if !hr.is_ok_and(|hr| hr.is_ok()) {
-        return None;
+        return (None, false);
     }
-    result.take()
+    let private = private.take();
+    (result.take(), private)
 }
 
 #[cfg(test)]
