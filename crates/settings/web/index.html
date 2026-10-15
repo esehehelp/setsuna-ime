@@ -194,6 +194,32 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="path" id="path"></div>
 <div class="banner" id="error" hidden></div>
 
+<h2>候補の窓</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">テーマ</div>
+      <div class="desc">自動は Windows のアプリのモード（ライト・ダーク）に合わせます</div>
+    </div>
+    <div class="control"><div class="segmented" id="window_theme"></div></div>
+  </div>
+  <div class="row" data-window-range="size_percent" data-min="80" data-max="200" data-step="10" data-unit="%">
+    <div class="text"><div class="title">大きさ</div></div>
+  </div>
+  <div class="row" data-window-range="font_pt" data-min="10" data-max="32" data-step="1" data-unit="px">
+    <div class="text"><div class="title">文字の大きさ</div></div>
+  </div>
+  <div class="row" data-window-range="font_weight" data-min="300" data-max="700" data-step="100" data-unit="">
+    <div class="text"><div class="title">文字の太さ</div><div class="desc">400 が標準、700 が太字</div></div>
+  </div>
+  <div class="row" data-window-range="corner_radius" data-min="0" data-max="24" data-step="1" data-unit="px">
+    <div class="text"><div class="title">角の丸み</div></div>
+  </div>
+  <div class="row" data-window-range="opacity_percent" data-min="20" data-max="100" data-step="5" data-unit="%">
+    <div class="text"><div class="title">不透明度</div></div>
+  </div>
+</div>
+
 <h2>入力方式</h2>
 <div class="card">
   <div class="row">
@@ -514,6 +540,35 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 
 const WIDTHS = [["as_typed", "入力どおり"], ["full", "全角"], ["half", "半角"], ["auto", "自動"]];
 const NAME_CASES = [["off", "オフ"], ["proper", "固有名詞"], ["acronyms", "固有名詞と略語"]];
+const WINDOW_THEMES = [["auto", "自動"], ["setsuna", "ライト"], ["setsuna-dark", "ダーク"], ["classic", "クラシック"]];
+
+function renderWindow() {
+  const w = cfg.ui.candidate_window;
+  const seg = $("window_theme");
+  seg.replaceChildren(...WINDOW_THEMES.map(([value, label]) => {
+    const b = el("button", { textContent: label });
+    b.setAttribute("aria-pressed", w.theme === value);
+    b.addEventListener("click", () => {
+      w.theme = value;
+      for (const o of seg.children) o.setAttribute("aria-pressed", o === b);
+      changed();
+    });
+    return b;
+  }));
+  for (const row of document.querySelectorAll("[data-window-range]")) {
+    const key = row.dataset.windowRange;
+    const value = el("span", { className: "value", textContent: `${w[key]}${row.dataset.unit}` });
+    const input = el("input", { type: "range", min: row.dataset.min, max: row.dataset.max, step: row.dataset.step, value: w[key] });
+    input.addEventListener("input", () => {
+      w[key] = Number(input.value);
+      value.textContent = `${w[key]}${row.dataset.unit}`;
+      changed();
+    });
+    row.querySelector(".control")?.remove();
+    row.append(el("div", { className: "control" }, input, value));
+  }
+}
+
 const ROMAJI_TABLES = [["standard", "標準"], ["azik", "AZIK"], ["kana_jis", "かな入力"], ["file", "ファイル"]];
 const PUNCTUATION = [
   ["as_is", "変換結果のまま"], ["toten_kuten", "、。"], ["comma_period", "，．"],
@@ -608,6 +663,7 @@ function render() {
   segmented("name_case", NAME_CASES);
   renderRomaji();
   renderApps();
+  renderWindow();
 
   const sel = $("punctuation");
   sel.replaceChildren(...PUNCTUATION.map(([value, label]) =>
