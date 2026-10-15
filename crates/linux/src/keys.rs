@@ -102,6 +102,10 @@ pub fn classify(key: &Key, symbols: &BTreeMap<String, String>) -> Option<KeyKind
     if let Some(form) = form_key(key) {
         return Some(KeyKind::ConvertTo(form));
     }
+    // Ctrl+Delete: forget or hide the candidate (taken only while converting)
+    if key.sym == DELETE && key.mods & (MOD_CTRL | MOD_ALT | MOD_SUPER) == MOD_CTRL {
+        return Some(KeyKind::ForgetCandidate);
+    }
     if key.mods & (MOD_CTRL | MOD_ALT | MOD_SUPER) != 0 {
         return None;
     }

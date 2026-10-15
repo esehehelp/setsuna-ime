@@ -15,6 +15,7 @@ pub mod date_time;
 pub mod diagnostics;
 pub mod engine_bridge;
 pub mod engine_client;
+pub mod hidden;
 pub mod kana_candidates;
 pub mod learning;
 pub mod mixed;

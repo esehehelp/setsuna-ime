@@ -12,7 +12,7 @@
 //! switching the input method away and back on fcitx5).
 //!
 //! The page and this process talk in JSON messages: the page posts
-//! `{"type": "init" | "save" | "clear_learning", ...}` (and the rewriter's)
+//! `{"type": "init" | "save" | "clear_learning" | "show_hidden", ...}` (and the rewriter's)
 //! through `window.ipc`, and each reply goes back as
 //! `setsuna.receive(<message>)`.
 
@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use setsuna_core::config::Config;
+use setsuna_core::hidden::Hidden;
 use setsuna_core::learning::Learning;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -73,7 +74,7 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::Ipc(message)) => {
                 let message: Value = serde_json::from_str(&message).unwrap_or(Value::Null);
                 let action = message["type"].as_str().unwrap_or_default();
-                if matches!(action, "init" | "save" | "clear_learning") {
+                if matches!(action, "init" | "save" | "clear_learning" | "show_hidden") {
                     Some(app.handle(action, &message))
                 } else {
                     rewriter.handle(action, &message)
@@ -131,6 +132,11 @@ impl Settings {
         Config::learning_path().map(|p| Learning::at(p, &self.cfg.learning).len())
     }
 
+    /// The candidates hidden with Ctrl+Delete, as `[reading, surface]`.
+    fn hidden(&self) -> Vec<(String, String)> {
+        Hidden::open().map(|mut h| h.list()).unwrap_or_default()
+    }
+
     /// The reply to one of the config's messages from the page.
     fn handle(&mut self, action: &str, message: &Value) -> Value {
         let (ok, status) = match action {
@@ -143,6 +149,16 @@ impl Settings {
                 Ok(s) => (true, Some(s)),
                 Err(s) => (false, Some(s)),
             },
+            "show_hidden" => {
+                let (reading, surface) = (
+                    message["reading"].as_str().unwrap_or_default(),
+                    message["surface"].as_str().unwrap_or_default(),
+                );
+                match Hidden::open().map(|mut h| h.show(reading, surface)) {
+                    Some(Ok(())) => (true, Some(format!("「{surface}」をまた表示します。"))),
+                    _ => (false, Some("戻せませんでした".to_string())),
+                }
+            }
             _ => (false, Some(format!("不明なメッセージです: {action}"))),
         };
         json!({
@@ -154,6 +170,7 @@ impl Settings {
             "load_error": self.load_error,
             "config": self.cfg,
             "learned": self.learned(),
+            "hidden": self.hidden(),
             "default_instructions": setsuna_rewrite::DEFAULT_INSTRUCTIONS,
         })
     }

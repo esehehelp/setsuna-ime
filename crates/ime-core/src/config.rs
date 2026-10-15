@@ -636,6 +636,11 @@ impl Config {
         config_dir().map(|d| d.join("learning.jsonl"))
     }
 
+    /// Where the candidates hidden with Ctrl+Delete are kept.
+    pub fn hidden_path() -> Option<PathBuf> {
+        config_dir().map(|d| d.join("hidden.jsonl"))
+    }
+
     /// Write this config to `path`, keeping the comments and layout of the
     /// file already there (or of the default template when there is none).
     /// Every key this config serializes is written; keys it leaves out (an
