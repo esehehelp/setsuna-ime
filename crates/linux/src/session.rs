@@ -104,8 +104,9 @@ impl View {
                 self.comments.clear();
                 self.selected = 0;
             }
-            // only the TSF frontend has rewrite mode (and its status) yet
-            Action::Status { .. } => {}
+            // only the TSF frontend has rewrite mode (and its status) yet;
+            // the suggestions are read from the bridge (`suggestions`)
+            Action::Status { .. } | Action::ShowSuggestions { .. } => {}
         }
     }
 }
@@ -144,6 +145,7 @@ impl Session {
         bridge.set_learning(Learning::open(&cfg.learning));
         bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         bridge.use_user_dictionary_file();
+        bridge.open_predictor(&cfg.frontend);
         bridge.set_candidate_paging(page_size(cfg), true);
         bridge.set_live_conversion(live_conversion(cfg));
         Self {
@@ -165,6 +167,7 @@ impl Session {
         self.bridge.set_learning(Learning::open(&cfg.learning));
         self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         self.bridge.use_user_dictionary_file();
+        self.bridge.open_predictor(&cfg.frontend);
         self.page_size = page_size(cfg);
         self.bridge.set_candidate_paging(self.page_size, true);
         self.bridge.set_live_conversion(live_conversion(cfg));

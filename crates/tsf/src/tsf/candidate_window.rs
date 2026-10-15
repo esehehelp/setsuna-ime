@@ -108,6 +108,8 @@ struct RenderData {
     notes: Vec<String>,
     /// A line about the list after its position (a rewrite in progress).
     status: String,
+    /// Predictions while typing: none highlighted, Tab picks.
+    suggest: bool,
     selected: usize,
     page_size: usize,
     font_face: Vec<u16>,
@@ -144,6 +146,7 @@ impl CandidateWindow {
                 candidates: Vec::new(),
                 notes: Vec::new(),
                 status: String::new(),
+                suggest: false,
                 selected: 0,
                 page_size: page_size.max(1),
                 font_face: face,
@@ -175,6 +178,22 @@ impl CandidateWindow {
     }
 
     pub fn show(&mut self, candidates: &[String], selected: usize) {
+        if let Some(d) = self.data() {
+            d.suggest = false;
+        }
+        self.render(candidates, selected);
+    }
+
+    /// Show predictions while typing: none highlighted, Tab picks.
+    pub fn show_suggestions(&mut self, list: &[String]) {
+        if let Some(d) = self.data() {
+            d.suggest = true;
+            d.status.clear();
+        }
+        self.render(list, 0);
+    }
+
+    fn render(&mut self, candidates: &[String], selected: usize) {
         let hwnd = self.hwnd;
         let Some(d) = self.data() else {
             return;
@@ -232,7 +251,7 @@ impl CandidateWindow {
         d.status = status.to_string();
         if visible {
             let (list, selected) = (d.candidates.clone(), d.selected);
-            self.show(&list, selected);
+            self.render(&list, selected);
         }
     }
 
@@ -368,6 +387,9 @@ pub(crate) unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
 
 /// The line above the list: the selection's position, then the status.
 fn heading(d: &RenderData) -> String {
+    if d.suggest {
+        return "予測  Tab で選択".to_string();
+    }
     let mut h = format!("[{}/{}]", d.selected + 1, d.candidates.len());
     if !d.status.is_empty() {
         h.push_str("  ");
@@ -618,7 +640,7 @@ unsafe fn render(hdc: HDC, d: &RenderData) {
         let last = (first + d.page_size).min(d.candidates.len());
         for (row, i) in (first..last).enumerate() {
             let top = l.rows_top + row as i32 * l.row_h;
-            let selected = i == d.selected;
+            let selected = !d.suggest && i == d.selected;
             if selected {
                 let inset = sc(HL_INSET, s);
                 let r = sc(HL_RADIUS * 2, s);

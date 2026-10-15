@@ -9,6 +9,7 @@ use crate::tsf::candidate_window::CandidateWindow;
 pub struct GdiCandidateUi {
     inner: CandidateWindow,
     visible: bool,
+    suggesting: bool,
 }
 
 impl GdiCandidateUi {
@@ -19,6 +20,7 @@ impl GdiCandidateUi {
                 crate::tsf::candidate_window::page_size(cfg),
             ),
             visible: false,
+            suggesting: false,
         }
     }
 }
@@ -30,12 +32,27 @@ impl CandidateUi for GdiCandidateUi {
             self.inner.move_to(anchor.x, anchor.y);
         }
         self.visible = true;
+        self.suggesting = false;
     }
 
     fn hide(&mut self) {
         self.inner.hide();
         self.inner.set_status("");
         self.visible = false;
+        self.suggesting = false;
+    }
+
+    fn show_suggestions(&mut self, list: &[String], anchor: ScreenPos) {
+        self.inner.show_suggestions(list);
+        if anchor != ScreenPos::default() {
+            self.inner.move_to(anchor.x, anchor.y);
+        }
+        self.visible = true;
+        self.suggesting = true;
+    }
+
+    fn is_suggesting(&self) -> bool {
+        self.visible && self.suggesting
     }
 
     fn is_visible(&self) -> bool {

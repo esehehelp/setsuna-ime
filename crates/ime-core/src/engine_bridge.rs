@@ -73,6 +73,12 @@ pub enum Action {
     Status {
         text: String,
     },
+    /// Predictions while typing, for a window beside the preedit with none
+    /// selected (Tab opens them as candidates). Frontends add it
+    /// (`EngineBridge::suggestions`).
+    ShowSuggestions {
+        list: Vec<String>,
+    },
 }
 
 pub struct KeyOutcome {
@@ -142,6 +148,9 @@ struct AltList {
 /// after the first `ALT_EARLY` of the mixed one).
 const ALT_MAX: usize = 5;
 const ALT_EARLY: usize = 3;
+
+/// Predictions offered while typing.
+const PREDICTIONS: usize = 3;
 
 /// Where the user dictionary comes from.
 enum UserDictSource {
@@ -225,6 +234,12 @@ pub struct EngineBridge {
     hidden: Option<crate::hidden::Hidden>,
     /// The user dictionary.
     user_dict: UserDictSource,
+    /// Prediction from the commits (`predict`).
+    predictor: Option<std::cell::RefCell<crate::predict::Predictor>>,
+    /// The last commit: what the next one is predicted after.
+    last_commit: String,
+    /// The predictions open as the candidate list (Tab while typing).
+    prediction: Option<Vec<crate::predict::Prediction>>,
     /// Reading the current candidate list (Composing / Converting) was
     /// produced for; empty for a provisional list. A choice is learned
     /// against it.
@@ -335,6 +350,9 @@ impl EngineBridge {
             learning: None,
             hidden: None,
             user_dict: UserDictSource::None,
+            predictor: None,
+            last_commit: String::new(),
+            prediction: None,
             list_reading: String::new(),
             list_starts: HashMap::new(),
             seg_requests: Vec::new(),
@@ -454,7 +472,7 @@ impl EngineBridge {
     /// The conversions of what is typed, for a suggestion window beside a
     /// kana preedit: the typing phase's candidates when they are for the
     /// whole reading. Empty otherwise (and with live conversion on).
-    pub fn suggestions(&self) -> &[String] {
+    pub fn suggestions(&self) -> Vec<String> {
         match &self.phase {
             Phase::Composing { candidates }
                 if !self.live_conversion
@@ -462,9 +480,13 @@ impl EngineBridge {
                     && self.composing.cursor_at_end()
                     && self.list_reading == self.composing.live_reading() =>
             {
-                candidates
+                candidates.clone()
             }
-            _ => &[],
+            // with live conversion, the predictions (Tab opens them)
+            Phase::Composing { .. } if self.live_conversion => {
+                self.predictions().into_iter().map(|p| p.surface).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1364,6 +1386,7 @@ impl EngineBridge {
                 // otherwise than what was typed so far (`ok`: OK, not お
                 // and k)
                 let done_otherwise = self.composing.reads_otherwise_when_done();
+                let reading = self.composing.full_reading();
                 let cand_top = candidates
                     .first()
                     .filter(|_| {
@@ -1394,6 +1417,7 @@ impl EngineBridge {
                         actions: vec![Action::EndComposition],
                     };
                 }
+                self.record_commit(&reading, &text);
                 self.append_context(&text);
                 KeyOutcome {
                     consumed: true,
@@ -2220,6 +2244,11 @@ impl EngineBridge {
             Phase::Converting { .. } if self.form_shown().is_none() => {
                 self.move_selection(if back { -1 } else { 1 })
             }
+            // typing with predictions: Tab opens them (as Mozc's)
+            Phase::Composing { .. } => match self.open_predictions(0) {
+                Some(out) => out,
+                None => self.handle_space(),
+            },
             _ => self.handle_space(),
         }
     }
@@ -2337,8 +2366,11 @@ impl EngineBridge {
     /// Leave Converting for typing, keeping the reading's candidates (Enter
     /// then commits the conversion the preedit shows).
     fn back_to_composing(&mut self) {
+        // the predictions are no conversion of what is typed
+        let predicted = self.prediction.take().is_some();
         let mut list = match self.form_shown() {
             Some(f) => f.list.clone(),
+            None if predicted => Vec::new(),
             None => self.current_list(),
         };
         // typing shows (and Enter commits) the engine's conversion; the
@@ -2433,6 +2465,13 @@ impl EngineBridge {
     /// While typing it picks from [`Self::suggestions`]: the conversion
     /// opens on that candidate.
     pub fn handle_select(&mut self, index: usize) -> KeyOutcome {
+        // a prediction picked from the suggestion window
+        if matches!(self.phase, Phase::Composing { .. }) && self.live_conversion {
+            if let Some(mut out) = self.open_predictions(index) {
+                out.actions.extend(self.handle_enter().actions);
+                return out;
+            }
+        }
         if matches!(self.phase, Phase::Composing { .. }) && index < self.suggestions().len() {
             let mut actions = self.handle_space().actions;
             actions.extend(self.handle_select(index).actions);
@@ -2724,10 +2763,84 @@ impl EngineBridge {
     }
 
     fn with_pending(&self, mut text: String) -> String {
-        if self.form_shown().is_none() {
+        // a prediction covers what is still being typed
+        if self.form_shown().is_none() && self.prediction.is_none() {
             text.push_str(self.composing.pending_romaji());
         }
         text
+    }
+
+    /// Record a commit for prediction (and as the commit before the next).
+    fn record_commit(&mut self, reading: &str, text: &str) {
+        if self.private_field {
+            return;
+        }
+        if let Some(p) = self.predictor.as_ref() {
+            if let Err(e) = p.borrow_mut().record(reading, text, &self.last_commit) {
+                tracing::warn!("prediction record failed: {e}");
+            }
+        }
+        self.last_commit = text.to_string();
+    }
+
+    /// Predictions for what is typed: commits whose reading starts with it
+    /// (`predict`), up to `PREDICTIONS`.
+    pub fn predictions(&self) -> Vec<crate::predict::Prediction> {
+        let Some(p) = self.predictor.as_ref() else {
+            return Vec::new();
+        };
+        if !matches!(self.phase, Phase::Composing { .. })
+            || !self.composing.cursor_at_end()
+            || self.private_field
+        {
+            return Vec::new();
+        }
+        p.borrow_mut().complete(
+            &self.composing.live_reading(),
+            &self.last_commit,
+            PREDICTIONS,
+        )
+    }
+
+    /// Predict from the commits of the config directory when `[frontend]
+    /// prediction` is on.
+    pub fn open_predictor(&mut self, frontend: &crate::config::FrontendCfg) {
+        self.set_predictor(if frontend.prediction {
+            crate::predict::Predictor::open()
+        } else {
+            None
+        });
+    }
+
+    /// Predict from `predictor` (`None`: no prediction).
+    pub fn set_predictor(&mut self, predictor: Option<crate::predict::Predictor>) {
+        self.predictor = predictor.map(std::cell::RefCell::new);
+    }
+
+    /// Open the predictions as the candidate list, `selected` chosen: Tab
+    /// (or a pick from the suggestion window) while typing.
+    fn open_predictions(&mut self, selected: usize) -> Option<KeyOutcome> {
+        let preds = self.predictions();
+        if preds.is_empty() {
+            return None;
+        }
+        let list: Vec<String> = preds.iter().map(|p| p.surface.clone()).collect();
+        let selected = selected.min(list.len() - 1);
+        self.stop_rerank();
+        self.stop_rewrite();
+        self.prediction = Some(preds);
+        self.list_reading.clear();
+        self.phase = Phase::Converting {
+            candidates: list.clone(),
+            selected,
+            seg: None,
+        };
+        Some(consumed(vec![
+            Action::UpdatePreedit {
+                text: list[selected].clone(),
+            },
+            Action::ShowCandidates { list, selected },
+        ]))
     }
 
     fn commit_converting(&mut self) -> Vec<Action> {
@@ -2759,18 +2872,34 @@ impl EngineBridge {
                 (text, learn)
             }
         };
-        let learn = learn.filter(|_| !self.private_field);
+        // a prediction: no choice to learn, but its use to record
+        let prediction = self.prediction.take().map(|p| {
+            let reading = p
+                .iter()
+                .find(|x| x.surface == text)
+                .map(|x| x.reading.clone())
+                .unwrap_or_default();
+            (reading, text.clone())
+        });
+        let learn = learn.filter(|_| !self.private_field && prediction.is_none());
         if let (Some((reading, rejected)), Some(learning)) = (learn, self.learning.as_mut()) {
             if let Err(e) = learning.record(&reading, &text, &rejected) {
                 tracing::warn!("learning record failed: {e}");
             }
         }
-        let tail = if self.form_shown().is_none() {
+        let reading = match &prediction {
+            Some((r, _)) => r.clone(),
+            None if !self.list_reading.is_empty() && seg.is_none() => self.list_reading.clone(),
+            None => self.composing.full_reading(),
+        };
+        let tail = if self.form_shown().is_none() && prediction.is_none() {
             self.composing.commit_tail()
         } else {
+            // a prediction covers what was still being typed
             self.composing.reset();
             String::new()
         };
+        self.record_commit(&reading, &text);
         let text = format!("{text}{tail}");
         self.invalidate_engine_results();
         self.seg_requests.clear();
@@ -3350,6 +3479,35 @@ mod tests {
         let mut bridge = EngineBridge::new(Some(Box::new(mock.clone())));
         bridge.emoji_enabled = false;
         (bridge, mock)
+    }
+
+    #[test]
+    fn commits_are_predicted_and_tab_opens_them() {
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-predict-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        bridge.set_predictor(Some(crate::predict::Predictor::at(path.clone())));
+        type_str(&mut bridge, "kasanoshita");
+        mock.set_result("かさのした", &["傘の下"]);
+        bridge.apply_async_result();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘の下"]);
+        // its start typed: predicted, in the suggestion window too
+        type_str(&mut bridge, "kasanos");
+        assert_eq!(bridge.suggestions(), ["傘の下"]);
+        let out = bridge.handle_tab(false);
+        assert_eq!(preedit(&out.actions).as_deref(), Some("傘の下"));
+        // the s still being typed is no part of it
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘の下"]);
+        // Escape from them goes back to typing
+        type_str(&mut bridge, "kasano");
+        bridge.handle_tab(false);
+        bridge.handle_escape();
+        assert!(!bridge.is_converting() && bridge.is_active());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
