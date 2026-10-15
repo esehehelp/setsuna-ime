@@ -73,6 +73,9 @@ void setsuna_session_reset(SetsunaSession *s);
 
 const SetsunaView *setsuna_session_view(const SetsunaSession *s);
 size_t setsuna_session_page_size(const SetsunaSession *s);
+/* Whether the field typed into is private (a password): no context, no
+ * rewrite, nothing learned. */
+void setsuna_session_set_private(SetsunaSession *s, bool private_field);
 /* Turn the IME on or off, committing what is composed. */
 void setsuna_session_toggle(SetsunaSession *s);
 /* Whether the IME is on; off, every key goes to the app. */

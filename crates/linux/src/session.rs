@@ -132,6 +132,12 @@ fn live_conversion(cfg: &Config) -> bool {
 }
 
 impl Session {
+    /// The field typed into is private (a password): no context, no
+    /// rewrite, nothing learned (`EngineBridge::set_private_field`).
+    pub fn set_private_field(&mut self, private: bool) {
+        self.bridge.set_private_field(private);
+    }
+
     /// A session converting through `client` (`None`: raw hiragana only).
     pub fn new(cfg: &Config, client: Option<Box<dyn EngineClient>>) -> Self {
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);

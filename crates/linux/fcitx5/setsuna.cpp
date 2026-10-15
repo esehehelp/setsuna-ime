@@ -174,6 +174,9 @@ public:
         // Shift+letter is the temporary alphabet mode.
         const Key &key = event.rawKey();
         bool enabled = setsuna_session_enabled(session_);
+        const auto caps = ic->capabilityFlags();
+        setsuna_session_set_private(
+            session_, caps.test(CapabilityFlag::Password) || caps.test(CapabilityFlag::Sensitive));
         if (setsuna_session_key(session_, key.sym(), key.code(), mods(key.states()))) {
             event.filterAndAccept();
             render(ic);

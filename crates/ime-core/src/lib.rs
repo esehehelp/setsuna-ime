@@ -19,6 +19,7 @@ pub mod kana_candidates;
 pub mod learning;
 pub mod mixed;
 pub mod postprocess;
+pub mod privacy;
 mod reading_align;
 pub mod rerank_client;
 pub mod rewrite_client;

@@ -190,6 +190,12 @@ Enter で確定、↓ でいつもの変換候補を選べる。変換のたび�
 - **API キー / 互換 API** — OpenAI の API キー、または OpenAI 互換 API（ローカルの
   LLM サーバーなど）のベース URL と、必要ならその API キー。互換 API は
   Chat Completions と Responses のどちらでも話せる。
+- **送らないもの** — カーソルの前の文章に URL、メールアドレス、パス、API キーや
+  トークン、長い数字（カード番号や電話番号）、「パスワード」「暗証番号」のような
+  語があれば、文章は送らない。読みや変換結果がそういうものなら書き直さない。
+  パスワード欄など入力欄が非公開のとき（Windows の InputScope、fcitx5 の
+  Password / Sensitive）は、文章も読まず、書き直さず、学習もしない。変換モデルは
+  文章のうち最後に見つかった箇所より後ろだけを読む。
 - **資格情報** — サインインのトークンと API キーは設定と同じディレクトリの
   `credentials.bin` に、Windows の DPAPI でこのユーザーだけが読める形で保存する
   （Linux / macOS では権限 0600 の `credentials.json`）。`config.toml` には入らない。
