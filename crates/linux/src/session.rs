@@ -178,6 +178,21 @@ impl Session {
         };
     }
 
+    /// How long (ms) until a deferred preedit is shown anyway (0: none).
+    pub fn deferred_ms(&self) -> u32 {
+        self.bridge
+            .deferred_for()
+            .map_or(0, |d| d.as_millis().min(10_000) as u32 + 1)
+    }
+
+    /// The deferred preedit's deadline passed; true when the view changed.
+    pub fn tick(&mut self) -> bool {
+        let actions = self.bridge.tick();
+        let changed = !actions.is_empty();
+        self.apply(actions);
+        changed
+    }
+
     /// Turn the IME on or off without committing (a new input context).
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;

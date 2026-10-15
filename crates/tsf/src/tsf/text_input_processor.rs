@@ -206,6 +206,16 @@ unsafe extern "system" fn notify_wnd_proc(
         }
         return LRESULT(0);
     }
+    if msg == WM_TIMER && wparam.0 == TIMER_DEFERRED {
+        let _ = KillTimer(hwnd, TIMER_DEFERRED);
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SetsunaTextService_Impl;
+        if !ptr.is_null() {
+            // Safety: as for WM_APP_CONVERT_DONE above.
+            let svc = unsafe { &*ptr };
+            on_deferred_deadline(svc);
+        }
+        return LRESULT(0);
+    }
     if msg == WM_APP_TOGGLE {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SetsunaTextService_Impl;
         if !ptr.is_null() {
@@ -225,6 +235,45 @@ unsafe extern "system" fn notify_wnd_proc(
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// The timer of a deferred preedit (`[rerank] defer_ms`).
+const TIMER_DEFERRED: usize = 0x5E7;
+
+/// Set the deferred preedit's timer when one waits.
+fn arm_deferred(svc: &SetsunaTextService_Impl) {
+    let (wait, hwnd) = {
+        let Ok(inner) = svc.inner.try_borrow() else {
+            return;
+        };
+        (inner.engine.deferred_for(), inner.notify_hwnd)
+    };
+    if let Some(wait) = wait {
+        if hwnd.0 as usize != 0 {
+            let ms = wait.as_millis().min(10_000) as u32 + 1;
+            unsafe {
+                SetTimer(hwnd, TIMER_DEFERRED, ms, None);
+            }
+        }
+    }
+}
+
+/// The deferred preedit's deadline: the engine's top without the reranked one.
+fn on_deferred_deadline(svc: &SetsunaTextService_Impl) {
+    let actions = {
+        let Ok(mut inner) = svc.inner.try_borrow_mut() else {
+            return;
+        };
+        inner.engine.tick()
+    };
+    if actions.is_empty() {
+        return;
+    }
+    if let Some(context) = focused_context(svc) {
+        if let Err(e) = crate::tsf::key_event_sink::apply_actions(svc, &context, actions) {
+            setsuna_core::diagnostics::log(format!("deferred apply failed: {e:?}"));
+        }
+    }
 }
 
 /// A candidate was clicked: pick it and commit, as its digit key would.
@@ -302,6 +351,7 @@ fn on_async_done(svc: &SetsunaTextService_Impl) {
         Ok(()) => setsuna_core::diagnostics::log("on_async_done applied"),
         Err(e) => setsuna_core::diagnostics::log(format!("on_async_done apply failed: {e:?}")),
     }
+    arm_deferred(svc);
 }
 
 fn resolve_display_atoms() -> (u32, u32) {
