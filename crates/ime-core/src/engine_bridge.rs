@@ -209,6 +209,8 @@ pub struct EngineBridge {
     /// `None`: `[frontend] symbol_dictionary = false`.
     symbol_dict: Option<std::sync::Arc<crate::symbol_dict::SymbolDict>>,
     date_time_enabled: bool,
+    /// Number candidates (`numbers`).
+    numbers_enabled: bool,
     /// Clock snapshot shared by local candidates and delayed model results.
     date_time_now: Option<DateTime<Local>>,
     /// With mixed input (`[frontend] mixed_model`): the ASCII char each
@@ -324,6 +326,7 @@ impl EngineBridge {
                 .symbol_dictionary
                 .then(|| crate::symbol_dict::shared(frontend.symbol_dictionary_file.as_deref())),
             date_time_enabled: frontend.date_time_candidates,
+            numbers_enabled: frontend.number_candidates,
             date_time_now: None,
             mixed_symbols: HashMap::new(),
             learning: None,
@@ -2072,6 +2075,10 @@ impl EngineBridge {
             self.date_time_now.get_or_insert_with(Local::now);
             arranged =
                 crate::date_time::insert(reading, arranged, self.date_time_candidates(reading));
+        }
+        if self.numbers_enabled {
+            arranged =
+                crate::numbers::insert(reading, arranged, crate::numbers::candidates(reading));
         }
         let mut list = self.char_rules.apply(arranged);
         if let Some(dict) = self.user_dict() {
