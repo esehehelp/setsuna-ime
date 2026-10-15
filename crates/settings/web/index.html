@@ -314,6 +314,13 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control" id="clear_controls"></div>
   </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">表示しない候補</div>
+      <div class="desc">変換中に Ctrl+Delete で消した候補です（学習で上がっていた候補は、学習の取り消しになります）</div>
+      <div id="hidden_list"></div>
+    </div>
+  </div>
 </div>
 
 <h2>書き直し</h2>
@@ -431,6 +438,7 @@ let cfg = null;        // the config being edited
 let saved = "";        // JSON of the config as last loaded / saved
 let canSave = false;   // false while the file could not be read
 let learned = null;
+let hidden = [];
 let confirmClear = false;
 
 const $ = (id) => document.getElementById(id);
@@ -511,6 +519,21 @@ function renderReplacements() {
     return el("div", { className: "rep" },
       toggle(r.enabled, (v) => { r.enabled = v; changed(); }),
       from, el("span", { className: "arrow", textContent: "→" }), to, del);
+  }));
+}
+
+function renderHidden() {
+  const box = $("hidden_list");
+  if (!hidden.length) {
+    box.replaceChildren(el("div", { className: "desc", textContent: "ありません" }));
+    return;
+  }
+  box.replaceChildren(...hidden.map(([reading, surface]) => {
+    const back = el("button", { textContent: "戻す" });
+    back.addEventListener("click", () => send({ type: "show_hidden", reading, surface }));
+    return el("div", { className: "rep" },
+      el("span", { textContent: reading }), el("span", { className: "arrow", textContent: "→" }),
+      el("span", { textContent: surface }), back);
   }));
 }
 
@@ -741,6 +764,8 @@ window.setsuna = {
     if (msg.type !== "state") return;
     learned = msg.learned;
     renderLearned();
+    hidden = msg.hidden ?? [];
+    renderHidden();
     // Keep unsaved edits unless the file is (re)loaded or they were saved.
     if (msg.action === "init" || (msg.action === "save" && msg.ok)) {
       cfg = msg.config;

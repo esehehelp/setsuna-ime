@@ -50,6 +50,14 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
             return Ok(BOOL::from(outcome.consumed));
         }
 
+        if self.ctrl_forget(vk) {
+            let outcome = self.inner.borrow_mut().engine.handle_forget_candidate();
+            if let Some(context) = pic {
+                apply_actions(self, context, outcome.actions)?;
+            }
+            return Ok(BOOL::from(outcome.consumed));
+        }
+
         if ctrl_down() || alt_down() || win_down() {
             return Ok(FALSE);
         }
@@ -107,6 +115,7 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
                 KeyKind::Exclaim => inner.engine.handle_punctuation("！"),
                 KeyKind::Question => inner.engine.handle_punctuation("？"),
                 KeyKind::Punctuation(s) => inner.engine.handle_punctuation(&s),
+                KeyKind::ForgetCandidate => inner.engine.handle_forget_candidate(),
             }
         };
 
@@ -192,7 +201,7 @@ impl SetsunaTextService_Impl {
         if is_toggle_key(vk, alt_down()) {
             return true;
         }
-        if self.ctrl_conversion(vk).is_some() {
+        if self.ctrl_conversion(vk).is_some() || self.ctrl_forget(vk) {
             return true;
         }
         // Ctrl/Alt/Win never consumed — preserves Ctrl+C, Alt+Tab, Win shortcuts.
@@ -212,6 +221,16 @@ impl SetsunaTextService_Impl {
             return false;
         };
         inner.engine.would_consume(&kind)
+    }
+
+    /// Ctrl+Delete while converting: forget or hide the candidate selected
+    /// (otherwise the key is the app's).
+    fn ctrl_forget(&self, vk: u32) -> bool {
+        vk == 0x2E // VK_DELETE
+            && ctrl_down()
+            && !alt_down()
+            && !win_down()
+            && self.inner.borrow().engine.is_converting()
     }
 
     /// The F6–F10 form of Ctrl+U / I / O / P / T, while something is composed

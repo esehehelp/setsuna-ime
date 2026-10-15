@@ -107,6 +107,8 @@ pub enum KeyKind {
     /// Shift+Space: Space, but a full-width space when nothing is composed
     /// (the other width than `full_width_space` gives).
     ShiftSpace,
+    /// Ctrl+Delete while converting: forget or hide the candidate selected.
+    ForgetCandidate,
     /// F6–F10 (Ctrl+U / I / O / P / T): the composition as hiragana,
     /// katakana, half-width katakana, full / half-width alphanumerics.
     ConvertTo(Form),
@@ -205,6 +207,8 @@ pub struct EngineBridge {
     mixed_symbols: HashMap<String, char>,
     /// Learned candidate choices; `None` when learning is off.
     learning: Option<Learning>,
+    /// Candidates hidden with Ctrl+Delete.
+    hidden: Option<crate::hidden::Hidden>,
     /// Reading the current candidate list (Composing / Converting) was
     /// produced for; empty for a provisional list. A choice is learned
     /// against it.
@@ -311,6 +315,7 @@ impl EngineBridge {
             date_time_now: None,
             mixed_symbols: HashMap::new(),
             learning: None,
+            hidden: None,
             list_reading: String::new(),
             list_starts: HashMap::new(),
             seg_requests: Vec::new(),
@@ -495,6 +500,90 @@ impl EngineBridge {
         self.learning = learning;
     }
 
+    /// Leave the candidates hidden with Ctrl+Delete out of the lists.
+    pub fn set_hidden(&mut self, hidden: Option<crate::hidden::Hidden>) {
+        self.hidden = hidden;
+    }
+
+    /// Ctrl+Delete on the candidate selected (Mozc's
+    /// DeleteSelectedCandidate): what was learned to put it up is forgotten;
+    /// when nothing was, it is hidden for this reading from now on
+    /// (`hidden.jsonl`). Either way it leaves the list open. The kana of the
+    /// reading and a list's last candidate stay.
+    pub fn handle_forget_candidate(&mut self) -> KeyOutcome {
+        let Some(reading) = self.shown_reading() else {
+            return not_consumed();
+        };
+        if self.form_shown().is_some() {
+            return consumed(Vec::new());
+        }
+        let (cand, count) = match &self.phase {
+            Phase::Converting { seg: Some(s), .. } => {
+                let f = &s.segs[s.focus];
+                (f.cands.get(f.selected).cloned(), f.cands.len())
+            }
+            Phase::Converting {
+                candidates,
+                selected,
+                ..
+            } => (candidates.get(*selected).cloned(), candidates.len()),
+            _ => return not_consumed(),
+        };
+        let Some(cand) = cand else {
+            return consumed(Vec::new());
+        };
+        let forgot = self
+            .learning
+            .as_mut()
+            .is_some_and(|l| l.forget(&reading, &cand).unwrap_or(false));
+        let message = if forgot {
+            "学習を取り消しました"
+        } else if count <= 1
+            || cand == reading
+            || cand == crate::kana_candidates::to_katakana(&reading)
+        {
+            return consumed(vec![Action::Status {
+                text: "この候補は消せません".to_string(),
+            }]);
+        } else {
+            match self.hidden.as_mut().map(|h| h.hide(&reading, &cand)) {
+                Some(Ok(())) => "この候補を表示しないようにしました",
+                _ => return consumed(Vec::new()),
+            }
+        };
+        // out of the list open
+        let mut actions = match &mut self.phase {
+            Phase::Converting { seg: Some(s), .. } => {
+                let f = &mut s.segs[s.focus];
+                f.cands.retain(|c| c != &cand);
+                f.selected = f.selected.min(f.cands.len().saturating_sub(1));
+                self.segment_actions()
+            }
+            Phase::Converting {
+                candidates,
+                selected,
+                ..
+            } => {
+                candidates.retain(|c| c != &cand);
+                *selected = (*selected).min(candidates.len().saturating_sub(1));
+                let (list, sel) = (candidates.clone(), *selected);
+                let text = self.with_pending(list[sel].clone());
+                vec![
+                    Action::UpdatePreedit { text },
+                    Action::ShowCandidates {
+                        list,
+                        selected: sel,
+                    },
+                ]
+            }
+            _ => Vec::new(),
+        };
+        actions.push(Action::Status {
+            text: message.to_string(),
+        });
+        consumed(actions)
+    }
+
     pub fn is_active(&self) -> bool {
         !matches!(self.phase, Phase::Empty)
     }
@@ -647,6 +736,7 @@ impl EngineBridge {
             | KeyKind::Down
             | KeyKind::PageUp
             | KeyKind::PageDown => self.is_active(),
+            KeyKind::ForgetCandidate => self.is_converting(),
         }
     }
 
@@ -1976,6 +2066,9 @@ impl EngineBridge {
                 list = learning.rerank(reading, list);
             }
         }
+        if let Some(hidden) = self.hidden.as_mut() {
+            list = hidden.filter(reading, list);
+        }
         list
     }
 
@@ -3089,6 +3182,57 @@ mod tests {
         let actions = bridge.set_rewrite_mode(true);
         assert_eq!(status(&actions), Some("書き直し中…"));
         assert_eq!(rewriter.requests(), 1);
+    }
+
+    #[test]
+    fn ctrl_delete_forgets_a_learned_candidate_or_hides_it() {
+        let dir =
+            std::env::temp_dir().join(format!("setsuna-bridge-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut bridge, mock) = bridge_with_mock();
+        let cfg = crate::config::LearningCfg::default();
+        bridge.set_learning(Some(Learning::at(dir.join("learning.jsonl"), &cfg)));
+        bridge.set_hidden(Some(crate::hidden::Hidden::at(dir.join("hidden.jsonl"))));
+        let convert = |bridge: &mut EngineBridge| {
+            type_str(bridge, "kasano");
+            mock.set_result("かさの", &["傘の", "笠の", "嵩の"]);
+            bridge.apply_async_result();
+            bridge.handle_space()
+        };
+        // nothing learned for 笠の: hidden from now on
+        convert(&mut bridge);
+        bridge.handle_down();
+        let out = bridge.handle_forget_candidate();
+        assert_eq!(
+            status(&out.actions),
+            Some("この候補を表示しないようにしました")
+        );
+        assert!(!shown(&out.actions).unwrap().0.contains(&"笠の".to_string()));
+        bridge.handle_escape();
+        bridge.handle_escape();
+        let (list, _) = shown(&convert(&mut bridge).actions).unwrap();
+        assert!(!list.contains(&"笠の".to_string()));
+        // 嵩の chosen, so learned first; Ctrl+Delete forgets that
+        for _ in 0..list.iter().position(|c| c == "嵩の").unwrap() {
+            bridge.handle_down();
+        }
+        bridge.handle_enter();
+        let (list, _) = shown(&convert(&mut bridge).actions).unwrap();
+        assert_eq!(list[0], "嵩の");
+        let out = bridge.handle_forget_candidate();
+        assert_eq!(status(&out.actions), Some("学習を取り消しました"));
+        bridge.handle_escape();
+        bridge.handle_escape();
+        let (list, _) = shown(&convert(&mut bridge).actions).unwrap();
+        assert_eq!(list[0], "傘の");
+        // the kana stay
+        let i = list.iter().position(|c| c == "かさの").unwrap();
+        for _ in 0..i {
+            bridge.handle_down();
+        }
+        let out = bridge.handle_forget_candidate();
+        assert_eq!(status(&out.actions), Some("この候補は消せません"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

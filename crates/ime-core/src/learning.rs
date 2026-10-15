@@ -89,12 +89,18 @@ fn cosine(a: &Vector, b: &Vector) -> f32 {
     dot
 }
 
-/// One line of `learning.jsonl`.
+/// One line of `learning.jsonl`: a choice, or (`forget`) that the choices
+/// of `chosen` for `reading`, and the word choices inside it, are
+/// forgotten (Ctrl+Delete on the candidate, as Mozc deletes it from its
+/// history).
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
     reading: String,
     chosen: String,
+    #[serde(default)]
     rejected: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    forget: bool,
 }
 
 struct Entry {
@@ -111,6 +117,12 @@ struct WordEntry {
     /// As `Entry::count`.
     count: u32,
     word: words::Word,
+}
+
+/// A learned choice, by index.
+enum Learned {
+    Sentence(usize),
+    Word(usize),
 }
 
 pub struct Learning {
@@ -217,6 +229,15 @@ impl Learning {
     }
 
     fn apply(&mut self, r: Record) {
+        if r.forget {
+            for i in self.learned(&r.reading, &r.chosen) {
+                match i {
+                    Learned::Sentence(i) => self.entries[i].count = 0,
+                    Learned::Word(i) => self.words[i].count = 0,
+                }
+            }
+            return;
+        }
         if r.reading.is_empty() || r.chosen.is_empty() || r.chosen == r.rejected {
             return;
         }
@@ -272,20 +293,64 @@ impl Learning {
         self.by_key.insert(key, id);
     }
 
+    /// The choices in effect that put `surface` up for `reading`: the
+    /// sentence choices of it, and the word choices of a word inside it.
+    fn learned(&self, reading: &str, surface: &str) -> Vec<Learned> {
+        let mut out: Vec<Learned> = self
+            .by_key
+            .iter()
+            .filter(|((r, c, _), &i)| r == reading && c == surface && self.entries[i].count > 0)
+            .map(|(_, &i)| Learned::Sentence(i))
+            .collect();
+        out.extend(
+            self.words
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| {
+                    w.count > 0
+                        && surface.contains(&w.word.chosen)
+                        && reading.contains(&w.word.span)
+                })
+                .map(|(i, _)| Learned::Word(i)),
+        );
+        out
+    }
+
+    /// Forget what was learned to put `surface` up for `reading`; false
+    /// when nothing was.
+    pub fn forget(&mut self, reading: &str, surface: &str) -> std::io::Result<bool> {
+        self.sync();
+        if reading.is_empty() || surface.is_empty() || self.learned(reading, surface).is_empty() {
+            return Ok(false);
+        }
+        self.append(&Record {
+            reading: reading.to_string(),
+            chosen: surface.to_string(),
+            rejected: String::new(),
+            forget: true,
+        })?;
+        Ok(true)
+    }
+
     /// Record that the user committed `chosen` for `reading` while `rejected`
     /// was shown first.
     pub fn record(&mut self, reading: &str, chosen: &str, rejected: &str) -> std::io::Result<()> {
         if reading.is_empty() || chosen.is_empty() || chosen == rejected {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut line = serde_json::to_vec(&Record {
+        self.append(&Record {
             reading: reading.to_string(),
             chosen: chosen.to_string(),
             rejected: rejected.to_string(),
-        })?;
+            forget: false,
+        })
+    }
+
+    fn append(&mut self, record: &Record) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         // One append-mode write per line keeps lines from different
         // processes whole.
@@ -502,6 +567,22 @@ mod tests {
             .unwrap();
         let cands = list(&["記者に連絡します", "貴社に連絡します"]);
         assert_eq!(l.rerank("きしゃにれんらくします", cands.clone()), cands);
+    }
+
+    #[test]
+    fn forgetting_a_candidate_drops_its_choices_everywhere() {
+        let t = TempFile::new("forget");
+        let mut a = Learning::at(t.0.clone(), &cfg());
+        let mut b = Learning::at(t.0.clone(), &cfg());
+        a.record("かみ", "紙", "神").unwrap();
+        assert_eq!(a.rerank("かみ", list(&["神", "紙"]))[0], "紙");
+        // nothing learned for 神: nothing to forget
+        assert!(!a.forget("かみ", "神").unwrap());
+        assert!(a.forget("かみ", "紙").unwrap());
+        assert_eq!(a.rerank("かみ", list(&["神", "紙"]))[0], "神");
+        assert_eq!(a.len(), 0);
+        // another process sees it
+        assert_eq!(b.rerank("かみ", list(&["神", "紙"]))[0], "神");
     }
 
     #[test]

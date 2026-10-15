@@ -142,6 +142,7 @@ impl Session {
     pub fn new(cfg: &Config, client: Option<Box<dyn EngineClient>>) -> Self {
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
         bridge.set_learning(Learning::open(&cfg.learning));
+        bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         bridge.set_candidate_paging(page_size(cfg), true);
         bridge.set_live_conversion(live_conversion(cfg));
         Self {
@@ -161,6 +162,7 @@ impl Session {
     pub fn configure(&mut self, cfg: &Config) {
         self.bridge.reset_preserving_client(&cfg.frontend);
         self.bridge.set_learning(Learning::open(&cfg.learning));
+        self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         self.page_size = page_size(cfg);
         self.bridge.set_candidate_paging(self.page_size, true);
         self.bridge.set_live_conversion(live_conversion(cfg));
@@ -245,6 +247,7 @@ impl Session {
             KeyKind::Exclaim => b.handle_punctuation("！"),
             KeyKind::Question => b.handle_punctuation("？"),
             KeyKind::Punctuation(s) => b.handle_punctuation(&s),
+            KeyKind::ForgetCandidate => b.handle_forget_candidate(),
         }
     }
 
