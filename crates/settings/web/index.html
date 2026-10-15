@@ -192,6 +192,24 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="path" id="path"></div>
 <div class="banner" id="error" hidden></div>
 
+<h2>入力方式</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">ローマ字表</div>
+      <div class="desc">AZIK は木村清氏の拡張ローマ字入力、かな入力は JIS 配列です。Mozc 形式（入力・出力・保留のタブ区切り）の表のファイルも使えます</div>
+    </div>
+    <div class="control"><div class="segmented" id="romaji_table"></div></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">表のファイル</div>
+      <div class="desc">ファイルの表を使うときのパス</div>
+    </div>
+    <div class="control"><input type="text" id="romaji_path" placeholder="C:/path/to/romaji.tsv"></div>
+  </div>
+</div>
+
 <h2>記号・句読点</h2>
 <div class="card">
   <div class="row">
@@ -475,6 +493,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 
 const WIDTHS = [["as_typed", "入力どおり"], ["full", "全角"], ["half", "半角"], ["auto", "自動"]];
 const NAME_CASES = [["off", "オフ"], ["proper", "固有名詞"], ["acronyms", "固有名詞と略語"]];
+const ROMAJI_TABLES = [["standard", "標準"], ["azik", "AZIK"], ["kana_jis", "かな入力"], ["file", "ファイル"]];
 const PUNCTUATION = [
   ["as_is", "変換結果のまま"], ["toten_kuten", "、。"], ["comma_period", "，．"],
   ["comma_kuten", "，。"], ["toten_period", "、．"],
@@ -530,6 +549,34 @@ function segmented(id, choices) {
   }));
 }
 
+// The romaji table: a preset, or a file whose path is typed below.
+function renderRomaji() {
+  const presets = ROMAJI_TABLES.map(([v]) => v).filter((v) => v !== "file");
+  const current = cfg.frontend.romaji_table || "standard";
+  const mode = presets.includes(current) ? current : "file";
+  const path = $("romaji_path");
+  if (mode === "file") path.value = current;
+  path.disabled = mode !== "file";
+  const seg = $("romaji_table");
+  seg.replaceChildren(...ROMAJI_TABLES.map(([value, label]) => {
+    const b = el("button", { textContent: label });
+    b.setAttribute("aria-pressed", value === mode);
+    b.addEventListener("click", () => {
+      cfg.frontend.romaji_table = value === "file" ? path.value.trim() : value;
+      if (value === "file") path.disabled = false;
+      for (const o of seg.children) o.setAttribute("aria-pressed", o === b);
+      path.disabled = value !== "file";
+      changed();
+    });
+    return b;
+  }));
+}
+
+$("romaji_path").addEventListener("input", () => {
+  cfg.frontend.romaji_table = $("romaji_path").value.trim();
+  changed();
+});
+
 function render() {
   for (const slot of document.querySelectorAll("[data-switch]")) {
     const path = slot.dataset.switch;
@@ -538,6 +585,7 @@ function render() {
 
   segmented("symbol_width", WIDTHS);
   segmented("name_case", NAME_CASES);
+  renderRomaji();
 
   const sel = $("punctuation");
   sel.replaceChildren(...PUNCTUATION.map(([value, label]) =>

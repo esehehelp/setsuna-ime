@@ -71,10 +71,16 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
         };
 
         let shift = shift_down();
-        let Some(kind) = classify_vk(vk, shift, crate::keymap::layout_char(vk, shift), &symbols)
+        let Some(mut kind) =
+            classify_vk(vk, shift, crate::keymap::layout_char(vk, shift), &symbols)
         else {
             return Ok(FALSE);
         };
+        // kana input on the JIS layout: Shift+0 types no char, but is を
+        if vk == 0x30 && shift && setsuna_core::romaji_table::active().is_some_and(|t| t.kana_keys)
+        {
+            kind = KeyKind::Char('を');
+        }
 
         if let Some(context) = pic {
             self.read_app_context(context, &kind);

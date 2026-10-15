@@ -382,13 +382,17 @@ impl ComposingText {
     }
 
     pub fn input_char(&mut self, c: char) {
-        // Mixed input keeps the case: Shift marks English.
-        let c = if self.mixed.is_some() {
+        // Mixed input keeps the case: Shift marks English; so does a table
+        // with capitals (kana input: Shift+E is ぃ).
+        let table = crate::romaji_table::active();
+        let c = if self.mixed.is_some() || table.as_ref().is_some_and(|t| t.case_sensitive()) {
             c
         } else {
             c.to_ascii_lowercase()
         };
-        if !c.is_ascii() {
+        // a kana typed by a key of its own (kana input's Shift+0: を)
+        let kana = table.is_some() && ('ぁ'..='ゖ').contains(&c);
+        if !c.is_ascii() && !kana {
             return;
         }
         self.insert_raw_at_cursor(c);
@@ -633,6 +637,9 @@ fn convert_raw(raw: &str, flush_final_n: bool) -> Converted {
 /// first kana of each table entry it starts, ん for `n`, っ for a lone
 /// consonant (doubled next).
 pub(crate) fn pending_kana(pending: &str) -> Vec<char> {
+    if let Some(table) = crate::romaji_table::active() {
+        return table.pending_kana(pending);
+    }
     let pending = pending.to_ascii_lowercase();
     let mut out: Vec<char> = ROMAJI_TABLE
         .iter()
@@ -673,6 +680,10 @@ pub(crate) enum UnitKind {
 /// `chars` read as romaji, left to right (letters in either case). A final
 /// `n` is ん when `flush_final_n`, else pending.
 pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUnit> {
+    // another table (`[frontend] romaji_table`)
+    if let Some(table) = crate::romaji_table::active() {
+        return table.units(chars, flush_final_n);
+    }
     let chars: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
     let mut units = Vec::new();
     let mut push = |start: usize, len: usize, kind: UnitKind| {
