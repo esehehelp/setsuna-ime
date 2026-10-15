@@ -19,6 +19,7 @@ pub mod hidden;
 pub mod kana_candidates;
 pub mod learning;
 pub mod mixed;
+pub mod numbers;
 pub mod postprocess;
 pub mod privacy;
 mod reading_align;

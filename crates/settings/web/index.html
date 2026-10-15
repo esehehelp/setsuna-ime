@@ -231,7 +231,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
 </div>
 
-<h2>日付・時間</h2>
+<h2>日付・時間・数字</h2>
 <div class="card">
   <div class="row">
     <div class="text">
@@ -239,6 +239,13 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
       <div class="desc">きょう・いま・1じかんご などから作ります。端末のローカル時刻を使い、曜日は今日を含む次の曜日、週は月曜始まりです</div>
     </div>
     <div class="control" data-switch="frontend.date_time_candidates"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">数字の候補</div>
+      <div class="desc">1234 → 1,234・千二百三十四・壱阡弐百参拾四・12:34、じゅうに → 12、2025ねん → 令和7年、れいわ7ねん → 2025年、1+2= → 3、U+3042 → あ</div>
+    </div>
+    <div class="control" data-switch="frontend.number_candidates"></div>
   </div>
 </div>
 
