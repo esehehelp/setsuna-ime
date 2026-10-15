@@ -206,6 +206,9 @@ pub struct FrontendCfg {
     /// start offers the longer conversions committed for it, beside the
     /// preedit; Tab opens them.
     pub prediction: bool,
+    /// The romaji table: "standard" (built in), "azik", "kana_jis" (kana
+    /// input on the JIS layout) or the path of a table in Mozc's format.
+    pub romaji_table: String,
     /// Space with nothing composed types a full-width space (U+3000), as
     /// MS-IME and Mozc do in hiragana mode; false leaves it to the app (a
     /// half-width space). Shift+Space types the other width.
@@ -344,6 +347,7 @@ impl Default for FrontendCfg {
             number_candidates: true,
             emoji_candidates: true,
             prediction: true,
+            romaji_table: "standard".to_string(),
             full_width_space: false,
             live_conversion: None,
             preedit_cursor_at_start: true,
@@ -774,6 +778,9 @@ impl Config {
              emoji_candidates = true\n\
              # Prediction from what was committed (Tab picks).\n\
              prediction = true\n\
+             # The romaji table: \"standard\", \"azik\", \"kana_jis\" (kana input on the\n\
+             # JIS layout) or the path of a table in Mozc's format.\n\
+             romaji_table = \"standard\"\n\
              # Space with nothing composed types a full-width space (U+3000);\n\
              # Shift+Space types the other width.\n\
              full_width_space = false\n\

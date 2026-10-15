@@ -370,10 +370,15 @@ impl EngineBridge {
             private_field: false,
             rewrite: None,
         };
+        if let Err(e) = crate::romaji_table::configure(&frontend.romaji_table) {
+            crate::diagnostics::log(format!("romaji table: {e}"));
+        }
+        // kana input: letters are kana keys, none of them English
+        let kana_keys = crate::romaji_table::active().is_some_and(|t| t.kana_keys);
         let mixed = frontend
             .mixed_model
             .as_deref()
-            .filter(|dir| !dir.is_empty())
+            .filter(|dir| !dir.is_empty() && !kana_keys)
             .and_then(|dir| crate::mixed::shared(dir, frontend.name_dictionary_file.as_deref()));
         bridge.set_mixed(mixed, &frontend.symbols, crate::mixed::Casing::of(frontend));
         bridge
@@ -752,7 +757,12 @@ impl EngineBridge {
 
     pub fn would_consume(&self, kind: &KeyKind) -> bool {
         match kind {
-            KeyKind::Char(c) => c.is_ascii_alphabetic() || c.is_ascii_digit() || *c == '-',
+            KeyKind::Char(c) => {
+                c.is_ascii_alphabetic()
+                    || c.is_ascii_digit()
+                    || *c == '-'
+                    || crate::romaji_table::active().is_some_and(|t| t.uses(*c))
+            }
             KeyKind::Comma
             | KeyKind::Period
             | KeyKind::Exclaim
@@ -1051,6 +1061,10 @@ impl EngineBridge {
         if !c.is_ascii_alphabetic() {
             return not_consumed();
         }
+        // kana input: Shift+letter is a kana key (Shift+E: ぃ)
+        if crate::romaji_table::active().is_some_and(|t| t.kana_keys) {
+            return self.handle_char(c);
+        }
         // Mixed input: the letter joins the composition, its case marking
         // it English.
         if self.composing.is_mixed() {
@@ -1090,7 +1104,10 @@ impl EngineBridge {
     }
 
     pub fn handle_char(&mut self, c: char) -> KeyOutcome {
-        if !c.is_ascii_alphabetic() && !c.is_ascii_digit() && c != '-' {
+        // a key the table reads, or a kana typed by a key of its own
+        let table_key =
+            crate::romaji_table::active().is_some_and(|t| t.uses(c) || ('ぁ'..='ゖ').contains(&c));
+        if !c.is_ascii_alphabetic() && !c.is_ascii_digit() && c != '-' && !table_key {
             return not_consumed();
         }
         // In Alphabet phase, letters / digits / hyphen append verbatim
@@ -2534,6 +2551,28 @@ impl EngineBridge {
     }
 
     pub fn handle_punctuation(&mut self, kana: &str) -> KeyOutcome {
+        // a key the romaji table reads (AZIK's `;`, kana input's `,`) goes
+        // into the composition
+        if let Some(table) = crate::romaji_table::active() {
+            let ascii: Vec<char> = kana
+                .chars()
+                .map(|c| match c {
+                    '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+                    '、' => ',',
+                    '。' => '.',
+                    '・' => '/',
+                    '「' => '[',
+                    '」' => ']',
+                    '￥' => '¥',
+                    c => c,
+                })
+                .collect();
+            if let [c] = ascii[..] {
+                if table.uses(c) && !matches!(self.phase, Phase::Alphabet { .. }) {
+                    return self.handle_char(c);
+                }
+            }
+        }
         // The period key right after a digit types `.` (3.5, and 3. before
         // the 5): a 。 there is next to never meant. Mixed input shows it so
         // itself (`mixed::render_parts`).

@@ -27,6 +27,7 @@ pub mod privacy;
 mod reading_align;
 pub mod rerank_client;
 pub mod rewrite_client;
+pub mod romaji_table;
 mod segmented;
 pub mod segments;
 pub mod symbol_dict;
