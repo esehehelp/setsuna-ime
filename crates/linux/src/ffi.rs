@@ -279,6 +279,25 @@ pub unsafe extern "C" fn setsuna_session_set_private(s: *mut SetsunaSession, pri
     with(s, (), |sess| sess.set_private_field(private))
 }
 
+/// How long (ms) until a deferred preedit is shown anyway (0: none waits);
+/// the shim then calls `setsuna_session_tick`.
+///
+/// # Safety
+/// `s` is a live session.
+#[no_mangle]
+pub unsafe extern "C" fn setsuna_session_deferred_ms(s: *mut SetsunaSession) -> u32 {
+    with(s, 0, |sess| sess.deferred_ms())
+}
+
+/// The deferred preedit's deadline passed; true when the view changed.
+///
+/// # Safety
+/// `s` is a live session.
+#[no_mangle]
+pub unsafe extern "C" fn setsuna_session_tick(s: *mut SetsunaSession) -> bool {
+    with(s, false, |sess| sess.tick())
+}
+
 /// Apply the engine's latest result (after a notify); true when the view
 /// changed.
 ///

@@ -152,6 +152,14 @@ const ALT_EARLY: usize = 3;
 /// Predictions offered while typing.
 const PREDICTIONS: usize = 3;
 
+/// The engine's top of what is typed, waiting for the reranked one
+/// (`[rerank] defer_ms`).
+struct Deferred {
+    reading: String,
+    top: String,
+    until: Instant,
+}
+
 /// Where the user dictionary comes from.
 enum UserDictSource {
     None,
@@ -242,6 +250,8 @@ pub struct EngineBridge {
     last_commit: String,
     /// The predictions open as the candidate list (Tab while typing).
     prediction: Option<Vec<crate::predict::Prediction>>,
+    /// The engine's top waiting for the reranked one.
+    deferred: Option<Deferred>,
     /// Reading the current candidate list (Composing / Converting) was
     /// produced for; empty for a provisional list. A choice is learned
     /// against it.
@@ -356,6 +366,7 @@ impl EngineBridge {
             predictor: None,
             last_commit: String::new(),
             prediction: None,
+            deferred: None,
             list_reading: String::new(),
             list_starts: HashMap::new(),
             seg_requests: Vec::new(),
@@ -850,10 +861,9 @@ impl EngineBridge {
             }
             self.list_reading = result.reading.clone();
             self.list_starts = starts;
-            self.cached_prefix_reading = result.reading.clone();
-            self.cached_prefix_kanji = top;
             // the conversion of all that is typed: rerank it once typing pauses
-            if result.reading == current_hira {
+            let whole = result.reading == current_hira;
+            if whole {
                 self.start_rerank(
                     &result.reading,
                     &raw,
@@ -861,6 +871,24 @@ impl EngineBridge {
                     &result.reading_pos,
                     false,
                 );
+            }
+            let reranking = self
+                .rerank
+                .as_ref()
+                .is_some_and(|j| j.reading == result.reading);
+            if whole && reranking && self.rerank_cfg.defer_ms > 0 {
+                // shown once the reranked top is in, or at the deadline: the
+                // preedit changes once (what was shown stays meanwhile)
+                self.deferred = Some(Deferred {
+                    reading: result.reading.clone(),
+                    top,
+                    until: Instant::now()
+                        + Duration::from_millis(self.rerank_cfg.idle_ms + self.rerank_cfg.defer_ms),
+                });
+            } else {
+                self.deferred = None;
+                self.cached_prefix_reading = result.reading.clone();
+                self.cached_prefix_kanji = top;
             }
             self.last_applied_reading = current_hira;
             return vec![Action::UpdatePreedit {
@@ -2113,6 +2141,11 @@ impl EngineBridge {
             _ => return Vec::new(),
         }
         self.list_starts = starts;
+        // the reranked top is what the deferred preedit waited for
+        if self.deferred.as_ref().is_some_and(|d| d.reading == reading) {
+            self.deferred = None;
+            self.cached_prefix_reading = reading.to_string();
+        }
         if self.cached_prefix_reading == reading {
             self.cached_prefix_kanji = list[0].clone();
         }
@@ -2880,6 +2913,36 @@ impl EngineBridge {
         });
     }
 
+    /// How long until the deferred preedit is shown anyway (`tick`), if one
+    /// waits: the frontend sets a timer.
+    pub fn deferred_for(&self) -> Option<Duration> {
+        self.deferred
+            .as_ref()
+            .map(|d| d.until.saturating_duration_since(Instant::now()))
+    }
+
+    /// The deferred preedit's deadline passed: the engine's top, without the
+    /// reranked one.
+    pub fn tick(&mut self) -> Vec<Action> {
+        let Some(d) = self.deferred.take() else {
+            return Vec::new();
+        };
+        if Instant::now() < d.until {
+            self.deferred = Some(d);
+            return Vec::new();
+        }
+        if !matches!(self.phase, Phase::Composing { .. })
+            || self.composing.live_reading() != d.reading
+        {
+            return Vec::new();
+        }
+        self.cached_prefix_reading = d.reading;
+        self.cached_prefix_kanji = d.top;
+        vec![Action::UpdatePreedit {
+            text: self.live_preedit(),
+        }]
+    }
+
     /// Predict from `predictor` (`None`: no prediction).
     pub fn set_predictor(&mut self, predictor: Option<crate::predict::Predictor>) {
         self.predictor = predictor.map(std::cell::RefCell::new);
@@ -3547,6 +3610,34 @@ mod tests {
         let mut bridge = EngineBridge::new(Some(Box::new(mock.clone())));
         bridge.emoji_enabled = false;
         (bridge, mock)
+    }
+
+    #[test]
+    fn a_deferred_preedit_changes_once() {
+        let (mut bridge, mock, rr) = bridge_with_reranker();
+        bridge.rerank_cfg.defer_ms = 250;
+        type_str(&mut bridge, "kasano");
+        answer_scored(&mock, &["傘の", "笠の", "嵩の"], &[-1.0, -1.5, -4.0]);
+        // the engine's top waits for the reranked one: the kana meanwhile
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("かさの")
+        );
+        assert!(bridge.deferred_for().is_some());
+        assert!(bridge.tick().is_empty());
+        rr.answer(&[-30.0, -20.0]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("笠の")
+        );
+        assert!(bridge.deferred_for().is_none());
+        // none by the deadline: the engine's top
+        bridge.handle_escape();
+        type_str(&mut bridge, "kasano");
+        answer_scored(&mock, &["傘の", "笠の", "嵩の"], &[-1.0, -1.5, -4.0]);
+        bridge.apply_async_result();
+        bridge.deferred.as_mut().unwrap().until = Instant::now();
+        assert_eq!(preedit(&bridge.tick()).as_deref(), Some("傘の"));
     }
 
     #[test]

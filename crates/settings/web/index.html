@@ -218,6 +218,13 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row" data-window-range="opacity_percent" data-min="20" data-max="100" data-step="5" data-unit="%">
     <div class="text"><div class="title">不透明度</div></div>
   </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">ライブ変換の表示を一度だけ変える</div>
+      <div class="desc">リランカを使うとき、打つのを止めてから並べ替えが終わるまで（最長 0.25 秒）変換の表示を待ち、先頭が二度入れ替わらないようにします</div>
+    </div>
+    <div class="control" id="defer_switch"></div>
+  </div>
 </div>
 
 <h2>入力方式</h2>
@@ -543,6 +550,10 @@ const NAME_CASES = [["off", "オフ"], ["proper", "固有名詞"], ["acronyms", 
 const WINDOW_THEMES = [["auto", "自動"], ["setsuna", "ライト"], ["setsuna-dark", "ダーク"], ["classic", "クラシック"]];
 
 function renderWindow() {
+  $("defer_switch").replaceChildren(toggle(cfg.rerank.defer_ms > 0, (v) => {
+    cfg.rerank.defer_ms = v ? 250 : 0;
+    changed();
+  }));
   const w = cfg.ui.candidate_window;
   const seg = $("window_theme");
   seg.replaceChildren(...WINDOW_THEMES.map(([value, label]) => {

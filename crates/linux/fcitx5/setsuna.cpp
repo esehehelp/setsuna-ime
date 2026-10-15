@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include <fcitx-utils/event.h>
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/key.h>
@@ -262,6 +263,26 @@ private:
         if (auto *ic = ic_.get()) {
             render(ic);
         }
+        armDeferred();
+    }
+
+    /* A deferred preedit ([rerank] defer_ms): shown anyway at its deadline. */
+    void armDeferred() {
+        uint32_t ms = setsuna_session_deferred_ms(session_);
+        if (ms == 0) {
+            deferredTimer_.reset();
+            return;
+        }
+        deferredTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + uint64_t(ms) * 1000, 0,
+            [this](EventSourceTime *, uint64_t) {
+                if (setsuna_session_tick(session_)) {
+                    if (auto *ic = ic_.get()) {
+                        render(ic);
+                    }
+                }
+                return true;
+            });
     }
 
     static uint32_t mods(KeyStates states) {
@@ -334,6 +355,7 @@ private:
     Instance *instance_;
     SetsunaModeAction modeAction_;
     EventDispatcher dispatcher_;
+    std::unique_ptr<EventSourceTime> deferredTimer_;
     SetsunaSession *session_ = nullptr;
     TrackableObjectReference<InputContext> ic_;
 };

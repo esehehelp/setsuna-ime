@@ -602,6 +602,11 @@ pub struct RerankCfg {
     pub lambda: Option<f32>,
     /// Typing pause (ms) before reranking; the conversion key reranks at once.
     pub idle_ms: u64,
+    /// While typing, how long (ms, after the pause) the engine's top waits
+    /// for the reranked one before it is shown, so that the preedit does
+    /// not change twice (Mozkey's deferred display). 0: off, the engine's
+    /// top at once.
+    pub defer_ms: u64,
 }
 
 impl Default for RerankCfg {
@@ -614,6 +619,7 @@ impl Default for RerankCfg {
             max_candidates: None,
             lambda: None,
             idle_ms: 120,
+            defer_ms: 0,
         }
     }
 }

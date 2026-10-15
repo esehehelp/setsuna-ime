@@ -79,6 +79,10 @@ size_t setsuna_session_page_size(const SetsunaSession *s);
 /* Whether the field typed into is private (a password): no context, no
  * rewrite, nothing learned. */
 void setsuna_session_set_private(SetsunaSession *s, bool private_field);
+/* How long (ms) until a deferred preedit is shown anyway (0: none waits);
+ * then call setsuna_session_tick (true when the view changed). */
+uint32_t setsuna_session_deferred_ms(SetsunaSession *s);
+bool setsuna_session_tick(SetsunaSession *s);
 /* Turn the IME on or off, committing what is composed. */
 void setsuna_session_toggle(SetsunaSession *s);
 /* Whether the IME is on; off, every key goes to the app. */
