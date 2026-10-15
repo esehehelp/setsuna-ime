@@ -12,7 +12,9 @@
 //! switching the input method away and back on fcitx5).
 //!
 //! The page and this process talk in JSON messages: the page posts
-//! `{"type": "init" | "save" | "clear_learning" | "show_hidden", ...}` (and the rewriter's)
+//! `{"type": "init" | "save" | "clear_learning" | "show_hidden", ...}`, the
+//! user dictionary's `dict_load` / `dict_save` / `dict_import` (answered with
+//! `{"type": "dict"}`), and the rewriter's
 //! through `window.ipc`, and each reply goes back as
 //! `setsuna.receive(<message>)`.
 
@@ -26,6 +28,7 @@ use serde_json::{json, Value};
 use setsuna_core::config::Config;
 use setsuna_core::hidden::Hidden;
 use setsuna_core::learning::Learning;
+use setsuna_core::user_dict::{self, Entry};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
@@ -76,6 +79,8 @@ fn main() -> wry::Result<()> {
                 let action = message["type"].as_str().unwrap_or_default();
                 if matches!(action, "init" | "save" | "clear_learning" | "show_hidden") {
                     Some(app.handle(action, &message))
+                } else if action.starts_with("dict_") {
+                    Some(dictionary(action, &message))
                 } else {
                     rewriter.handle(action, &message)
                 }
@@ -97,6 +102,93 @@ fn main() -> wry::Result<()> {
             let _ = webview.evaluate_script(&format!("setsuna.receive({reply})"));
         }
     });
+}
+
+/// The reply to a user dictionary message: its entries, and a status.
+fn dictionary(action: &str, message: &Value) -> Value {
+    let Some(path) = user_dict::path() else {
+        return json!({"type": "dict", "entries": [], "status": "設定ディレクトリが見つかりません"});
+    };
+    let as_json = |entries: &[Entry]| -> Vec<Value> {
+        entries
+            .iter()
+            .map(|e| json!({"reading": e.reading, "word": e.word, "pos": e.pos, "comment": e.comment}))
+            .collect()
+    };
+    match action {
+        "dict_save" => {
+            let mut entries = Vec::new();
+            let mut bad = 0;
+            for v in message["entries"].as_array().into_iter().flatten() {
+                let s = |k: &str| v[k].as_str().unwrap_or_default().trim().to_string();
+                let (word, pos) = (s("word"), s("pos"));
+                let reading = match user_dict::normalize_reading(&s("reading")) {
+                    Some(r) => r,
+                    None if s("reading").is_empty()
+                        && user_dict::Kind::of(&pos) == user_dict::Kind::Suppress =>
+                    {
+                        String::new()
+                    }
+                    None => {
+                        bad += 1;
+                        continue;
+                    }
+                };
+                if word.is_empty() {
+                    bad += 1;
+                    continue;
+                }
+                let pos = if pos.is_empty() {
+                    user_dict::DEFAULT_POS.to_string()
+                } else {
+                    pos
+                };
+                entries.push(Entry {
+                    reading,
+                    word,
+                    pos,
+                    comment: s("comment"),
+                });
+            }
+            let status = match user_dict::save(&path, &entries) {
+                Ok(()) if bad > 0 => format!(
+                    "{} 件を保存しました（読みか語のない {bad} 件は除きました）",
+                    entries.len()
+                ),
+                Ok(()) => format!(
+                    "{} 件を保存しました。変換にすぐ反映されます。",
+                    entries.len()
+                ),
+                Err(e) => format!("保存できませんでした: {e}"),
+            };
+            json!({"type": "dict", "entries": as_json(&user_dict::load(&path)), "status": status})
+        }
+        "dict_import" => {
+            let (entries, skipped) = user_dict::parse(message["text"].as_str().unwrap_or_default());
+            let status = if skipped.is_empty() {
+                format!(
+                    "{} 件を読み込みました。保存すると反映されます。",
+                    entries.len()
+                )
+            } else {
+                format!(
+                    "{} 件を読み込みました。{} 行は読めませんでした（{}）",
+                    entries.len(),
+                    skipped.len(),
+                    skipped
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )
+            };
+            json!({"type": "dict", "imported": as_json(&entries), "status": status})
+        }
+        _ => {
+            json!({"type": "dict", "entries": as_json(&user_dict::load(&path)), "path": path.display().to_string()})
+        }
+    }
 }
 
 struct Settings {

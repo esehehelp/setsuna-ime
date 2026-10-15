@@ -623,6 +623,7 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
             inner
                 .engine
                 .set_hidden(setsuna_core::hidden::Hidden::open());
+            inner.engine.use_user_dictionary_file();
             // the GDI window shows 10 per page, labelled 1–9, 0
             inner
                 .engine

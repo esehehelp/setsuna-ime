@@ -272,6 +272,31 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="reps" id="reps"></div>
 </div>
 
+<h2>ユーザー辞書</h2>
+<div class="card">
+  <div class="row">
+    <div class="text">
+      <div class="title">登録した語</div>
+      <div class="desc" id="dict_desc">読みはひらがな（ローマ字でも入力できます）。読み全体のほか、長い読みの一部に一致しても候補に入ります。品詞「短縮よみ」は読み全体だけ、「抑制単語」はその語を出さなくなります</div>
+    </div>
+    <div class="control">
+      <input type="text" id="dict_search" placeholder="検索">
+      <button id="dict_add">追加</button>
+    </div>
+  </div>
+  <div class="reps" id="dict_rows"></div>
+  <div class="row">
+    <div class="text">
+      <div class="desc">Google 日本語入力 / Mozc、Microsoft IME、ATOK、Gboard の書き出したファイルを読み込めます</div>
+    </div>
+    <div class="control">
+      <input type="file" id="dict_file" accept=".txt,.tsv,.csv" hidden>
+      <button id="dict_import">読み込む…</button>
+      <button id="dict_save" class="primary">辞書を保存</button>
+    </div>
+  </div>
+</div>
+
 <h2>学習</h2>
 <div class="card">
   <div class="row">
@@ -438,6 +463,8 @@ let cfg = null;        // the config being edited
 let saved = "";        // JSON of the config as last loaded / saved
 let canSave = false;   // false while the file could not be read
 let learned = null;
+let dict = [];
+const DICT_POS = ["名詞", "固有名詞", "人名", "地名", "組織", "短縮よみ", "抑制単語"];
 let hidden = [];
 let confirmClear = false;
 
@@ -521,6 +548,52 @@ function renderReplacements() {
       from, el("span", { className: "arrow", textContent: "→" }), to, del);
   }));
 }
+
+function renderDict() {
+  const query = $("dict_search").value.trim();
+  const rows = dict
+    .map((e, i) => [e, i])
+    .filter(([e]) => !query || e.reading.includes(query) || e.word.includes(query));
+  $("dict_rows").replaceChildren(...rows.slice(0, 300).map(([e, i]) => {
+    const reading = el("input", { type: "text", value: e.reading, placeholder: "読み" });
+    const word = el("input", { type: "text", value: e.word, placeholder: "語" });
+    const pos = el("select", {}, ...[...new Set([...DICT_POS, e.pos])].map((p) =>
+      el("option", { value: p, textContent: p, selected: p === e.pos })));
+    const comment = el("input", { type: "text", value: e.comment, placeholder: "コメント" });
+    reading.addEventListener("input", () => { e.reading = reading.value; });
+    word.addEventListener("input", () => { e.word = word.value; });
+    pos.addEventListener("change", () => { e.pos = pos.value; });
+    comment.addEventListener("input", () => { e.comment = comment.value; });
+    const del = el("button", { textContent: "削除", className: "danger" });
+    del.addEventListener("click", () => { dict.splice(i, 1); renderDict(); });
+    return el("div", { className: "rep" }, reading, word, pos, comment, del);
+  }));
+  $("dict_desc").dataset.count = dict.length;
+}
+
+$("dict_search").addEventListener("input", renderDict);
+$("dict_add").addEventListener("click", () => {
+  dict.unshift({ reading: "", word: "", pos: "名詞", comment: "" });
+  $("dict_search").value = "";
+  renderDict();
+});
+$("dict_save").addEventListener("click", () => send({ type: "dict_save", entries: dict }));
+$("dict_import").addEventListener("click", () => $("dict_file").click());
+$("dict_file").addEventListener("change", async () => {
+  const file = $("dict_file").files[0];
+  if (!file) return;
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  // UTF-16 by its BOM (MS-IME), else UTF-8, else Shift_JIS
+  let text;
+  if (bytes[0] === 0xFF && bytes[1] === 0xFE) text = new TextDecoder("utf-16le").decode(bytes);
+  else if (bytes[0] === 0xFE && bytes[1] === 0xFF) text = new TextDecoder("utf-16be").decode(bytes);
+  else {
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+    catch { text = new TextDecoder("shift_jis").decode(bytes); }
+  }
+  $("dict_file").value = "";
+  send({ type: "dict_import", text });
+});
 
 function renderHidden() {
   const box = $("hidden_list");
@@ -761,6 +834,17 @@ window.setsuna = {
         ?? (models.length ? `${models.length} 件のモデルから選べます` : "モデルがありません");
       return;
     }
+    if (msg.type === "dict") {
+      if (msg.imported) {
+        const key = (e) => `${e.reading}\t${e.word}\t${e.pos}`;
+        const have = new Set(dict.map(key));
+        dict.push(...msg.imported.filter((e) => !have.has(key(e))));
+      } else if (msg.entries) {
+        dict = msg.entries;
+      }
+      renderDict();
+      return;
+    }
     if (msg.type !== "state") return;
     learned = msg.learned;
     renderLearned();
@@ -777,7 +861,10 @@ window.setsuna = {
       error.textContent = msg.load_error ? `設定を読み込めないため保存できません: ${msg.load_error}` : "";
       $("instructions").placeholder = msg.default_instructions ?? "";
       render();
-      if (msg.action === "init") send(endpoint("rewriter_state"));
+      if (msg.action === "init") {
+        send(endpoint("rewriter_state"));
+        send({ type: "dict_load" });
+      }
     } else {
       changed();
     }

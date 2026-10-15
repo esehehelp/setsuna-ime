@@ -39,8 +39,10 @@ Parts of Setsuna follow the design, rules and data of Mozc
 (<https://github.com/google/mozc>) and of Mozkey, a Mozc fork
 (<https://github.com/koyasi777/mozkey>), both under the BSD 3-Clause
 License: the context privacy rules (`crates/ime-core/src/privacy.rs`, from
-Mozkey's `src/session/zenz_text_privacy_analyzer.cc`) and the private input
-scopes (`crates/tsf`, as Mozc's `win32/tip`).
+Mozkey's `src/session/zenz_text_privacy_analyzer.cc`), the private input
+scopes (`crates/tsf`, as Mozc's `win32/tip`), Ctrl+Delete on a candidate
+(Mozc's DeleteSelectedCandidate and suppression dictionary) and the user
+dictionary's text format and parts of speech (`crates/ime-core/src/user_dict.rs`).
 
 ```
 Copyright 2010-2018, Google Inc.

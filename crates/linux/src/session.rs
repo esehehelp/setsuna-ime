@@ -143,6 +143,7 @@ impl Session {
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
         bridge.set_learning(Learning::open(&cfg.learning));
         bridge.set_hidden(setsuna_core::hidden::Hidden::open());
+        bridge.use_user_dictionary_file();
         bridge.set_candidate_paging(page_size(cfg), true);
         bridge.set_live_conversion(live_conversion(cfg));
         Self {
@@ -163,6 +164,7 @@ impl Session {
         self.bridge.reset_preserving_client(&cfg.frontend);
         self.bridge.set_learning(Learning::open(&cfg.learning));
         self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
+        self.bridge.use_user_dictionary_file();
         self.page_size = page_size(cfg);
         self.bridge.set_candidate_paging(self.page_size, true);
         self.bridge.set_live_conversion(live_conversion(cfg));

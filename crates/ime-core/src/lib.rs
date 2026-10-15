@@ -27,3 +27,4 @@ pub mod rewrite_client;
 mod segmented;
 pub mod segments;
 pub mod symbol_dict;
+pub mod user_dict;
