@@ -344,8 +344,10 @@ pub struct FrontendCfg {
     /// What English typed in lowercase takes its case: the names of the
     /// names dictionary, and acronyms.
     pub name_case: NameCase,
-    /// With `mixed_model`: an English sentence (two words or more) starts
-    /// with a capital, `i` is `I` and its `.` `,` stay as typed.
+    /// An English sentence (two words or more, with `mixed_model`) starts
+    /// with a capital and `i` is `I`; the `.` `,` `!` `?` right after an
+    /// English word stay as typed in a sentence with no Japanese
+    /// (`mixed::english_after`).
     pub sentence_case: bool,
 }
 
@@ -923,7 +925,8 @@ impl Config {
              # \"proper\" (proper nouns only) or \"off\".\n\
              name_case = \"acronyms\"\n\
              # An English sentence starts with a capital (hello world -> Hello\n\
-             # world) and keeps its . and , as typed.\n\
+             # world), and . , ! ? after English stay as typed where no\n\
+             # Japanese is in the sentence.\n\
              sentence_case = true\n\
              # Literal replacements applied to every candidate, in order:\n\
              # [[frontend.replacements]]\n\

@@ -17,6 +17,10 @@
 //!   `switch_out`. The text before the caret sets the language the input
 //!   starts in.
 //!
+//! A word the model knows, typed in lowercase, that reads better as a
+//! commoner word and a form of する (`dlsite`: dl + して) is split so: the
+//! sentence is preferred by `sentence` over the rarer word or name.
+//!
 //! `MixedModel::cased` then gives the English its case: a name of the names
 //! dictionary typed in lowercase as the name is written (github → GitHub),
 //! and an English sentence (two words or more) a capital at its start, `I`
@@ -75,6 +79,9 @@ pub struct MixedParams {
     /// The frequency of a name of the names dictionary of weight 1 among
     /// Latin words (its weight scales it).
     pub name: f64,
+    /// What a sentence is preferred by over a word it overlaps, typed in
+    /// lowercase (`dlsite`: dl + して over the name DLsite).
+    pub sentence: f64,
 }
 
 impl Default for MixedParams {
@@ -92,12 +99,13 @@ impl Default for MixedParams {
             digit: 1.0,
             case_break: 8.0,
             name: 1e-4,
+            sentence: 1.0,
         }
     }
 }
 
 impl MixedParams {
-    pub const NAMES: [&'static str; 12] = [
+    pub const NAMES: [&'static str; 13] = [
         "switch_in",
         "switch_out",
         "en_en",
@@ -110,6 +118,7 @@ impl MixedParams {
         "digit",
         "case_break",
         "name",
+        "sentence",
     ];
 
     pub fn field(&mut self, name: &str) -> Option<&mut f64> {
@@ -126,6 +135,7 @@ impl MixedParams {
             "digit" => &mut self.digit,
             "case_break" => &mut self.case_break,
             "name" => &mut self.name,
+            "sentence" => &mut self.sentence,
             _ => return None,
         })
     }
@@ -224,6 +234,13 @@ const MAX_EN: usize = 40;
 const PARTICLES: &[&str] = &[
     "ga", "wo", "de", "no", "ni", "ha", "to", "mo", "he", "kara", "yori", "raga", "rawo", "rade",
     "rano", "rani", "raha", "rato", "ramo",
+];
+
+/// The forms of する a Latin word goes on with (DLして, OKした, DLする),
+/// two kana or more: し, さ, せ alone would read too much as one (these:
+/// the + せ).
+const SURU: &[&str] = &[
+    "して", "した", "しな", "しま", "しよ", "しろ", "する", "すれ", "され", "させ", "せず", "せよ",
 ];
 
 impl MixedModel {
@@ -411,6 +428,42 @@ impl MixedModel {
             // Romaji before a space is done (`think so`: no kana is coming
             // for the k).
             let seg_fin = fin || seg_end < n;
+            // Sentence punctuation right after an English word, up to a
+            // space or the end (`a pen.`, `hello,`): English goes on past
+            // it. As Japanese it is the kana model's 。, likely after kana,
+            // which turned `this is a pen.` into Japanese: here it costs what
+            // the kana model gives it after a Latin word (Google。), with no
+            // switch. After a sentence's end Japanese may start as freely.
+            // Whether it shows as `.` or 。 is the sentence's
+            // (`english_punctuation`).
+            if !spaced && !first && is_sentence_punct(chars[start]) && best[start][EN].is_finite() {
+                let end = (start..n)
+                    .find(|&k| !is_sentence_punct(chars[k]))
+                    .unwrap_or(n);
+                if end == n || chars[end] == ' ' {
+                    let mut ctx = ['@', '@'];
+                    let mut cost = best[start][EN];
+                    for &c in &chars[start..end] {
+                        // the corpus readings end and split sentences with
+                        // 。、 only
+                        let class = match c {
+                            '.' | '!' | '?' => '。',
+                            _ => '、',
+                        };
+                        cost += self.kana.cost(ctx[0], ctx[1], class);
+                        ctx = [ctx[1], class];
+                    }
+                    let ends = chars[start..end]
+                        .iter()
+                        .any(|c| matches!(c, '.' | '!' | '?'));
+                    for state in [EN, JA].into_iter().filter(|&s| s == EN || ends) {
+                        if cost < best[end][state] {
+                            best[end][state] = cost;
+                            back[end][state] = (start, Some(EN));
+                        }
+                    }
+                }
+            }
             let mut update = |end: usize, state: usize, cost: f64, prev: Option<usize>| {
                 if cost < best[end][state] {
                     best[end][state] = cost;
@@ -517,7 +570,15 @@ impl MixedModel {
         spans.reverse();
         lone_i(&chars, &mut spans);
         let spans = self.split_particles(&chars, spans, fin);
-        protect(&chars, spans)
+        let mut spans = protect(&chars, spans);
+        // the punctuation English went on past is Japanese's (、。) until
+        // `cased` reads its sentence
+        for s in &mut spans {
+            if chars[s.start..s.end].iter().all(|&c| is_sentence_punct(c)) {
+                s.lang = Lang::Ja;
+            }
+        }
+        spans
     }
 
     /// An English span the model does not know as a word that ends in a
@@ -569,10 +630,94 @@ impl MixedModel {
                         ..span
                     });
                 }
-                None => out.push(span),
+                None => match self.sentence_split(
+                    chars,
+                    span,
+                    rest_end,
+                    fin,
+                    before_kana(&out, chars, span),
+                ) {
+                    Some(at) => {
+                        if next_ja {
+                            todo.pop_front();
+                        }
+                        out.push(Span { end: at, ..span });
+                        out.push(Span {
+                            lang: Lang::Ja,
+                            start: at,
+                            end: rest_end,
+                        });
+                    }
+                    None => out.push(span),
+                },
             }
         }
         out
+    }
+
+    /// Where a word the model knows, typed in lowercase, reads better as a
+    /// commoner word and romaji (`dlsite`: dl + して, not the name DLsite):
+    /// the word's cost against the shorter word's and the kana after a
+    /// Latin word, with no switch back to Japanese counted (the sentence
+    /// is the commoner text). Typed with Shift it stays (English meant).
+    /// `before`: the kana right before the word (`^` none), as the kana
+    /// model reads on from it.
+    fn sentence_split(
+        &self,
+        chars: &[char],
+        span: Span,
+        rest_end: usize,
+        fin: bool,
+        before: char,
+    ) -> Option<usize> {
+        let p = &self.params;
+        let word: String = chars[span.start..span.end].iter().collect();
+        if !word.chars().all(|c| c.is_ascii_lowercase()) {
+            return None;
+        }
+        let rest_fin = fin && rest_end == chars.len();
+        // the kana of `chars[from..rest_end]`, but for romaji still being
+        // typed; `None` when it does not read as kana
+        let kana_from = |from: usize| {
+            let units = romaji_units(&chars[from..rest_end], rest_fin);
+            let mut kana = String::new();
+            for (i, u) in units.iter().enumerate() {
+                match u.kind {
+                    UnitKind::Kana(k) => kana.push_str(k),
+                    UnitKind::Pending
+                        if !rest_fin && i + 1 == units.len() && rest_end == chars.len() => {}
+                    _ => return None,
+                }
+            }
+            Some(kana)
+        };
+        // the kana model's cost of `kana` after the Latin word
+        let after_latin = |kana: &str| {
+            let mut ctx = [before, '@'];
+            let mut cost = 0.0;
+            for c in kana.chars() {
+                cost += self.kana.cost(ctx[0], ctx[1], c);
+                ctx = [ctx[1], c];
+            }
+            cost
+        };
+        // what follows counts both ways (DLsite + で, not DL + してで)
+        let whole = -(p.known * self.known(&word)?).ln() + after_latin(&kana_from(span.end)?);
+        (span.start + 2..span.end.saturating_sub(1))
+            .filter_map(|at| {
+                let head: String = chars[span.start..at].iter().collect();
+                let head = -(p.known * self.known(&head)?).ln();
+                let kana = kana_from(at)?;
+                // a form of する (DLして, OKした): a Latin word's commonest
+                // use in Japanese
+                if !SURU.iter().any(|f| kana.starts_with(f)) {
+                    return None;
+                }
+                Some((at, head + after_latin(&kana) - p.sentence))
+            })
+            .filter(|&(_, cost)| cost < whole)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(at, _)| at)
     }
 
     /// Where `span` (English) splits before a particle, Japanese running on
@@ -771,7 +916,17 @@ impl MixedModel {
     /// its case breaks.
     fn piece_cost(&self, piece: &Piece, prefix: bool) -> f64 {
         let p = &self.params;
-        let breaks = p.case_break * piece.breaks as f64;
+        // a name as it is written has no case break (DLsite, as the casing
+        // writes dlsite and the composition is read again on Space)
+        let written = self
+            .names
+            .get(&piece.lower)
+            .is_some_and(|(name, _, _)| *name == piece.typed);
+        let breaks = if written {
+            0.0
+        } else {
+            p.case_break * piece.breaks as f64
+        };
         if piece.digits {
             return breaks + p.digit * piece.lower.len() as f64;
         }
@@ -906,6 +1061,9 @@ impl MixedModel {
             }
         }
         english_case(&mut chars, &mut spans[..sentence]);
+        if casing.sentences {
+            english_punctuation(&chars, &mut spans, before.unwrap_or(""));
+        }
         (chars, spans)
     }
 }
@@ -1018,14 +1176,16 @@ impl Casing {
 }
 
 /// Whether `candidate` has the Latin words of `reading` as they are, in
-/// order (the engine passes them through; a candidate that changed one is a
-/// misconversion).
+/// order, with the English punctuation right after them (`pen.`, `hello,`:
+/// the reading has `,` `.` only where they are English, 、。 elsewhere). The
+/// engine passes them through; a candidate that changed one is a
+/// misconversion.
 pub fn keeps_latin(reading: &str, candidate: &str) -> bool {
     // a full-width word is the same word (`symbol_width = "auto"`)
     let candidate: String = candidate.chars().map(crate::postprocess::to_half).collect();
     let mut rest = candidate.as_str();
     for word in reading
-        .split(|c: char| !(c.is_ascii_alphanumeric() || is_joiner(c)))
+        .split(|c: char| !(c.is_ascii_alphanumeric() || is_joiner(c) || is_sentence_punct(c)))
         .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
     {
         // as a word of its own: no letter or digit glued on (Hhello)
@@ -1045,6 +1205,8 @@ pub fn keeps_latin(reading: &str, candidate: &str) -> bool {
 #[derive(Default)]
 struct Piece {
     lower: String,
+    /// As typed, its case kept.
+    typed: String,
     /// The letter model's cost of its chars, and its context after them.
     letters: f64,
     ctx: [char; 2],
@@ -1086,6 +1248,7 @@ impl Piece {
         self.digits &= c.is_ascii_digit();
         let lower = c.to_ascii_lowercase();
         self.lower.push(lower);
+        self.typed.push(c);
         let class = letter_class(lower);
         self.letters += model.letters.cost(self.ctx[0], self.ctx[1], class);
         self.ctx = [self.ctx[1], class];
@@ -1291,6 +1454,113 @@ fn english_case(chars: &mut [char], sentence: &mut [Span]) {
             }
         }
         capital = false;
+    }
+}
+
+/// The last kana of the Japanese span right before `span` in `done` (no
+/// space between), else `^`.
+fn before_kana(done: &[Span], chars: &[char], span: Span) -> char {
+    done.last()
+        .filter(|s| s.lang == Lang::Ja && s.end == span.start)
+        .and_then(|s| {
+            romaji_units(&chars[s.start..s.end], true)
+                .iter()
+                .rev()
+                .find_map(|u| match u.kind {
+                    UnitKind::Kana(k) => k.chars().last(),
+                    _ => None,
+                })
+        })
+        .unwrap_or('^')
+}
+
+/// Punctuation that ends or splits a sentence, typed after a word.
+fn is_sentence_punct(c: char) -> bool {
+    matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
+}
+
+/// Japanese text: kana, kanji and the CJK symbols (、。「」).
+fn is_japanese(c: char) -> bool {
+    matches!(c, '\u{3000}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{FF61}'..='\u{FF9F}')
+}
+
+/// The sentence the text `before` the caret ends in: whether it has
+/// Japanese in it, its English words, and whether the sentence before it
+/// was Japanese (its end a 。 or kana).
+pub(crate) fn sentence_of(before: &str) -> (bool, usize, bool) {
+    let chars: Vec<char> = before.chars().collect();
+    // the end of the last sentence: 。！？ or a line break, or `.` `!` `?`
+    // before a space (not example.com)
+    let end = (0..chars.len())
+        .rev()
+        .find(|&i| match chars[i] {
+            '。' | '！' | '？' | '\n' => true,
+            '.' | '!' | '?' => chars.get(i + 1).is_some_and(|c| c.is_whitespace()),
+            _ => false,
+        })
+        .map_or(0, |i| i + 1);
+    let tail: String = chars[end..].iter().collect();
+    let japanese = tail.chars().any(is_japanese);
+    let words = tail
+        .split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
+        .count();
+    let prev_ja = chars[..end]
+        .iter()
+        .rev()
+        .find(|c| !c.is_whitespace())
+        .is_some_and(|&c| is_japanese(c));
+    (japanese, words, prev_ja)
+}
+
+/// Whether the sentence punctuation typed right after `before` is English
+/// (`.` `,` `!` `?` as typed, not 、。): `before` ends in an English word
+/// and its sentence has no Japanese in it. A sentence of one English word
+/// after a Japanese one is taken as Japanese's (ありがとう。OK。).
+pub fn english_after(before: &str) -> bool {
+    if !before.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let (japanese, words, prev_ja) = sentence_of(before);
+    !japanese && (words >= 2 || !prev_ja)
+}
+
+/// The punctuation right after an English word is English when its
+/// sentence is (`english_after`, the text before the caret and the spans
+/// before it read as one text): `this is a pen.`, `hello, world.`, `.`
+/// after an English text committed; これはgoogle。 stays.
+fn english_punctuation(chars: &[char], spans: &mut [Span], before: &str) {
+    let (mut japanese, mut words, mut prev_ja) = sentence_of(before);
+    let after_before = before.ends_with(|c: char| c.is_ascii_alphabetic());
+    for k in 0..spans.len() {
+        let s = spans[k];
+        let text = &chars[s.start..s.end];
+        let ends = |c: &char| matches!(c, '.' | '!' | '?');
+        if text.iter().all(|&c| is_sentence_punct(c)) {
+            let after_word = if s.start == 0 {
+                after_before
+            } else {
+                k > 0 && spans[k - 1].end == s.start && spans[k - 1].lang == Lang::En
+            };
+            let english = s.lang == Lang::En || after_word && !japanese && (words >= 2 || !prev_ja);
+            if english {
+                spans[k].lang = Lang::En;
+            }
+            if text.iter().any(ends) {
+                (japanese, words, prev_ja) = (false, 0, !english);
+            }
+        } else if s.lang == Lang::En {
+            words += 1;
+        } else if let Some(last) = text.iter().rposition(ends) {
+            // a Japanese span with a sentence's end in it (けんさく。)
+            japanese = text[last + 1..].iter().any(|c| c.is_ascii_alphabetic());
+            (words, prev_ja) = (0, true);
+        } else if text
+            .iter()
+            .any(|&c| c.is_ascii_alphabetic() || is_japanese(c))
+        {
+            japanese = true;
+        }
     }
 }
 
@@ -1793,7 +2063,9 @@ pub(crate) mod tests {
         assert_eq!(cased(&m, "hello.world", None), "hello.world");
         // one word is no sentence, nor English inside Japanese
         assert_eq!(cased(&m, "hello", None), "hello");
-        assert_eq!(cased(&m, "hello.", None), "hello。");
+        // but its punctuation is English, in a sentence with no Japanese
+        assert_eq!(cased(&m, "hello.", None), "hello.");
+        assert_eq!(cased(&m, "hello.", Some("ありがとう。")), "hello。");
         assert_eq!(cased(&m, "hello nice", Some("きょうは")), "hello nice");
         assert_eq!(cased(&m, "hello nicewotsukau", None), "hello niceをつかう");
         // a sentence and then Japanese
@@ -1827,6 +2099,58 @@ pub(crate) mod tests {
             cased(&m, "kyouhaiitenkidesune", None),
             "きょうはいいてんきですね"
         );
+    }
+
+    #[test]
+    fn punctuation_after_english_is_the_sentences() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        // a 。 after it once made this all Japanese (this is あ ぺん。)
+        assert_eq!(cased(&m, "this is a pen.", None), "This is a pen.");
+        assert_eq!(cased(&m, "it works!", None), "It works!");
+        assert_eq!(
+            cased(&m, "I think so, demo ikanai.", None),
+            "I think so, でも いかない。"
+        );
+        assert_eq!(cased(&m, "korehagoogle.", None), "これはgoogle。");
+        // after the text before the caret
+        assert_eq!(cased(&m, ".", Some("This is a pen")), ".");
+        assert_eq!(cased(&m, ", and", Some("This is a pen")), ", and");
+        assert_eq!(cased(&m, ".", Some("これはGoogle")), "。");
+    }
+
+    #[test]
+    fn a_sentence_wins_over_a_rare_word_it_overlaps() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let mut m = MixedModel::load(&dir).unwrap();
+        m.add_names(
+            "DLsite	0.3
+",
+        );
+        // dl + して over the name, but the name before a particle
+        assert_eq!(cased(&m, "dlsite", None), "dlして");
+        assert_eq!(cased(&m, "dlsitemita", None), "dlしてみた");
+        assert_eq!(cased(&m, "dlsitede", None), "DLsiteで");
+        // a common word stays, and so does the name typed as it is written
+        // (as the composition is read again on Space)
+        assert_eq!(cased(&m, "website", None), "website");
+        assert_eq!(cased(&m, "DLsite", None), "DLsite");
+        assert_eq!(cased(&m, "DLsiteで", None), "DLsiteで");
+    }
+
+    #[test]
+    fn english_after_reads_the_sentence_before() {
+        assert!(english_after("This is a pen"));
+        assert!(english_after("OK"));
+        assert!(english_after("Fine. OK"));
+        assert!(english_after("ありがとう。Thank you"));
+        // Japanese in the sentence, or one word after a Japanese one
+        assert!(!english_after("これはGoogle"));
+        assert!(!english_after("ありがとう。OK"));
+        // not right after a word
+        assert!(!english_after("Hello "));
+        assert!(!english_after("100"));
+        assert!(!english_after(""));
     }
 
     #[test]

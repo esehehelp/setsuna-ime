@@ -256,6 +256,25 @@ en-sentence	I want to go home	I want to go home
 en-sentence	let me know	Let me know
 en-sentence	pull request	Pull request
 #
+# en-suru: a Latin word and a form of する, over a rarer word or name the
+# letters spell (dlsite: dl + して, the name DLsite before a particle).
+en-suru	dlsite	dlして
+en-suru	dlsitemita	dlしてみた
+en-suru	dlsitede	DLsiteで
+en-suru	website	website
+#
+# en-punct: punctuation after English, as the sentence it is in: as typed in
+# English (or after an English text), 、。 in Japanese.
+en-punct	this is a pen.	This is a pen.
+en-punct	hello, world.	Hello, world.
+en-punct	thank you!	Thank you!
+en-punct	it works!	It works!
+en-punct	.	.	This is a pen
+en-punct	, and	, and	This is a pen
+en-punct	kyouhagoogle.	きょうはGoogle。
+en-punct	.	。	きょうはGoogle
+en-punct	I think so, demo ikanai.	I think so, でも いかない。
+#
 # new-word: names a word list would not have (new products, projects).
 new-word	setsuna-enginetomeltype	setsuna-engineとmeltype
 new-word	meltypewotsukau	meltypeをつかう
