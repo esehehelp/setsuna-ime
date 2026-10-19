@@ -120,9 +120,14 @@ impl Predictor {
     }
 
     /// Whether a commit is worth predicting: it differs from its reading
-    /// (kana alone needs no prediction) and the reading is not too short.
+    /// (kana alone needs no prediction), the reading is not too short, and
+    /// it keeps the numbers typed in digits (a commit the model garbled,
+    /// 19911225 -> 199125, before `postprocess::drop_changed_digits`).
     pub fn worth(reading: &str, surface: &str) -> bool {
-        reading.chars().count() > MIN_PREFIX && surface != reading && !surface.trim().is_empty()
+        reading.chars().count() > MIN_PREFIX
+            && surface != reading
+            && !surface.trim().is_empty()
+            && crate::postprocess::keeps_digits(reading, surface)
     }
 
     /// Record that `surface` was committed for `reading` after `prev`.
@@ -174,7 +179,9 @@ impl Predictor {
         let mut scored: Vec<(f64, &(String, String))> = self
             .stats
             .iter()
-            .filter(|((r, _), _)| r.len() > prefix.len() && r.starts_with(prefix))
+            .filter(|((r, s), _)| {
+                r.len() > prefix.len() && r.starts_with(prefix) && Self::worth(r, s)
+            })
             .map(|(k, s)| {
                 let after = if prev.is_empty() {
                     0
@@ -246,6 +253,23 @@ mod tests {
             q.complete("よろし", "", 1)[0].surface,
             "よろしくお願いします"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_garbled_number_is_neither_recorded_nor_predicted() {
+        let path = temp("digits");
+        // one recorded before commits were checked
+        std::fs::write(&path, "{\"r\":\"19911225\",\"s\":\"199125\"}\n").unwrap();
+        let mut p = Predictor::at(path.clone());
+        p.record("19911225", "1991125", "").unwrap();
+        p.record("1991ねん", "1991年", "").unwrap();
+        let out: Vec<String> = p
+            .complete("1991", "", 5)
+            .into_iter()
+            .map(|x| x.surface)
+            .collect();
+        assert_eq!(out, ["1991年"]);
         let _ = std::fs::remove_file(&path);
     }
 

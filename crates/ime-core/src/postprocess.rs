@@ -260,6 +260,44 @@ pub fn drop_untyped_symbols(reading: &str, candidates: Vec<String>) -> Vec<Strin
         .collect()
 }
 
+/// Drop the candidates that change a number typed in digits: each run of
+/// digits of the reading must be a run of the candidate, in order (more
+/// runs, from kana, may come between). The model's CTC merges a repeated
+/// digit (19911225 -> 199125) and swaps digits for kanji (2025・11・2二), so
+/// a typed number is kept as it was typed, as Mozc keeps it.
+pub fn drop_changed_digits(reading: &str, candidates: Vec<String>) -> Vec<String> {
+    if !reading.chars().any(|c| to_half(c).is_ascii_digit()) {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|cand| keeps_digits(reading, cand))
+        .collect()
+}
+
+/// Whether `candidate` keeps the numbers typed in digits in `reading`
+/// (`drop_changed_digits`).
+pub fn keeps_digits(reading: &str, candidate: &str) -> bool {
+    let mut runs = digit_runs(candidate).into_iter();
+    digit_runs(reading).iter().all(|t| runs.any(|r| r == *t))
+}
+
+/// The runs of digits of `s`, full-width ones as half-width.
+fn digit_runs(s: &str) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut in_run = false;
+    for c in s.chars().map(to_half) {
+        if c.is_ascii_digit() {
+            if !in_run {
+                runs.push(String::new());
+            }
+            runs.last_mut().unwrap().push(c);
+        }
+        in_run = c.is_ascii_digit();
+    }
+    runs
+}
+
 /// Half-width form of a full-width ASCII char (U+FF01..U+FF5E), else `c`.
 pub(crate) fn to_half(c: char) -> char {
     match c {
@@ -354,6 +392,10 @@ pub(crate) fn usually_full(c: char, beside: usize) -> bool {
 ///   there, full-width when Japanese text usually writes it so (凄い！,
 ///   （本当）, 50％), else the width of the digit / letter beside it (C#, Ｃ＃)
 ///   or half-width (" ' [ ] | -).
+/// - But a symbol of English, in the width of the letters: one inside a
+///   word (https://example.com, e.g), or at a word's edge in a sentence
+///   with no Japanese before it (`Thank you!`, `hello, world`; これはGoogle！
+///   is Japanese's).
 pub fn auto_width(cand: &str, context: &str) -> String {
     let hint = WidthHint::of(context);
     let chars: Vec<char> = cand.chars().collect();
@@ -362,13 +404,35 @@ pub fn auto_width(cand: &str, context: &str) -> String {
         j.and_then(|j| half.get(j))
             .and_then(|&n| hint.alnum_full(n))
     };
+    let ascii = |j: usize| ('!'..='~').contains(&half[j]);
+    let english = |i: usize| {
+        // the word of ASCII chars around it
+        let (mut a, mut b) = (i, i + 1);
+        while a > 0 && ascii(a - 1) {
+            a -= 1;
+        }
+        while b < half.len() && ascii(b) {
+            b += 1;
+        }
+        if !half[a..b].iter().any(|c| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        let inside = a < i && i + 1 < b;
+        inside || {
+            let before: String = context.chars().chain(chars[..i].iter().copied()).collect();
+            !crate::mixed::sentence_of(&before).0
+        }
+    };
     (0..chars.len())
         .map(|i| {
             let h = half[i];
-            if !('!'..='~').contains(&h) {
+            if !ascii(i) {
                 return chars[i];
             }
             let full = hint.alnum_full(h).unwrap_or_else(|| {
+                if english(i) {
+                    return hint.letter.unwrap_or(false);
+                }
                 let (left, right) = (alnum_at(i.checked_sub(1)), alnum_at(Some(i + 1)));
                 let beside = left.or(right);
                 let n = usize::from(left.is_some()) + usize::from(right.is_some());
@@ -516,6 +580,28 @@ mod tests {
     }
 
     #[test]
+    fn auto_width_writes_english_symbols_as_its_letters() {
+        assert_eq!(
+            auto("https://example.com", "https://example.com", ""),
+            "https://example.com"
+        );
+        assert_eq!(auto("Thank you!", "Thank you!", "やった！"), "Thank you!");
+        assert_eq!(auto("hello, world.", "hello, world.", ""), "hello, world.");
+        // a URL inside Japanese too
+        assert_eq!(
+            auto("しょうさいはhttps://a.com", "詳細はhttps://a.com", ""),
+            "詳細はhttps://a.com"
+        );
+        // full-width letters: their symbols too
+        assert_eq!(auto("Ｏｋ！", "Ok!", "ＸＹＺ"), "Ｏｋ！");
+        // English inside Japanese ends as Japanese does
+        assert_eq!(
+            auto("これはGoogle！", "これはGoogle!", ""),
+            "これはGoogle！"
+        );
+    }
+
+    #[test]
     fn auto_width_leaves_other_chars() {
         assert_eq!(auto("まる", "○", "ＡＢＣ"), "○");
         assert_eq!(auto("ほんとう、", "本当、", "１２３"), "本当、");
@@ -549,6 +635,48 @@ mod tests {
         );
         // the typed colon sits between ひ and ふ, the model's own one at the end
         assert_eq!(one("ひ：ふ", "比:ふ:", SymbolWidth::AsTyped), "比：ふ:");
+    }
+
+    fn digits(reading: &str, cands: &[&str]) -> Vec<String> {
+        drop_changed_digits(reading, cands.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn candidates_that_change_a_typed_number_are_dropped() {
+        // shion-v4.10 for 19911225 and 11じ22ふん: CTC merges a repeated digit
+        assert_eq!(
+            digits(
+                "19911225",
+                &["199125", "1991125", "19911225", "１９９１１２２５"]
+            ),
+            ["19911225", "１９９１１２２５"]
+        );
+        assert_eq!(
+            digits(
+                "11じ22ふん",
+                &[
+                    "11時22分",
+                    "11時に2分",
+                    "11時2二分",
+                    "1一時22分",
+                    "11時229分"
+                ]
+            ),
+            ["11時22分"]
+        );
+        assert_eq!(
+            digits(
+                "2025・11・22",
+                &["2025/11/22", "2025・11・2二", "2025011・22"]
+            ),
+            ["2025/11/22"]
+        );
+        assert_eq!(digits("100まん", &["100万", "1000万", "10〇万"]), ["100万"]);
+        assert_eq!(digits("3.14", &["3.14", "314"]), ["3.14"]);
+        // a number from kana may come beside the typed ones
+        assert_eq!(digits("2がつついたち", &["2月1日"]), ["2月1日"]);
+        // no digit typed: nothing to keep
+        assert_eq!(digits("いちばん", &["1番", "一番"]), ["1番", "一番"]);
     }
 
     fn drop(reading: &str, cands: &[&str]) -> Vec<String> {

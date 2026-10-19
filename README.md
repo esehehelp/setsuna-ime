@@ -59,8 +59,13 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
   （kana / Latin の n-gram モデルによる分割。モデルは IME に同梱：
   `crates/ime-core/data/mixed`、インストールで有効になり、`mixed_model = ""`
   でオフ）。英単語の後ろの助詞
-  （`Ollamade` → Ollamaで）から日本語に戻る。英単語が 2 語以上の英文は
-  文頭を大文字にし、`.` `,` も英文のまま残す（`sentence_case`）。小文字で
+  （`Ollamade` → Ollamaで）から日本語に戻る。小文字で打ったまれな語や名前が
+  「よくある英単語＋する」とも読めるときは文を取る（`dlsite` → dlして、助詞が
+  続けば `dlsitede` → DLsiteで。名前の表記どおり Shift で打てばそのまま）。
+  英単語が 2 語以上の英文は文頭を大文字にする。英単語の直後の `.` `,` `!` `?`
+  は、その文に日本語がなければ英文のまま（`this is a pen.`、英文を確定した後の
+  `.`）、日本語の文の中なら `、。`（`korehagoogle.` → これはgoogle。）
+  （`sentence_case`）。小文字で
   打った英語の表記は `name_case` で選ぶ：`proper` は英字の名前の辞書
   （`name_dictionary_file`）の固有名詞をその表記に（`github` → GitHub、
   `iphone` → iPhone）、`acronyms`（既定）はさらに、英単語として読めない

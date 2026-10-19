@@ -404,6 +404,7 @@ mod tests {
     fn session_with(f: impl FnOnce(&mut Config)) -> (Session, Echo) {
         let mut cfg = Config::default();
         cfg.learning.enabled = false;
+        cfg.frontend.prediction = false;
         cfg.frontend.preedit_cursor_at_start = false;
         f(&mut cfg);
         let echo = Echo::default();

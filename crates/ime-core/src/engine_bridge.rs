@@ -277,6 +277,9 @@ pub struct EngineBridge {
     /// instead of typing; for a window that labels its candidates.
     digit_select: bool,
     full_width_space: bool,
+    /// `[frontend] sentence_case`: the punctuation typed after an English
+    /// sentence is English (`mixed::english_after`).
+    sentence_case: bool,
     /// Typing shows the conversion in the preedit (else the kana, with the
     /// conversions offered by [`Self::suggestions`]).
     live_conversion: bool,
@@ -383,6 +386,7 @@ impl EngineBridge {
             page_size: 10,
             digit_select: false,
             full_width_space: frontend.full_width_space,
+            sentence_case: frontend.sentence_case,
             live_conversion: frontend.live_conversion.unwrap_or(true),
             form: None,
             reranker: None,
@@ -2198,6 +2202,7 @@ impl EngineBridge {
         } else {
             processed
         };
+        let processed = crate::postprocess::drop_changed_digits(reading, processed);
         // The English words of a mixed reading stay as typed.
         let processed = if self.composing.is_mixed() {
             processed
@@ -2688,6 +2693,36 @@ impl EngineBridge {
                 if table.uses(c) && !matches!(self.phase, Phase::Alphabet { .. }) {
                     return self.handle_char(c);
                 }
+            }
+        }
+        // Sentence punctuation right after English, in a sentence with no
+        // Japanese (`mixed::english_after`): as typed, not 、。！. After the
+        // English typed with Shift it goes on with it; after an English text
+        // committed it is committed. Mixed input decides it per span.
+        let sentence_punct = match typed[..] {
+            ['。'] => Some('.'),
+            ['、'] => Some(','),
+            [c @ ('.' | ',' | '!' | '?' | ';' | ':')] => Some(c),
+            _ => None,
+        };
+        if let Some(c) = sentence_punct {
+            match &self.phase {
+                _ if !self.sentence_case => {}
+                Phase::Alphabet { buffer }
+                    if crate::mixed::english_after(&format!("{}{buffer}", self.context)) =>
+                {
+                    let buf = format!("{buffer}{c}");
+                    self.phase = Phase::Alphabet {
+                        buffer: buf.clone(),
+                    };
+                    return consumed(vec![Action::UpdatePreedit { text: buf }]);
+                }
+                Phase::Empty if crate::mixed::english_after(&self.context) => {
+                    let text = c.to_string();
+                    self.append_context(&text);
+                    return consumed(vec![Action::Commit { text }]);
+                }
+                _ => {}
             }
         }
         // The period key right after a digit types `.` (3.5, and 3. before
@@ -3950,6 +3985,57 @@ mod tests {
     }
 
     #[test]
+    fn punctuation_after_an_english_sentence_is_english() {
+        let (mut bridge, _mock) = bridge_with_mock();
+        // typed with Shift: it goes on with the English
+        bridge.handle_shifted_alpha('T');
+        type_str(&mut bridge, "his");
+        bridge.handle_space();
+        type_str(&mut bridge, "works");
+        let out = bridge.handle_punctuation("！");
+        assert_eq!(preedit(&out.actions).as_deref(), Some("This works!"));
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["This works!"]);
+        // after English committed: committed as typed
+        bridge.set_app_context(Some("This is a pen"));
+        let out = bridge.handle_punctuation("。");
+        assert_eq!(commits(&out.actions), vec!["."]);
+        // English inside Japanese: Japanese punctuation
+        bridge.set_app_context(Some("これはGoogle"));
+        let out = bridge.handle_punctuation("。");
+        assert_eq!(preedit(&out.actions).as_deref(), Some("。"));
+    }
+
+    #[test]
+    fn mixed_punctuation_follows_the_sentence() {
+        let (mut bridge, mock) = mixed_bridge();
+        type_str(&mut bridge, "hello");
+        bridge.handle_punctuation("、");
+        // Space after English punctuation types a space, as after a word
+        let out = bridge.handle_space();
+        assert_eq!(preedit(&out.actions).as_deref(), Some("hello, "));
+        type_str(&mut bridge, "google");
+        bridge.handle_punctuation("。");
+        assert_eq!(
+            commits(&bridge.handle_enter().actions),
+            vec!["Hello, google."]
+        );
+        // a candidate that turned it into 。 is a misconversion
+        type_str(&mut bridge, "korehagoogle");
+        bridge.handle_punctuation("。");
+        mock.set_result("これはgoogle。", &["これはgoogle。"]);
+        bridge.apply_async_result();
+        assert_eq!(
+            commits(&bridge.handle_enter().actions),
+            vec!["これはgoogle。"]
+        );
+        assert!(crate::mixed::keeps_latin("hello, world.", "hello, world."));
+        assert!(!crate::mixed::keeps_latin(
+            "hello, world.",
+            "hello、world。"
+        ));
+    }
+
+    #[test]
     fn mixed_candidates_keep_the_english_as_typed() {
         let (mut bridge, mock) = mixed_bridge();
         type_str(&mut bridge, "googlede");
@@ -4064,6 +4150,26 @@ mod tests {
         mock.set_result("か", &["可", "蚊"]);
         let actions = bridge.apply_async_result();
         assert_eq!(actions, vec![Action::UpdatePreedit { text: "可".into() }]);
+    }
+
+    #[test]
+    fn a_typed_number_stays_as_typed_when_the_model_merges_its_digits() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "19911225");
+        mock.set_result("19911225", &["199125", "1991125"]);
+        let actions = bridge.apply_async_result();
+        assert_eq!(
+            actions,
+            vec![Action::UpdatePreedit {
+                text: "19911225".into()
+            }]
+        );
+        let outcome = bridge.handle_space();
+        let Some(Action::ShowCandidates { list, .. }) = outcome.actions.last() else {
+            panic!("no candidate window: {:?}", outcome.actions);
+        };
+        assert_eq!(list[0], "19911225");
+        assert!(!list.iter().any(|c| c == "199125" || c == "1991125"));
     }
 
     #[test]
