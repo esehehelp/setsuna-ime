@@ -12,15 +12,24 @@
 # Options:
 #   --precision int8|fp32   the model (default int8)
 #   --archive <file>        a local release archive instead of the download
+#   --rerank-manifest <m>   also the reranker's LM (an LM scorer manifest and
+#                           the weights it names): candidates are reranked
+#   --name-dictionary <tsv> also mixed input's Latin names dictionary
 #   --no-register           install only; leave fcitx5 as it is
 #   --root <dir>            install under <dir> (staging, tests): no root
 #                           needed, implies --no-register
+# A reranker model or names dictionary installed before stays when the
+# option is not given again.
 #
 # Layout:
 #   <fcitx5 addon dir>/setsuna.so
 #   /usr/share/fcitx5/{addon,inputmethod,themes}/, /usr/share/icons/hicolor/scalable/apps/setsuna*.svg
-#   /usr/lib/setsuna-ime/  the engine and rewriter daemons, libonnxruntime.so,
-#                          mixed/, models/onnx/, licenses/, uninstall.sh, installed-files
+#   /usr/lib/setsuna-ime/  the engine, reranker and rewriter daemons, libonnxruntime.so,
+#                          llama.cpp's libraries, mixed/, models/onnx/, licenses/,
+#                          uninstall.sh, installed-files
+#   /usr/lib/setsuna-ime/models/rerank/<manifest> + its weights  (with --rerank-manifest)
+#   /usr/lib/setsuna-ime/names/latin-names.tsv  (with --name-dictionary)
+# These are the addon's defaults where config.toml sets nothing.
 #   /usr/bin/setsuna-settings  (when WebKitGTK 4.1 is there)
 #   /var/cache/setsuna-ime/models  (verified model downloads, reused offline)
 # /usr/lib/setsuna-ime is compiled into the addon, so no config.toml is needed.
@@ -43,6 +52,8 @@ precision=int8
 archive=
 register=1
 root=
+rerank_manifest=
+name_dictionary=
 
 log() { echo "setsuna-install: $*" >&2; }
 fail() {
@@ -56,6 +67,8 @@ while (($#)); do
     case $1 in
         --precision) precision=${2:?}; shift 2 ;;
         --archive) archive=${2:?}; shift 2 ;;
+        --rerank-manifest) rerank_manifest=${2:?}; shift 2 ;;
+        --name-dictionary) name_dictionary=${2:?}; shift 2 ;;
         --no-register) register=0; shift ;;
         --root) root=${2:?}; register=0; shift 2 ;;
         -h | --help) sed -n '1d; /^#/!q; s/^# \{0,1\}//p' "$0"; exit 0 ;;
@@ -87,6 +100,30 @@ for d in /usr/lib/fcitx5 /usr/lib64/fcitx5 /usr/lib/*/fcitx5; do
     fi
 done
 [[ -n $addon_dir ]] || fail 10 "fcitx5 not found: install fcitx5 first"
+
+# The reranker's LM: its manifest and the weights file it names, relative
+# to it (copied to the same relative path, so the manifest resolves).
+rerank_weights=
+if [[ -n $rerank_manifest ]]; then
+    [[ -f $rerank_manifest ]] || fail 30 "rerank manifest not found: $rerank_manifest"
+    if command -v jq >/dev/null; then
+        rerank_weights=$(jq -r '.weights.path // empty' "$rerank_manifest") ||
+            fail 30 "rerank manifest is not JSON: $rerank_manifest"
+    else
+        # weights.path is the manifest's only "path"
+        paths=$(grep -o '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$rerank_manifest" | sed 's/.*"\([^"]*\)"$/\1/')
+        [[ $(grep -c . <<<"$paths") == 1 ]] || fail 30 "cannot read the weights path without jq: $rerank_manifest"
+        rerank_weights=$paths
+    fi
+    if [[ -z $rerank_weights || $rerank_weights == /* || $rerank_weights =~ (^|/)\.\.(/|$) ]]; then
+        fail 30 "rerank manifest weights path leaves the artifact directory: $rerank_weights"
+    fi
+    [[ -f $(dirname "$rerank_manifest")/$rerank_weights ]] ||
+        fail 30 "rerank weights not found: $(dirname "$rerank_manifest")/$rerank_weights"
+fi
+if [[ -n $name_dictionary && ! -f $name_dictionary ]]; then
+    fail 30 "names dictionary not found: $name_dictionary"
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -196,11 +233,27 @@ if [[ -f $src/bin/setsuna-settings ]]; then
         put "$src/bin/setsuna-settings" /usr/bin/setsuna-settings 755
     fi
 fi
-# Files of the previous install that this one no longer has (another model).
+if [[ -n $rerank_manifest ]]; then
+    # one LM: the reranker reads the only manifest there
+    rm -f -- "$root$module"/models/rerank/*manifest.json
+    put "$rerank_manifest" "$module/models/rerank/$(basename "$rerank_manifest")" 644
+    put "$(dirname "$rerank_manifest")/$rerank_weights" "$module/models/rerank/$rerank_weights" 644
+fi
+if [[ -n $name_dictionary ]]; then
+    put "$name_dictionary" "$module/names/latin-names.tsv" 644
+fi
+# Files of the previous install that this one no longer has (another model);
+# its reranker model and names dictionary stay unless replaced.
 if [[ -f $root$module/installed-files ]]; then
     while IFS= read -r f; do
         [[ $f == /* && ! -d $root$f ]] || continue
-        printf '%s\n' "${installed[@]}" | grep -qxF -- "$f" || rm -f -- "$root$f"
+        printf '%s\n' "${installed[@]}" | grep -qxF -- "$f" && continue
+        if [[ ($f == "$module"/models/rerank/* && -z $rerank_manifest) ||
+            ($f == "$module"/names/* && -z $name_dictionary) ]] && [[ -f $root$f ]]; then
+            installed+=("$f")
+            continue
+        fi
+        rm -f -- "$root$f"
     done <"$root$module/installed-files"
 fi
 printf '%s\n' "${installed[@]}" "$module/installed-files" >"$root$module/installed-files"

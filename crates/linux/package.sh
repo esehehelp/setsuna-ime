@@ -9,11 +9,12 @@
 #   gh release create v<version> target/dist/*                                     # publish
 #
 # The archive holds the fcitx5 addon (its module dir compiled in as
-# /usr/lib/setsuna-ime), the engine and rewriter daemons, ONNX Runtime, the
-# mixed input model, the settings GUI and models.tsv, the conversion model pins
-# of crates/tsf/models.json (install.sh downloads the model). Needs what the
-# build needs (cargo, cmake, fcitx5 and WebKitGTK 4.1 development files), curl
-# and jq.
+# /usr/lib/setsuna-ime), the engine, reranker (with llama.cpp) and rewriter
+# daemons, ONNX Runtime, the mixed input model, the settings GUI and
+# models.tsv, the conversion model pins of crates/tsf/models.json (install.sh
+# downloads the model). Needs what the build needs (cargo, cmake, fcitx5 and
+# WebKitGTK 4.1 development files, and for llama.cpp a C/C++ compiler with
+# OpenMP), curl and jq.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -40,6 +41,7 @@ cmake -S "$here/fcitx5" -B "$build_dir" \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DSETSUNA_MODULE_DIR=/usr/lib/setsuna-ime \
     -DSETSUNA_BUILD_SETTINGS=ON \
+    -DSETSUNA_BUILD_RERANK=ON \
     -DSETSUNA_ORT_LIBRARY="$repo/target/release/libonnxruntime.so" \
     -DSETSUNA_MODEL_MANIFEST=
 cmake --build "$build_dir"
@@ -48,17 +50,22 @@ stage=$build_dir/stage
 rm -rf "$stage" "$dist"
 DESTDIR=$stage cmake --install "$build_dir" >/dev/null
 out=$dist/$name
-mkdir -p "$out/addon" "$out/module/licenses/onnxruntime" "$out/bin"
+mkdir -p "$out/addon" "$out/module/licenses/onnxruntime" "$out/module/licenses/llama.cpp" "$out/bin"
 mv "$(find "$stage" -name setsuna.so -path '*/fcitx5/*')" "$out/addon/"
 mv "$stage/usr/share" "$out/share"
 mv "$stage/usr/lib/setsuna-ime/"* "$out/module/"
 mv "$stage/usr/bin/setsuna-settings" "$out/bin/"
-strip "$out/addon/setsuna.so" "$out/module/setsuna-engine" "$out/module/setsuna-rewrite" "$out/bin/setsuna-settings"
+strip "$out/addon/setsuna.so" "$out/module/setsuna-engine" "$out/module/setsuna-rewrite" \
+    "$out/module/setsuna-rerank" "$out/bin/setsuna-settings"
 install -m755 "$here/uninstall.sh" "$out/module/uninstall.sh"
 install -m644 "$repo/LICENSE" "$repo/THIRD_PARTY_NOTICES.md" "$out/module/licenses/"
 ort=$(basename "$(ls "$repo"/local/onnxruntime/onnxruntime-linux-x64-*.tgz | tail -1)" .tgz)
 tar -xzf "$repo/local/onnxruntime/$ort.tgz" -C "$out/module/licenses/onnxruntime" --strip-components=1 \
     "$ort/LICENSE" "$ort/ThirdPartyNotices.txt"
+# llama.cpp (MIT), built into the reranker from the llama-cpp-sys-2 crate
+sys=$(sed -n '/^name = "llama-cpp-sys-2"$/{n;s/^version = "\(.*\)"$/\1/p}' "$repo/Cargo.lock")
+install -m644 "$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/llama-cpp-sys-2-"$sys"/llama.cpp/LICENSE | head -1)" \
+    "$out/module/licenses/llama.cpp/LICENSE"
 
 # models.tsv: "repository" / "revision" lines, then <precision> <path> <size> <sha256>
 catalog=$repo/crates/tsf/models.json

@@ -10,11 +10,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use setsuna_core::child_daemon;
-use setsuna_core::config::Config;
-use setsuna_core::engine_client::EngineClient;
+use setsuna_core::config::{Config, RewriterCfg};
+use setsuna_core::engine_client::{EngineClient, Notify};
+use setsuna_core::rerank_client::{self, RerankClient};
+use setsuna_core::rewrite_client::{self, RewriteClient};
 
 use crate::keys::Key;
-use crate::session::Session;
+use crate::session::{Field, Session};
 
 /// Wakes the addon's event loop; called from a backend thread with the
 /// `user` pointer given to `setsuna_session_new`.
@@ -46,6 +48,8 @@ pub struct SetsunaView {
     pub suggestions: *const *const c_char,
     pub suggestion_comments: *const *const c_char,
     pub n_suggestions: usize,
+    /// A line under the open candidate list (書き直し中…), "" for none.
+    pub status: *const c_char,
 }
 
 /// C strings of a list, and the pointer array handed out.
@@ -69,11 +73,16 @@ pub struct SetsunaSession {
     session: Session,
     /// Where the engine and models are looked for last (see `load_config`).
     module_dir: Option<PathBuf>,
+    /// What the daemons wake the addon with.
+    notify: SetsunaNotify,
+    user: UserPtr,
+    /// The settings the running rewriter was started with.
+    rewriter_started: Option<RewriterCfg>,
     commits: CList,
     preedit: CList,
     candidates: CList,
     comments: CList,
-    /// reading, form, form key
+    /// reading, form, form key, status
     texts: CList,
     suggestions: CList,
     suggestion_comments: CList,
@@ -91,8 +100,12 @@ impl SetsunaSession {
         self.suggestions.set(&v.suggestions);
         self.suggestion_comments.set(&v.suggestion_comments);
         let (form, key) = v.form.unwrap_or(("", ""));
-        self.texts
-            .set(&[v.reading.clone(), form.to_string(), key.to_string()]);
+        self.texts.set(&[
+            v.reading.clone(),
+            form.to_string(),
+            key.to_string(),
+            v.status.clone(),
+        ]);
         self.view = SetsunaView {
             commits: self.commits.ptrs.as_ptr(),
             n_commits: self.commits.ptrs.len(),
@@ -110,12 +123,68 @@ impl SetsunaSession {
             suggestions: self.suggestions.ptrs.as_ptr(),
             suggestion_comments: self.suggestion_comments.ptrs.as_ptr(),
             n_suggestions: self.suggestions.ptrs.len(),
+            status: self.texts.ptrs[3],
         };
+    }
+
+    /// A notify for a daemon's reader thread: wakes the addon, which then
+    /// takes the result (`setsuna_session_apply_async`).
+    fn wake(&self) -> Notify {
+        let (notify, user) = (self.notify, self.user);
+        Box::new(move |_req_id: u64| {
+            let user = &user;
+            notify(user.0)
+        })
+    }
+
+    /// Take up `cfg` and start the daemons it asks for, as the TSF DLL does
+    /// on ActivateEx: an engine when there is none or its daemon exited
+    /// (with a new bridge, so a new reranker and rewriter too), a reranker
+    /// when there is none, the rewriter when it is on and was not started
+    /// with these settings; then rewrite mode on (only with a rewriter).
+    fn configure(&mut self, cfg: &Config) {
+        let module_dir = self.module_dir.clone();
+        let module_dir = module_dir.as_deref();
+        let client = (!self.session.has_client())
+            .then(|| child_daemon::spawn_with_config(cfg, module_dir, self.wake()))
+            .flatten()
+            .map(|c| Box::new(c) as Box<dyn EngineClient>);
+        let new_bridge = client.is_some();
+        if new_bridge {
+            setsuna_core::diagnostics::log("fcitx5 engine started");
+        }
+        self.session.configure_with(cfg, client);
+        if new_bridge || !self.session.has_reranker() {
+            let reranker = rerank_client::spawn_with_config(cfg, module_dir, self.wake())
+                .map(|c| Box::new(c) as Box<dyn RerankClient>);
+            self.session.set_reranker(reranker, cfg);
+        } else {
+            self.session.set_rerank_config(cfg);
+        }
+        let needs_rewriter = cfg.rewriter.enabled
+            && (!self.session.has_rewriter()
+                || self.rewriter_started.as_ref() != Some(&cfg.rewriter));
+        if needs_rewriter || !cfg.rewriter.enabled {
+            let rewriter = needs_rewriter
+                .then(|| rewrite_client::spawn_with_config(cfg, module_dir, self.wake()))
+                .flatten();
+            self.rewriter_started = rewriter.as_ref().map(|_| cfg.rewriter.clone());
+            self.session
+                .set_rewriter(rewriter.map(|c| Box::new(c) as Box<dyn RewriteClient>));
+        }
+        self.session.set_rewrite_mode(true);
+        setsuna_core::diagnostics::log(format!(
+            "fcitx5 daemons engine={} reranker={} rewriter={}",
+            self.session.has_client(),
+            self.session.has_reranker(),
+            self.session.rewrite_mode()
+        ));
     }
 }
 
-/// The addon's `user` pointer, carried to the reader thread. The addon keeps
-/// it valid until `setsuna_session_free` returns, which joins that thread.
+/// The addon's `user` pointer, carried to the reader threads. The addon
+/// keeps it valid until `setsuna_session_free` returns, which joins them.
+#[derive(Clone, Copy)]
 struct UserPtr(*mut c_void);
 unsafe impl Send for UserPtr {}
 
@@ -126,7 +195,7 @@ fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
     })
 }
 
-/// Start a session: load `config.toml` and spawn the engine daemon.
+/// Start a session: load `config.toml` and spawn the daemons it asks for.
 /// `module_dir` (may be null) is where the engine and models are looked for
 /// last, and the mixed input model (`mixed`, installed with the addon) when
 /// `[frontend] mixed_model` is not set. Never returns null.
@@ -143,22 +212,12 @@ pub unsafe extern "C" fn setsuna_session_new(
     setsuna_core::diagnostics::init("fcitx5.log");
     let module_dir = (!module_dir.is_null())
         .then(|| PathBuf::from(CStr::from_ptr(module_dir).to_string_lossy().into_owned()));
-    let session = guard(None, || {
-        let cfg = load_config(module_dir.as_deref());
-        let user = UserPtr(user);
-        let wake = Box::new(move |_req_id: u64| {
-            let user = &user;
-            notify(user.0)
-        });
-        let client = child_daemon::spawn_with_config(&cfg, module_dir.as_deref(), wake)
-            .map(|c| Box::new(c) as Box<dyn EngineClient>);
-        setsuna_core::diagnostics::log(format!("fcitx5 session: engine={}", client.is_some()));
-        Some(Session::new(&cfg, client))
-    });
-    let session = session.unwrap_or_else(|| Session::new(&Config::default(), None));
     let mut s = Box::new(SetsunaSession {
-        session,
+        session: Session::new(&Config::default(), None),
         module_dir,
+        notify,
+        user: UserPtr(user),
+        rewriter_started: None,
         commits: CList::default(),
         preedit: CList::default(),
         candidates: CList::default(),
@@ -183,13 +242,18 @@ pub unsafe extern "C" fn setsuna_session_new(
             suggestions: std::ptr::null(),
             suggestion_comments: std::ptr::null(),
             n_suggestions: 0,
+            status: std::ptr::null(),
         },
+    });
+    guard((), || {
+        let cfg = load_config(s.module_dir.as_deref());
+        s.configure(&cfg);
     });
     s.refresh();
     Box::into_raw(s)
 }
 
-/// Stop the engine daemon and free the session. No notify follows.
+/// Stop the daemons and free the session. No notify follows.
 ///
 /// # Safety
 /// `s` came from `setsuna_session_new` and is not used afterwards.
@@ -219,25 +283,61 @@ unsafe fn with<R>(s: *mut SetsunaSession, fallback: R, f: impl FnOnce(&mut Sessi
 pub unsafe extern "C" fn setsuna_session_configure(s: *mut SetsunaSession) {
     setsuna_core::diagnostics::log("fcitx5 configure");
     let cfg = load_config(module_dir_of(s));
-    with(s, (), |sess| sess.configure(&cfg));
+    with_outer(s, |s| s.configure(&cfg));
 }
 
-/// `config.toml` over what the addon's install supplies: the mixed input
-/// model installed next to the engine (`<module_dir>/mixed`) when
-/// `[frontend] mixed_model` is not set. Every (re)load goes through here, so
-/// a reload on activation or focus keeps it.
+/// `with` for what needs the whole session (its daemons).
+unsafe fn with_outer(s: *mut SetsunaSession, f: impl FnOnce(&mut SetsunaSession)) {
+    let Some(s) = s.as_mut() else {
+        return;
+    };
+    guard((), || f(s));
+    s.refresh();
+}
+
+/// `config.toml` over what the addon's install supplies, each where
+/// config.toml sets nothing (the Windows installer writes them into it): the
+/// mixed input model (`<module_dir>/mixed`), the Latin names dictionary
+/// (`<module_dir>/names/latin-names.tsv`) and the reranker's model (the one
+/// `*manifest.json` of `<module_dir>/models/rerank`). Every (re)load goes
+/// through here, so a reload on activation or focus keeps them.
 fn load_config(module_dir: Option<&Path>) -> Config {
     with_module_defaults(Config::load_default(), module_dir)
 }
 
 fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
+    let Some(dir) = module_dir else {
+        return cfg;
+    };
+    let path = |p: PathBuf| p.to_string_lossy().into_owned();
     if cfg.frontend.mixed_model.is_none() {
-        cfg.frontend.mixed_model = module_dir
-            .map(|d| d.join("mixed"))
-            .filter(|d| d.join("kana.tsv").is_file())
-            .map(|d| d.to_string_lossy().into_owned());
+        let mixed = dir.join("mixed");
+        cfg.frontend.mixed_model = mixed.join("kana.tsv").is_file().then(|| path(mixed));
+    }
+    if cfg.frontend.name_dictionary_file.is_none() {
+        let names = dir.join("names").join("latin-names.tsv");
+        cfg.frontend.name_dictionary_file = names.is_file().then(|| path(names));
+    }
+    if cfg.rerank.manifest.is_none() {
+        cfg.rerank.manifest = the_manifest_in(&dir.join("models").join("rerank"));
     }
     cfg
+}
+
+/// The one `*manifest.json` of `dir`: none when there is none or several.
+fn the_manifest_in(dir: &Path) -> Option<PathBuf> {
+    let mut found = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("manifest.json"))
+        });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 /// The session's module dir.
@@ -267,38 +367,57 @@ pub unsafe extern "C" fn setsuna_session_configure_app(
         "fcitx5 configure for {program:?} app settings={}",
         app.is_some()
     ));
-    with(s, (), |sess| {
-        sess.configure(&cfg);
+    with_outer(s, |s| {
+        s.configure(&cfg);
         match app.map(|a| a.start) {
-            Some(setsuna_core::config::AppStart::On) => sess.set_enabled(true),
-            Some(setsuna_core::config::AppStart::Off) => sess.set_enabled(false),
+            Some(setsuna_core::config::AppStart::On) => s.session.set_enabled(true),
+            Some(setsuna_core::config::AppStart::Off) => s.session.set_enabled(false),
             _ => {}
         }
     });
 }
 
-/// A key press; true when the IME took it.
+/// `setsuna_session_key`'s `field`: what the field typed into is.
+pub const SETSUNA_FIELD_NORMAL: u32 = 0;
+/// No context, no rewrite, nothing learned.
+pub const SETSUNA_FIELD_PRIVATE: u32 = 1;
+/// Direct input: keys that would start a composition go to the app.
+pub const SETSUNA_FIELD_DIRECT: u32 = 2;
+
+/// A key press typed into `field` (`SETSUNA_FIELD_*`), with `before_caret`
+/// the app's text before the caret (null when it does not tell); true when
+/// the IME took it.
 ///
 /// # Safety
-/// `s` is a live session.
+/// `s` is a live session; `before_caret` is null or a NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_key(
     s: *mut SetsunaSession,
     sym: u32,
     code: u32,
     mods: u32,
+    field: u32,
+    before_caret: *const c_char,
 ) -> bool {
-    with(s, false, |sess| sess.key(&Key { sym, code, mods }))
+    let field = match field {
+        SETSUNA_FIELD_PRIVATE => Field::Private,
+        SETSUNA_FIELD_DIRECT => Field::Direct,
+        _ => Field::Normal,
+    };
+    let before = (!before_caret.is_null())
+        .then(|| CStr::from_ptr(before_caret).to_string_lossy().into_owned());
+    with(s, false, |sess| {
+        sess.key_in(&Key { sym, code, mods }, field, before.as_deref())
+    })
 }
 
-/// Whether the field typed into is private (fcitx5's Password or
-/// Sensitive capability): no context, no rewrite, nothing learned.
+/// Rewrite mode is on (a rewriter is running): the mode shows 直.
 ///
 /// # Safety
 /// `s` is a live session.
 #[no_mangle]
-pub unsafe extern "C" fn setsuna_session_set_private(s: *mut SetsunaSession, private: bool) {
-    with(s, (), |sess| sess.set_private_field(private))
+pub unsafe extern "C" fn setsuna_session_rewrite_mode(s: *const SetsunaSession) -> bool {
+    s.as_ref().is_some_and(|s| s.session.rewrite_mode())
 }
 
 /// How long (ms) until a deferred preedit is shown anyway (0: none waits);
@@ -448,10 +567,42 @@ mod tests {
     }
 
     #[test]
+    fn an_installed_names_dictionary_and_rerank_model_are_defaults() {
+        let dir = std::env::temp_dir().join(format!("setsuna-ffi-rr-{}", std::process::id()));
+        let rerank = dir.join("models/rerank");
+        std::fs::create_dir_all(&rerank).unwrap();
+        std::fs::create_dir_all(dir.join("names")).unwrap();
+        std::fs::write(dir.join("names/latin-names.tsv"), "GitHub\t1\n").unwrap();
+        std::fs::write(rerank.join("lm.manifest.json"), "{}").unwrap();
+        let cfg = with_module_defaults(Config::default(), Some(&dir));
+        let names = dir
+            .join("names/latin-names.tsv")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(cfg.frontend.name_dictionary_file, Some(names));
+        assert_eq!(cfg.rerank.manifest, Some(rerank.join("lm.manifest.json")));
+        // config.toml's own wins
+        let mut own = Config::default();
+        own.rerank.manifest = Some(PathBuf::from("/m.json"));
+        let cfg = with_module_defaults(own, Some(&dir));
+        assert_eq!(cfg.rerank.manifest, Some(PathBuf::from("/m.json")));
+        // two models: which one is not guessed
+        std::fs::write(rerank.join("other.manifest.json"), "{}").unwrap();
+        let cfg = with_module_defaults(Config::default(), Some(&dir));
+        assert!(cfg.rerank.manifest.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    extern "C" fn no_wake(_: *mut c_void) {}
+
+    #[test]
     fn the_c_view_mirrors_the_session() {
         let mut s = SetsunaSession {
             session: Session::new(&Config::default(), None),
             module_dir: None,
+            notify: no_wake,
+            user: UserPtr(std::ptr::null_mut()),
+            rewriter_started: None,
             commits: CList::default(),
             preedit: CList::default(),
             candidates: CList::default(),
@@ -465,7 +616,7 @@ mod tests {
         let p = &mut s as *mut SetsunaSession;
         unsafe {
             for c in "kana".chars() {
-                assert!(setsuna_session_key(p, c as u32, 0, 0));
+                assert!(setsuna_session_key(p, c as u32, 0, 0, 0, std::ptr::null()));
             }
             let v = &*setsuna_session_view(p);
             assert_eq!(strings(v.preedit, v.n_preedit), vec!["かな"]);
@@ -473,7 +624,7 @@ mod tests {
             // preedit_cursor_at_start: the caret stays at the start
             assert_eq!(v.cursor, 0);
             assert_eq!(v.n_candidates, 0);
-            assert!(setsuna_session_key(p, 0xff0d, 0, 0));
+            assert!(setsuna_session_key(p, 0xff0d, 0, 0, 0, std::ptr::null()));
             let v = &*setsuna_session_view(p);
             assert_eq!(strings(v.commits, v.n_commits), vec!["かな"]);
             assert_eq!(v.n_preedit, 0);

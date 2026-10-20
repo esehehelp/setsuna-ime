@@ -15,7 +15,7 @@
 # crates/linux/package.sh builds the release archive (crates/linux/install.sh
 # installs it) with these.
 cmake_minimum_required(VERSION 3.19)
-project(fcitx5-setsuna VERSION 0.1.1 LANGUAGES CXX)
+project(fcitx5-setsuna VERSION 0.1.2 LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(GNUInstallDirs)
@@ -44,6 +44,11 @@ set(SETSUNA_CARGO_PACKAGES -p setsuna-linux -p setsuna-engine -p setsuna-rewrite
 set(SETSUNA_DAEMONS "${CARGO_OUT}/setsuna-engine" "${CARGO_OUT}/setsuna-rewrite")
 if(SETSUNA_BUILD_SETTINGS)
     list(APPEND SETSUNA_CARGO_PACKAGES -p setsuna-settings)
+endif()
+# The reranker builds llama.cpp from source (CMake, a C/C++ compiler, OpenMP).
+option(SETSUNA_BUILD_RERANK "Build and install the reranker (setsuna-rerank, llama.cpp)" OFF)
+if(SETSUNA_BUILD_RERANK)
+    list(APPEND SETSUNA_CARGO_PACKAGES -p setsuna-rerank)
 endif()
 
 # Always run: cargo knows best whether anything changed.
@@ -94,6 +99,16 @@ install(PROGRAMS ${SETSUNA_DAEMONS} DESTINATION "${SETSUNA_MODULE_DIR}")
 if(SETSUNA_BUILD_SETTINGS)
     install(PROGRAMS "${CARGO_OUT}/setsuna-settings" DESTINATION "${CMAKE_INSTALL_BINDIR}")
     install(FILES setsuna-settings.desktop DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+endif()
+# The reranker with the llama.cpp libraries it links (its RPATH is $ORIGIN)
+# and the CPU backends it picks one of at run time.
+if(SETSUNA_BUILD_RERANK)
+    install(PROGRAMS "${CARGO_OUT}/setsuna-rerank" "${CARGO_OUT}/libllama.so.0"
+        "${CARGO_OUT}/libggml.so.0" "${CARGO_OUT}/libggml-base.so.0"
+        DESTINATION "${SETSUNA_MODULE_DIR}")
+    install(CODE "
+        file(GLOB backends \"${CARGO_OUT}/libggml-cpu-*.so\")
+        file(INSTALL \${backends} DESTINATION \"${SETSUNA_MODULE_DIR}\" USE_SOURCE_PERMISSIONS)")
 endif()
 
 set(SETSUNA_ORT_LIBRARY "${CARGO_OUT}/libonnxruntime.so" CACHE FILEPATH
