@@ -285,6 +285,9 @@ pub struct EngineBridge {
     live_conversion: bool,
     /// The last F6–F10 conversion, while its text is what Converting shows.
     form: Option<FormShown>,
+    /// The character n-gram table and its bigram and trigram weights
+    /// (`[ngram]`); `None` when off.
+    ngram: Option<(Arc<crate::char_ngram::CharNgram>, f32, f32)>,
     /// The reranker; `None` when reranking is off.
     reranker: Option<Box<dyn RerankClient>>,
     rerank_cfg: crate::config::RerankCfg,
@@ -389,6 +392,7 @@ impl EngineBridge {
             sentence_case: frontend.sentence_case,
             live_conversion: frontend.live_conversion.unwrap_or(true),
             form: None,
+            ngram: None,
             reranker: None,
             rerank_cfg: crate::config::RerankCfg::default(),
             rerank: None,
@@ -674,6 +678,7 @@ impl EngineBridge {
         let client = self.client.take();
         let reranker = self.reranker.take();
         let rerank_cfg = self.rerank_cfg.clone();
+        let ngram = self.ngram.take();
         let rewriter = self.rewriter.take();
         let rewrite_mode = self.rewrite_mode;
         let (page_size, digit_select, live) =
@@ -683,6 +688,7 @@ impl EngineBridge {
         self.invalidate_engine_results();
         self.set_candidate_paging(page_size, digit_select);
         self.set_reranker(reranker, &rerank_cfg);
+        self.ngram = ngram;
         self.rewriter = rewriter;
         self.rewrite_mode = rewrite_mode && self.rewriter.is_some();
         if frontend.live_conversion.is_none() {
@@ -693,6 +699,46 @@ impl EngineBridge {
     /// New rerank settings for the reranker already running.
     pub fn set_rerank_config(&mut self, cfg: &crate::config::RerankCfg) {
         self.rerank_cfg = cfg.clone();
+    }
+
+    /// Reorder the engine's candidates by character n-gram scores as
+    /// `[ngram]` says (off without a table, or when it does not load).
+    pub fn set_ngram(&mut self, cfg: &crate::config::NgramCfg) {
+        self.ngram = cfg
+            .table
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(crate::char_ngram::shared)
+            .map(|t| (t, cfg.bigram_weight, cfg.trigram_weight));
+    }
+
+    /// The engine's candidates in the order of their scores with the
+    /// character n-gram terms added; those sums become the scores, which
+    /// the LM reranker then adds to.
+    fn rescore_ngram(&self, result: &mut EngineResult) {
+        let Some((table, w2, w3)) = &self.ngram else {
+            return;
+        };
+        let n = result.candidates.len();
+        if n < 2 || result.scores.len() != n {
+            return;
+        }
+        let (order, total) = table.rescore(
+            &result.context,
+            &result.candidates,
+            &result.scores,
+            *w2,
+            *w3,
+        );
+        fn permute<T>(v: &mut Vec<T>, order: &[usize]) {
+            let mut old: Vec<Option<T>> = std::mem::take(v).into_iter().map(Some).collect();
+            *v = order.iter().map(|&i| old[i].take().unwrap()).collect();
+        }
+        permute(&mut result.candidates, &order);
+        if result.reading_pos.len() == n {
+            permute(&mut result.reading_pos, &order);
+        }
+        result.scores = order.iter().map(|&i| total[i]).collect();
     }
 
     /// Drop the composition without committing it (the host reset the
@@ -849,6 +895,7 @@ impl EngineBridge {
         if result.req_id < self.result_floor {
             return Vec::new();
         }
+        self.rescore_ngram(&mut result);
         if self
             .alt
             .as_ref()
@@ -4475,6 +4522,50 @@ mod tests {
             bridge.handle_enter().actions[0],
             Action::Commit { text: date }
         );
+    }
+
+    #[test]
+    fn ngram_scores_reorder_the_engines_candidates_for_the_reranker_too() {
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-ngram-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let text = "博士が来る。猫が白い。白紙に書く。".repeat(20);
+        std::fs::write(&path, crate::char_ngram::tests::table(&text)).unwrap();
+        let (mut bridge, mock, _rr) = bridge_with_reranker();
+        bridge.set_ngram(&crate::config::NgramCfg {
+            table: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        type_str(&mut bridge, "hakusi");
+        bridge.handle_space();
+        // 博紙, the model's top, joins two chars no text has together
+        answer_scored(&mock, &["博紙", "博士", "白紙"], &[-1.0, -1.2, -1.3]);
+        let actions = bridge.apply_async_result();
+        let list = match &actions[1] {
+            Action::ShowCandidates { list, .. } => list.clone(),
+            _ => panic!(),
+        };
+        assert_eq!(list[..2], ["博士", "白紙"]);
+        let pos = |c: &str| list.iter().position(|x| x == c).unwrap();
+        assert!(pos("博紙") > pos("白紙"), "{list:?}");
+        let job = bridge.rerank.as_ref().unwrap();
+        assert_eq!(job.raw, ["博士", "白紙", "博紙"]);
+        assert_eq!(job.scores[..2], [-1.2, -1.3]);
+        assert!(job.scores[2] < -1.3);
+        // off: the engine's order
+        bridge.handle_escape();
+        bridge.set_ngram(&crate::config::NgramCfg::default());
+        type_str(&mut bridge, "hakusi");
+        bridge.handle_space();
+        answer_scored(&mock, &["博紙", "博士", "白紙"], &[-1.0, -1.2, -1.3]);
+        bridge.apply_async_result();
+        assert_eq!(
+            bridge.rerank.as_ref().unwrap().raw,
+            ["博紙", "博士", "白紙"]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

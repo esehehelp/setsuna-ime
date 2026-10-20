@@ -20,5 +20,7 @@ serde_json.workspace = true
 toml.workspace = true
 toml_edit = "0.22"
 unicode-normalization = "0.1"
+# the character n-gram table, shared by every process the IME runs in
+memmap2 = "0.9"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

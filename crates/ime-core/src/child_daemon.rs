@@ -91,6 +91,8 @@ struct Pending {
 /// A request the writer has sent and is awaiting a response for.
 struct InFlight {
     reading: String,
+    /// The context as sent (NFKC).
+    context: String,
     dispatched_at: Instant,
 }
 
@@ -296,6 +298,7 @@ fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
             let p = st.pending.take().unwrap();
             st.in_flight = Some(InFlight {
                 reading: p.reading.clone(),
+                context: p.context.nfkc().collect(),
                 dispatched_at: p.dispatched_at,
             });
             p
@@ -415,9 +418,9 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
         if resp.error.is_some() {
             continue;
         }
-        let (reading, dispatched_at) = match inflight {
-            Some(f) => (f.reading, f.dispatched_at),
-            None => (String::new(), Instant::now()),
+        let (reading, context, dispatched_at) = match inflight {
+            Some(f) => (f.reading, f.context, f.dispatched_at),
+            None => (String::new(), String::new(), Instant::now()),
         };
         let wait = pacing_wait(dispatched_at.elapsed());
         if !wait.is_zero() {
@@ -428,6 +431,7 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
             *slot = Some(EngineResult {
                 req_id: resp.id,
                 reading,
+                context,
                 candidates: resp.candidates,
                 reading_pos: resp.candidate_reading_pos,
                 scores: resp.candidate_scores,

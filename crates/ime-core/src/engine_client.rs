@@ -20,6 +20,9 @@ pub struct EngineResult {
     /// the bridge check the result is still a prefix of what the user has
     /// typed before applying it.
     pub reading: String,
+    /// The left context the candidates were produced after, as the engine
+    /// read it (NFKC); empty when not known.
+    pub context: String,
     /// Ranked candidate surfaces, best-first.
     pub candidates: Vec<String>,
     /// Per candidate, for each char the index of the reading char it was

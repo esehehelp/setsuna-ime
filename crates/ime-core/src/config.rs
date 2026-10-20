@@ -44,6 +44,7 @@ pub struct Config {
     pub frontend: FrontendCfg,
     pub learning: LearningCfg,
     pub rerank: RerankCfg,
+    pub ngram: NgramCfg,
     pub rewriter: RewriterCfg,
     /// Settings for one application each (`[[apps]]`), over the others.
     pub apps: Vec<AppCfg>,
@@ -57,6 +58,7 @@ impl Default for Config {
             frontend: FrontendCfg::default(),
             learning: LearningCfg::default(),
             rerank: RerankCfg::default(),
+            ngram: NgramCfg::default(),
             rewriter: RewriterCfg::default(),
             apps: Vec::new(),
         }
@@ -633,6 +635,34 @@ impl Default for RerankCfg {
     }
 }
 
+/// Character n-gram scores added to the engine's (`char_ngram`): the
+/// engine's candidates are reordered by them before anything else sees the
+/// list, the LM reranker included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NgramCfg {
+    /// The table (`CHNGRAM1`, counted from the training text). Unset or
+    /// empty: off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    /// Weight of `Σ min(0, PMI)` over the candidate's adjacent chars.
+    pub bigram_weight: f32,
+    /// Weight of `Σ min(0, PMI)` over its triples (a pair and the char
+    /// after it).
+    pub trigram_weight: f32,
+}
+
+impl Default for NgramCfg {
+    fn default() -> Self {
+        // picked on the distributed model's wiki-fresh conversions
+        Self {
+            table: None,
+            bigram_weight: 0.7,
+            trigram_weight: 0.5,
+        }
+    }
+}
+
 /// The rewriter (`setsuna-rewrite daemon`): an OpenAI model, or one behind
 /// an OpenAI-compatible API, rewriting the conversion into natural Japanese.
 /// While it is on, the conversion key also asks for a rewrite and puts it
@@ -973,6 +1003,15 @@ impl Config {
              # Typing pause (ms) before reranking; the conversion key reranks at once.\n\
              idle_ms = {rerank_idle}\n\
              \n\
+             [ngram]\n\
+             # Character bigram / trigram counts of text: a candidate joining\n\
+             # chars rarer than chance (博紙 for はくし) moves down. Off while no\n\
+             # table is set.\n\
+             # table = \"C:/path/to/chars.ngram\"\n\
+             # Weights of the bigram and trigram terms against the converter's score.\n\
+             bigram_weight = {ngram_bigram:?}\n\
+             trigram_weight = {ngram_trigram:?}\n\
+             \n\
              [rewriter]\n\
              # Rewriting: the conversion key also asks a model to rewrite the\n\
              # input into natural Japanese and puts the result first. Sign in,\n\
@@ -1007,6 +1046,8 @@ impl Config {
             learning_words = d.learning.words,
             rerank_first = d.rerank.first_candidates,
             rerank_idle = d.rerank.idle_ms,
+            ngram_bigram = d.ngram.bigram_weight,
+            ngram_trigram = d.ngram.trigram_weight,
             rewriter_enabled = d.rewriter.enabled,
             rewriter_provider = d.rewriter.provider.as_str(),
             rewriter_context = d.rewriter.send_context,
