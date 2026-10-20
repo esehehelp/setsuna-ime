@@ -14,6 +14,11 @@
 # <m> is the model's `*.manifest.json` written by export. The manifest and
 # every file it lists are copied, keeping their relative paths.
 #
+# In a release zip (crates\tsf\package.ps1) the binaries sit next to this
+# script and the mixed input model in mixed\; it runs on Windows PowerShell
+# 5.1 as well as pwsh. The Visual C++ runtime the binaries link (14.44 or
+# later) is installed from Microsoft when missing.
+#
 # Exit codes:
 #   0  success / already up to date
 #   10 unsupported architecture (need x64)
@@ -21,6 +26,7 @@
 #   30 model file(s) not found, download failed, or integrity check failed
 #   40 source DLL, engine.exe or onnxruntime.dll not found
 #   50 file copy failed
+#   60 Visual C++ runtime missing and could not be installed
 #
 # Layout produced:
 #   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf.dll
@@ -53,7 +59,8 @@
 #Requires -Version 5.1
 [CmdletBinding(DefaultParameterSetName = 'Download')]
 param(
-    [string]$SourceDir = (Join-Path $PSScriptRoot '..\..\target\release'),
+    # Default: the build output, or this script's own directory in a release zip.
+    [string]$SourceDir,
     [Parameter(Mandatory, ParameterSetName = 'Local')]
     [ValidateNotNullOrEmpty()]
     [string]$Manifest,
@@ -64,8 +71,8 @@ param(
     [string]$RerankManifest,
     # Mixed input model directory (kana.tsv, latin.tsv, params.txt): English
     # words typed in romaji stay English ([frontend] mixed_model). Default:
-    # the one of this repository.
-    [string]$MixedModel = (Join-Path $PSScriptRoot '..\ime-core\data\mixed'),
+    # the one of this repository, or mixed\ of a release zip; "" for none.
+    [string]$MixedModel,
     # Latin names dictionary for mixed input ([frontend] name_dictionary_file).
     [string]$NameDictionary,
     [switch]$Force,
@@ -73,6 +80,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Defaults that name this script's directory are set here: Windows PowerShell
+# 5.1 leaves $PSScriptRoot empty in an advanced script's parameter defaults.
+$Packaged = Test-Path -LiteralPath (Join-Path $PSScriptRoot 'setsuna_tsf.dll')
+if (-not $PSBoundParameters.ContainsKey('SourceDir')) {
+    $SourceDir = if ($Packaged) { $PSScriptRoot } else { Join-Path $PSScriptRoot '..\..\target\release' }
+}
+if (-not $PSBoundParameters.ContainsKey('MixedModel')) {
+    $MixedModel = if ($Packaged) { Join-Path $PSScriptRoot 'mixed' } else { Join-Path $PSScriptRoot '..\ime-core\data\mixed' }
+}
 
 # ---- constants ----
 $InstallDir = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
@@ -85,6 +102,14 @@ $SettingsExe = 'setsuna-settings.exe'
 $RewriteExe = 'setsuna-rewrite.exe'
 $RerankExe  = 'setsuna-rerank.exe'
 $UninstReg  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
+# The PowerShell running this (pwsh or Windows PowerShell): the elevated
+# install runs on it too.
+$PsExe      = (Get-Process -Id $PID).Path
+# Microsoft's link to the latest supported redistributable
+$VcRuntimeUrl = 'https://aka.ms/vc14/vc_redist.x64.exe'
+# GitHub and Microsoft's downloads need TLS 1.2, not the default of older
+# Windows PowerShell 5.1 installs.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # ---- helpers ----
 function Write-Log {
@@ -103,6 +128,63 @@ function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pri = [Security.Principal.WindowsPrincipal] $id
     $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# config.toml is UTF-8 without a BOM whichever PowerShell writes it
+# (Windows PowerShell's -Encoding utf8 adds one).
+function Write-Utf8Lines {
+    param([string]$Path, [string[]]$Lines)
+    [IO.File]::WriteAllLines($Path, $Lines, (New-Object Text.UTF8Encoding $false))
+}
+
+# The Visual C++ 2015-2022 runtime (VCRUNTIME140, MSVCP140, VCOMP140) the
+# DLL, the daemons, ONNX Runtime and llama.cpp link, at least the 14.44
+# toolset they are built with: a binary may crash on an older MSVCP140 (a
+# 14.40 build's std::mutex does). Raise it with the build's toolset.
+function Test-VcRuntime {
+    try {
+        $k = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction Stop
+        ($k.Installed -eq 1) -and (($k.Major -gt 14) -or ($k.Major -eq 14 -and $k.Minor -ge 44))
+    } catch {
+        $false
+    }
+}
+
+# Microsoft's redistributable, checked to carry Microsoft's signature, run
+# quietly (elevated).
+function Install-VcRuntime {
+    $exe = Join-Path ([IO.Path]::GetTempPath()) "setsuna-vc_redist-$PID.exe"
+    try {
+        Write-Log INFO "downloading the Visual C++ runtime: $VcRuntimeUrl"
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $VcRuntimeUrl -OutFile $exe -UseBasicParsing
+        $sig = Get-AuthenticodeSignature -LiteralPath $exe
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "vc_redist.x64.exe is not signed by Microsoft ($($sig.Status))"
+        }
+        $p = Start-Process -FilePath $exe -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+        # 3010: installed, a restart pending; 1638: a newer one is installed
+        if ($p.ExitCode -notin 0, 3010, 1638) {
+            throw "vc_redist.x64.exe exited with $($p.ExitCode)"
+        }
+        Write-Log INFO "Visual C++ runtime installed (exit code $($p.ExitCode))"
+    } finally {
+        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# The release's version (VERSION of a release zip), else the workspace's.
+function Get-SetsunaVersion {
+    $file = Join-Path $SourceDir 'VERSION'
+    if (Test-Path -LiteralPath $file) {
+        return (Get-Content -LiteralPath $file -TotalCount 1).Trim()
+    }
+    $cargo = Join-Path $PSScriptRoot '..\..\Cargo.toml'
+    if ((Test-Path -LiteralPath $cargo) -and
+        ((Get-Content -LiteralPath $cargo -Raw) -match '(?ms)^\[workspace\.package\].*?^version = "([^"]+)"')) {
+        return $Matches[1]
+    }
+    'unknown'
 }
 
 # `<stem>_<sha256[:12]><ext>` of the destination name: where a locked binary
@@ -245,7 +327,7 @@ function Update-ExistingConfig {
         [string]$NameDictionaryPath
     )
 
-    $lines = @(Get-Content -LiteralPath $ConfigPath -ErrorAction Stop)
+    $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -ErrorAction Stop)
     $qManifestPath = '"' + ($ManifestPath.Replace('\','/').Replace('"','\"')) + '"'
     $qEnginePath = '"' + ($EnginePath.Replace('\','/').Replace('"','\"')) + '"'
     $qOrtPath = '"' + ($OrtPath.Replace('\','/').Replace('"','\"')) + '"'
@@ -280,7 +362,7 @@ function Update-ExistingConfig {
     } elseif ($RewriteExePath) {
         $lines = Remove-ConfigValue -Lines $lines -Section 'rewriter' -Key 'exe'
     }
-    Set-Content -LiteralPath $ConfigPath -Value $lines -Encoding utf8
+    Write-Utf8Lines -Path $ConfigPath -Lines $lines
 }
 
 # ---- pre-flight ----
@@ -385,15 +467,33 @@ if (-not (Test-IsAdmin) -and -not $NoElevate) {
         '-SourceDir',("`"$SourceDir`""),'-Manifest',("`"$Manifest`"")
     )
     if ($RerankManifest) { $argv += @('-RerankManifest', ("`"$RerankManifest`"")) }
-    if ($MixedModel) { $argv += @('-MixedModel', ("`"$MixedModel`"")) }
+    # always: "" (none) would be the default again
+    $argv += @('-MixedModel', ("`"$MixedModel`""))
     if ($NameDictionary) { $argv += @('-NameDictionary', ("`"$NameDictionary`"")) }
     if ($Force) { $argv += '-Force' }
     try {
-        $p = Start-Process pwsh -ArgumentList $argv -Verb RunAs -Wait -PassThru
+        $p = Start-Process $PsExe -ArgumentList $argv -Verb RunAs -Wait -PassThru
         Write-Log INFO "elevated install exit code: $($p.ExitCode)"
         exit $p.ExitCode
     } catch {
         Write-Log ERROR "elevation declined: $_"; exit 1
+    }
+}
+
+# ---- Visual C++ runtime ----
+# Without it regsvr32 cannot load the DLL, nor input hosts afterwards.
+if (Test-VcRuntime) {
+    Write-Log INFO 'Visual C++ runtime 14.44+ present'
+} elseif ($NoElevate) {
+    Write-Log WARN "Visual C++ runtime 14.44+ missing: install $VcRuntimeUrl"
+} else {
+    try {
+        Install-VcRuntime
+    } catch {
+        Write-Log ERROR "Visual C++ runtime missing and not installed: $_ (install $VcRuntimeUrl and re-run)"; exit 60
+    }
+    if (-not (Test-VcRuntime)) {
+        Write-Log ERROR "Visual C++ runtime still missing after its installer (install $VcRuntimeUrl and re-run)"; exit 60
     }
 }
 
@@ -535,6 +635,10 @@ try {
     Write-Log ERROR "copy failed (mixed input): $_"; exit 50
 }
 
+# Files unpacked from a downloaded zip carry its mark of the web; the
+# settings GUI started from the language bar would get SmartScreen's prompt.
+Get-ChildItem -LiteralPath $InstallDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+
 # ---- config.toml ----
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 $ConfigPath = Join-Path $ConfigDir 'config.toml'
@@ -543,7 +647,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
     $ModelConfigFile = (Join-Path $ModelConfigDir $ManifestItem.Name).Replace('\','/').Replace('"','\"')
     $EngineConfigExe = $EngineInstalled.Replace('\','/').Replace('"','\"')
     $OrtConfigDll = $OrtInstalled.Replace('\','/').Replace('"','\"')
-    @"
+    $DefaultConfig = @"
 # Setsuna TSF IME configuration. Edit and save; activations after the save
 # pick up new values (Win+Space twice).
 # Missing fields fall back to built-in defaults.
@@ -581,7 +685,8 @@ right_bracket = "」"
 yen = "￥"
 shift_8 = "（"
 shift_9 = "）"
-"@ | Set-Content -LiteralPath $ConfigPath -Encoding utf8
+"@
+    Write-Utf8Lines -Path $ConfigPath -Lines ($DefaultConfig -split "`r?`n")
     if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled) {
         Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled
     }
@@ -615,11 +720,13 @@ if (-not $NoElevate) {
 # ---- Apps & Features entry (HKCU) ----
 New-Item -Path $UninstReg -Force | Out-Null
 Set-ItemProperty $UninstReg DisplayName     'Setsuna Japanese IME'
-Set-ItemProperty $UninstReg DisplayVersion  '0.1.0'
+Set-ItemProperty $UninstReg DisplayVersion  (Get-SetsunaVersion)
 Set-ItemProperty $UninstReg Publisher       'Setsuna'
 Set-ItemProperty $UninstReg InstallLocation $InstallDir
 Set-ItemProperty $UninstReg InstallDate     (Get-Date -Format 'yyyyMMdd')
-Set-ItemProperty $UninstReg UninstallString "pwsh -NoProfile -File `"$(Join-Path $InstallDir 'uninstall.ps1')`""
+# Windows PowerShell: always there, whichever PowerShell installed this.
+$WinPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`""
 Set-ItemProperty $UninstReg NoModify        1 -Type DWord
 Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
 Write-Log INFO "registered HKCU Uninstall entry: $UninstReg"
@@ -628,5 +735,5 @@ Write-Log INFO "install complete at $InstallDir"
 Write-Host ""
 Write-Host "Setsuna IME installed."
 Write-Host "Switch input source via Win+Space -> 'Setsuna Japanese IME'."
-Write-Host "Uninstall: 'Apps & Features' > 'Setsuna Japanese IME' OR pwsh -File $(Join-Path $InstallDir 'uninstall.ps1')"
+Write-Host "Uninstall: 'Apps & Features' > 'Setsuna Japanese IME' OR powershell -ExecutionPolicy Bypass -File $(Join-Path $InstallDir 'uninstall.ps1')"
 exit 0

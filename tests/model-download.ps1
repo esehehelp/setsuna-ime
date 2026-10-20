@@ -70,7 +70,8 @@ function New-Fixture {
 # The mutable state object is shared with this dynamically scoped HTTP stub.
 # This intercepts all requests made by the helper, including nested functions.
 function Invoke-WebRequest {
-    param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$TimeoutSec)
+    param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$TimeoutSec,
+          [int]$ConnectionTimeoutSeconds, [int]$OperationTimeoutSeconds)
     $state.requests += $Uri
     if ($state.offline) { throw 'network disabled by test' }
     if (-not $Uri.StartsWith($prefix)) { throw "unexpected URL: $Uri" }

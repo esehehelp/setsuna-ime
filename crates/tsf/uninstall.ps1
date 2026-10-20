@@ -62,7 +62,8 @@ if ((Test-Path -LiteralPath $RegisteredDllPath) -and -not (Test-IsAdmin) -and -n
     if ($Yes)        { $argv += '-Yes' }
     if ($KeepConfig) { $argv += '-KeepConfig' }
     try {
-        $p = Start-Process pwsh -ArgumentList $argv -Verb RunAs -Wait -PassThru
+        # on the PowerShell running this: pwsh may not be installed
+        $p = Start-Process (Get-Process -Id $PID).Path -ArgumentList $argv -Verb RunAs -Wait -PassThru
         Write-Log INFO "elevated uninstall exit code: $($p.ExitCode)"
         exit $p.ExitCode
     } catch {
