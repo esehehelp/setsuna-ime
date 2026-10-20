@@ -1,7 +1,9 @@
-//! Long readings: the model reads at most `max_seq_len` tokens ([CLS],
-//! context, [SEP], reading), and converts readings much longer than its
-//! training sentences poorly. A long reading is cut into chunks, converted
-//! one after another with the output before each as its context.
+//! Readings of several sentences, and long readings: the model is trained
+//! on one sentence per reading, after the text before it as context, and
+//! reads at most `max_seq_len` tokens ([CLS], context, [SEP], reading). A
+//! reading is cut after each sentence end, and a sentence much longer than
+//! the training sentences into chunks; they are converted one after another
+//! with the output before each as its context, so no output crosses a 。.
 
 use anyhow::Result;
 
@@ -31,15 +33,29 @@ fn is_comma(c: char) -> bool {
     matches!(c, '、' | '，')
 }
 
+/// Whether the sentence end at `i` goes on as one word with what follows
+/// it: a decimal point (`３．５`), or an ASCII ! or ? before an ASCII char
+/// (`?q=1` of a URL, `ok!ok`).
+fn goes_on(chars: &[char], i: usize) -> bool {
+    let digit =
+        |c: Option<&char>| c.is_some_and(|c| c.is_ascii_digit() || ('０'..='９').contains(c));
+    let next = chars.get(i + 1);
+    match chars[i] {
+        '．' => i > 0 && digit(chars.get(i - 1)) && digit(next),
+        c if c.is_ascii() => next.is_some_and(|c| c.is_ascii_graphic()),
+        _ => false,
+    }
+}
+
 /// `reading` cut into chunks of at most `max` chars: one per sentence (cut
-/// after 。！？), a sentence still longer than `max` cut after its last
-/// comma within `max`, else at `HARD_CUT`. A reading of at most `max` chars
-/// is one chunk. A chunk's cut depends only on the text up to it, so
-/// typing on changes the last chunk alone.
+/// after 。！？ and the closing brackets after it, but where it goes on as
+/// one word), a sentence still longer than `max` cut after its last comma
+/// within `max`, else at `HARD_CUT`. A chunk's cut depends only on the text
+/// up to it, so typing on changes the last chunk alone.
 pub fn split(reading: &str, max: usize) -> Vec<String> {
     let chars: Vec<char> = reading.chars().collect();
-    if chars.len() <= max {
-        return vec![reading.to_string()];
+    if chars.is_empty() {
+        return vec![String::new()];
     }
     let max = max.max(1);
     let mut out = Vec::new();
@@ -48,7 +64,7 @@ pub fn split(reading: &str, max: usize) -> Vec<String> {
     let mut ending = false;
     for i in 0..chars.len() {
         ending = is_sentence_end(chars[i]) || (ending && closes_sentence(chars[i]));
-        if ending && !chars.get(i + 1).is_some_and(|&c| closes_sentence(c)) {
+        if ending && !chars.get(i + 1).is_some_and(|&c| closes_sentence(c)) && !goes_on(&chars, i) {
             split_long(&chars[start..=i], max, &mut out);
             start = i + 1;
             ending = false;
@@ -213,11 +229,21 @@ mod tests {
     }
 
     #[test]
-    fn a_short_reading_is_one_chunk() {
+    fn each_sentence_is_a_chunk() {
         assert_eq!(
             split("きょうは。いいてんき。", 80),
-            ["きょうは。いいてんき。"]
+            ["きょうは。", "いいてんき。"]
         );
+        assert_eq!(split("ほんとう？うん", 80), ["ほんとう？", "うん"]);
+        assert_eq!(split("いいてんき", 80), ["いいてんき"]);
+        assert_eq!(split("", 80), [""]);
+    }
+
+    #[test]
+    fn a_sentence_end_inside_a_word_is_no_cut() {
+        assert_eq!(split("３．５ばい。", 80), ["３．５ばい。"]);
+        assert_eq!(split("example.com/?q=1を", 80), ["example.com/?q=1を"]);
+        assert_eq!(split("できた。2025ねん", 80), ["できた。", "2025ねん"]);
     }
 
     #[test]

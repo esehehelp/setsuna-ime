@@ -222,8 +222,9 @@ impl EngineSession {
     }
 
     /// Convert one request: the pipeline's candidates, cut to the display
-    /// limit. A reading longer than a chunk (`chunk::MAX_CHUNK`, or what the
-    /// model's sequence holds) is converted chunk by chunk. A reading
+    /// limit. A reading of several sentences, or longer than a chunk
+    /// (`chunk::MAX_CHUNK`, or what the model's sequence holds), is converted
+    /// chunk by chunk, a sentence after another. A reading
     /// carrying bracket / annotation symbols, or chars the vocabulary has no
     /// token for, goes through symbol split when it is enabled; with symbol
     /// token, every run of symbols is read as one token instead. With digit
