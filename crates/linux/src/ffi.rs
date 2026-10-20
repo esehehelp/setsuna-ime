@@ -576,7 +576,8 @@ mod tests {
         std::fs::write(rerank.join("lm.manifest.json"), "{}").unwrap();
         let cfg = with_module_defaults(Config::default(), Some(&dir));
         let names = dir
-            .join("names/latin-names.tsv")
+            .join("names")
+            .join("latin-names.tsv")
             .to_string_lossy()
             .into_owned();
         assert_eq!(cfg.frontend.name_dictionary_file, Some(names));
@@ -621,8 +622,8 @@ mod tests {
             let v = &*setsuna_session_view(p);
             assert_eq!(strings(v.preedit, v.n_preedit), vec!["かな"]);
             assert_eq!(v.focus, -1);
-            // preedit_cursor_at_start: the caret stays at the start
-            assert_eq!(v.cursor, 0);
+            // the caret at the end of what is typed
+            assert_eq!(v.cursor, "かな".len());
             assert_eq!(v.n_candidates, 0);
             assert!(setsuna_session_key(p, 0xff0d, 0, 0, 0, std::ptr::null()));
             let v = &*setsuna_session_view(p);
