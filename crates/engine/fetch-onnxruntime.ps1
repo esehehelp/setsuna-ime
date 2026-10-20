@@ -21,10 +21,14 @@
 [CmdletBinding()]
 param(
     [string]$Version = '1.28.0',
-    [string]$Dest = (Join-Path $PSScriptRoot '..\..\target\release')
+    # Default: target\release
+    [string]$Dest
 )
 
 $ErrorActionPreference = 'Stop'
+# Set here: Windows PowerShell 5.1 leaves $PSScriptRoot empty in an advanced
+# script's parameter defaults.
+if (-not $Dest) { $Dest = Join-Path $PSScriptRoot '..\..\target\release' }
 
 # SHA-256 of onnxruntime-win-x64-<version>.zip from
 # https://github.com/microsoft/onnxruntime/releases

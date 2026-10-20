@@ -12,9 +12,13 @@ param(
     [ValidateSet('int8', 'fp32')]
     [string]$Precision = 'int8',
     [string]$CacheDir = (Join-Path $env:LOCALAPPDATA 'setsuna-ime\cache\models'),
-    [string]$CatalogPath = (Join-Path $PSScriptRoot 'models.json')
+    # Default: models.json next to this script.
+    [string]$CatalogPath
 )
 $ErrorActionPreference = 'Stop'
+# Set here: Windows PowerShell 5.1 leaves $PSScriptRoot empty in an advanced
+# script's parameter defaults.
+if (-not $CatalogPath) { $CatalogPath = Join-Path $PSScriptRoot 'models.json' }
 
 function Assert-ArtifactPath {
     param([string]$Path)
@@ -65,6 +69,18 @@ $destination = (Resolve-Path -LiteralPath $destination).Path
 $baseUrl = "https://huggingface.co/$($catalog.repository)/resolve/$($catalog.revision)"
 # Windows PowerShell 5.1 may otherwise negotiate an obsolete TLS version.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+# Its progress bar slows a download many times over.
+$ProgressPreference = 'SilentlyContinue'
+# A stalled download fails, a slow one does not: pwsh's -TimeoutSec bounds
+# the whole transfer (the fp32 model is 107 MB), so pwsh 7.4+ bounds the
+# connection and each read instead, and older pwsh nothing; Windows
+# PowerShell's -TimeoutSec waits for the response only, its reads for 5 min.
+$timeouts = @{}
+if ($PSVersionTable.PSVersion -ge [version]'7.4') {
+    $timeouts = @{ ConnectionTimeoutSeconds = 60; OperationTimeoutSeconds = 120 }
+} elseif ($PSVersionTable.PSVersion.Major -lt 6) {
+    $timeouts = @{ TimeoutSec = 120 }
+}
 
 function Get-ArtifactFile {
     param([string]$RelativePath)
@@ -84,7 +100,7 @@ function Get-ArtifactFile {
     Write-Host "downloading model: $RelativePath"
     try {
         # Never attach HF credentials: only public, pinned artifacts are used.
-        Invoke-WebRequest -Uri "$baseUrl/$escaped" -OutFile $temporary -UseBasicParsing -TimeoutSec 120 | Out-Null
+        Invoke-WebRequest -Uri "$baseUrl/$escaped" -OutFile $temporary -UseBasicParsing @timeouts | Out-Null
         if (-not (Test-VerifiedFile $temporary $spec)) {
             throw "size or SHA-256 mismatch: $RelativePath"
         }

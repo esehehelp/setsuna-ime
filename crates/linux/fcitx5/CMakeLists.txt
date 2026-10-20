@@ -15,7 +15,7 @@
 # crates/linux/package.sh builds the release archive (crates/linux/install.sh
 # installs it) with these.
 cmake_minimum_required(VERSION 3.19)
-project(fcitx5-setsuna VERSION 0.1.2 LANGUAGES CXX)
+project(fcitx5-setsuna VERSION 0.1.3 LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(GNUInstallDirs)

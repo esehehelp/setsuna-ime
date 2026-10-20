@@ -137,6 +137,32 @@ macOS では `libonnxruntime.dylib` をエンジンの隣に置くか
 
 ### Windows（TSF）
 
+x64 の Windows 10 / 11 なら release から入れられる（Windows PowerShell 5.1 でも pwsh でも動く）:
+
+```powershell
+irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
+# fp32 版: & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -ModelPrecision fp32
+```
+
+`setup.ps1` は自分と組になった release の zip（SHA-256 固定）を取ってきて、その中の
+`install.ps1` を動かす。zip（`setsuna-ime-<version>-windows-x64.zip`）を展開して
+`install.cmd` をダブルクリックしても同じ（オプションは `install.ps1` と同じ）。zip には
+DLL・エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・設定 GUI・ONNX Runtime
+1.28.0・英日混在のモデルが入り、変換モデルはインストール時に取得する。バイナリが使う
+Visual C++ ランタイム（14.44 以上）が無ければ Microsoft から取得して入れる。
+
+release は `crates/tsf/package.ps1` が作る:
+
+```powershell
+pwsh crates/tsf/package.ps1      # target\dist\ に zip、setup.ps1、SHA256SUMS
+pwsh target/dist/setup.ps1 -Archive target/dist/setsuna-ime-<version>-windows-x64.zip   # 手元で試す
+```
+
+一つの release に Linux の分（下の `crates/linux/package.sh`）と合わせて上げる
+（`releases/latest/download/` の `setup.ps1` と `install.sh` が両方そろうように）。
+
+ソースから入れる場合:
+
 ```powershell
 cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
