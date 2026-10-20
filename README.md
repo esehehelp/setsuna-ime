@@ -16,7 +16,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 
 研究段階のプロジェクト。変換モデル
 [Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small)
-（Apache-2.0）を公開しており、Windows インストーラーは既定で int8 版を自動取得する。
+（Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定で int8 版を自動取得する。
 
 - エンジンと IME はこの変換モデルを前提に調整している（記号分割、
   前の文脈 64 トークン、長い読みは 80 文字ごとに区切って変換）。
@@ -129,7 +129,8 @@ Windows では公式 build を取ってくるスクリプトがある:
 pwsh crates/engine/fetch-onnxruntime.ps1   # ONNX Runtime 1.28.0 を target/release へ
 ```
 
-Linux / macOS では `libonnxruntime.so` / `.dylib` をエンジンの隣に置くか
+Linux では `crates/engine/fetch-onnxruntime.sh` が同じことをする（x64 / aarch64）。
+macOS では `libonnxruntime.dylib` をエンジンの隣に置くか
 `SETSUNA_ORT_DYLIB` で指す。ORT の版が変わると int8 の数値が変わり候補も
 変わるので、既定版（1.28.0）の変更は bench の取り直しとセットで行う。
 
@@ -168,12 +169,41 @@ pwsh tests/model-download.ps1
 
 ### Linux（fcitx5）
 
-fcitx5 の開発パッケージ（`Fcitx5Core` 5.1 以上）と CMake が要る。設定 GUI の build には
-WebKitGTK 4.1 の開発パッケージ（`libwebkit2gtk-4.1-dev` など）も要る。
+fcitx5（5.1 以上）が入った x86_64 の環境（glibc 2.39 以上: Arch、Fedora 40、Ubuntu 24.04 以降）なら:
 
 ```sh
-cmake -B build -DCMAKE_INSTALL_PREFIX=/usr crates/linux/fcitx5
-cmake --build build && sudo cmake --install build
+curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
+# fp32 版: ... | sudo bash -s -- --precision fp32
+# アンインストール: sudo /usr/lib/setsuna-ime/uninstall.sh
+```
+
+`install.sh`（`crates/linux/install.sh`）は root で動く前提で、中で権限昇格はしない。
+自分と組になった release アーカイブ（SHA-256 固定）と、そのアーカイブが固定する
+変換モデル（`crates/tsf/models.json` と同じ。`/var/cache/setsuna-ime/models` に取得・検証し、
+検証済みならオフラインで再利用）を取ってきて入れる。addon は fcitx5 の addon
+ディレクトリに、エンジン・書き直しの daemon・ONNX Runtime 1.28.0・モデル・英日混在の
+モデルは `/usr/lib/setsuna-ime`（addon に埋め込んだ場所なので `config.toml` は要らない）に、
+設定 GUI は WebKitGTK 4.1 があれば `/usr/bin/setsuna-settings` に入る。最後に sudo
+（または pkexec）した利用者の fcitx5 の入力メソッドに Setsuna を足し、fcitx5 を
+再起動して読み込ませる（KDE Plasma の Wayland では `fcitx5-wayland-launcher` も
+起動し直させる）。`--no-register` ならファイルを置くだけ。
+
+release は `crates/linux/package.sh` が作る（build に要るもの: CMake、fcitx5 と
+WebKitGTK 4.1 の開発パッケージ、curl、jq）:
+
+```sh
+crates/linux/package.sh        # target/dist/ に tar.gz、install.sh、SHA256SUMS
+sudo bash target/dist/install.sh --archive target/dist/setsuna-ime-*.tar.gz   # 手元で試す
+gh release create v<version> target/dist/*                                     # 公開
+```
+
+```sh
+# 開発中に手で build する場合（モデルも入れるなら -DSETSUNA_MODEL_MANIFEST=<manifest>、
+# ONNX Runtime は crates/engine/fetch-onnxruntime.sh、モデルは crates/linux/fetch-model.sh で取る）:
+cmake -B target/fcitx5 -DCMAKE_INSTALL_PREFIX=/usr crates/linux/fcitx5
+cmake --build target/fcitx5 && sudo cmake --install target/fcitx5
+# ダウンローダーの回帰テスト（ネット接続不要）:
+bash tests/model-download.sh
 ```
 
 エンジンとモデルは `config.toml`（`~/.config/setsuna-ime/`）、環境変数
@@ -181,12 +211,6 @@ cmake --build build && sudo cmake --install build
 `SETSUNA_MODULE_DIR`（既定 `<libdir>/setsuna-ime`）の順に探す。開発中は
 `-DSETSUNA_MODULE_DIR=<repo>/target/release` とすると `target/release` の
 エンジンと `<repo>/local/models/onnx` のモデルを使う。
-
-モデルの自動取得はまだ無い。
-[Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small) から
-`Aster-v1.2-small.int8.manifest.json`、`Aster-v1.2-small.int8.onnx`、
-`Aster-v1.2-small.vocab.hex.tsv` を同じディレクトリに置き、`config.toml` の
-`[engine] model_manifest` にその manifest を指定する（`SETSUNA_MANIFEST` でもよい）。
 
 ### デモ / 設定 GUI
 

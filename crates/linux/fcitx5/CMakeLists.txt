@@ -8,7 +8,13 @@
 # config.toml and the SETSUNA_* environment variables). For development,
 # point it at the cargo target dir: -DSETSUNA_MODULE_DIR=<repo>/target/release
 # finds target/release/setsuna-engine and <repo>/local/models/onnx.
-cmake_minimum_required(VERSION 3.16)
+#
+# The install puts the engine and rewriter daemons, the ONNX Runtime the engine
+# loads (SETSUNA_ORT_LIBRARY) and the model (SETSUNA_MODEL_MANIFEST) into
+# SETSUNA_MODULE_DIR, where they are found with no config.toml.
+# crates/linux/package.sh builds the release archive (crates/linux/install.sh
+# installs it) with these.
+cmake_minimum_required(VERSION 3.19)
 project(fcitx5-setsuna VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -30,14 +36,22 @@ else()
     set(CARGO_PROFILE_FLAG "--release")
     set(CARGO_PROFILE_DIR "release")
 endif()
-set(SETSUNA_RUST_LIB "${CARGO_TARGET_DIR}/${CARGO_PROFILE_DIR}/libsetsuna_linux.a")
+set(CARGO_OUT "${CARGO_TARGET_DIR}/${CARGO_PROFILE_DIR}")
+set(SETSUNA_RUST_LIB "${CARGO_OUT}/libsetsuna_linux.a")
+
+option(SETSUNA_BUILD_SETTINGS "Build and install the settings GUI (needs WebKitGTK 4.1)" OFF)
+set(SETSUNA_CARGO_PACKAGES -p setsuna-linux -p setsuna-engine -p setsuna-rewrite)
+set(SETSUNA_DAEMONS "${CARGO_OUT}/setsuna-engine" "${CARGO_OUT}/setsuna-rewrite")
+if(SETSUNA_BUILD_SETTINGS)
+    list(APPEND SETSUNA_CARGO_PACKAGES -p setsuna-settings)
+endif()
 
 # Always run: cargo knows best whether anything changed.
 add_custom_target(setsuna_rust ALL
-    COMMAND cargo build ${CARGO_PROFILE_FLAG} -p setsuna-linux
+    COMMAND cargo build ${CARGO_PROFILE_FLAG} ${SETSUNA_CARGO_PACKAGES}
             --target-dir "${CARGO_TARGET_DIR}"
     WORKING_DIRECTORY "${SETSUNA_REPO}"
-    BYPRODUCTS "${SETSUNA_RUST_LIB}"
+    BYPRODUCTS "${SETSUNA_RUST_LIB}" ${SETSUNA_DAEMONS}
     USES_TERMINAL
     COMMENT "cargo build -p setsuna-linux")
 
@@ -72,3 +86,74 @@ install(FILES icons/setsuna.svg icons/setsuna-hiragana.svg icons/setsuna-direct.
     DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
 # The mixed input model, used when config.toml sets no [frontend] mixed_model.
 install(DIRECTORY ../../ime-core/data/mixed/ DESTINATION "${SETSUNA_MODULE_DIR}/mixed")
+
+# --- the daemons, ONNX Runtime and the model ---------------------------------
+
+install(PROGRAMS ${SETSUNA_DAEMONS} DESTINATION "${SETSUNA_MODULE_DIR}")
+if(SETSUNA_BUILD_SETTINGS)
+    install(PROGRAMS "${CARGO_OUT}/setsuna-settings" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
+
+set(SETSUNA_ORT_LIBRARY "${CARGO_OUT}/libonnxruntime.so" CACHE FILEPATH
+    "ONNX Runtime library installed next to the engine (crates/engine/fetch-onnxruntime.sh)")
+if(EXISTS "${SETSUNA_ORT_LIBRARY}")
+    get_filename_component(ort_file "${SETSUNA_ORT_LIBRARY}" REALPATH)
+    install(PROGRAMS "${ort_file}" DESTINATION "${SETSUNA_MODULE_DIR}" RENAME libonnxruntime.so)
+else()
+    message(WARNING "${SETSUNA_ORT_LIBRARY} does not exist: the engine needs ONNX Runtime "
+        "next to it (crates/engine/fetch-onnxruntime.sh), SETSUNA_ORT_DYLIB or [engine] ort_dylib")
+endif()
+
+# The manifest and every file it names, at the same paths relative to it, so
+# the installed manifest resolves unchanged; a path leaving the artifact
+# directory is refused.
+set(SETSUNA_MODEL_MANIFEST "" CACHE FILEPATH
+    "Conversion model manifest (*.manifest.json) installed with its files; empty installs none")
+if(SETSUNA_MODEL_MANIFEST)
+    get_filename_component(manifest "${SETSUNA_MODEL_MANIFEST}" ABSOLUTE)
+    if(NOT EXISTS "${manifest}")
+        message(FATAL_ERROR "SETSUNA_MODEL_MANIFEST ${manifest} does not exist")
+    endif()
+    get_filename_component(manifest_dir "${manifest}" DIRECTORY)
+    get_filename_component(manifest_name "${manifest}" NAME)
+    file(READ "${manifest}" manifest_json)
+    string(JSON model_files_0 GET "${manifest_json}" proposal path)
+    string(JSON model_files_1 GET "${manifest_json}" vocab)
+    set(model_files "${model_files_0}" "${model_files_1}")
+    string(JSON external ERROR_VARIABLE no_external GET "${manifest_json}" proposal external_data)
+    if(no_external STREQUAL "NOTFOUND")
+        string(JSON external_type TYPE "${manifest_json}" proposal external_data)
+        if(external_type STREQUAL "ARRAY")
+            string(JSON n LENGTH "${manifest_json}" proposal external_data)
+            math(EXPR last "${n} - 1")
+            foreach(i RANGE ${last})
+                string(JSON f GET "${manifest_json}" proposal external_data ${i})
+                list(APPEND model_files "${f}")
+            endforeach()
+        else()
+            list(APPEND model_files "${external}")
+        endif()
+    endif()
+    set(model_dest "${SETSUNA_MODULE_DIR}/models/onnx")
+    # The engine reads the only manifest there: another model's is removed.
+    install(CODE "
+        file(GLOB old_manifests \"\$ENV{DESTDIR}${model_dest}/*manifest.json\")
+        foreach(m IN LISTS old_manifests)
+            get_filename_component(n \"\${m}\" NAME)
+            if(NOT n STREQUAL \"${manifest_name}\")
+                message(STATUS \"Removing: \${m}\")
+                file(REMOVE \"\${m}\")
+            endif()
+        endforeach()")
+    install(FILES "${manifest}" DESTINATION "${model_dest}")
+    foreach(f IN LISTS model_files)
+        if(IS_ABSOLUTE "${f}" OR f MATCHES "(^|[/\\\\])\\.\\.([/\\\\]|$)")
+            message(FATAL_ERROR "manifest path ${f} leaves the artifact directory")
+        endif()
+        if(NOT EXISTS "${manifest_dir}/${f}")
+            message(FATAL_ERROR "artifact file not found: ${manifest_dir}/${f}")
+        endif()
+        get_filename_component(sub "${f}" DIRECTORY)
+        install(FILES "${manifest_dir}/${f}" DESTINATION "${model_dest}/${sub}")
+    endforeach()
+endif()
