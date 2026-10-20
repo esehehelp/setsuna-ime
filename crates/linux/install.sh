@@ -208,7 +208,7 @@ log "installed Setsuna $VERSION ($precision model) into ${root:-/}"
 
 # ---- add Setsuna to the user's fcitx5 ----
 register_user() {
-    local user=$1 uid home bus pid launcher env_file
+    local user=$1 uid home bus pid env_file
     uid=$(id -u "$user")
     home=$(getent passwd "$user" | cut -d: -f6)
     bus=/run/user/$uid/bus
@@ -240,7 +240,12 @@ register_user() {
     # through fcitx5-wayland-launcher and starts that again only when its
     # InputMethod setting changes; elsewhere fcitx5 comes back by D-Bus
     # activation, or from the environment it ran with.
-    launcher=$(pgrep -u "$uid" -f fcitx5-wayland-launcher | head -1 || true)
+    local kwin_im=
+    if pgrep -u "$uid" -x kwin_wayland >/dev/null && command -v kreadconfig6 >/dev/null &&
+        command -v kwriteconfig6 >/dev/null; then
+        kwin_im=$(as_user kreadconfig6 --file kwinrc --group Wayland --key InputMethod || true)
+        [[ $kwin_im == *fcitx5* ]] || kwin_im=
+    fi
     env_file=$work/fcitx5.environ
     cp "/proc/$pid/environ" "$env_file" 2>/dev/null || : >"$env_file"
     log "restarting fcitx5 for $user"
@@ -249,14 +254,12 @@ register_user() {
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.25
     done
-    if [[ -n $launcher ]] && command -v kwriteconfig6 >/dev/null &&
-        [[ $(ps -o comm= -p "$(ps -o ppid= -p "$launcher" | tr -d ' ')" 2>/dev/null) == kwin_wayland* ]]; then
-        local kwinrc=$home/.config/kwinrc value
-        value=$(as_user kreadconfig6 --file kwinrc --group Wayland --key InputMethod)
+    if [[ -n $kwin_im ]]; then
+        local kwinrc=$home/.config/kwinrc
         as_user cp -p "$kwinrc" "$kwinrc.setsuna-install"
         as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify ""
         sleep 1
-        as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "$value"
+        as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "$kwin_im"
         # the file exactly as it was (kwriteconfig6 rewrites the key's flags)
         as_user mv -f "$kwinrc.setsuna-install" "$kwinrc"
     elif [[ ! -f /usr/share/dbus-1/services/org.fcitx.Fcitx5.service ]]; then
