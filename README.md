@@ -174,6 +174,8 @@ fcitx5（5.1 以上）が入った x86_64 の環境（glibc 2.39 以上: Arch、
 ```sh
 curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
 # fp32 版: ... | sudo bash -s -- --precision fp32
+# リランカの LM も入れる場合: ... | sudo bash -s -- --rerank-manifest <LM scorer manifest>
+# 英日混在入力の名前の辞書も入れる場合: ... | sudo bash -s -- --name-dictionary <names tsv>
 # アンインストール: sudo /usr/lib/setsuna-ime/uninstall.sh
 ```
 
@@ -181,15 +183,28 @@ curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/ins
 自分と組になった release アーカイブ（SHA-256 固定）と、そのアーカイブが固定する
 変換モデル（`crates/tsf/models.json` と同じ。`/var/cache/setsuna-ime/models` に取得・検証し、
 検証済みならオフラインで再利用）を取ってきて入れる。addon は fcitx5 の addon
-ディレクトリに、エンジン・書き直しの daemon・ONNX Runtime 1.28.0・モデル・英日混在の
-モデルは `/usr/lib/setsuna-ime`（addon に埋め込んだ場所なので `config.toml` は要らない）に、
-設定 GUI は WebKitGTK 4.1 があれば `/usr/bin/setsuna-settings` に入る。最後に sudo
-（または pkexec）した利用者の fcitx5 の入力メソッドに Setsuna を足し、fcitx5 を
+ディレクトリに、エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・ONNX Runtime
+1.28.0・モデル・英日混在のモデルは `/usr/lib/setsuna-ime`（addon に埋め込んだ場所なので
+`config.toml` は要らない）に、設定 GUI は WebKitGTK 4.1 があれば
+`/usr/bin/setsuna-settings` に入る。`--rerank-manifest` の LM は
+`/usr/lib/setsuna-ime/models/rerank`、`--name-dictionary` の辞書は
+`/usr/lib/setsuna-ime/names/latin-names.tsv` に入り、`config.toml` が `[rerank] manifest` /
+`name_dictionary_file` を決めていなければそれを使う（次の更新でオプションを付けなくても残る）。
+最後に sudo（または pkexec）した利用者の fcitx5 の入力メソッドに Setsuna を足し、fcitx5 を
 再起動して読み込ませる（KDE Plasma の Wayland では `fcitx5-wayland-launcher` も
 起動し直させる）。`--no-register` ならファイルを置くだけ。
 
+fcitx5 版は Windows TSF 版と同じく、有効にするたびに `config.toml` を読み直し、エンジン・
+リランカ（`[rerank]`）・書き直し（`[rewriter]`）の daemon を必要なら起動する（書き直しが
+オンなら変換キーで書き直しを頼み、状態表示は「直」、進み具合は候補の位置の後ろに出る）。
+アプリが周りの文字列を教えるならカーソルの前の文章を文脈に使い、URL・メール・数値・
+電話番号・日時・英数字・パスワードの欄は直接入力、Sensitive の欄（プライベートウィンドウ
+など）は文脈も学習も使わない。設定 GUI は fcitx5 の設定の「Setsuna の設定」、状態表示の
+「設定」、アプリメニューの「Setsuna の設定」から開く。候補ウィンドウの見た目は fcitx5 の
+テーマ（同梱の `setsuna` / `setsuna-dark`）で、`[ui.candidate_window]` は Windows だけ。
+
 release は `crates/linux/package.sh` が作る（build に要るもの: CMake、fcitx5 と
-WebKitGTK 4.1 の開発パッケージ、curl、jq）:
+WebKitGTK 4.1 の開発パッケージ、OpenMP 付きの C/C++ コンパイラ（llama.cpp）、curl、jq）:
 
 ```sh
 crates/linux/package.sh        # target/dist/ に tar.gz、install.sh、SHA256SUMS

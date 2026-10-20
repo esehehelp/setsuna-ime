@@ -19,6 +19,7 @@
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/misc.h>
 #include <fcitx-utils/trackableobject.h>
+#include <fcitx-utils/utf8.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/action.h>
@@ -205,10 +206,10 @@ public:
         // Shift+letter is the temporary alphabet mode.
         const Key &key = event.rawKey();
         bool enabled = setsuna_session_enabled(session_);
-        const auto caps = ic->capabilityFlags();
-        setsuna_session_set_private(
-            session_, caps.test(CapabilityFlag::Password) || caps.test(CapabilityFlag::Sensitive));
-        if (setsuna_session_key(session_, key.sym(), key.code(), mods(key.states()))) {
+        std::string before;
+        bool known = beforeCaret(ic, before);
+        if (setsuna_session_key(session_, key.sym(), key.code(), mods(key.states()), field(ic),
+                                known ? before.c_str() : nullptr)) {
             event.filterAndAccept();
             render(ic);
         }
@@ -218,6 +219,14 @@ public:
     }
 
     bool enabled() const { return setsuna_session_enabled(session_); }
+
+    /* あ on, 直 on and rewriting, A off: the TSF language bar's glyph. */
+    std::string modeLabel() const {
+        if (!enabled()) {
+            return "A";
+        }
+        return setsuna_session_rewrite_mode(session_) ? "直" : "あ";
+    }
 
     /* The tray icon: あ on, A off (icons/). */
     std::string subModeIconImpl(const InputMethodEntry &, InputContext &) override {
@@ -240,15 +249,15 @@ public:
     void deferKey(KeySym sym) {
         dispatcher_.schedule([this, sym] {
             auto *ic = ic_.get();
-            if (ic && setsuna_session_key(session_, sym, 0, 0)) {
+            if (ic && setsuna_session_key(session_, sym, 0, 0, SETSUNA_FIELD_NORMAL, nullptr)) {
                 render(ic);
             }
         });
     }
 
-    /* あ while on, A while ` / Zenkaku_Hankaku has turned it off. */
+    /* あ while on (直 rewriting), A while ` / Zenkaku_Hankaku has turned it off. */
     std::string subModeLabelImpl(const InputMethodEntry &, InputContext &) override {
-        return setsuna_session_enabled(session_) ? "あ" : "A";
+        return modeLabel();
     }
     std::string subMode(const InputMethodEntry &, InputContext &) override {
         return setsuna_session_enabled(session_) ? "" : "Direct";
@@ -257,7 +266,7 @@ public:
     /* A click on a candidate: pick and commit it, as its digit would. */
     void select(InputContext *ic, size_t index) {
         if (setsuna_session_select(session_, index)) {
-            setsuna_session_key(session_, FcitxKey_Return, 0, 0);
+            setsuna_session_key(session_, FcitxKey_Return, 0, 0, SETSUNA_FIELD_NORMAL, nullptr);
             render(ic);
         }
     }
@@ -271,7 +280,9 @@ private:
         if (panel.clientPreedit().empty() && panel.preedit().empty() &&
             !panel.candidateList()) {
             instance_->showCustomInputMethodInformation(
-                ic, enabled() ? "あ  ひらがな" : "A  直接入力");
+                ic, !enabled()                          ? "A  直接入力"
+                    : setsuna_session_rewrite_mode(session_) ? "直  書き直し"
+                                                             : "あ  ひらがな");
         }
     }
 
@@ -309,6 +320,46 @@ private:
                 return true;
             });
     }
+
+    /* What the field is, from the client's hints, as the TSF DLL reads input
+     * scopes (Mozc's list): a URL, an e-mail address, a number, a phone
+     * number, a date or time, alphanumerics or a password take direct input;
+     * a sensitive one (a private window) is private. */
+    static uint32_t field(InputContext *ic) {
+        const auto caps = ic->capabilityFlags();
+        for (auto flag : {CapabilityFlag::Url, CapabilityFlag::Email, CapabilityFlag::Digit,
+                          CapabilityFlag::Number, CapabilityFlag::Dialable,
+                          CapabilityFlag::Date, CapabilityFlag::Time, CapabilityFlag::Alpha,
+                          CapabilityFlag::Password}) {
+            if (caps.test(flag)) {
+                return SETSUNA_FIELD_DIRECT;
+            }
+        }
+        return caps.test(CapabilityFlag::Sensitive) ? SETSUNA_FIELD_PRIVATE
+                                                     : SETSUNA_FIELD_NORMAL;
+    }
+
+    /* The app's text before the caret, at most kContextChars of it, when the
+     * client tells it (surrounding text); false when it does not. */
+    static bool beforeCaret(InputContext *ic, std::string &out) {
+        if (!ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+            return false;
+        }
+        const auto &surrounding = ic->surroundingText();
+        if (!surrounding.isValid()) {
+            return false;
+        }
+        const std::string &text = surrounding.text();
+        size_t cursor = std::min<size_t>(surrounding.cursor(), utf8::length(text));
+        size_t start = cursor > kContextChars ? cursor - kContextChars : 0;
+        auto from = utf8::ncharByteLength(text.begin(), start);
+        auto len = utf8::ncharByteLength(text.begin() + from, cursor - start);
+        out = text.substr(from, len);
+        return true;
+    }
+    /* Chars of context read, as the TSF DLL's 160 UTF-16 units: the bridge
+     * keeps the last 80. */
+    static constexpr size_t kContextChars = 160;
 
     static uint32_t mods(KeyStates states) {
         uint32_t m = 0;
@@ -360,8 +411,14 @@ private:
             }
             list->padTo(static_cast<int>(page));
             panel.setCandidateList(std::move(list));
-            panel.setAuxUp(Text("[" + std::to_string(v->selected + 1) + "/" +
-                                std::to_string(v->n_candidates) + "]"));
+            std::string aux =
+                "[" + std::to_string(v->selected + 1) + "/" + std::to_string(v->n_candidates) + "]";
+            // after it, as on Windows: the rewrite's progress or failure
+            if (v->status && *v->status) {
+                aux += "  ";
+                aux += v->status;
+            }
+            panel.setAuxUp(Text(aux));
         } else if (v->n_suggestions > 0) {
             auto list = std::make_unique<SetsunaCandidateList>(this, false, false, -1);
             for (size_t i = 0; i < v->n_suggestions; i++) {
@@ -395,7 +452,7 @@ void SetsunaCandidateList::prevCandidate() { engine_->deferKey(FcitxKey_Up); }
 void SetsunaCandidateList::nextCandidate() { engine_->deferKey(FcitxKey_Down); }
 
 std::string SetsunaModeAction::shortText(InputContext *) const {
-    return engine_->enabled() ? "あ" : "A";
+    return engine_->modeLabel();
 }
 std::string SetsunaModeAction::longText(InputContext *) const {
     return engine_->enabled() ? "ひらがな (` で直接入力)" : "直接入力 (` でひらがな)";

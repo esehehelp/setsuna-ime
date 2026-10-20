@@ -16,6 +16,8 @@ use setsuna_core::config::Config;
 use setsuna_core::engine_bridge::{Action, EngineBridge, KeyKind, KeyOutcome};
 use setsuna_core::engine_client::EngineClient;
 use setsuna_core::learning::Learning;
+use setsuna_core::rerank_client::RerankClient;
+use setsuna_core::rewrite_client::RewriteClient;
 
 use crate::keys::{self, Key};
 
@@ -51,6 +53,21 @@ pub struct View {
     pub suggestion_comments: Vec<String>,
     /// The highlighted candidate.
     pub selected: usize,
+    /// A line under the open candidate list (書き直し中…, a rewrite's
+    /// failure, a candidate forgotten); empty for none.
+    pub status: String,
+}
+
+/// What the focused field is, from fcitx5's capability flags (the input
+/// scopes on Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Normal,
+    /// No context, no rewrite, nothing learned.
+    Private,
+    /// Direct input: a URL, an e-mail address, a number, a password, ...
+    /// Keys go to the app.
+    Direct,
 }
 
 impl View {
@@ -85,10 +102,12 @@ impl View {
                 self.commits.push(text);
                 self.preedit.clear();
                 self.focus = None;
+                self.status.clear();
             }
             Action::EndComposition => {
                 self.preedit.clear();
                 self.focus = None;
+                self.status.clear();
             }
             Action::ShowCandidates { list, selected }
             | Action::ShowSegmentCandidates { list, selected, .. } => {
@@ -103,10 +122,11 @@ impl View {
                 self.candidates.clear();
                 self.comments.clear();
                 self.selected = 0;
+                self.status.clear();
             }
-            // only the TSF frontend has rewrite mode (and its status) yet;
-            // the suggestions are read from the bridge (`suggestions`)
-            Action::Status { .. } | Action::ShowSuggestions { .. } => {}
+            Action::Status { text } => self.status = text,
+            // read from the bridge (`suggestions`)
+            Action::ShowSuggestions { .. } => {}
         }
     }
 }
@@ -133,12 +153,6 @@ fn live_conversion(cfg: &Config) -> bool {
 }
 
 impl Session {
-    /// The field typed into is private (a password): no context, no
-    /// rewrite, nothing learned (`EngineBridge::set_private_field`).
-    pub fn set_private_field(&mut self, private: bool) {
-        self.bridge.set_private_field(private);
-    }
-
     /// A session converting through `client` (`None`: raw hiragana only).
     pub fn new(cfg: &Config, client: Option<Box<dyn EngineClient>>) -> Self {
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
@@ -163,7 +177,17 @@ impl Session {
     /// Take up a (re)loaded config, dropping any composition. Called when
     /// the input method is activated, as the TSF DLL reloads on ActivateEx.
     pub fn configure(&mut self, cfg: &Config) {
-        self.bridge.reset_preserving_client(&cfg.frontend);
+        self.configure_with(cfg, None);
+    }
+
+    /// `configure`, converting through `client` from now on when given (the
+    /// last one's daemon exited): a new bridge, without the reranker and
+    /// rewriter of the old one, as on Windows.
+    pub fn configure_with(&mut self, cfg: &Config, client: Option<Box<dyn EngineClient>>) {
+        match client {
+            Some(client) => self.bridge = EngineBridge::with_frontend(Some(client), &cfg.frontend),
+            None => self.bridge.reset_preserving_client(&cfg.frontend),
+        }
         self.bridge.set_learning(Learning::open(&cfg.learning));
         self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         self.bridge.use_user_dictionary_file();
@@ -202,6 +226,41 @@ impl Session {
         self.bridge.has_client()
     }
 
+    pub fn has_reranker(&self) -> bool {
+        self.bridge.has_reranker()
+    }
+
+    /// Rerank with `reranker` (`None`: none) as `[rerank]` says.
+    pub fn set_reranker(&mut self, reranker: Option<Box<dyn RerankClient>>, cfg: &Config) {
+        self.bridge.set_reranker(reranker, &cfg.rerank);
+    }
+
+    /// New `[rerank]` settings for the reranker already running.
+    pub fn set_rerank_config(&mut self, cfg: &Config) {
+        self.bridge.set_rerank_config(&cfg.rerank);
+    }
+
+    pub fn has_rewriter(&self) -> bool {
+        self.bridge.has_rewriter()
+    }
+
+    /// Rewrite with `rewriter` (`None`: none, and rewrite mode off).
+    pub fn set_rewriter(&mut self, rewriter: Option<Box<dyn RewriteClient>>) {
+        self.bridge.set_rewriter(rewriter);
+    }
+
+    /// Rewrite mode, on only with a rewriter: the conversion key also asks
+    /// for a rewrite, which joins the list first. The TSF DLL turns it on
+    /// at every activation.
+    pub fn set_rewrite_mode(&mut self, on: bool) {
+        let actions = self.bridge.set_rewrite_mode(on);
+        self.apply(actions);
+    }
+
+    pub fn rewrite_mode(&self) -> bool {
+        self.bridge.rewrite_mode()
+    }
+
     pub fn view(&self) -> &View {
         &self.view
     }
@@ -214,8 +273,18 @@ impl Session {
         self.page_size
     }
 
-    /// Handle a key press; `false` leaves it to the app.
+    /// Handle a key press in a normal field whose text cannot be read;
+    /// `false` leaves it to the app.
     pub fn key(&mut self, key: &Key) -> bool {
+        self.key_in(key, Field::Normal, None)
+    }
+
+    /// Handle a key press typed into `field`, with `before_caret` the app's
+    /// text before the caret (`None` when it does not tell). A key starting
+    /// a composition takes both up, as the TSF DLL reads them then: a
+    /// direct-input field gets the key, a private one no context, else the
+    /// text before the caret is the left context.
+    pub fn key_in(&mut self, key: &Key, field: Field, before_caret: Option<&str>) -> bool {
         self.view.commits.clear();
         if keys::is_toggle(key) {
             self.toggle();
@@ -224,7 +293,20 @@ impl Session {
         if !self.enabled {
             return false;
         }
-        let outcome = match keys::classify(key, &self.symbols) {
+        let kind = keys::classify(key, &self.symbols);
+        if let Some(kind) = &kind {
+            if !self.bridge.is_active() && self.bridge.would_consume(kind) {
+                if field == Field::Direct {
+                    if keys::breaks_context(key) {
+                        self.bridge.forget_context();
+                    }
+                    return false;
+                }
+                self.bridge.set_private_field(field == Field::Private);
+                self.bridge.set_app_context(before_caret);
+            }
+        }
+        let outcome = match kind {
             Some(kind) => self.dispatch(kind),
             None => KeyOutcome {
                 consumed: false,
@@ -463,6 +545,45 @@ mod tests {
         // commits are reported once
         press(&mut s, 'k' as u32, 0);
         assert!(s.view().commits.is_empty());
+    }
+
+    fn type_in(s: &mut Session, text: &str, field: Field, before: Option<&str>) -> bool {
+        text.chars().all(|c| {
+            let key = Key {
+                sym: c as u32,
+                code: 0,
+                mods: 0,
+            };
+            s.key_in(&key, field, before)
+        })
+    }
+
+    #[test]
+    fn a_direct_input_field_gets_the_keys() {
+        let (mut s, _) = session();
+        assert!(!type_in(&mut s, "https", Field::Direct, None));
+        assert!(s.view().preedit.is_empty());
+        // the next field is a normal one
+        assert!(type_in(&mut s, "ka", Field::Normal, None));
+        assert_eq!(s.view().preedit, vec!["か"]);
+    }
+
+    #[test]
+    fn the_text_before_the_caret_is_the_left_context() {
+        let (mut s, echo) = session();
+        type_in(&mut s, "desuyone", Field::Normal, Some("今日は良い天気"));
+        assert_eq!(echo.context(), "今日は良い天気");
+        // an app that does not tell keeps the context of what was committed
+        assert!(press(&mut s, RETURN, 0));
+        type_in(&mut s, "hontouni", Field::Normal, None);
+        assert_eq!(echo.context(), "今日は良い天気ですよね");
+    }
+
+    #[test]
+    fn a_private_field_has_no_context() {
+        let (mut s, echo) = session();
+        type_in(&mut s, "desuyone", Field::Private, Some("秘密の文"));
+        assert_eq!(echo.context(), "");
     }
 
     #[test]

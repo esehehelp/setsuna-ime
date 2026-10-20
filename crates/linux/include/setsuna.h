@@ -47,24 +47,34 @@ typedef struct {
     const char *const *suggestions;
     const char *const *suggestion_comments;
     size_t n_suggestions;
+    const char *status; /* a line under the open list (書き直し中…), "" for none */
 } SetsunaView;
 
-/* Load config.toml and spawn the engine daemon. `module_dir` (may be NULL)
- * is searched last for setsuna-engine and models. Never returns NULL. */
+/* Load config.toml and spawn the daemons it asks for (the engine; the
+ * reranker and rewriter when set up). `module_dir` (may be NULL) is searched
+ * last for them and the models. Never returns NULL. */
 SetsunaSession *setsuna_session_new(const char *module_dir, SetsunaNotify notify,
                                   void *user);
-/* Stop the daemon; no notify follows once this returns. */
+/* Stop the daemons; no notify follows once this returns. */
 void setsuna_session_free(SetsunaSession *s);
 
-/* Reload config.toml, dropping any composition. */
+/* Reload config.toml, dropping any composition, and start the daemons it
+ * asks for that are not running (as the TSF DLL does on activation). */
 void setsuna_session_configure(SetsunaSession *s);
 /* setsuna_session_configure for the application `program` (its [[apps]]
  * settings and start state); null or empty when unknown. */
 void setsuna_session_configure_app(SetsunaSession *s, const char *program);
-/* A key press (X keysym, X keycode, SETSUNA_MOD_*); true when taken.
- * ` and Zenkaku_Hankaku turn the IME on or off. */
+/* What the field typed into is (setsuna_session_key's `field`). */
+#define SETSUNA_FIELD_NORMAL 0u
+#define SETSUNA_FIELD_PRIVATE 1u /* no context, no rewrite, nothing learned */
+#define SETSUNA_FIELD_DIRECT 2u  /* a URL, a number, a password: keys go to the app */
+
+/* A key press (X keysym, X keycode, SETSUNA_MOD_*) typed into `field`, with
+ * `before_caret` the app's text before the caret (NULL when unknown): a key
+ * starting a composition takes both up. True when taken. ` and
+ * Zenkaku_Hankaku turn the IME on or off. */
 bool setsuna_session_key(SetsunaSession *s, uint32_t sym, uint32_t code,
-                        uint32_t mods);
+                        uint32_t mods, uint32_t field, const char *before_caret);
 /* Apply the latest conversion result; true when the view changed. */
 bool setsuna_session_apply_async(SetsunaSession *s);
 /* Pick candidate `index` of the open list (moves the selection there). */
@@ -76,9 +86,6 @@ void setsuna_session_reset(SetsunaSession *s);
 
 const SetsunaView *setsuna_session_view(const SetsunaSession *s);
 size_t setsuna_session_page_size(const SetsunaSession *s);
-/* Whether the field typed into is private (a password): no context, no
- * rewrite, nothing learned. */
-void setsuna_session_set_private(SetsunaSession *s, bool private_field);
 /* How long (ms) until a deferred preedit is shown anyway (0: none waits);
  * then call setsuna_session_tick (true when the view changed). */
 uint32_t setsuna_session_deferred_ms(SetsunaSession *s);
@@ -88,6 +95,8 @@ void setsuna_session_toggle(SetsunaSession *s);
 /* Whether the IME is on; off, every key goes to the app. */
 bool setsuna_session_enabled(const SetsunaSession *s);
 bool setsuna_session_has_engine(const SetsunaSession *s);
+/* Rewrite mode is on (a rewriter runs): the mode shows 直. */
+bool setsuna_session_rewrite_mode(const SetsunaSession *s);
 
 #ifdef __cplusplus
 }
