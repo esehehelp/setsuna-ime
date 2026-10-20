@@ -10,10 +10,14 @@
 #include <string>
 #include <vector>
 
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/option.h>
+#include <fcitx-config/rawconfig.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/key.h>
+#include <fcitx-utils/misc.h>
 #include <fcitx-utils/trackableobject.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
@@ -124,6 +128,14 @@ private:
     SetsunaEngine *engine_;
 };
 
+/* What fcitx5's settings show for Setsuna: a button opening its own
+ * settings GUI (setSubConfig), which edits config.toml. */
+FCITX_CONFIGURATION(SetsunaConfig,
+                    ExternalOption settings{this, "Settings", "Setsuna の設定",
+                                            "fcitx://config/addon/setsuna/settings"};);
+
+void openSettings() { startProcess({SETSUNA_SETTINGS_EXE}); }
+
 class SetsunaEngine final : public InputMethodEngineV2 {
 public:
     explicit SetsunaEngine(Instance *instance)
@@ -131,9 +143,14 @@ public:
         dispatcher_.attach(&instance->eventLoop());
         session_ = setsuna_session_new(SETSUNA_MODULE_DIR, &SetsunaEngine::notify, this);
         instance->userInterfaceManager().registerAction("setsuna-mode", &modeAction_);
+        settingsAction_.setShortText("設定");
+        settingsAction_.setIcon("configure");
+        settingsAction_.connect<SimpleAction::Activated>([](InputContext *) { openSettings(); });
+        instance->userInterfaceManager().registerAction("setsuna-settings", &settingsAction_);
     }
 
     ~SetsunaEngine() override {
+        instance_->userInterfaceManager().unregisterAction(&settingsAction_);
         instance_->userInterfaceManager().unregisterAction(&modeAction_);
         // Joins the engine client's threads: no notify follows, so nothing
         // is scheduled on the dispatcher after this.
@@ -150,6 +167,14 @@ public:
         }
         ic_ = ic->watch();
         ic->statusArea().addAction(StatusGroup::InputMethod, &modeAction_);
+        ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
+    }
+
+    const Configuration *getConfig() const override { return &config_; }
+    void setSubConfig(const std::string &path, const RawConfig &) override {
+        if (path == "settings") {
+            openSettings();
+        }
     }
 
     /* Focus out or input method switch: commit what is composed. On focus
@@ -354,6 +379,8 @@ private:
 
     Instance *instance_;
     SetsunaModeAction modeAction_;
+    SimpleAction settingsAction_;
+    SetsunaConfig config_;
     EventDispatcher dispatcher_;
     std::unique_ptr<EventSourceTime> deferredTimer_;
     SetsunaSession *session_ = nullptr;

@@ -15,7 +15,7 @@
 # crates/linux/package.sh builds the release archive (crates/linux/install.sh
 # installs it) with these.
 cmake_minimum_required(VERSION 3.19)
-project(fcitx5-setsuna VERSION 0.1.0 LANGUAGES CXX)
+project(fcitx5-setsuna VERSION 0.1.1 LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(GNUInstallDirs)
@@ -64,7 +64,8 @@ add_dependencies(setsuna_rust_lib setsuna_rust)
 add_library(setsuna MODULE setsuna.cpp)
 set_target_properties(setsuna PROPERTIES PREFIX "")
 target_include_directories(setsuna PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
-target_compile_definitions(setsuna PRIVATE SETSUNA_MODULE_DIR="${SETSUNA_MODULE_DIR}")
+target_compile_definitions(setsuna PRIVATE SETSUNA_MODULE_DIR="${SETSUNA_MODULE_DIR}"
+    SETSUNA_SETTINGS_EXE="${CMAKE_INSTALL_FULL_BINDIR}/setsuna-settings")
 # `cargo rustc -- --print native-static-libs`
 target_link_libraries(setsuna PRIVATE Fcitx5::Core setsuna_rust_lib
     gcc_s util rt pthread m dl)
@@ -92,6 +93,7 @@ install(DIRECTORY ../../ime-core/data/mixed/ DESTINATION "${SETSUNA_MODULE_DIR}/
 install(PROGRAMS ${SETSUNA_DAEMONS} DESTINATION "${SETSUNA_MODULE_DIR}")
 if(SETSUNA_BUILD_SETTINGS)
     install(PROGRAMS "${CARGO_OUT}/setsuna-settings" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(FILES setsuna-settings.desktop DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
 endif()
 
 set(SETSUNA_ORT_LIBRARY "${CARGO_OUT}/libonnxruntime.so" CACHE FILEPATH

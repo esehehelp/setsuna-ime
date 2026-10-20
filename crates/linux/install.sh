@@ -189,6 +189,9 @@ done
 if [[ -f $src/bin/setsuna-settings ]]; then
     if ldd "$src/bin/setsuna-settings" 2>/dev/null | grep -q 'not found'; then
         log "the settings GUI needs WebKitGTK 4.1: not installed"
+        # nor its menu entry
+        rm -f -- "$root/usr/share/applications/setsuna-settings.desktop"
+        mapfile -t installed < <(printf '%s\n' "${installed[@]}" | grep -vxF /usr/share/applications/setsuna-settings.desktop)
     else
         put "$src/bin/setsuna-settings" /usr/bin/setsuna-settings 755
     fi
