@@ -38,36 +38,48 @@ pub fn char_starts(reading: &str, text: &str, engine_pos: Option<&[u32]>) -> Opt
         return align(&t, &r).map(|ranges| ranges.iter().map(|&(a, _)| a).collect());
     };
     let mut starts = Vec::with_capacity(t.len());
+    // chars that spell their own reading char: kana, and the punctuation,
+    // digits and latin the reading carries as they are
+    let mut literal = Vec::with_capacity(t.len());
     let mut lo = 0usize;
     for (i, &c) in t.iter().enumerate() {
         let mut q = (pos[i] as usize).max(lo);
-        if is_kana(c) {
-            // the emitting frame can be a char or two off the kana it spells
-            let h = to_hira(c);
-            let near = [Some(q), Some(q + 1), q.checked_sub(1), Some(q + 2)];
-            if let Some(j) = near
-                .into_iter()
-                .flatten()
-                .find(|&j| j >= lo && j < r.len() && to_hira(r[j]) == h)
-            {
-                q = j;
-            }
+        // the emitting frame can be a char or two off the char it spells
+        // (、 of 場合、運び at the い of ばあい、)
+        let near = [Some(q), Some(q + 1), q.checked_sub(1), Some(q + 2)];
+        let found = near
+            .into_iter()
+            .flatten()
+            .find(|&j| j >= lo && j < r.len() && spells(c, r[j]));
+        if let Some(j) = found {
+            q = j;
         }
         starts.push(q);
+        literal.push(is_kana(c) || found.is_some());
         lo = q;
     }
     starts[0] = 0;
-    // A kana spells exactly its own reading char, so what follows it starts
-    // right after. The engine can emit the next kanji a char late (使 of
-    // 方式を使う at the か of をつかう, which would leave つ with を) or
-    // early (merging it into the kana's unit).
+    // A literal char spells exactly its own reading char, so what follows it
+    // starts right after. The engine can emit the next kanji a char late (使
+    // of 方式を使う at the か of をつかう, which would leave つ with を; 主 of
+    // 、主に at the も of 、おもに) or early (merging it into the kana's unit).
     for i in 1..t.len() {
-        if is_kana(t[i - 1]) && !is_kana(t[i]) {
+        if literal[i - 1] && !literal[i] {
             starts[i] = (starts[i - 1] + 1).min(r.len() - 1);
         }
         starts[i] = starts[i].max(starts[i - 1]);
     }
     Some(starts)
+}
+
+/// Whether text char `c` spells reading char `rc`: the same kana in either
+/// script, or the same char (a symbol, digit or latin letter kept as typed).
+fn spells(c: char, rc: char) -> bool {
+    if is_kana(c) {
+        to_hira(c) == to_hira(rc)
+    } else {
+        c == rc
+    }
 }
 
 fn is_hiragana(c: char) -> bool {
@@ -272,6 +284,34 @@ mod tests {
         assert_eq!(
             texts(t, r, &segment(t, &starts, 8)),
             pairs(&[("方式を", "ほうしきを"), ("使う", "つかう")])
+        );
+    }
+
+    #[test]
+    fn punctuation_and_digits_are_snapped_like_kana() {
+        // Aster-v1.2-small emitted 主 at the も of 、おもに
+        let (r, t) = ("せっけいには、おもに2つの", "設計には、主に2つの");
+        let starts = char_starts(r, t, Some(&[0, 2, 4, 5, 6, 8, 9, 10, 11, 12])).unwrap();
+        assert_eq!(starts, [0, 2, 4, 5, 6, 7, 9, 10, 11, 12]);
+        assert_eq!(
+            texts(t, r, &segment(t, &starts, 13)),
+            pairs(&[
+                ("設計には、", "せっけいには、"),
+                ("主に", "おもに"),
+                ("2つの", "2つの")
+            ])
+        );
+        // and 、 of 場合、運び at the い of ばあい
+        let (r, t) = ("ばあい、はこびこまれる", "場合、運び込まれる");
+        let starts = char_starts(r, t, Some(&[0, 1, 2, 4, 6, 7, 8, 9, 10])).unwrap();
+        assert_eq!(starts, [0, 1, 3, 4, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            texts(t, r, &segment(t, &starts, 11)),
+            pairs(&[
+                ("場合、", "ばあい、"),
+                ("運び", "はこび"),
+                ("込まれる", "こまれる")
+            ])
         );
     }
 
