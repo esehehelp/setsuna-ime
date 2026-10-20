@@ -3,8 +3,8 @@
 Setsuna (刹那) is a Japanese input method built around a non-autoregressive
 neural kana-kanji converter (CTC-NAT). This repository holds the inference engine, the IME
 frontends for Windows (TSF) and Linux (fcitx5), an optional LM reranker, a
-settings GUI and a browser demo. **Research stage: no trained model is
-distributed yet**, so the IME cannot convert out of the box (see
+settings GUI and a browser demo. **Research stage**: a public conversion model
+is available, and the Windows installer downloads it automatically (see
 [Status](#状態)).
 
 Setsuna（刹那）は、非自己回帰のニューラルかな漢字変換（CTC-NAT）を中心にした
@@ -14,11 +14,12 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 
 ## 状態
 
-研究段階のプロジェクトで、**学習済みモデルと辞書はまだ配布していない**。
+研究段階のプロジェクト。変換モデル
+[Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small)
+（Apache-2.0）を公開しており、Windows インストーラーは既定で int8 版を自動取得する。
 
-- エンジンと IME は変換モデル Aster-v1.2 を前提に調整している（記号分割、
-  前の文脈 64 トークン、長い読みは 80 文字ごとに区切って変換）。配布の予定が
-  決まり次第ここに書く。
+- エンジンと IME はこの変換モデルを前提に調整している（記号分割、
+  前の文脈 64 トークン、長い読みは 80 文字ごとに区切って変換）。
 - 辞書データは、生成元は公開せず辞書ファイルとして配布し、エンジンと IME は
   それを読んで使う予定。今読むのは記号辞書（`[frontend] symbol_dictionary_file`）
   と英字の名前の辞書（`name_dictionary_file`）で、読みの辞書はこれから使う。
@@ -137,7 +138,10 @@ Linux / macOS では `libonnxruntime.so` / `.dylib` をエンジンの隣に置�
 ```powershell
 cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
-pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
+pwsh crates/tsf/install.ps1                  # 公開モデルの int8 版を自動取得してインストール
+# fp32 版: pwsh crates/tsf/install.ps1 -ModelPrecision fp32
+# 取得済み・独自のモデル（ネット接続不要）:
+# pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 # リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
 # 英日混在入力の名前の辞書も入れる場合: -NameDictionary <names tsv>
 ```
@@ -146,6 +150,21 @@ pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 （UAC が出る）。設定は `%APPDATA%\setsuna-ime\config.toml` で、タスクバーの
 「あ / A」アイコンの右クリックメニュー「設定...」から設定 GUI を開ける。アンインストールは
 `%LOCALAPPDATA%\setsuna-ime\uninstall.ps1`。
+
+モデルはログイン不要で Hugging Face から取得する。取得元・commit・各ファイルの
+サイズと SHA-256 は `crates/tsf/models.json` に固定し、manifest と参照先の ONNX・語彙を
+検証してから配置する。キャッシュは `%LOCALAPPDATA%\setsuna-ime\cache\models`。
+再実行では検証済みファイルを再利用するので、取得完了後はオフラインでも使える。
+通信・検証に失敗するとインストールを中止する（終了コード 30）。`-Manifest` と
+`-ModelPrecision` は併用できない。ビルドと ONNX Runtime の取得は上記の手順が別途必要。
+
+モデルだけ取得する場合（標準出力にローカル manifest のパスを返す）:
+
+```powershell
+pwsh crates/tsf/fetch-model.ps1 -Precision int8 -CacheDir local/models/downloads
+# ダウンローダーの回帰テスト（ネット接続不要）:
+pwsh tests/model-download.ps1
+```
 
 ### Linux（fcitx5）
 
@@ -162,6 +181,12 @@ cmake --build build && sudo cmake --install build
 `SETSUNA_MODULE_DIR`（既定 `<libdir>/setsuna-ime`）の順に探す。開発中は
 `-DSETSUNA_MODULE_DIR=<repo>/target/release` とすると `target/release` の
 エンジンと `<repo>/local/models/onnx` のモデルを使う。
+
+モデルの自動取得はまだ無い。
+[Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small) から
+`Aster-v1.2-small.int8.manifest.json`、`Aster-v1.2-small.int8.onnx`、
+`Aster-v1.2-small.vocab.hex.tsv` を同じディレクトリに置き、`config.toml` の
+`[engine] model_manifest` にその manifest を指定する（`SETSUNA_MANIFEST` でもよい）。
 
 ### デモ / 設定 GUI
 
@@ -180,6 +205,7 @@ cargo run --release -p setsuna-settings
 
 - 変換モデル: schema `neo-ime-ctc-nat-export-v1`。proposal の ONNX、語彙、
   special token id、`decode_defaults`（beam 幅、記号の扱いなど）を持つ。
+  公開モデル Aster-v1.2-small には int8 版（約 29 MB）と fp32 版（約 107 MB）がある。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults` を持つ。
 
@@ -246,6 +272,8 @@ MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）か�
 その他の Rust crate は `Cargo.lock` を参照。英日混在入力のモデル
 （`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
 出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と
-THIRD_PARTY_NOTICES.md）。辞書データとかな漢字変換モデルの重みは
-このリポジトリに含まない。配布する辞書ファイルのライセンスと出典表示は、
+THIRD_PARTY_NOTICES.md）。かな漢字変換モデルは
+[Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small)（Apache-2.0）。
+辞書データとかな漢字変換モデルの重みはこのリポジトリに含まない。
+配布する辞書ファイルのライセンスと出典表示は、
 それぞれの辞書ファイルに同梱する。
