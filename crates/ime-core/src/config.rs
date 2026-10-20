@@ -325,7 +325,8 @@ pub struct FrontendCfg {
     /// "preedit cursor position at beginning"). Apps put the candidate
     /// window at the caret, so it then stays put while typing, converting
     /// and moving between segments; some draw the caret there too. A caret
-    /// moved with ← / → is still shown. fcitx5 only.
+    /// moved with ← / → is still shown. fcitx5 only; off by default (user
+    /// 2026-10-20: the caret seemed stuck at the start of the sentence).
     pub preedit_cursor_at_start: bool,
     /// Directory of the mixed-input model (`setsuna_core::mixed`; the IME
     /// ships one, `data/mixed`, which the Windows installer sets here and
@@ -457,7 +458,7 @@ impl Default for FrontendCfg {
             pass_through_commands: false,
             full_width_space: false,
             live_conversion: None,
-            preedit_cursor_at_start: true,
+            preedit_cursor_at_start: false,
             mixed_model: None,
             name_dictionary_file: None,
             name_case: NameCase::Acronyms,
@@ -911,8 +912,9 @@ impl Config {
              # Default true.\n\
              # live_conversion = false\n\
              # fcitx5: keep the preedit caret at the start of the composition,\n\
-             # so the candidate window stays put.\n\
-             preedit_cursor_at_start = true\n\
+             # so the candidate window stays put (the caret is then not seen\n\
+             # to move while typing). Default false.\n\
+             # preedit_cursor_at_start = true\n\
              # Directory of the mixed Japanese / English input model: English\n\
              # words typed among the romaji stay as typed. The installer sets\n\
              # the one it installs; \"\" turns mixed input off.\n\
