@@ -1,12 +1,16 @@
 # Setsuna TSF IME installer.
 #
 # Usage:
-#   pwsh -File crates\tsf\install.ps1 -Manifest <m>             # full install (UAC for regsvr32)
+#   pwsh -File crates\tsf\install.ps1                           # download pinned int8 model + install
+#   pwsh -File crates\tsf\install.ps1 -ModelPrecision fp32      # download pinned fp32 model instead
+#   pwsh -File crates\tsf\install.ps1 -Manifest <m>             # local model, no download (UAC for regsvr32)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NoElevate  # files-only (CI)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Force      # overwrite even if same
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -RerankManifest <r>  # also the reranker
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NameDictionary <tsv>  # also mixed input's names
 #
+# Without -Manifest, fetch-model.ps1 downloads the public artifact pinned in
+# models.json, verifies its size/SHA-256, and reuses verified cache files offline.
 # <m> is the model's `*.manifest.json` written by export. The manifest and
 # every file it lists are copied, keeping their relative paths.
 #
@@ -14,7 +18,7 @@
 #   0  success / already up to date
 #   10 unsupported architecture (need x64)
 #   20 regsvr32 failed
-#   30 model file(s) not found in source
+#   30 model file(s) not found, download failed, or integrity check failed
 #   40 source DLL, engine.exe or onnxruntime.dll not found
 #   50 file copy failed
 #
@@ -47,11 +51,15 @@
 # HKCU\Software\Classes instead would allow a no-elevation install.
 
 #Requires -Version 5.1
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Download')]
 param(
     [string]$SourceDir = (Join-Path $PSScriptRoot '..\..\target\release'),
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'Local')]
+    [ValidateNotNullOrEmpty()]
     [string]$Manifest,
+    [Parameter(ParameterSetName = 'Download')]
+    [ValidateSet('int8', 'fp32')]
+    [string]$ModelPrecision = 'int8',
     # LM scorer manifest (neo-ime-lm-scorer-export-v1): install the reranker too.
     [string]$RerankManifest,
     # Mixed input model directory (kana.tsv, latin.tsv, params.txt): English
@@ -284,7 +292,6 @@ if ([Environment]::Is64BitOperatingSystem -ne $true) {
 }
 
 $SourceDir = Resolve-Path-Safe $SourceDir
-$Manifest  = Resolve-Path-Safe $Manifest
 $DllSrc    = Join-Path $SourceDir $DllName
 $EngineSrc = Join-Path $SourceDir $EngineExe
 
@@ -294,6 +301,17 @@ $OrtSrc = Join-Path $SourceDir $OrtDll
 if (-not (Test-Path -LiteralPath $OrtSrc)) {
     Write-Log ERROR "onnxruntime.dll not found: $OrtSrc (run crates\engine\fetch-onnxruntime.ps1)"; exit 40
 }
+
+# Resolve the public artifact before elevation. The elevated invocation receives
+# this local manifest, so it neither downloads again nor changes cache ownership.
+if ($PSCmdlet.ParameterSetName -eq 'Download') {
+    try {
+        $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision
+    } catch {
+        Write-Log ERROR "model download failed: $_ (retry, or use -Manifest for a local artifact)"; exit 30
+    }
+}
+$Manifest = Resolve-Path-Safe $Manifest
 
 # The manifest names every artifact file relative to itself. Each is copied
 # to the same relative path under the install dir, so the installed manifest
