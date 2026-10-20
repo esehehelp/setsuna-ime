@@ -107,6 +107,88 @@ const ROMAJI_TABLE: &[(&str, &str)] = &[
     ("fya", "ふゃ"),
     ("fyu", "ふゅ"),
     ("fyo", "ふょ"),
+    // the rest of MS-IME's and Mozc's y-row and w-row: small い / え after
+    // each consonant's i-kana (tye ちぇ, nye にぇ), the z- / c- / d- spellings
+    // of じゃ / ちゃ / ぢゃ, small vowels after と / ど / く / ぐ / す / ふ / う
+    // (twu とぅ, kwa くぁ, who うぉ). Without them `tye` stranded the `t` as
+    // a letter.
+    ("kyi", "きぃ"),
+    ("kye", "きぇ"),
+    ("gyi", "ぎぃ"),
+    ("gye", "ぎぇ"),
+    ("syi", "しぃ"),
+    ("sye", "しぇ"),
+    ("zya", "じゃ"),
+    ("zyi", "じぃ"),
+    ("zyu", "じゅ"),
+    ("zye", "じぇ"),
+    ("zyo", "じょ"),
+    ("jyi", "じぃ"),
+    ("jye", "じぇ"),
+    ("tyi", "ちぃ"),
+    ("tye", "ちぇ"),
+    ("cya", "ちゃ"),
+    ("cyi", "ちぃ"),
+    ("cyu", "ちゅ"),
+    ("cye", "ちぇ"),
+    ("cyo", "ちょ"),
+    ("dya", "ぢゃ"),
+    ("dyi", "ぢぃ"),
+    ("dyu", "ぢゅ"),
+    ("dye", "ぢぇ"),
+    ("dyo", "ぢょ"),
+    ("nyi", "にぃ"),
+    ("nye", "にぇ"),
+    ("hyi", "ひぃ"),
+    ("hye", "ひぇ"),
+    ("byi", "びぃ"),
+    ("bye", "びぇ"),
+    ("pyi", "ぴぃ"),
+    ("pye", "ぴぇ"),
+    ("myi", "みぃ"),
+    ("mye", "みぇ"),
+    ("ryi", "りぃ"),
+    ("rye", "りぇ"),
+    ("fyi", "ふぃ"),
+    ("fye", "ふぇ"),
+    ("vyi", "ゔぃ"),
+    ("vye", "ゔぇ"),
+    ("twa", "とぁ"),
+    ("twi", "とぃ"),
+    ("twu", "とぅ"),
+    ("twe", "とぇ"),
+    ("two", "とぉ"),
+    ("dwa", "どぁ"),
+    ("dwi", "どぃ"),
+    ("dwu", "どぅ"),
+    ("dwe", "どぇ"),
+    ("dwo", "どぉ"),
+    ("kwa", "くぁ"),
+    ("qwa", "くぁ"),
+    ("qwi", "くぃ"),
+    ("qwu", "くぅ"),
+    ("qwe", "くぇ"),
+    ("qwo", "くぉ"),
+    ("gwa", "ぐぁ"),
+    ("gwi", "ぐぃ"),
+    ("gwu", "ぐぅ"),
+    ("gwe", "ぐぇ"),
+    ("gwo", "ぐぉ"),
+    ("swa", "すぁ"),
+    ("swi", "すぃ"),
+    ("swu", "すぅ"),
+    ("swe", "すぇ"),
+    ("swo", "すぉ"),
+    ("fwa", "ふぁ"),
+    ("fwi", "ふぃ"),
+    ("fwu", "ふぅ"),
+    ("fwe", "ふぇ"),
+    ("fwo", "ふぉ"),
+    ("wha", "うぁ"),
+    ("whi", "うぃ"),
+    ("whu", "う"),
+    ("whe", "うぇ"),
+    ("who", "うぉ"),
     // two-letter
     ("ka", "か"),
     ("ki", "き"),
@@ -1204,6 +1286,16 @@ mod tests {
         assert_eq!(commit_all("fya"), "ふゃ");
         assert_eq!(commit_all("fyu"), "ふゅ");
         assert_eq!(commit_all("fyo"), "ふょ");
+        // the y-row and w-row of MS-IME and Mozc
+        assert_eq!(commit_all("tye"), "ちぇ");
+        assert_eq!(commit_all("tyekku"), "ちぇっく");
+        assert_eq!(commit_all("nye"), "にぇ");
+        assert_eq!(commit_all("cya"), "ちゃ");
+        assert_eq!(commit_all("zyo"), "じょ");
+        assert_eq!(commit_all("dyu"), "ぢゅ");
+        assert_eq!(commit_all("twu"), "とぅ");
+        assert_eq!(commit_all("kwa"), "くぁ");
+        assert_eq!(commit_all("who"), "うぉ");
     }
 
     #[test]
