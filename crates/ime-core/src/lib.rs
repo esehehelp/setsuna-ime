@@ -8,6 +8,7 @@
 //! into `engine_bridge::KeyKind`s and renders the `Action`s that come back.
 
 pub mod char_forms;
+pub mod char_ngram;
 pub mod child_daemon;
 pub mod composing_text;
 pub mod config;

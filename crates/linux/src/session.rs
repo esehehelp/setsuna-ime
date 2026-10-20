@@ -157,6 +157,7 @@ impl Session {
     pub fn new(cfg: &Config, client: Option<Box<dyn EngineClient>>) -> Self {
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
         bridge.set_learning(Learning::open(&cfg.learning));
+        bridge.set_ngram(&cfg.ngram);
         bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         bridge.use_user_dictionary_file();
         bridge.open_predictor(&cfg.frontend);
@@ -189,6 +190,7 @@ impl Session {
             None => self.bridge.reset_preserving_client(&cfg.frontend),
         }
         self.bridge.set_learning(Learning::open(&cfg.learning));
+        self.bridge.set_ngram(&cfg.ngram);
         self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         self.bridge.use_user_dictionary_file();
         self.bridge.open_predictor(&cfg.frontend);

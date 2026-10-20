@@ -675,6 +675,7 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
             inner
                 .engine
                 .set_learning(setsuna_core::learning::Learning::open(&cfg.learning));
+            inner.engine.set_ngram(&cfg.ngram);
             inner
                 .engine
                 .set_hidden(setsuna_core::hidden::Hidden::open());
