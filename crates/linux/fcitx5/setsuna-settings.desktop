@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Setsuna IME Settings
+Name[ja]=Setsuna の設定
+Comment=Settings of the Setsuna Japanese input method
+Comment[ja]=日本語入力 Setsuna の設定
+Exec=setsuna-settings
+Icon=setsuna
+Categories=Settings;
+Keywords=IME;input method;Japanese;fcitx;
+Keywords[ja]=IME;日本語入力;かな漢字変換;fcitx;

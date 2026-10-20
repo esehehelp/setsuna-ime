@@ -7,7 +7,7 @@
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use setsuna_core::child_daemon;
 use setsuna_core::config::Config;
@@ -67,6 +67,8 @@ impl CList {
 
 pub struct SetsunaSession {
     session: Session,
+    /// Where the engine and models are looked for last (see `load_config`).
+    module_dir: Option<PathBuf>,
     commits: CList,
     preedit: CList,
     candidates: CList,
@@ -141,15 +143,8 @@ pub unsafe extern "C" fn setsuna_session_new(
     setsuna_core::diagnostics::init("fcitx5.log");
     let module_dir = (!module_dir.is_null())
         .then(|| PathBuf::from(CStr::from_ptr(module_dir).to_string_lossy().into_owned()));
-    let session = guard(None, move || {
-        let mut cfg = Config::load_default();
-        if cfg.frontend.mixed_model.is_none() {
-            cfg.frontend.mixed_model = module_dir
-                .as_deref()
-                .map(|d| d.join("mixed"))
-                .filter(|d| d.join("kana.tsv").is_file())
-                .map(|d| d.to_string_lossy().into_owned());
-        }
+    let session = guard(None, || {
+        let cfg = load_config(module_dir.as_deref());
         let user = UserPtr(user);
         let wake = Box::new(move |_req_id: u64| {
             let user = &user;
@@ -163,6 +158,7 @@ pub unsafe extern "C" fn setsuna_session_new(
     let session = session.unwrap_or_else(|| Session::new(&Config::default(), None));
     let mut s = Box::new(SetsunaSession {
         session,
+        module_dir,
         commits: CList::default(),
         preedit: CList::default(),
         candidates: CList::default(),
@@ -222,8 +218,34 @@ unsafe fn with<R>(s: *mut SetsunaSession, fallback: R, f: impl FnOnce(&mut Sessi
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_configure(s: *mut SetsunaSession) {
     setsuna_core::diagnostics::log("fcitx5 configure");
-    let cfg = Config::load_default();
+    let cfg = load_config(module_dir_of(s));
     with(s, (), |sess| sess.configure(&cfg));
+}
+
+/// `config.toml` over what the addon's install supplies: the mixed input
+/// model installed next to the engine (`<module_dir>/mixed`) when
+/// `[frontend] mixed_model` is not set. Every (re)load goes through here, so
+/// a reload on activation or focus keeps it.
+fn load_config(module_dir: Option<&Path>) -> Config {
+    with_module_defaults(Config::load_default(), module_dir)
+}
+
+fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
+    if cfg.frontend.mixed_model.is_none() {
+        cfg.frontend.mixed_model = module_dir
+            .map(|d| d.join("mixed"))
+            .filter(|d| d.join("kana.tsv").is_file())
+            .map(|d| d.to_string_lossy().into_owned());
+    }
+    cfg
+}
+
+/// The session's module dir.
+///
+/// # Safety
+/// `s` is null or a live session.
+unsafe fn module_dir_of<'a>(s: *mut SetsunaSession) -> Option<&'a Path> {
+    s.as_ref().and_then(|s| s.module_dir.as_deref())
 }
 
 /// `setsuna_session_configure` for the application `program` (the input
@@ -240,7 +262,7 @@ pub unsafe extern "C" fn setsuna_session_configure_app(
     let program = (!program.is_null())
         .then(|| CStr::from_ptr(program).to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (cfg, app) = Config::load_default().for_app(&program);
+    let (cfg, app) = load_config(module_dir_of(s)).for_app(&program);
     setsuna_core::diagnostics::log(format!(
         "fcitx5 configure for {program:?} app settings={}",
         app.is_some()
@@ -395,9 +417,41 @@ mod tests {
     }
 
     #[test]
+    fn the_installed_mixed_model_is_the_default_of_every_load() {
+        // A reload on activation or focus once dropped it: mixed input then
+        // worked only until the first app switch (commit read as cおっみっと).
+        let dir = std::env::temp_dir().join(format!("setsuna-ffi-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("mixed")).unwrap();
+        std::fs::write(dir.join("mixed/kana.tsv"), "").unwrap();
+        let mixed = dir.join("mixed").to_string_lossy().into_owned();
+        let cfg = with_module_defaults(Config::default(), Some(&dir));
+        assert_eq!(cfg.frontend.mixed_model.as_deref(), Some(mixed.as_str()));
+        let (cfg, _) = with_module_defaults(Config::default(), Some(&dir)).for_app("code");
+        assert_eq!(cfg.frontend.mixed_model.as_deref(), Some(mixed.as_str()));
+        // config.toml's own value (mixed_model = "" turns it off) wins
+        let mut off = Config::default();
+        off.frontend.mixed_model = Some(String::new());
+        assert_eq!(
+            with_module_defaults(off, Some(&dir))
+                .frontend
+                .mixed_model
+                .as_deref(),
+            Some("")
+        );
+        // no model installed: none
+        std::fs::remove_file(dir.join("mixed/kana.tsv")).unwrap();
+        assert!(with_module_defaults(Config::default(), Some(&dir))
+            .frontend
+            .mixed_model
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_c_view_mirrors_the_session() {
         let mut s = SetsunaSession {
             session: Session::new(&Config::default(), None),
+            module_dir: None,
             commits: CList::default(),
             preedit: CList::default(),
             candidates: CList::default(),
