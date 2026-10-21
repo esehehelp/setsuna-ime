@@ -20,8 +20,8 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenElevation, TokenUser, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -77,6 +77,31 @@ pub fn user_sid() -> io::Result<String> {
             return Err(err);
         }
         sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid)
+    }
+}
+
+/// Whether this process runs elevated (an administrator's full token).
+pub fn is_elevated() -> io::Result<bool> {
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        let err = io::Error::last_os_error();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(elevation.TokenIsElevated != 0)
     }
 }
 
@@ -406,6 +431,12 @@ mod tests {
     #[test]
     fn user_sid_is_a_sid() {
         assert!(user_sid().unwrap().starts_with("S-1-"));
+    }
+
+    #[test]
+    fn elevation_is_read() {
+        // whichever way the tests run, the token tells
+        is_elevated().unwrap();
     }
 
     #[test]

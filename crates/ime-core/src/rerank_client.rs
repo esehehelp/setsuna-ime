@@ -2,8 +2,9 @@
 //! the left context (`crates/rerank`).
 //!
 //! On Windows the IME of every app shares one `setsuna-rerank serve` process
-//! over a named pipe ([`PipeRerankClient`]); elsewhere each frontend has a
-//! `setsuna-rerank daemon` child ([`ChildRerankClient`]).
+//! over a named pipe ([`PipeRerankClient`]); elsewhere, and in an elevated
+//! app, each frontend has a `setsuna-rerank daemon` child
+//! ([`ChildRerankClient`]).
 //!
 //! As with the engine client, a writer thread sends one request at a time and
 //! results come back through the frontend's [`Notify`]. A request waits until
@@ -511,7 +512,10 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
 /// `module_dir` is the frontend module's directory, searched for the binary.
 /// On Windows it connects to the login's shared server, starting it when
 /// there is none (in the background: this returns at once); elsewhere the
-/// child starts with the first request.
+/// child starts with the first request. An elevated app has a child too: a
+/// server it started would run elevated, serve the login's other apps across
+/// that boundary and, in a job it cannot leave (an elevated installer's
+/// console), keep the job's waiters until its idle exit.
 pub fn spawn_with_config(
     cfg: &crate::config::Config,
     module_dir: Option<&Path>,
@@ -536,8 +540,14 @@ pub fn spawn_with_config(
         return None;
     };
     #[cfg(windows)]
-    let client = PipeRerankClient::start(manifest, &exe, notify, c)
-        .map(|c| Box::new(c) as Box<dyn RerankClient>);
+    let client = if setsuna_rerank_pipe::win::is_elevated().unwrap_or(false) {
+        crate::diagnostics::log("rerank: elevated, a child of this app's own");
+        ChildRerankClient::spawn(manifest, &exe, notify, c)
+            .map(|c| Box::new(c) as Box<dyn RerankClient>)
+    } else {
+        PipeRerankClient::start(manifest, &exe, notify, c)
+            .map(|c| Box::new(c) as Box<dyn RerankClient>)
+    };
     #[cfg(not(windows))]
     let client = ChildRerankClient::spawn(manifest, &exe, notify, c)
         .map(|c| Box::new(c) as Box<dyn RerankClient>);
