@@ -4,7 +4,7 @@
 //! export pipeline.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -19,6 +19,9 @@ pub struct SharedCharTokenizer {
     pub sep_id: u32,
     pub blank_id: u32,
     pub mask_id: u32,
+    /// The chars of the vocabulary the training rows were written in
+    /// (manifest `input_vocab`), when the model's keeps part of it.
+    pub input_chars: Option<HashSet<String>>,
 }
 
 impl SharedCharTokenizer {
@@ -65,7 +68,25 @@ impl SharedCharTokenizer {
             mask_id: lookup("[MASK]", 5),
             id_to_token,
             token_to_id,
+            input_chars: None,
         })
+    }
+
+    /// Read the input vocabulary (manifest `input_vocab`): its tokens other
+    /// than specials and byte tokens, the chars a training row held as one
+    /// token each.
+    pub fn with_input_vocab(mut self, path: &Path) -> Result<Self> {
+        let input = Self::load_vocab_hex_tsv(path)?;
+        self.input_chars = Some(
+            input
+                .token_to_id
+                .into_keys()
+                .filter(|t| {
+                    !(t.starts_with('[') && t.ends_with(']')) && parse_byte_token(t).is_none()
+                })
+                .collect(),
+        );
+        Ok(self)
     }
 
     /// Whether `c` is a token of its own. A char that is not would reach the
@@ -88,19 +109,24 @@ impl SharedCharTokenizer {
         self.token_to_id.get(ch).copied().unwrap_or(self.unk_id)
     }
 
-    /// Encode a single character with byte-level fallback, matching the
-    /// Python `SharedCharTokenizer.encode()` semantics (`runtime.py:147`).
-    ///
-    /// When `ch` is in the vocab, return a 1-element vec with its id.
-    /// Otherwise emit one `<0xXX>` token id per UTF-8 byte (or `unk_id`
-    /// if a byte token is somehow missing from the vocab). Without this
-    /// fallback, `encode_char` returned UNK for any out-of-vocab char,
-    /// which diverges from how training encoded the very same input.
-    /// The mismatch surfaces on rare-kanji / cross-script context where
-    /// the model saw byte tokens at train time but UNK at inference.
+    /// One char's token ids as the training rows read it
+    /// (tests/fixtures/model_input): its own id
+    /// when the vocabulary has it; else, with an input vocabulary (the rows
+    /// written in a larger one, mapped to this one with `[UNK]` for what it
+    /// lacks), one `[UNK]` for a char of the input vocabulary and one token
+    /// per UTF-8 byte for any other (the row's byte tokens: a byte token of
+    /// this vocabulary or `[UNK]`); without one, the byte tokens when this
+    /// vocabulary has them, else one `[UNK]`.
     pub fn encode_with_byte_fallback(&self, ch: &str) -> Vec<u32> {
         if let Some(&id) = self.token_to_id.get(ch) {
             return vec![id];
+        }
+        let bytes = match &self.input_chars {
+            Some(chars) => !chars.contains(ch),
+            None => self.token_to_id.contains_key("<0x00>"),
+        };
+        if !bytes {
+            return vec![self.unk_id];
         }
         let mut out = Vec::with_capacity(ch.len());
         for b in ch.as_bytes() {
@@ -259,13 +285,16 @@ mod tests {
             sep_id: 3,
             blank_id: 4,
             mask_id: 5,
+            input_chars: None,
         }
     }
 
     #[test]
     fn has_char_is_a_single_token_lookup() {
+        // byte fallback is on when the vocabulary has its byte tokens (as
+        // the Python tokenizer: `<0x00>` present); `,` here lacks its own
         let t = tokenizer(&[
-            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ", "<0x2E>",
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ", "<0x00>", "<0x2E>",
         ]);
         assert!(t.has_char('あ'));
         // a byte-fallback token does not make `.` a token of its own
@@ -275,6 +304,11 @@ mod tests {
         assert!(!t.is_unknown('.'));
         assert!(t.is_unknown(','));
         assert!(!t.is_unknown('あ'));
+        // without byte tokens an out-of-vocabulary char is one [UNK]
+        let plain = tokenizer(&[
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ",
+        ]);
+        assert_eq!(plain.encode_with_byte_fallback("頌"), [1]);
     }
 
     #[test]

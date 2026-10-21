@@ -15,8 +15,13 @@ pub fn load(
 ) -> Result<(SharedCharTokenizer, ProposalRunner)> {
     crate::runtime::init(None)?;
     let tsv_path = &manifest.vocab_path;
-    let tokenizer = SharedCharTokenizer::load_vocab_hex_tsv(tsv_path)
+    let mut tokenizer = SharedCharTokenizer::load_vocab_hex_tsv(tsv_path)
         .with_context(|| format!("load tokenizer vocab {}", tsv_path.display()))?;
+    if let Some(input) = &manifest.input_vocab_path {
+        tokenizer = tokenizer
+            .with_input_vocab(input)
+            .with_context(|| format!("load input vocab {}", input.display()))?;
+    }
 
     let session = SessionBuilder::new()
         .map_err(|e| anyhow::anyhow!("{e}"))?

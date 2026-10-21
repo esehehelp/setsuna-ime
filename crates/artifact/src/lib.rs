@@ -75,6 +75,10 @@ pub struct DecodeDefaults {
     /// Runs of ASCII digits cut out of the reading and spliced back verbatim
     /// (training readings spell numbers in kana).
     pub digit_split: Option<bool>,
+    /// Map the candidates' punctuation and full-width ASCII the IME way
+    /// (`normalize_candidate`); unset or false, a candidate is the model's
+    /// output as decoded (the research default).
+    pub normalize_candidates: Option<bool>,
 }
 
 /// Keys of the dictionary / n-gram fusion recipe that engine v1 read and v2
@@ -99,6 +103,12 @@ struct CtcNatManifestFile {
     model_family: String,
     proposal: ProposalArtifact,
     vocab: PathBuf,
+    /// The vocabulary the training rows were written in, when the model's
+    /// keeps part of it (the shard vocabulary remapped to `[UNK]`): a char of
+    /// it the model's vocabulary lacks is one `[UNK]`, a char outside both
+    /// one `[UNK]` per UTF-8 byte, as the training rows encode it.
+    #[serde(default)]
+    input_vocab: Option<PathBuf>,
     special_ids: SpecialIds,
     max_seq_len: usize,
     #[serde(default)]
@@ -113,6 +123,8 @@ pub struct CtcNatManifest {
     pub proposal_path: PathBuf,
     pub precision: String,
     pub vocab_path: PathBuf,
+    /// See `CtcNatManifestFile::input_vocab`.
+    pub input_vocab_path: Option<PathBuf>,
     pub special_ids: SpecialIds,
     pub max_seq_len: usize,
     pub decode_defaults: DecodeDefaults,
@@ -169,6 +181,11 @@ impl CtcNatManifest {
             proposal_path: resolve(&file.proposal.path, "proposal")?,
             precision: file.proposal.precision,
             vocab_path: resolve(&file.vocab, "vocab")?,
+            input_vocab_path: file
+                .input_vocab
+                .as_deref()
+                .map(|p| resolve(p, "input vocab"))
+                .transpose()?,
             special_ids: file.special_ids,
             max_seq_len: file.max_seq_len,
             decode_defaults: file.decode_defaults,
