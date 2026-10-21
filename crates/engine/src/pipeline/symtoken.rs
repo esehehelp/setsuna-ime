@@ -14,14 +14,35 @@ use crate::candidate::Candidate;
 /// The token a run of symbols becomes.
 pub const SYMBOL_TOKEN: char = '\u{25C7}'; // ◇
 
-/// Not kana, a kanji, ー 々 〆 〇, Japanese punctuation 、。・「」『』 or an
-/// ASCII letter / digit.
-pub fn is_symbol(c: char) -> bool {
-    !(matches!(
+/// Kana: ぁ-ゖ, ァ-ヺ, ー, the iteration marks ゝゞ ヽヾ 〱-〵, ゟ ヿ and the
+/// small katakana ㇰ-ㇿ, as the training rows draw kana.
+pub fn is_kana(c: char) -> bool {
+    matches!(c, 'ぁ'..='ゖ' | 'ゝ'..='ゟ' | 'ァ'..='ヺ' | 'ー'..='ヿ' | '〱'..='〵' | 'ㇰ'..='ㇿ')
+}
+
+/// Kanji: the CJK unified ideographs (extension A, the basic block,
+/// extensions B to I), the compatibility ideographs, and 々 〆 〇 〻
+/// (as the training rows draw kanji).
+pub fn is_kanji(c: char) -> bool {
+    matches!(
         c,
-        'ぁ'..='ゖ' | 'ァ'..='ヺ' | 'ー' | '㐀'..='䶿' | '一'..='鿿' | '豈'..='\u{faff}' | '々' | '〆' | '〇'
-    ) || "、。・「」『』".contains(c)
-        || c.is_ascii_alphanumeric())
+        '㐀'..='䶿'
+            | '一'..='鿿'
+            | '豈'..='\u{faff}'
+            | '\u{20000}'..='\u{2ee5f}'
+            | '\u{2f800}'..='\u{2fa1f}'
+            | '\u{30000}'..='\u{323af}'
+            | '々'
+            | '〆'
+            | '〇'
+            | '〻'
+    )
+}
+
+/// Not kana, a kanji, Japanese punctuation 、。・「」『』 or an ASCII letter /
+/// digit.
+pub fn is_symbol(c: char) -> bool {
+    !(is_kana(c) || is_kanji(c) || "、。・「」『』".contains(c) || c.is_ascii_alphanumeric())
 }
 
 /// `is_symbol`, except `.` and `,` between two ASCII digits, which belong to
@@ -194,7 +215,14 @@ mod tests {
             tok("「方」、何。・ー々"),
             ("「方」、何。・ー々".to_string(), runs(&[]))
         );
-        assert!(is_symbol(SYMBOL_TOKEN) && is_symbol('ゝ') && !is_symbol('〆'));
+        // iteration marks and small katakana are kana, the extension-B kanji
+        // kanji, as the training rows draw them
+        assert_eq!(
+            tok("いすゞ、こゝろ、ヽヾ、〻、ㇰㇷ"),
+            ("いすゞ、こゝろ、ヽヾ、〻、ㇰㇷ".to_string(), runs(&[]))
+        );
+        assert_eq!(tok("𠮟る𩸽𤆬"), ("𠮟る𩸽𤆬".to_string(), runs(&[])));
+        assert!(is_symbol(SYMBOL_TOKEN) && !is_symbol('ゝ') && !is_symbol('〆') && is_symbol('é'));
     }
 
     #[test]
