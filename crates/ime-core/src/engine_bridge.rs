@@ -712,24 +712,53 @@ impl EngineBridge {
             .map(|t| (t, cfg.bigram_weight, cfg.trigram_weight));
     }
 
-    /// The engine's candidates in the order of their scores with the
-    /// character n-gram terms added; those sums become the scores, which
-    /// the LM reranker then adds to.
-    fn rescore_ngram(&self, result: &mut EngineResult) {
-        let Some((table, w2, w3)) = &self.ngram else {
-            return;
-        };
+    /// The engine's candidates that spell the reading out first, by their
+    /// scores with the character n-gram terms added (`[ngram]`: those sums
+    /// become their scores, which the LM reranker then adds to), then those
+    /// that do not, in the engine's order and scored no higher than the
+    /// others. A candidate that does not has lost a char or put a kana out
+    /// of place (ゼロプラモデル for ぜろせんぷらもでる): never the gold over
+    /// wiki_fresh_v2 and AJIMEE, and one the n-gram would favour, with fewer
+    /// pairs to lose points on.
+    fn order_engine_result(&self, result: &mut EngineResult) {
+        use unicode_normalization::UnicodeNormalization;
         let n = result.candidates.len();
-        if n < 2 || result.scores.len() != n {
+        if n < 2 {
             return;
         }
-        let (order, total) = table.rescore(
-            &result.context,
-            &result.candidates,
-            &result.scores,
-            *w2,
-            *w3,
-        );
+        let reading: Vec<char> = result.reading.nfkc().collect();
+        let (mut order, mut rest): (Vec<usize>, Vec<usize>) = (0..n)
+            .partition(|&i| crate::reading_align::spells_out(&result.candidates[i], &reading));
+        if order.is_empty() {
+            std::mem::swap(&mut order, &mut rest);
+        }
+        let scored = result.scores.len() == n;
+        if rest.is_empty() && !(scored && self.ngram.is_some()) {
+            return;
+        }
+        let mut scores = result.scores.clone();
+        if let (Some((table, w2, w3)), true) = (&self.ngram, scored && order.len() >= 2) {
+            let cands: Vec<String> = order
+                .iter()
+                .map(|&i| result.candidates[i].clone())
+                .collect();
+            let own: Vec<f32> = order.iter().map(|&i| scores[i]).collect();
+            let (by, total) = table.rescore(&result.context, &cands, &own, *w2, *w3);
+            for (k, &i) in order.iter().enumerate() {
+                scores[i] = total[k];
+            }
+            order = by.iter().map(|&k| order[k]).collect();
+        }
+        if scored {
+            let floor = order
+                .iter()
+                .map(|&i| scores[i])
+                .fold(f32::INFINITY, f32::min);
+            for &i in &rest {
+                scores[i] = scores[i].min(floor);
+            }
+        }
+        order.extend(rest);
         fn permute<T>(v: &mut Vec<T>, order: &[usize]) {
             let mut old: Vec<Option<T>> = std::mem::take(v).into_iter().map(Some).collect();
             *v = order.iter().map(|&i| old[i].take().unwrap()).collect();
@@ -738,7 +767,9 @@ impl EngineBridge {
         if result.reading_pos.len() == n {
             permute(&mut result.reading_pos, &order);
         }
-        result.scores = order.iter().map(|&i| total[i]).collect();
+        if scored {
+            result.scores = order.iter().map(|&i| scores[i]).collect();
+        }
     }
 
     /// Drop the composition without committing it (the host reset the
@@ -895,7 +926,7 @@ impl EngineBridge {
         if result.req_id < self.result_floor {
             return Vec::new();
         }
-        self.rescore_ngram(&mut result);
+        self.order_engine_result(&mut result);
         if self
             .alt
             .as_ref()
@@ -4565,6 +4596,40 @@ mod tests {
             bridge.rerank.as_ref().unwrap().raw,
             ["博紙", "博士", "白紙"]
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn candidates_that_leave_reading_out_go_last() {
+        let (mut bridge, mock, _rr) = bridge_with_reranker();
+        type_str(&mut bridge, "hakusi");
+        bridge.handle_space();
+        // はし leaves く out
+        answer_scored(&mock, &["はし", "博士", "白紙"], &[-1.0, -1.2, -1.3]);
+        bridge.apply_async_result();
+        let job = bridge.rerank.as_ref().unwrap();
+        assert_eq!(job.raw, ["博士", "白紙", "はし"]);
+        assert_eq!(job.scores, [-1.2, -1.3, -1.3]);
+        // and the n-gram does not lift one: し has no pair to lose points on
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-ngram-spell-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let text = "博士が来る。猫が白い。白紙に書く。".repeat(20);
+        std::fs::write(&path, crate::char_ngram::tests::table(&text)).unwrap();
+        bridge.handle_escape();
+        bridge.set_ngram(&crate::config::NgramCfg {
+            table: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        type_str(&mut bridge, "hakusi");
+        bridge.handle_space();
+        answer_scored(&mock, &["博紙", "し", "博士"], &[-1.0, -1.1, -1.2]);
+        bridge.apply_async_result();
+        let job = bridge.rerank.as_ref().unwrap();
+        assert_eq!(job.raw, ["博士", "博紙", "し"]);
+        assert!(job.scores[2] <= job.scores[1], "{:?}", job.scores);
         let _ = std::fs::remove_file(&path);
     }
 
