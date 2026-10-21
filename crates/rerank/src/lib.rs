@@ -10,8 +10,14 @@
 //!
 //!   - trie: the candidates as one token trie
 //!   - scorer: the trie decoded with llama.cpp, the cache kept across requests
+//!   - protocol: the JSONL requests and responses of `daemon` and `serve`
+//!   - server: `serve`, one reranker for every app of a login over a named
+//!     pipe (Windows)
 
+pub mod protocol;
 pub mod scorer;
+#[cfg(windows)]
+pub mod server;
 pub mod trie;
 
 use std::path::Path;
@@ -32,6 +38,8 @@ pub struct RerankOptions {
     pub max_context_chars: Option<usize>,
     pub max_candidates: Option<usize>,
     pub lambda: Option<f32>,
+    /// Tokens llama.cpp computes in one pass. Default: `scorer::N_UBATCH`.
+    pub n_ubatch: Option<u32>,
 }
 
 /// The resolved settings of a reranker.
@@ -46,7 +54,11 @@ pub struct RerankConfig {
 
 pub struct Reranker {
     model: &'static LlamaModel,
-    scorer: scorer::TreeScorer,
+    backend: &'static LlamaBackend,
+    /// The llama.cpp context (KV cache and compute buffers); `None` once
+    /// released, made again by the next request.
+    scorer: Option<scorer::TreeScorer>,
+    n_ubatch: u32,
     bos: i32,
     pub config: RerankConfig,
 }
@@ -99,13 +111,23 @@ impl Reranker {
         // the daemon keeps one model for its whole life
         let model: &'static LlamaModel = Box::leak(Box::new(model));
         let bos = manifest.special_ids.bos as i32;
-        let scorer = scorer::TreeScorer::new(model, backend, config.threads)?;
+        let n_ubatch = options.n_ubatch.unwrap_or(scorer::N_UBATCH);
+        let scorer = scorer::TreeScorer::new(model, backend, config.threads, n_ubatch)?;
         Ok(Self {
             model,
-            scorer,
+            backend,
+            scorer: Some(scorer),
+            n_ubatch,
             bos,
             config,
         })
+    }
+
+    /// Free the llama.cpp context, its KV cache and compute buffers, keeping
+    /// the model; the next request makes a new one (and decodes its context
+    /// again). False when there was none.
+    pub fn release(&mut self) -> bool {
+        self.scorer.take().is_some()
     }
 
     pub fn load_path(path: &Path, options: &RerankOptions) -> Result<Self> {
@@ -150,6 +172,15 @@ impl Reranker {
             .map(|c| self.tokens(&format!("{context}{c}")))
             .collect();
         let start = trie::scoring_start(&seqs, &self.tokens(&context));
-        self.scorer.score(&seqs, start)
+        let scorer = match &mut self.scorer {
+            Some(s) => s,
+            None => self.scorer.insert(scorer::TreeScorer::new(
+                self.model,
+                self.backend,
+                self.config.threads,
+                self.n_ubatch,
+            )?),
+        };
+        scorer.score(&seqs, start)
     }
 }

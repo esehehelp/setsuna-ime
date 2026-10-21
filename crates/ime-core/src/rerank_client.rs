@@ -1,16 +1,25 @@
-//! Child `setsuna-rerank daemon` process client: a causal LM's log-probability
-//! of each candidate after the left context (`crates/rerank`).
+//! Reranker clients: a causal LM's log-probability of each candidate after
+//! the left context (`crates/rerank`).
+//!
+//! On Windows the IME of every app shares one `setsuna-rerank serve` process
+//! over a named pipe ([`PipeRerankClient`]); elsewhere each frontend has a
+//! `setsuna-rerank daemon` child ([`ChildRerankClient`]).
 //!
 //! As with the engine client, a writer thread sends one request at a time and
-//! a reader thread delivers results through the frontend's [`Notify`]. A
-//! request waits until its `not_before` time: the bridge sends one when a
-//! conversion lands, due once typing has paused, and a newer request or
-//! [`RerankClient::cancel`] replaces it before then.
+//! results come back through the frontend's [`Notify`]. A request waits until
+//! its `not_before` time: the bridge sends one when a conversion lands, due
+//! once typing has paused, and a newer request or [`RerankClient::cancel`]
+//! replaces it before then.
 //!
-//! The daemon starts with the first request, not with the client (most apps
-//! the IME is active in never convert), and stops after [`IDLE_STOP`]
-//! without one, to start again with the next: each holds a few hundred MB
-//! of its own, and every app the IME runs in has a client.
+//! A child starts with the first request, not with the client (most apps the
+//! IME is active in never convert), and stops after [`IDLE_STOP`] without
+//! one, to start again with the next: each holds a few hundred MB of its
+//! own.
+
+#[cfg(windows)]
+mod pipe;
+#[cfg(windows)]
+pub use pipe::PipeRerankClient;
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
@@ -303,14 +312,7 @@ fn writer_loop(shared: &Arc<Shared>, launch: &Launch, notify: &Arc<Mutex<Notify>
         let (Some(pending), Some(c)) = (step, conn.as_mut()) else {
             continue;
         };
-        // the engine converts NFKC text: score the context it saw
-        let context: String = pending.context.nfkc().collect();
-        let line = serde_json::to_string(&Request {
-            id: pending.req_id,
-            context: &context,
-            candidates: &pending.candidates,
-        });
-        let Ok(line) = line else {
+        let Ok(line) = request_line(&pending) else {
             shared.state.lock().unwrap().in_flight = false;
             continue;
         };
@@ -327,6 +329,51 @@ fn writer_loop(shared: &Arc<Shared>, launch: &Launch, notify: &Arc<Mutex<Notify>
     }
 }
 
+/// The reranker's stderr (the child's, the server's log), its directory made.
+fn stderr_log_path() -> Option<PathBuf> {
+    let path = crate::diagnostics::log_path("rerank-stderr.log")?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    Some(path)
+}
+
+/// Wait for the pending request to fall due with none in flight, then take
+/// it, in flight now; `None` once the client is closing.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn next_due(shared: &Shared) -> Option<Pending> {
+    let mut st = shared.state.lock().unwrap();
+    loop {
+        if !shared.alive.load(Ordering::SeqCst) {
+            return None;
+        }
+        match &st.pending {
+            Some(p) if !st.in_flight => {
+                let now = Instant::now();
+                if p.not_before <= now {
+                    break;
+                }
+                let wait = p.not_before - now;
+                st = shared.cv.wait_timeout(st, wait).unwrap().0;
+            }
+            _ => st = shared.cv.wait(st).unwrap(),
+        }
+    }
+    st.in_flight = true;
+    st.pending.take()
+}
+
+/// The request line for `pending`.
+fn request_line(pending: &Pending) -> serde_json::Result<String> {
+    // the engine converts NFKC text: score the context it saw
+    let context: String = pending.context.nfkc().collect();
+    serde_json::to_string(&Request {
+        id: pending.req_id,
+        context: &context,
+        candidates: &pending.candidates,
+    })
+}
+
 /// Start the daemon and its reader.
 fn start(
     shared: &Arc<Shared>,
@@ -340,11 +387,8 @@ fn start(
     ));
     let mut cmd = Command::new(&launch.exe);
     cmd.args(&launch.args);
-    let stderr = crate::diagnostics::log_path("rerank-stderr.log")
+    let stderr = stderr_log_path()
         .and_then(|path| {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -465,11 +509,14 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
 /// The client of the reranker `cfg` names, or `None` when reranking is off
 /// (no manifest), the binary is missing or the client fails to start.
 /// `module_dir` is the frontend module's directory, searched for the binary.
+/// On Windows it connects to the login's shared server, starting it when
+/// there is none (in the background: this returns at once); elsewhere the
+/// child starts with the first request.
 pub fn spawn_with_config(
     cfg: &crate::config::Config,
     module_dir: Option<&Path>,
     notify: Notify,
-) -> Option<ChildRerankClient> {
+) -> Option<Box<dyn RerankClient>> {
     let c = &cfg.rerank;
     let manifest = c.manifest.as_ref()?;
     if !manifest.is_file() {
@@ -488,7 +535,13 @@ pub fn spawn_with_config(
         crate::diagnostics::log(format!("rerank disabled: {RERANK_EXE} not found"));
         return None;
     };
-    match ChildRerankClient::spawn(manifest, &exe, notify, c) {
+    #[cfg(windows)]
+    let client = PipeRerankClient::start(manifest, &exe, notify, c)
+        .map(|c| Box::new(c) as Box<dyn RerankClient>);
+    #[cfg(not(windows))]
+    let client = ChildRerankClient::spawn(manifest, &exe, notify, c)
+        .map(|c| Box::new(c) as Box<dyn RerankClient>);
+    match client {
         Ok(client) => Some(client),
         Err(e) => {
             crate::diagnostics::log(format!("rerank spawn failed: {e}"));
