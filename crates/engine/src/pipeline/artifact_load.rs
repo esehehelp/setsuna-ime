@@ -27,6 +27,9 @@ pub fn load(
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_intra_threads(ort_intra_threads)
         .map_err(|e| anyhow::anyhow!("{e}"))?
+        // the research export's fused ops (neo_ime.TokenMoE); a graph without them never calls them
+        .with_operators(crate::moe_op::domain().map_err(|e| anyhow::anyhow!("{e}"))?)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         .commit_from_file(&manifest.proposal_path)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 

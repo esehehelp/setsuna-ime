@@ -9,10 +9,12 @@
 //!   - tokenizer: SharedCharTokenizer (`.vocab.hex.tsv` sidecar)
 //!   - pipeline: conversion stages (proposal, decode, pool, symsplit)
 //!   - normalize: full-width ASCII / punctuation normalization
+//!   - moe_op: the `neo_ime.TokenMoE` fused kernel registered with every session
 //!   - runtime: loading the official ONNX Runtime from an explicit path
 //!   - session: EngineSession (manifest load, decode settings, `convert`)
 
 pub mod candidate;
+pub mod moe_op;
 pub mod normalize;
 pub mod pipeline;
 pub mod runtime;
