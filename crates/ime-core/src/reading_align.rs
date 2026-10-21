@@ -8,8 +8,10 @@
 /// Reading chars a run of `n` free characters may take at most.
 const MAX_READING_PER_CHAR: usize = 4;
 
+/// ヶ and ヵ (and their hiragana) are not: in 2ヶ月 and 鎌ヶ谷 they are
+/// read か / が / こ, as a kanji is.
 pub(crate) fn is_kana(c: char) -> bool {
-    matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' | 'ー')
+    matches!(c, '\u{3041}'..='\u{3094}' | '\u{30A1}'..='\u{30F4}' | '\u{30F7}'..='\u{30FA}' | 'ー')
 }
 
 pub(crate) fn to_hira(c: char) -> char {
@@ -26,7 +28,8 @@ pub(crate) fn is_free(c: char) -> bool {
 
 fn anchor_matches(s: char, r: char) -> bool {
     if is_kana(s) {
-        is_kana(r) && to_hira(s) == to_hira(r)
+        // ケ is が in place names (栗ケ沢)
+        is_kana(r) && (to_hira(s) == to_hira(r) || (s == 'ケ' && r == 'が'))
     } else {
         // A symbol matches any reading symbol: its width or style (、 / ，)
         // may differ after post-processing.
@@ -80,6 +83,13 @@ impl Aligner<'_> {
 
 /// The reading range of every surface char (a free run's chars share the
 /// run's range), or `None` when the surface does not fit the reading.
+/// Whether `text` spells `reading` out: no kana out of place, no reading
+/// char left with nothing emitted for it (ゼロプラモデル does not, for
+/// ぜろせんぷらもでる).
+pub(crate) fn spells_out(text: &str, reading: &[char]) -> bool {
+    align(&text.chars().collect::<Vec<_>>(), reading).is_some()
+}
+
 pub(crate) fn align(s: &[char], r: &[char]) -> Option<Vec<(usize, usize)>> {
     let cells = (s.len() + 1) * (r.len() + 1);
     let mut a = Aligner {
@@ -107,4 +117,24 @@ pub(crate) fn align(s: &[char], r: &[char]) -> Option<Vec<(usize, usize)>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spells(text: &str, reading: &str) -> bool {
+        spells_out(text, &reading.chars().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_lost_char_or_a_kana_out_of_place_does_not_spell_the_reading() {
+        assert!(spells("ゼロ戦プラモデル", "ぜろせんぷらもでる"));
+        assert!(!spells("ゼロプラモデル", "ぜろせんぷらもでる"));
+        assert!(!spells("和えたたあん", "あえたたくあん"));
+        // ヶ is read as a kanji is, ケ may be が
+        assert!(spells("2ヶ月", "2かげつ"));
+        assert!(spells("鎌ヶ谷", "かまがや"));
+        assert!(spells("栗ケ沢", "くりがさわ"));
+    }
 }
