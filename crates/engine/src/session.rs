@@ -116,6 +116,10 @@ pub struct DecodeConfig {
     /// `pipeline::digitsplit`). Applies before symbol token / symbol split,
     /// which then handle each other segment.
     pub digit_split: bool,
+    /// Map the candidates' punctuation and full-width ASCII the IME way
+    /// (`normalize_candidate`); off, a candidate is the model's output as
+    /// decoded (the research default: what training and the bench compare).
+    pub normalize_candidates: bool,
 }
 
 impl DecodeConfig {
@@ -140,6 +144,10 @@ impl DecodeConfig {
             symbol_split: explicit.symbol_split.or(d.symbol_split).unwrap_or(false),
             symbol_token: explicit.symbol_token.or(d.symbol_token).unwrap_or(false),
             digit_split: explicit.digit_split.or(d.digit_split).unwrap_or(false),
+            normalize_candidates: explicit
+                .normalize_candidates
+                .or(d.normalize_candidates)
+                .unwrap_or(false),
         }
     }
 
@@ -262,9 +270,11 @@ impl EngineSession {
                 } else if in_vocab {
                     1
                 } else {
-                    // Fallback emits one token per UTF-8 byte, including
-                    // missing bytes mapped to UNK. No allocation needed.
-                    c.len_utf8()
+                    // as the input encodes it: one [UNK] or one token a byte
+                    let mut buf = [0u8; 4];
+                    self.tokenizer
+                        .encode_with_byte_fallback(c.encode_utf8(&mut buf))
+                        .len()
                 }
             },
         )?;
@@ -498,6 +508,7 @@ impl EngineSession {
             reading,
             &self.tokenizer,
             frame_reading,
+            cfg.normalize_candidates,
         );
         candidates.truncate(cfg.pool_limit());
         let perf = ConvertPerf {

@@ -112,6 +112,14 @@ struct EngineArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     digit_split: Option<bool>,
 
+    /// Map the candidates' punctuation and full-width ASCII the IME way
+    /// (`,` `.` -> `、` `。` but after a Latin letter or a digit, full-width
+    /// ASCII -> ASCII, `?` `!` -> full-width). Default false: a candidate is
+    /// the model's output as decoded. `--normalize-candidates` alone means
+    /// true.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    normalize_candidates: Option<bool>,
+
     /// Include each candidate's score and source in each response.
     #[arg(long, default_value_t = false)]
     emit_meta: bool,
@@ -139,6 +147,7 @@ impl EngineArgs {
             symbol_split: self.symbol_split,
             symbol_token: self.symbol_token,
             digit_split: self.digit_split,
+            normalize_candidates: self.normalize_candidates,
         }
     }
 }
@@ -168,6 +177,7 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
         "symbol_split": cfg.symbol_split,
         "symbol_token": cfg.symbol_token,
         "digit_split": cfg.digit_split,
+        "normalize_candidates": cfg.normalize_candidates,
     });
     eprintln!("[engine] effective {effective}");
     let artifact_format = match manifest.precision.as_str() {

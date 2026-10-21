@@ -619,6 +619,9 @@ fn daemon_args(manifest: &Path, engine_cfg: &crate::config::EngineCfg) -> Vec<st
         manifest.as_os_str().to_owned(),
         // segment editing cuts conversions by the CTC alignment
         "--emit-alignment".into(),
+        // the IME shows punctuation and full-width ASCII normalized (the
+        // engine's default is the model's output as decoded)
+        "--normalize-candidates".into(),
     ];
     let c = engine_cfg;
     if let Some(p) = &c.ort_dylib {
@@ -684,7 +687,8 @@ mod tests {
                 "daemon",
                 "--manifest",
                 "m.manifest.json",
-                "--emit-alignment"
+                "--emit-alignment",
+                "--normalize-candidates"
             ]
         );
         let cfg = EngineCfg {
@@ -703,6 +707,7 @@ mod tests {
                 "--manifest",
                 "m.manifest.json",
                 "--emit-alignment",
+                "--normalize-candidates",
                 "--ort-dylib=ort/onnxruntime.dll",
                 "--beam-width=20",
                 "--symbol-split=true",

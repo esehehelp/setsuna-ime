@@ -92,10 +92,13 @@ fn fixed_input_seq_len(session: &Session) -> Option<usize> {
 
 /// Build (input_ids, attention_mask, actual_len) for the proposal graph.
 /// Layout: `[CLS] context [SEP] reading`, padded to seq_len with [PAD] / 0
-/// (no trailing [SEP] after reading), as the training rows are laid out:
-/// the context's last `max_context` tokens (tokens, not chars: a
-/// byte-spelled char counts each of its bytes), the reading reserved first
-/// and the context left-trimmed to the room left in `seq_len`.
+/// (no trailing [SEP] after reading), as the training rows are laid out
+/// (tests/fixtures/model_input):
+/// each char encoded as the rows read it
+/// (`SharedCharTokenizer::encode_with_byte_fallback`), the context's last
+/// `max_context` tokens (tokens, not chars: a byte-spelled char counts each
+/// of its bytes), the reading reserved first and the context left-trimmed to
+/// the room left in `seq_len`.
 pub fn encode(
     tokenizer: &SharedCharTokenizer,
     seq_len: usize,
@@ -104,22 +107,8 @@ pub fn encode(
     reading: &str,
 ) -> Result<(Vec<i64>, Vec<i64>, usize)> {
     anyhow::ensure!(seq_len >= 2, "model sequence must hold [CLS] and [SEP]");
-    let reading_chars = chars(reading);
-
-    // Byte-level fallback for OOV chars, matching the Python tokenizer
-    // used at train + eval time (`runtime.py:147`). Without this the
-    // engine's context for rare kanji / cross-script chars drifts from
-    // what the model was trained on (training: `<0xXX>` byte tokens;
-    // engine was: single UNK).
-    //
-    // Layout mirrors the training encoder: reserve [CLS] + reading +
-    // [SEP] first, then fill the remaining slot with context
-    // (left-trimmed). Tail-truncating the whole [CLS]…[SEP]…reading
-    // string would drop reading tokens whenever context + byte
-    // fallback pushed total length past `seq_len`, putting the engine
-    // in a state the model never saw at training time.
-    let mut reading_ids: Vec<u32> = Vec::with_capacity(reading_chars.len());
-    for ch in &reading_chars {
+    let mut reading_ids: Vec<u32> = Vec::new();
+    for ch in &chars(reading) {
         reading_ids.extend(tokenizer.encode_with_byte_fallback(ch));
     }
     anyhow::ensure!(
@@ -473,6 +462,7 @@ mod tests {
             sep_id: 3,
             blank_id: 4,
             mask_id: 5,
+            input_chars: None,
         }
     }
 
@@ -544,10 +534,10 @@ mod tests {
         assert_eq!(ids, vec![2, 6, 3, 6, 0, 0, 0, 0]);
         assert_eq!(mask, vec![1, 1, 1, 1, 0, 0, 0, 0]);
         assert_eq!(actual, 4);
-        // max_context counts tokens: a char the vocabulary lacks takes one a
-        // byte (here [UNK] each, the test vocabulary having no byte tokens)
+        // max_context counts tokens: a char the vocabulary lacks is one
+        // [UNK] here, the test vocabulary having no byte tokens
         let (ids, _, actual) = encode(&tok, 16, 3, "いあ\u{20B9F}", "あ").unwrap();
-        assert_eq!(&ids[..actual], &[2, 1, 1, 1, 3, 6]);
+        assert_eq!(&ids[..actual], &[2, 7, 6, 1, 3, 6]);
     }
 
     #[test]

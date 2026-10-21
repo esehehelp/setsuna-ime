@@ -1,4 +1,4 @@
-//! Decoded hypotheses to candidates: detokenize, normalize, drop empty and
+//! Decoded hypotheses to candidates: detokenize, normalize (when asked), drop empty and
 //! duplicate surfaces (first occurrence wins, so decode order is kept). An
 //! empty result falls back to the proposal's greedy output, then to the raw
 //! reading and its katakana form, so a host always gets something to show.
@@ -11,17 +11,25 @@ use crate::pipeline::decode::BeamHypothesis;
 use crate::pipeline::proposal::ProposalOutput;
 use crate::tokenizer::SharedCharTokenizer;
 
-/// Normalized text of `tokens` and each char's reading position.
-/// `normalize_candidate` maps char for char, so the positions carry over;
-/// they are dropped if it ever does not.
+/// Text of `tokens` (normalized with `normalize`, else as decoded; a
+/// whitespace-only text is empty either way) and each char's reading
+/// position. `normalize_candidate` maps char for char, so the positions
+/// carry over; they are dropped if it ever does not.
 fn aligned_text(
     tokenizer: &SharedCharTokenizer,
     tokens: &[u32],
     frames: &[u32],
     frame_reading: &[u32],
+    normalize: bool,
 ) -> (String, Vec<u32>) {
     let (raw, char_frames) = tokenizer.decode_aligned(tokens, frames);
-    let text = normalize_candidate(&raw);
+    let text = if normalize {
+        normalize_candidate(&raw)
+    } else if raw.chars().all(char::is_whitespace) {
+        String::new()
+    } else {
+        raw
+    };
     let last = frame_reading.last().copied().unwrap_or(0);
     let pos = if text.chars().count() == char_frames.len() {
         char_frames
@@ -35,7 +43,8 @@ fn aligned_text(
 }
 
 /// Candidates of one span, best first. `frame_reading` maps a proposal
-/// frame to its reading char (`proposal::frame_reading`).
+/// frame to its reading char (`proposal::frame_reading`); `normalize`:
+/// `normalize_candidate` on each text (the IME), else the decoded text.
 pub fn candidates(
     hyps: Vec<BeamHypothesis>,
     greedy: bool,
@@ -43,6 +52,7 @@ pub fn candidates(
     reading: &str,
     tokenizer: &SharedCharTokenizer,
     frame_reading: &[u32],
+    normalize: bool,
 ) -> Vec<Candidate> {
     let source = if greedy {
         CandidateSource::Greedy
@@ -52,7 +62,8 @@ pub fn candidates(
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<Candidate> = Vec::with_capacity(hyps.len());
     for h in hyps {
-        let (text, reading_pos) = aligned_text(tokenizer, &h.tokens, &h.frames, frame_reading);
+        let (text, reading_pos) =
+            aligned_text(tokenizer, &h.tokens, &h.frames, frame_reading, normalize);
         if !text.is_empty() && seen.insert(text.clone()) {
             out.push(Candidate {
                 text,
@@ -64,7 +75,8 @@ pub fn candidates(
     }
     if out.is_empty() {
         let (tokens, frames) = proposal.collapsed_with_frames(tokenizer.blank_id);
-        let (greedy_text, reading_pos) = aligned_text(tokenizer, &tokens, &frames, frame_reading);
+        let (greedy_text, reading_pos) =
+            aligned_text(tokenizer, &tokens, &frames, frame_reading, normalize);
         if !greedy_text.is_empty() {
             out.push(Candidate {
                 text: greedy_text,
@@ -127,6 +139,7 @@ mod tests {
             sep_id: 3,
             blank_id: 4,
             mask_id: 5,
+            input_chars: None,
         }
     }
 
@@ -161,13 +174,29 @@ mod tests {
         let tok = tokenizer();
         let mut h = beam(&[8, 7], -1.0);
         h.frames = vec![0, 2];
-        let out = candidates(vec![h], false, &proposal(&[4]), "ああい", &tok, FRAMES);
+        let out = candidates(
+            vec![h],
+            false,
+            &proposal(&[4]),
+            "ああい",
+            &tok,
+            FRAMES,
+            false,
+        );
         assert_eq!(
             (out[0].text.as_str(), out[0].reading_pos.clone()),
             ("亜い", vec![0, 2])
         );
         // fallbacks align char for char
-        let out = candidates(Vec::new(), false, &proposal(&[4, 4]), "あい", &tok, FRAMES);
+        let out = candidates(
+            Vec::new(),
+            false,
+            &proposal(&[4, 4]),
+            "あい",
+            &tok,
+            FRAMES,
+            false,
+        );
         assert_eq!(out[0].reading_pos, [0, 1]);
         assert_eq!(out[1].reading_pos, [0, 1]);
     }
@@ -176,7 +205,7 @@ mod tests {
     fn hypotheses_are_deduped_in_decode_order() {
         let tok = tokenizer();
         let hyps = vec![beam(&[6, 7], -1.0), beam(&[6, 7], -2.0), beam(&[7], -3.0)];
-        let out = candidates(hyps, false, &proposal(&[4]), "あい", &tok, FRAMES);
+        let out = candidates(hyps, false, &proposal(&[4]), "あい", &tok, FRAMES, false);
         let got: Vec<_> = out.iter().map(|c| (c.text.as_str(), c.score)).collect();
         assert_eq!(got, [("あい", -1.0), ("い", -3.0)]);
         assert!(out.iter().all(|c| c.source == CandidateSource::Beam));
@@ -192,6 +221,7 @@ mod tests {
             "あい",
             &tok,
             FRAMES,
+            false,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(
@@ -207,6 +237,7 @@ mod tests {
             "あい",
             &tok,
             FRAMES,
+            false,
         );
         let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, ["あい", "アイ"]);
@@ -223,6 +254,7 @@ mod tests {
             "あ",
             &tok,
             FRAMES,
+            false,
         );
         assert_eq!(
             (out[0].text.as_str(), out[0].source),
