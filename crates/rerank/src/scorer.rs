@@ -24,8 +24,21 @@ use crate::trie::Trie;
 
 /// Sequences (candidates) one request may hold.
 pub const MAX_SEQ: usize = 32;
-/// Tokens the cache holds: BOS, the context and every candidate's own part.
-const N_CTX: u32 = 2048;
+/// Tokens the cache holds: BOS, the context and every candidate's own part
+/// (20 candidates of 46 chars that part at their first char after 40 chars
+/// of context hold 643).
+const N_CTX: u32 = 1024;
+/// Nodes decoded at once; a request with more decodes them in parts.
+/// llama.cpp reserves the logits of as many for the graph and keeps those
+/// of the most a decode has output, 400 KB each at a 102400 vocabulary:
+/// at 2048 for the whole cache, a daemon took 1.0 GB up front and 1.3 GB
+/// after wiki_fresh_v2 (5 then 20 candidates of each conversion: 45 nodes
+/// at the median, 233 at the 99th percentile, 587 at the most).
+const N_BATCH: u32 = 128;
+/// Logit rows kept for a request that adds candidates below the last
+/// trie's nodes (400 KB each); when one it needs is not kept, the whole
+/// trie is decoded again.
+const KEPT_ROWS: usize = 64;
 
 /// What a request cost.
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,8 +79,8 @@ impl TreeScorer {
         let threads = threads.max(1);
         let params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_n_batch(N_CTX)
-            .with_n_ubatch(N_CTX)
+            .with_n_batch(N_BATCH)
+            .with_n_ubatch(N_BATCH)
             .with_n_seq_max(MAX_SEQ as u32)
             .with_kv_unified(true)
             .with_n_threads(threads as i32)
@@ -77,7 +90,7 @@ impl TreeScorer {
             .context("create the llama.cpp context")?;
         Ok(Self {
             ctx,
-            batch: LlamaBatch::new(N_CTX as usize, MAX_SEQ as i32),
+            batch: LlamaBatch::new(N_BATCH as usize, MAX_SEQ as i32),
             n_vocab: model.n_vocab() as usize,
             threads,
             cached: Vec::new(),
@@ -185,56 +198,7 @@ impl TreeScorer {
                 leaf[end] = true;
             }
         }
-        self.batch.clear();
-        let mut row = vec![None; n];
-        let mut with_logits = Vec::new();
-        for i in old_n..n {
-            let node = trie.nodes[i];
-            if last.is_none() && i < keep {
-                continue;
-            }
-            // BOS and the context belong to every sequence, so they serve any
-            // candidate count later; deeper nodes to their candidates only
-            let seq_ids: &[i32] = if node.depth <= fresh {
-                &all
-            } else {
-                &owners[i]
-            };
-            // a leaf's logits are kept for candidates a later request may add below it
-            let logits = need[i] || (leaf[i] && node.depth >= fresh);
-            row[i] = Some(self.batch.n_tokens());
-            self.batch
-                .add(LlamaToken(node.token), node.depth as i32, seq_ids, logits)
-                .context("llama.cpp batch")?;
-            if logits {
-                with_logits.push(i);
-            }
-        }
-        let decoded = self.batch.n_tokens() as usize;
-        let t0 = Instant::now();
-        if decoded > 0 {
-            self.ctx
-                .decode(&mut self.batch)
-                .context("llama.cpp decode")?;
-        }
-        let t1 = Instant::now();
-
-        // log-sum-exp of each new row, the rows split across the threads
-        let logits: Vec<&[f32]> = with_logits
-            .iter()
-            .map(|&i| self.ctx.get_logits_ith(row[i].expect("in the batch")))
-            .collect();
-        let mut lse = vec![0.0f64; logits.len()];
-        let per = logits.len().div_ceil(self.threads).max(1);
-        std::thread::scope(|s| {
-            for (rows, out) in logits.chunks(per).zip(lse.chunks_mut(per)) {
-                s.spawn(move || {
-                    for (r, o) in rows.iter().zip(out) {
-                        *o = log_sum_exp(r);
-                    }
-                });
-            }
-        });
+        let last_none = last.is_none();
         let mut l = last.take().unwrap_or_else(|| Last {
             seqs: Vec::new(),
             start,
@@ -244,18 +208,91 @@ impl TreeScorer {
             lse: HashMap::new(),
             logp: HashMap::new(),
         });
-        for ((&i, r), s) in with_logits.iter().zip(&logits).zip(&lse) {
-            l.rows.insert(i, r[..self.n_vocab].to_vec());
-            l.lse.insert(i, *s);
-        }
+        // the nodes scored by each node's logits; those under an old node
+        // take its kept row
+        let mut below: HashMap<usize, Vec<usize>> = HashMap::new();
         for &j in &scored {
-            let node = trie.nodes[j];
-            let p = node.parent.expect("a scored node is below BOS");
-            l.logp
-                .insert(j, f64::from(l.rows[&p][node.token as usize]) - l.lse[&p]);
+            let p = trie.nodes[j].parent.expect("a scored node is below BOS");
+            below.entry(p).or_default().push(j);
         }
-        let t2 = Instant::now();
+        for (&p, js) in &below {
+            if p < old_n {
+                for &j in js {
+                    let logp = f64::from(l.rows[&p][trie.nodes[j].token as usize]) - l.lse[&p];
+                    l.logp.insert(j, logp);
+                }
+            }
+        }
 
+        let mut todo = Vec::new();
+        for i in old_n..n {
+            if last_none && i < keep {
+                continue;
+            }
+            // a leaf's logits are kept for candidates a later request may add below it
+            let logits = need[i] || (leaf[i] && trie.nodes[i].depth >= fresh);
+            todo.push((i, logits));
+        }
+        let decoded = todo.len();
+        let (mut decode_s, mut lse_s) = (0.0, 0.0);
+        // N_BATCH nodes per decode: a parent comes before its children, so a
+        // node sees its ancestors in the cache or in the same batch
+        for part in todo.chunks(N_BATCH as usize) {
+            self.batch.clear();
+            let mut with_logits = Vec::new();
+            for &(i, logits) in part {
+                let node = trie.nodes[i];
+                // BOS and the context belong to every sequence, so they serve any
+                // candidate count later; deeper nodes to their candidates only
+                let seq_ids: &[i32] = if node.depth <= fresh {
+                    &all
+                } else {
+                    &owners[i]
+                };
+                if logits {
+                    with_logits.push((i, self.batch.n_tokens()));
+                }
+                self.batch
+                    .add(LlamaToken(node.token), node.depth as i32, seq_ids, logits)
+                    .context("llama.cpp batch")?;
+            }
+            let t0 = Instant::now();
+            self.ctx
+                .decode(&mut self.batch)
+                .context("llama.cpp decode")?;
+            let t1 = Instant::now();
+
+            // log-sum-exp of each new row, the rows split across the threads
+            let logits: Vec<&[f32]> = with_logits
+                .iter()
+                .map(|&(_, r)| self.ctx.get_logits_ith(r))
+                .collect();
+            let mut lse = vec![0.0f64; logits.len()];
+            let per = logits.len().div_ceil(self.threads).max(1);
+            std::thread::scope(|s| {
+                for (rows, out) in logits.chunks(per).zip(lse.chunks_mut(per)) {
+                    s.spawn(move || {
+                        for (r, o) in rows.iter().zip(out) {
+                            *o = log_sum_exp(r);
+                        }
+                    });
+                }
+            });
+            for ((&(i, _), r), &s) in with_logits.iter().zip(&logits).zip(&lse) {
+                for &j in below.get(&i).into_iter().flatten() {
+                    l.logp
+                        .insert(j, f64::from(r[trie.nodes[j].token as usize]) - s);
+                }
+                // kept, as many as KEPT_ROWS, for candidates a later request
+                // adds below the node
+                if l.rows.len() < KEPT_ROWS {
+                    l.rows.insert(i, r[..self.n_vocab].to_vec());
+                    l.lse.insert(i, s);
+                }
+            }
+            decode_s += (t1 - t0).as_secs_f64();
+            lse_s += t1.elapsed().as_secs_f64();
+        }
         let scores = trie
             .paths
             .iter()
@@ -270,8 +307,8 @@ impl TreeScorer {
         let stats = Stats {
             cached: if old_n > 0 { old_n } else { keep },
             decoded,
-            decode_ms: (t1 - t0).as_secs_f64() * 1000.0,
-            lse_ms: (t2 - t1).as_secs_f64() * 1000.0,
+            decode_ms: decode_s * 1000.0,
+            lse_ms: lse_s * 1000.0,
         };
         l.seqs = seqs.to_vec();
         l.trie = trie;
