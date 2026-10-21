@@ -647,7 +647,6 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
                 );
             });
             rerank_client::spawn_with_config(&cfg, dll_dir().as_deref(), notify)
-                .map(|c| Box::new(c) as Box<dyn RerankClient>)
         } else {
             None
         };

@@ -2597,6 +2597,7 @@ dependencies = [
  "memmap2",
  "serde",
  "serde_json",
+ "setsuna-rerank-pipe",
  "toml",
  "toml_edit 0.22.27",
  "tracing",
@@ -2644,6 +2645,14 @@ dependencies = [
  "serde",
  "serde_json",
  "setsuna-artifact",
+ "setsuna-rerank-pipe",
+]
+
+[[package]]
+name = "setsuna-rerank-pipe"
+version = "0.1.3"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

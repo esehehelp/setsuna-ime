@@ -38,8 +38,10 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 - **リランク（任意）** — 入力が止まったときに causal LM（llama.cpp、GGUF）で
   上位候補の対数尤度を足して並べ替える。`[rerank] defer_ms` を設定すると、
   ライブ変換の表示を並べ替えの結果まで待たせて、先頭が二度入れ替わらないように
-  する（Mozkey の deferred display と同じ考え方）。リランカの daemon は
-  最初の並べ替えで起動し、5 分使われなければ終了する（次の並べ替えでまた起動する）。
+  する（Mozkey の deferred display と同じ考え方）。Windows ではログイン中の
+  全アプリが 1 つのリランカ（`setsuna-rerank serve`、名前付きパイプ）を共有し、
+  60 秒使われなければ LM のキャッシュを手放し、最後のアプリが離れて 10 分で終了する。
+  Linux では最初の並べ替えで起動し、5 分使われなければ終了する。
 - **文字 n-gram（任意）** — 学習データの文字 bigram / trigram の数から、
   偶然より珍しい文字の並びを含む候補（はくし → 博士と白紙が混ざった「博紙」）を
   下げる。engine のスコアに足してから並べ替え、リランカはその後に足す
@@ -107,6 +109,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 | `crates/artifact` | artifact | manifest reader |
 | `crates/engine` | runtime | 推論エンジン（`setsuna-engine`、library / CLI / daemon） |
 | `crates/rerank` | runtime | LM リランカ（`setsuna-rerank`、llama.cpp） |
+| `crates/rerank-pipe` | runtime | 共有リランカの名前付きパイプ（名前と Win32 の呼び出し、Windows） |
 | `crates/ime-core` | platform | 各 frontend 共通の IME ロジック（ローマ字合成、状態遷移、後処理、学習、設定、daemon client） |
 | `crates/tsf` | platform | Windows TSF IME（DLL） |
 | `crates/linux` | platform | fcitx5 addon（Rust 部分 + `fcitx5/` の C++ shim） |
@@ -116,6 +119,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 
 frontend はエンジンをリンクせず、`setsuna-engine daemon` / `setsuna-rerank
 daemon` / `setsuna-rewrite daemon` を子プロセスとして起動し stdio で話す。
+Windows のリランカだけは、ログインで 1 つの `setsuna-rerank serve` に名前付きパイプでつなぐ。
 
 ## ビルド
 

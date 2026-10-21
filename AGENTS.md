@@ -14,8 +14,8 @@ Dependencies point one way: artifact -> runtime -> platform.
 | layer    | where                                  | may use                                                 |
 |----------|----------------------------------------|---------------------------------------------------------|
 | artifact | `crates/artifact`                      | manifest schemas only                                   |
-| runtime  | `crates/engine`, `crates/rerank`       | `crates/artifact`; models load only through a manifest  |
-| platform | `crates/ime-core`, `crates/tsf`, `crates/linux`, `crates/rewrite`, `crates/settings`, `crates/demo` | the engine, reranker and rewriter daemons' stdio protocol; `crates/settings` also links `crates/rewrite` (sign-in, keys, models) |
+| runtime  | `crates/engine`, `crates/rerank`, `crates/rerank-pipe` | `crates/artifact`; models load only through a manifest  |
+| platform | `crates/ime-core`, `crates/tsf`, `crates/linux`, `crates/rewrite`, `crates/settings`, `crates/demo` | the engine, reranker and rewriter daemons' stdio protocol, and the shared reranker's named pipe (`crates/rerank-pipe`, Windows); `crates/settings` also links `crates/rewrite` (sign-in, keys, models) |
 
 The engine does inference only (proposal -> CTC beam -> candidates), and so
 does the reranker (an LM's log-probability of each candidate). IME-level

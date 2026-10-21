@@ -24,3 +24,8 @@ unicode-normalization = "0.1"
 memmap2 = "0.9"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# The shared reranker's pipe: its name and the Win32 calls, the same as the
+# server's (crates/rerank).
+[target.'cfg(windows)'.dependencies]
+setsuna-rerank-pipe = { path = "../rerank-pipe" }

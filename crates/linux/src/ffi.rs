@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use setsuna_core::child_daemon;
 use setsuna_core::config::{Config, RewriterCfg};
 use setsuna_core::engine_client::{EngineClient, Notify};
-use setsuna_core::rerank_client::{self, RerankClient};
+use setsuna_core::rerank_client;
 use setsuna_core::rewrite_client::{self, RewriteClient};
 
 use crate::keys::Key;
@@ -155,8 +155,7 @@ impl SetsunaSession {
         }
         self.session.configure_with(cfg, client);
         if new_bridge || !self.session.has_reranker() {
-            let reranker = rerank_client::spawn_with_config(cfg, module_dir, self.wake())
-                .map(|c| Box::new(c) as Box<dyn RerankClient>);
+            let reranker = rerank_client::spawn_with_config(cfg, module_dir, self.wake());
             self.session.set_reranker(reranker, cfg);
         } else {
             self.session.set_rerank_config(cfg);

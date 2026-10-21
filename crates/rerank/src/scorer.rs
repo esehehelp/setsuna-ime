@@ -1,6 +1,8 @@
-//! Tree scoring with llama.cpp: one `llama_decode` per request, each trie
-//! node a token carrying the sequence ids of the candidates through it. A
-//! unified KV cache turns that into a tree attention mask.
+//! Tree scoring with llama.cpp: each trie node a token carrying the
+//! sequence ids of the candidates through it, decoded `N_UBATCH` at a time.
+//! A unified KV cache turns that into a tree attention mask: a node sees the
+//! cells of its sequences at lower positions, its ancestors, whichever
+//! decode put them there.
 //!
 //! Two things stay in the cache between requests:
 //!   * BOS and the context, which belong to every sequence: the next request
@@ -28,13 +30,14 @@ pub const MAX_SEQ: usize = 32;
 /// (20 candidates of 46 chars that part at their first char after 40 chars
 /// of context hold 643).
 const N_CTX: u32 = 1024;
-/// Nodes decoded at once; a request with more decodes them in parts.
+/// Nodes decoded at once, by default; a request with more decodes them in
+/// parts.
 /// llama.cpp reserves the logits of as many for the graph and keeps those
 /// of the most a decode has output, 400 KB each at a 102400 vocabulary:
 /// at 2048 for the whole cache, a daemon took 1.0 GB up front and 1.3 GB
 /// after wiki_fresh_v2 (5 then 20 candidates of each conversion: 45 nodes
 /// at the median, 233 at the 99th percentile, 587 at the most).
-const N_BATCH: u32 = 128;
+pub const N_UBATCH: u32 = 128;
 /// Logit rows kept for a request that adds candidates below the last
 /// trie's nodes (400 KB each); when one it needs is not kept, the whole
 /// trie is decoded again.
@@ -69,18 +72,26 @@ pub struct TreeScorer {
     batch: LlamaBatch<'static>,
     n_vocab: usize,
     threads: usize,
+    /// Nodes decoded at once.
+    n_ubatch: usize,
     /// Tokens at positions 0.. that every sequence holds in the cache.
     cached: Vec<i32>,
     last: Option<Last>,
 }
 
 impl TreeScorer {
-    pub fn new(model: &'static LlamaModel, backend: &LlamaBackend, threads: usize) -> Result<Self> {
+    pub fn new(
+        model: &'static LlamaModel,
+        backend: &LlamaBackend,
+        threads: usize,
+        n_ubatch: u32,
+    ) -> Result<Self> {
         let threads = threads.max(1);
+        let n_ubatch = n_ubatch.clamp(1, N_CTX);
         let params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_n_batch(N_BATCH)
-            .with_n_ubatch(N_BATCH)
+            .with_n_batch(n_ubatch)
+            .with_n_ubatch(n_ubatch)
             .with_n_seq_max(MAX_SEQ as u32)
             .with_kv_unified(true)
             .with_n_threads(threads as i32)
@@ -90,9 +101,10 @@ impl TreeScorer {
             .context("create the llama.cpp context")?;
         Ok(Self {
             ctx,
-            batch: LlamaBatch::new(N_BATCH as usize, MAX_SEQ as i32),
+            batch: LlamaBatch::new(n_ubatch as usize, MAX_SEQ as i32),
             n_vocab: model.n_vocab() as usize,
             threads,
+            n_ubatch: n_ubatch as usize,
             cached: Vec::new(),
             last: None,
         })
@@ -235,9 +247,9 @@ impl TreeScorer {
         }
         let decoded = todo.len();
         let (mut decode_s, mut lse_s) = (0.0, 0.0);
-        // N_BATCH nodes per decode: a parent comes before its children, so a
+        // n_ubatch nodes per decode: a parent comes before its children, so a
         // node sees its ancestors in the cache or in the same batch
-        for part in todo.chunks(N_BATCH as usize) {
+        for part in todo.chunks(self.n_ubatch) {
             self.batch.clear();
             let mut with_logits = Vec::new();
             for &(i, logits) in part {

@@ -1,0 +1,22 @@
+[package]
+name = "setsuna-rerank-pipe"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "The named pipe one shared `setsuna-rerank serve` process listens on for every app of a Windows login: its name and the Win32 calls of both ends."
+
+[lib]
+name = "setsuna_rerank_pipe"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
