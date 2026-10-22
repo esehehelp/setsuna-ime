@@ -1,16 +1,17 @@
 [package]
-name = "setsuna-rerank-pipe"
+name = "setsuna-pipe"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
-description = "The named pipe one shared `setsuna-rerank serve` process listens on for every app of a Windows login: its name and the Win32 calls of both ends."
+description = "The named pipes the shared `setsuna-engine serve` and `setsuna-rerank serve` processes listen on for every app of a Windows login: their names, the Win32 calls of both ends and the server loop."
 
 [lib]
-name = "setsuna_rerank_pipe"
+name = "setsuna_pipe"
 path = "src/lib.rs"
 
 [target.'cfg(windows)'.dependencies]
+anyhow.workspace = true
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

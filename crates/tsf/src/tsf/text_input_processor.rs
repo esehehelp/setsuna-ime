@@ -625,7 +625,6 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
                 );
             });
             child_daemon::spawn_with_config(&cfg, dll_dir().as_deref(), notify)
-                .map(|c| Box::new(c) as Box<dyn EngineClient>)
         } else {
             None
         };

@@ -126,12 +126,12 @@ fn run_serve(
     exit_after_secs: u64,
     log: Option<PathBuf>,
 ) -> Result<()> {
-    use setsuna_rerank_pipe::{exe_identity, pipe_name, win, PipeKey};
+    use setsuna_pipe::{exe_identity, rerank_pipe_name, win, RerankKey};
     let user = win::user_sid().context("this process's user")?;
     let manifest = std::fs::canonicalize(&args.manifest)
         .with_context(|| format!("{}", args.manifest.display()))?;
     let exe = exe_identity(&std::env::current_exe()?).context("this binary")?;
-    let name = pipe_name(&PipeKey {
+    let name = rerank_pipe_name(&RerankKey {
         user: &user,
         manifest: &manifest,
         exe: &exe,
@@ -144,9 +144,10 @@ fn run_serve(
         setsuna_rerank::server::ServeOptions {
             pipe_name: name,
             user_sid: user,
-            idle_release: std::time::Duration::from_secs(idle_release_secs),
+            idle_after: std::time::Duration::from_secs(idle_release_secs),
             exit_after: std::time::Duration::from_secs(exit_after_secs),
             log,
+            label: "setsuna-rerank serve",
         },
         move || args.load(),
     )

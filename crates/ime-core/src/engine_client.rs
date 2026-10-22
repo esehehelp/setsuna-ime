@@ -1,9 +1,10 @@
 //! Conversion-backend abstraction.
 //!
 //! `EngineBridge` talks to the engine only through `EngineClient`, so no
-//! frontend links `setsuna-engine` directly. The production implementation
-//! is `child_daemon::ChildDaemonClient` (a child `setsuna-engine daemon`
-//! process); tests use an in-memory mock.
+//! frontend links `setsuna-engine` directly. The production implementations
+//! are `child_daemon::ChildDaemonClient` (a child `setsuna-engine daemon`
+//! process) and, on Windows, `child_daemon::PipeEngineClient` (the login's
+//! shared `setsuna-engine serve`); tests use an in-memory mock.
 
 /// Called from a backend thread when a conversion result is ready, with the
 /// request id. The frontend wakes its UI thread with it (a posted window

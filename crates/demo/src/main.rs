@@ -188,9 +188,9 @@ fn run_session(mut ws: WebSocket<TcpStream>) {
         let woke = woke.clone();
         Box::new(move |_req_id: u64| woke.store(true, Ordering::SeqCst))
     };
-    let client = child_daemon::spawn_with_config(&cfg, None, wake).map(|c| {
+    let client = child_daemon::spawn_with_config(&cfg, None, wake).map(|inner| {
         Box::new(Tap {
-            inner: Box::new(c),
+            inner,
             last: last.clone(),
         }) as Box<dyn EngineClient>
     });
