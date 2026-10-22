@@ -86,8 +86,8 @@ public:
         labels_.emplace_back(std::move(label));
     }
     /* Blank rows up to `rows`: the panel then has the same height on every
-     * page and while suggesting, and the app does not flip it between
-     * below and above the caret as its height changes. */
+     * page of a conversion, and the app does not flip it between below and
+     * above the caret as its height changes. */
     void padTo(int rows) {
         while (size() < rows) {
             add(std::make_unique<BlankCandidate>(), "");
@@ -426,7 +426,8 @@ private:
                                                             v->suggestion_comments[i]),
                           "");
             }
-            list->padTo(static_cast<int>(setsuna_session_page_size(session_)));
+            // not padded: the predictions come and go as the reading is
+            // typed, and a page-high panel for one of them flickers
             panel.setCandidateList(std::move(list));
             panel.setAuxUp(Text("[Tabキーで選択]"));
         }
