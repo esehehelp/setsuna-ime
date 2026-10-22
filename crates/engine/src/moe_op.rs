@@ -56,20 +56,18 @@ impl Operator for TokenMoE {
             let (shape, data) = v.try_extract_tensor::<f32>()?;
             Ok((shape.iter().map(|&s| s as usize).collect(), data.to_vec()))
         };
-        let i8s = |idx: usize| -> ort::Result<(Vec<usize>, Vec<i8>)> {
-            let v = kctx.constant_input::<DynValueTypeMarker>(idx)?;
-            let (shape, data) = v.try_extract_tensor::<i8>()?;
-            Ok((shape.iter().map(|&s| s as usize).collect(), data.to_vec()))
-        };
         let (rs, router) = f32s(1)?;
-        let (w1s, w1) = i8s(2)?;
         let (_, s1) = f32s(3)?;
         let (_, b1) = f32s(4)?;
-        let (_, w2) = i8s(5)?;
         let (_, s2) = f32s(6)?;
         let (_, b2) = f32s(7)?;
-        let (e, d, f) = (rs[0], rs[1], w1s[1]);
-        let moe = MoeWeights::new(e, d, f, k as usize, router, &w1, s1, b1, &w2, s2, b2)
+        // the int8 weights packed straight from the session's initializers, no copy between
+        let w1v = kctx.constant_input::<DynValueTypeMarker>(2)?;
+        let (w1s, w1) = w1v.try_extract_tensor::<i8>()?;
+        let w2v = kctx.constant_input::<DynValueTypeMarker>(5)?;
+        let (_, w2) = w2v.try_extract_tensor::<i8>()?;
+        let (e, d, f) = (rs[0], rs[1], w1s[1] as usize);
+        let moe = MoeWeights::new(e, d, f, k as usize, router, w1, s1, b1, w2, s2, b2)
             .map_err(|m| ort::Error::new(format!("TokenMoE: {m}")))?;
         Ok(MoeKernel {
             moe,
@@ -100,7 +98,8 @@ impl Kernel for MoeKernel {
 }
 
 /// An int8 matrix (out, in) prepacked for the u8 x i8 dot products: 16 output rows x 4 inputs a 64-byte block (lane j
-/// = row 16 * b + j), blocks along the inputs; `colsum` the sum of each row (for the activations' zero point).
+/// = row 16 * b + j), blocks along the inputs; `colsum` the sum of each row (for the activations' zero point). Only
+/// one layout is kept: `blocked` for the VNNI paths, else `raw` (row-major) for the plain one.
 struct Packed {
     out: usize,
     inp: usize,
@@ -110,13 +109,14 @@ struct Packed {
 }
 
 impl Packed {
-    fn new(w: &[i8], out: usize, inp: usize) -> Self {
+    fn new(w: &[i8], out: usize, inp: usize, block: bool) -> Self {
         assert_eq!(w.len(), out * inp);
         let colsum = (0..out)
             .map(|o| w[o * inp..(o + 1) * inp].iter().map(|&v| v as i32).sum())
             .collect();
         let mut blocked = Vec::new();
-        if out % 16 == 0 && inp % 4 == 0 {
+        let mut raw = Vec::new();
+        if block && out % 16 == 0 && inp % 4 == 0 {
             blocked = vec![0i8; out * inp];
             let mut i = 0;
             for ob in 0..out / 16 {
@@ -128,13 +128,24 @@ impl Packed {
                     }
                 }
             }
+        } else {
+            raw = w.to_vec();
         }
         Packed {
             out,
             inp,
             blocked,
-            raw: w.to_vec(),
+            raw,
             colsum,
+        }
+    }
+
+    /// Row `o`'s input `i`, from whichever layout is kept.
+    fn at(&self, o: usize, i: usize) -> i8 {
+        if self.blocked.is_empty() {
+            self.raw[o * self.inp + i]
+        } else {
+            self.blocked[(o / 16) * 16 * self.inp + (i / 4) * 64 + (o % 16) * 4 + i % 4]
         }
     }
 }
@@ -181,8 +192,16 @@ fn gemm_plain(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
     for r in 0..rows {
         let qr = &q[r * k..(r + 1) * k];
         for o in 0..n {
-            let wr = &w.raw[o * k..(o + 1) * k];
-            acc[r * n + o] = qr.iter().zip(wr).map(|(&a, &b)| a as i32 * b as i32).sum();
+            acc[r * n + o] = if w.blocked.is_empty() {
+                let wr = &w.raw[o * k..(o + 1) * k];
+                qr.iter().zip(wr).map(|(&a, &b)| a as i32 * b as i32).sum()
+            } else {
+                // a VNNI matrix on the plain path (tests)
+                qr.iter()
+                    .enumerate()
+                    .map(|(i, &a)| a as i32 * w.at(o, i) as i32)
+                    .sum()
+            };
         }
     }
 }
@@ -427,11 +446,13 @@ impl MoeWeights {
         if !(1..=e).contains(&k) {
             return Err(format!("k {k} with {e} experts"));
         }
+        let isa = detect_isa();
+        let block = isa != Isa::Plain;
         let w1 = (0..e)
-            .map(|i| Packed::new(&w1[i * f * d..(i + 1) * f * d], f, d))
+            .map(|i| Packed::new(&w1[i * f * d..(i + 1) * f * d], f, d, block))
             .collect();
         let w2 = (0..e)
-            .map(|i| Packed::new(&w2[i * d * f..(i + 1) * d * f], d, f))
+            .map(|i| Packed::new(&w2[i * d * f..(i + 1) * d * f], d, f, block))
             .collect();
         Ok(MoeWeights {
             e,
@@ -445,7 +466,7 @@ impl MoeWeights {
             w2,
             s2,
             b2,
-            isa: detect_isa(),
+            isa,
         })
     }
 
@@ -597,13 +618,20 @@ mod tests {
         let mut rng = Rng(7);
         let (out, inp) = (48, 40);
         let w: Vec<i8> = (0..out * inp).map(|_| (rng.next() * 127.0) as i8).collect();
-        let p = Packed::new(&w, out, inp);
+        let (plain, p) = (
+            Packed::new(&w, out, inp, false),
+            Packed::new(&w, out, inp, true),
+        );
+        assert!(plain.blocked.is_empty() && p.raw.is_empty());
         for rows in [1, 3, 8, 9, 13] {
             let q: Vec<u8> = (0..rows * inp)
                 .map(|_| ((rng.next() + 1.0) * 127.0) as u8)
                 .collect();
             let mut want = vec![0i32; rows * out];
-            gemm_plain(&q, rows, &p, &mut want);
+            gemm_plain(&q, rows, &plain, &mut want);
+            let mut got = vec![0i32; rows * out];
+            gemm_plain(&q, rows, &p, &mut got);
+            assert_eq!(got, want, "plain over the blocked layout, rows {rows}");
             for isa in [Isa::Vnni512, Isa::Vnni256] {
                 if detect_isa() == Isa::Plain
                     || (isa == Isa::Vnni512 && detect_isa() != Isa::Vnni512)
