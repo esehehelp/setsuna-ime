@@ -20,8 +20,9 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, TokenUser, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenElevation, TokenIsAppContainer, TokenUser,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -33,9 +34,9 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, OpenProcessToken, CREATE_BREAKAWAY_FROM_JOB,
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 
 const BUFFER: u32 = 64 * 1024;
@@ -102,6 +103,32 @@ pub fn is_elevated() -> io::Result<bool> {
             return Err(err);
         }
         Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+/// Whether this process runs in an AppContainer (a Store app's sandbox): what
+/// it starts runs there too, unseen by the login's other apps.
+pub fn is_app_container() -> io::Result<bool> {
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut is = 0u32;
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            (&mut is as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut len,
+        );
+        let err = io::Error::last_os_error();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(is != 0)
     }
 }
 
@@ -178,6 +205,22 @@ pub fn spawn_detached(exe: &Path, args: &[&OsStr], cwd: Option<&Path>) -> io::Re
         Ok(pid) => Ok((pid, true)),
         // a job that forbids breaking away refuses the flag
         Err(_) => run(flags).map(|pid| (pid, false)),
+    }
+}
+
+/// Whether process `pid` (one [`spawn_detached`] started) still runs.
+pub fn is_running(pid: u32) -> bool {
+    // GetExitCodeProcess's code while the process runs
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
     }
 }
 
@@ -407,7 +450,7 @@ mod tests {
 
     fn test_name() -> String {
         format!(
-            r"\\.\pipe\setsuna-rerank-pipe-test-{}-{:?}",
+            r"\\.\pipe\setsuna-pipe-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         )
@@ -437,6 +480,20 @@ mod tests {
     fn elevation_is_read() {
         // whichever way the tests run, the token tells
         is_elevated().unwrap();
+        // a test is no Store app
+        assert!(!is_app_container().unwrap());
+    }
+
+    #[test]
+    fn a_started_process_runs_until_it_exits() {
+        assert!(is_running(std::process::id()));
+        let cmd = Path::new(r"C:\Windows\System32\cmd.exe");
+        let (pid, _) = spawn_detached(cmd, &[OsStr::new("/c"), OsStr::new("exit")], None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while is_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!is_running(pid));
     }
 
     #[test]

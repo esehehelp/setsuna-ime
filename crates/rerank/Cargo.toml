@@ -18,7 +18,7 @@ path = "src/bin/main.rs"
 setsuna-artifact = { path = "../artifact" }
 # The pipe of `serve`: its name and the Win32 calls, shared with the client
 # in setsuna-core.
-setsuna-rerank-pipe = { path = "../rerank-pipe" }
+setsuna-pipe = { path = "../pipe" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true

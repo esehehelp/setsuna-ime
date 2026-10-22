@@ -32,7 +32,10 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 
 - **推論専用エンジン** — CTC-NAT の proposal（ONNX）→ CTC beam search →
   候補。モデルは manifest 経由でのみ読み、推奨 decode 設定も manifest に載る。
-  stdio の JSONL protocol で動く daemon として IME から使う。
+  stdio の JSONL protocol で動く daemon として IME から使う。Windows では
+  ログイン中の全アプリが 1 つのエンジン（`setsuna-engine serve`、名前付きパイプ）を
+  共有し、モデルはメモリに 1 つだけ載る。最後のアプリが離れて 10 分で終了する。
+  管理者権限のアプリと AppContainer のアプリは、自分専用の子プロセスを使う。
 - **文節編集** — CTC アラインメント（候補の各文字の読み位置）から文節を作り、
   変換中に ← / → / Shift+← / Shift+→ で文節ごとに編集できる。
 - **リランク（任意）** — 入力が止まったときに causal LM（llama.cpp、GGUF）で
@@ -109,7 +112,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 | `crates/artifact` | artifact | manifest reader |
 | `crates/engine` | runtime | 推論エンジン（`setsuna-engine`、library / CLI / daemon） |
 | `crates/rerank` | runtime | LM リランカ（`setsuna-rerank`、llama.cpp） |
-| `crates/rerank-pipe` | runtime | 共有リランカの名前付きパイプ（名前と Win32 の呼び出し、Windows） |
+| `crates/pipe` | runtime | 共有エンジン・共有リランカの名前付きパイプ（名前、Win32 の呼び出し、サーバのループ。Windows） |
 | `crates/ime-core` | platform | 各 frontend 共通の IME ロジック（ローマ字合成、状態遷移、後処理、学習、設定、daemon client） |
 | `crates/tsf` | platform | Windows TSF IME（DLL） |
 | `crates/linux` | platform | fcitx5 addon（Rust 部分 + `fcitx5/` の C++ shim） |
@@ -119,7 +122,8 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 
 frontend はエンジンをリンクせず、`setsuna-engine daemon` / `setsuna-rerank
 daemon` / `setsuna-rewrite daemon` を子プロセスとして起動し stdio で話す。
-Windows のリランカだけは、ログインで 1 つの `setsuna-rerank serve` に名前付きパイプでつなぐ。
+Windows のエンジンとリランカは、ログインで 1 つずつの `setsuna-engine serve` /
+`setsuna-rerank serve` に名前付きパイプでつなぐ（管理者権限のアプリは子プロセス）。
 
 ## ビルド
 

@@ -2,7 +2,7 @@
 //! one reranker for the IME of every app instead of a child per app.
 //!
 //! The pipe's name comes from the user, the manifest, the binary and the
-//! options (`setsuna_rerank_pipe::pipe_name`), as the server computes it. One
+//! options (`setsuna_pipe::rerank_pipe_name`), as the server computes it. One
 //! I/O thread connects, starting the server when the pipe does not exist, then
 //! sends each request due and reads its response on the same synchronous
 //! handle (one request in flight at most). A pipe that broke (the server
@@ -18,8 +18,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use setsuna_rerank_pipe::win::{self, Pipe};
-use setsuna_rerank_pipe::{exe_identity, pipe_name, PipeKey};
+use setsuna_pipe::win::{self, Pipe};
+use setsuna_pipe::{exe_identity, rerank_pipe_name, RerankKey};
 
 use super::{
     next_due, request_line, stderr_log_path, Pending, RerankClient, RerankInfo, RerankResult,
@@ -59,7 +59,7 @@ impl PipeRerankClient {
     ) -> io::Result<Self> {
         let user = win::user_sid()?;
         let canonical = std::fs::canonicalize(manifest)?;
-        let name = pipe_name(&PipeKey {
+        let name = rerank_pipe_name(&RerankKey {
             user: &user,
             manifest: &canonical,
             exe: &exe_identity(exe)?,

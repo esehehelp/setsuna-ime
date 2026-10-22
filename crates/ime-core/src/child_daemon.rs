@@ -12,6 +12,9 @@
 //! Clobbering: only the latest dispatched request matters. `dispatch`
 //! overwrites a single `pending` slot, and the writer holds at most one
 //! request in flight, so a burst of keystrokes collapses to one backend run.
+//!
+//!   - pipe: the same protocol with the login's shared `setsuna-engine
+//!     serve` (Windows), which `spawn_with_config` prefers to a child
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +28,11 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::engine_client::{EngineClient, EngineResult, Notify};
+
+#[cfg(windows)]
+mod pipe;
+#[cfg(windows)]
+pub use pipe::PipeEngineClient;
 
 /// File name of the engine binary on this platform.
 const ENGINE_EXE: &str = if cfg!(windows) {
@@ -283,50 +291,58 @@ impl Drop for ChildDaemonClient {
     }
 }
 
-fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
-    loop {
-        let pending = {
-            let mut st = shared.state.lock().unwrap();
-            while shared.alive.load(Ordering::SeqCst)
-                && !(st.pending.is_some() && st.in_flight.is_none())
-            {
-                st = shared.cv.wait(st).unwrap();
-            }
-            if !shared.alive.load(Ordering::SeqCst) {
-                return;
-            }
-            let p = st.pending.take().unwrap();
-            st.in_flight = Some(InFlight {
-                reading: p.reading.clone(),
-                context: p.context.nfkc().collect(),
-                dispatched_at: p.dispatched_at,
-            });
-            p
-        };
+/// Wait for a request to send (one queued, none in flight) and put it in
+/// flight; `None` once the client is gone.
+fn next_request(shared: &Shared) -> Option<Pending> {
+    let mut st = shared.state.lock().unwrap();
+    while shared.alive.load(Ordering::SeqCst) && !(st.pending.is_some() && st.in_flight.is_none()) {
+        st = shared.cv.wait(st).unwrap();
+    }
+    if !shared.alive.load(Ordering::SeqCst) {
+        return None;
+    }
+    let p = st.pending.take().unwrap();
+    st.in_flight = Some(InFlight {
+        reading: p.reading.clone(),
+        context: p.context.nfkc().collect(),
+        dispatched_at: p.dispatched_at,
+    });
+    Some(p)
+}
 
-        // The model is trained on NFKC text; the typed forms of symbols are
-        // restored on the way back (postprocess), keyed on the original
-        // reading kept in `in_flight`.
-        let context: String = pending.context.nfkc().collect();
-        let reading: String = pending.reading.nfkc().collect();
-        let req = DaemonRequest {
-            id: pending.req_id,
-            context: &context,
-            reading: &reading,
-            continue_beam: pending.continue_beam,
-        };
-        crate::diagnostics::log(format!(
-            "writer send req_id={} reading={}",
-            pending.req_id, pending.reading
-        ));
-        let line = match serde_json::to_string(&req) {
-            Ok(l) => l,
-            Err(_) => {
-                // Clear in_flight so the writer doesn't deadlock waiting
-                // for a response that will never come.
-                shared.state.lock().unwrap().in_flight = None;
-                continue;
-            }
+/// The request's line (no newline); `None`, with nothing left in flight,
+/// when it cannot be written.
+fn request_line(shared: &Shared, pending: &Pending) -> Option<String> {
+    // The model is trained on NFKC text; the typed forms of symbols are
+    // restored on the way back (postprocess), keyed on the original
+    // reading kept in `in_flight`.
+    let context: String = pending.context.nfkc().collect();
+    let reading: String = pending.reading.nfkc().collect();
+    let req = DaemonRequest {
+        id: pending.req_id,
+        context: &context,
+        reading: &reading,
+        continue_beam: pending.continue_beam,
+    };
+    crate::diagnostics::log(format!(
+        "writer send req_id={} reading={}",
+        pending.req_id, pending.reading
+    ));
+    match serde_json::to_string(&req) {
+        Ok(l) => Some(l),
+        Err(_) => {
+            // Clear in_flight so the writer doesn't deadlock waiting
+            // for a response that will never come.
+            shared.state.lock().unwrap().in_flight = None;
+            None
+        }
+    }
+}
+
+fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
+    while let Some(pending) = next_request(&shared) {
+        let Some(line) = request_line(&shared, &pending) else {
+            continue;
         };
         if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
             crate::diagnostics::log("writer failed: stdin closed");
@@ -391,75 +407,90 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
             }
             Ok(_) => {}
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let resp: DaemonResponse = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::diagnostics::log(format!("reader parse failed: {e}; line={trimmed}"));
-                continue;
-            }
-        };
-        crate::diagnostics::log(format!(
-            "reader response id={} candidates={} error={:?}",
-            resp.id,
-            resp.candidates.len(),
-            resp.error
-        ));
-
-        // Clear the in-flight slot and wake the writer so it can send the
-        // next pending request immediately — before we pace + post, so the
-        // daemon overlaps the next conversion with our pacing delay.
-        let inflight = shared.state.lock().unwrap().in_flight.take();
-        shared.cv.notify_all();
-
-        if resp.error.is_some() {
-            continue;
-        }
-        let (reading, context, dispatched_at) = match inflight {
-            Some(f) => (f.reading, f.context, f.dispatched_at),
-            None => (String::new(), String::new(), Instant::now()),
-        };
-        let wait = pacing_wait(dispatched_at.elapsed());
-        if !wait.is_zero() {
-            thread::sleep(wait);
-        }
-        {
-            let mut slot = shared.latest.lock().unwrap();
-            *slot = Some(EngineResult {
-                req_id: resp.id,
-                reading,
-                context,
-                candidates: resp.candidates,
-                reading_pos: resp.candidate_reading_pos,
-                scores: resp.candidate_scores,
-                engine_ms: resp.engine_ms,
-                frames: resp.frames,
-                round_trip_ms: dispatched_at.elapsed().as_secs_f64() * 1000.0,
-            });
-        }
-        if shared.alive.load(Ordering::SeqCst) {
-            crate::diagnostics::log(format!("notify req_id={}", resp.id));
-            notify(resp.id);
-        } else {
-            crate::diagnostics::log(format!("notify skipped: client dropped req_id={}", resp.id));
+        if let Some((resp, inflight)) = take_response(shared, &line) {
+            deliver(shared, resp, inflight, notify);
         }
     }
 }
 
-/// Spawn the engine daemon with the model and binary `cfg` names or
-/// discovery finds. `module_dir` is the directory the frontend module is
-/// installed in (the TSF DLL's), searched last for the engine and models.
-/// Returns `None` (→ raw-hiragana passthrough) when no model is found or
-/// the child fails to start. `notify` is called from the reader thread for
-/// each result.
+/// A response line read: the request it answers taken out of flight, so
+/// that the next one goes at once (the engine overlaps it with this one's
+/// pacing). `None` for a blank line, one that does not parse, or an error.
+fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<InFlight>)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let resp: DaemonResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::diagnostics::log(format!("reader parse failed: {e}; line={trimmed}"));
+            return None;
+        }
+    };
+    crate::diagnostics::log(format!(
+        "reader response id={} candidates={} error={:?}",
+        resp.id,
+        resp.candidates.len(),
+        resp.error
+    ));
+    let inflight = shared.state.lock().unwrap().in_flight.take();
+    shared.cv.notify_all();
+    if resp.error.is_some() {
+        return None;
+    }
+    Some((resp, inflight))
+}
+
+/// Pace a result (`pacing_wait`), make it the latest and tell the frontend.
+fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, notify: &Notify) {
+    let (reading, context, dispatched_at) = match inflight {
+        Some(f) => (f.reading, f.context, f.dispatched_at),
+        None => (String::new(), String::new(), Instant::now()),
+    };
+    let wait = pacing_wait(dispatched_at.elapsed());
+    if !wait.is_zero() {
+        thread::sleep(wait);
+    }
+    {
+        let mut slot = shared.latest.lock().unwrap();
+        *slot = Some(EngineResult {
+            req_id: resp.id,
+            reading,
+            context,
+            candidates: resp.candidates,
+            reading_pos: resp.candidate_reading_pos,
+            scores: resp.candidate_scores,
+            engine_ms: resp.engine_ms,
+            frames: resp.frames,
+            round_trip_ms: dispatched_at.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+    if shared.alive.load(Ordering::SeqCst) {
+        crate::diagnostics::log(format!("notify req_id={}", resp.id));
+        notify(resp.id);
+    } else {
+        crate::diagnostics::log(format!("notify skipped: client dropped req_id={}", resp.id));
+    }
+}
+
+/// The engine client for the model and binary `cfg` names or discovery
+/// finds. `module_dir` is the directory the frontend module is installed in
+/// (the TSF DLL's), searched last for the engine and models. On Windows it
+/// connects to the login's shared server (`setsuna-engine serve`, one model
+/// in memory for every app), starting it when there is none, in the
+/// background: this returns at once; an elevated app or one in an
+/// AppContainer has a child of its own (a server it started would run
+/// elevated and serve the login's other apps across that boundary, or run
+/// in the container where they cannot reach it), as does every app
+/// elsewhere. Returns `None` (→ raw-hiragana passthrough) when no model is
+/// found or the client fails to start. `notify` is called from a client
+/// thread for each result.
 pub fn spawn_with_config(
     cfg: &crate::config::Config,
     module_dir: Option<&Path>,
     notify: Notify,
-) -> Option<ChildDaemonClient> {
+) -> Option<Box<dyn EngineClient>> {
     let manifest = match resolve_manifest(&cfg.engine, module_dir, |key| {
         std::env::var_os(key).map(PathBuf::from)
     }) {
@@ -490,6 +521,27 @@ pub fn spawn_with_config(
             return None;
         }
     };
+    #[cfg(windows)]
+    let notify = {
+        use setsuna_pipe::win;
+        if win::is_elevated().unwrap_or(false) {
+            crate::diagnostics::log("engine: elevated, a child of this app's own");
+            notify
+        } else if win::is_app_container().unwrap_or(false) {
+            crate::diagnostics::log("engine: in an AppContainer, a child of this app's own");
+            notify
+        } else {
+            match pipe::PipeEngineClient::start(&manifest, &engine_exe, notify, &cfg.engine) {
+                Ok(c) => return Some(Box::new(c)),
+                Err((e, notify)) => {
+                    crate::diagnostics::log(format!(
+                        "engine pipe client failed: {e}; a child of this app's own"
+                    ));
+                    notify
+                }
+            }
+        }
+    };
     match ChildDaemonClient::spawn(&manifest, &engine_exe, notify, &cfg.engine) {
         Ok(c) => {
             tracing::info!(
@@ -497,7 +549,7 @@ pub fn spawn_with_config(
                 engine_exe.display(),
                 manifest.display(),
             );
-            Some(c)
+            Some(Box::new(c))
         }
         Err(e) => {
             tracing::warn!("engine daemon spawn failed: {}", e);
@@ -617,6 +669,15 @@ fn daemon_args(manifest: &Path, engine_cfg: &crate::config::EngineCfg) -> Vec<st
         "daemon".into(),
         "--manifest".into(),
         manifest.as_os_str().to_owned(),
+    ];
+    args.extend(decode_flags(engine_cfg).into_iter().map(Into::into));
+    args
+}
+
+/// The flags after the manifest, `daemon`'s and `serve`'s: what changes the
+/// engine's answers, and so what a shared server is named by.
+fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
+    let mut args: Vec<String> = vec![
         // segment editing cuts conversions by the CTC alignment
         "--emit-alignment".into(),
         // the IME shows punctuation and full-width ASCII normalized (the
@@ -625,11 +686,11 @@ fn daemon_args(manifest: &Path, engine_cfg: &crate::config::EngineCfg) -> Vec<st
     ];
     let c = engine_cfg;
     if let Some(p) = &c.ort_dylib {
-        args.push(format!("--ort-dylib={}", p.display()).into());
+        args.push(format!("--ort-dylib={}", p.display()));
     }
     let mut flag = |name: &str, value: Option<String>| {
         if let Some(v) = value {
-            args.push(format!("--{name}={v}").into());
+            args.push(format!("--{name}={v}"));
         }
     };
     flag("beam-width", c.beam_width.map(|v| v.to_string()));
@@ -642,14 +703,14 @@ fn daemon_args(manifest: &Path, engine_cfg: &crate::config::EngineCfg) -> Vec<st
     flag("emit-frames", c.emit_frames.map(|v| v.to_string()));
     match &c.vocab_blacklist {
         // The bare flag clears a manifest blacklist.
-        Some(ids) if ids.is_empty() => args.push("--vocab-blacklist".into()),
+        Some(ids) if ids.is_empty() => args.push("--vocab-blacklist".to_string()),
         Some(ids) => {
             let csv = ids
                 .iter()
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            args.push(format!("--vocab-blacklist={csv}").into());
+            args.push(format!("--vocab-blacklist={csv}"));
         }
         None => {}
     }

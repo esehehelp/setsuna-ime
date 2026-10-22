@@ -24,3 +24,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 ndarray = "0.16"
 serde.workspace = true
 serde_json.workspace = true
+
+# `serve`: the pipe shared with the IME's client (setsuna-core) and its server loop.
+[target.'cfg(windows)'.dependencies]
+setsuna-pipe = { path = "../pipe" }

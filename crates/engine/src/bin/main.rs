@@ -1,8 +1,9 @@
 //! setsuna-engine: ONNX CTC-NAT inference daemon / one-shot CLI.
 //!
-//! Drives a `setsuna_engine::EngineSession` from JSONL stdio (daemon mode) or
-//! a single CLI invocation (convert mode). Hosts (the IME frontend, the
-//! research bench) talk to the daemon only through this protocol; see
+//! Drives a `setsuna_engine::EngineSession` from JSONL stdio (daemon mode),
+//! a named pipe shared by every app of a Windows login (serve mode, the same
+//! lines) or a single CLI invocation (convert mode). Hosts (the IME frontend,
+//! the research bench) talk to the daemon only through this protocol; see
 //! `backend-manifest`.
 
 use std::io::{BufRead, BufReader, Write};
@@ -48,6 +49,23 @@ enum Command {
     Daemon {
         #[command(flatten)]
         engine: EngineArgs,
+    },
+    /// Serve the daemon's protocol to every client of this user on the named
+    /// pipe `--pipe`; exit at once when another server has it.
+    #[cfg(windows)]
+    Serve {
+        #[command(flatten)]
+        engine: EngineArgs,
+        /// The pipe (`\\.\pipe\setsuna-engine-...`), named by the client
+        /// from the user, the manifest, this binary and the flags.
+        #[arg(long)]
+        pipe: String,
+        /// Seconds without a connected client before the server exits.
+        #[arg(long, default_value_t = 600)]
+        exit_after_secs: u64,
+        /// File to append the server's messages to. Default: stderr.
+        #[arg(long)]
+        log: Option<PathBuf>,
     },
     /// Print the stable backend protocol description as JSON.
     BackendManifest {
@@ -496,59 +514,122 @@ fn backend_manifest() -> BackendManifest {
     }
 }
 
-fn write_line<T: Serialize>(value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "{}", serde_json::to_string(value)?)?;
-    out.flush()?;
-    Ok(())
+/// A loaded session answering request lines, the daemon's and the server's.
+struct Daemon {
+    session: EngineSession,
+    args: EngineArgs,
+    perf_enabled: bool,
+}
+
+impl Daemon {
+    /// Load the session; the ready line hosts wait for before the first request.
+    fn load(args: EngineArgs) -> Result<(Self, String)> {
+        let (session, af) = build_session(&args)?;
+        let ready = serde_json::to_string(&Ready {
+            ready: true,
+            version: env!("CARGO_PKG_VERSION"),
+            artifact_format: af,
+            beam_width: session.config.beam_width,
+            top_k: session.config.max_candidates,
+        })?;
+        let daemon = Self {
+            session,
+            args,
+            perf_enabled: env_flag("SETSUNA_PERF"),
+        };
+        Ok((daemon, ready))
+    }
+
+    /// The response line to one request line.
+    fn respond(&mut self, line: &str) -> String {
+        let req: Request = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = format!("invalid request json: {e}");
+                return to_line(&Response::err(0, 0.0, &err));
+            }
+        };
+        let t0 = Instant::now();
+        let result = decode_one(
+            &mut self.session,
+            &req.context,
+            &req.reading,
+            req.continue_beam,
+        );
+        let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        match result {
+            Ok((cands, perf, frames)) => {
+                let perf = perf.filter(|_| self.perf_enabled).map(PerfResponse::from);
+                to_line(&Response::ok(
+                    req.id,
+                    cands,
+                    engine_ms,
+                    perf,
+                    self.args.emit_meta,
+                    self.args.emit_alignment,
+                    frames,
+                ))
+            }
+            Err(e) => to_line(&Response::err(req.id, engine_ms, &e.to_string())),
+        }
+    }
+}
+
+fn to_line(response: &Response) -> String {
+    serde_json::to_string(response).unwrap_or_else(|e| {
+        serde_json::json!({ "id": response.id, "error": e.to_string() }).to_string()
+    })
 }
 
 fn run_daemon(args: EngineArgs) -> Result<()> {
-    let (mut session, af) = build_session(&args)?;
-    let perf_enabled = env_flag("SETSUNA_PERF");
-    write_line(&Ready {
-        ready: true,
-        version: env!("CARGO_PKG_VERSION"),
-        artifact_format: af,
-        beam_width: session.config.beam_width,
-        top_k: session.config.max_candidates,
-    })?;
-
+    let (mut daemon, ready) = Daemon::load(args)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{ready}")?;
+    out.flush()?;
     let stdin = std::io::stdin();
     for line in BufReader::new(stdin.lock()).lines() {
         let line = line.context("read stdin line")?;
         if line.trim().is_empty() {
             continue;
         }
-        let req: Request = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = format!("invalid request json: {e}");
-                write_line(&Response::err(0, 0.0, &err))?;
-                continue;
-            }
-        };
-        let t0 = Instant::now();
-        let result = decode_one(&mut session, &req.context, &req.reading, req.continue_beam);
-        let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        match result {
-            Ok((cands, perf, frames)) => {
-                let perf = perf.filter(|_| perf_enabled).map(PerfResponse::from);
-                write_line(&Response::ok(
-                    req.id,
-                    cands,
-                    engine_ms,
-                    perf,
-                    args.emit_meta,
-                    args.emit_alignment,
-                    frames,
-                ))?;
-            }
-            Err(e) => write_line(&Response::err(req.id, engine_ms, &e.to_string()))?,
-        }
+        writeln!(out, "{}", daemon.respond(&line))?;
+        out.flush()?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+impl setsuna_pipe::server::Service for Daemon {
+    fn handle(&mut self, line: &str) -> String {
+        self.respond(line)
+    }
+}
+
+/// Serve the clients of `pipe` (the name the IME's client computed for this
+/// user, manifest, binary and these flags) until none has been connected
+/// for `exit_after_secs`.
+#[cfg(windows)]
+fn run_serve(
+    args: EngineArgs,
+    pipe: String,
+    exit_after_secs: u64,
+    log: Option<PathBuf>,
+) -> Result<()> {
+    let user = setsuna_pipe::win::user_sid().context("this process's user")?;
+    let exit_after = std::time::Duration::from_secs(exit_after_secs);
+    setsuna_pipe::server::serve(
+        setsuna_pipe::server::ServeOptions {
+            pipe_name: pipe,
+            user_sid: user,
+            // the session has nothing to free and make again
+            idle_after: exit_after,
+            exit_after,
+            log,
+            label: "setsuna-engine serve",
+        },
+        move || Daemon::load(args),
+    )
 }
 
 fn run_convert(
@@ -609,6 +690,13 @@ fn main() -> Result<()> {
             continue_beam,
         } => run_convert(engine, reading, context, continue_beam),
         Command::Daemon { engine } => run_daemon(engine),
+        #[cfg(windows)]
+        Command::Serve {
+            engine,
+            pipe,
+            exit_after_secs,
+            log,
+        } => run_serve(engine, pipe, exit_after_secs, log),
         Command::BackendManifest { pretty } => run_backend_manifest(pretty),
     }
 }

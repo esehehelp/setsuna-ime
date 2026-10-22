@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use setsuna_core::child_daemon;
 use setsuna_core::config::{Config, RewriterCfg};
-use setsuna_core::engine_client::{EngineClient, Notify};
+use setsuna_core::engine_client::Notify;
 use setsuna_core::rerank_client;
 use setsuna_core::rewrite_client::{self, RewriteClient};
 
@@ -147,8 +147,7 @@ impl SetsunaSession {
         let module_dir = module_dir.as_deref();
         let client = (!self.session.has_client())
             .then(|| child_daemon::spawn_with_config(cfg, module_dir, self.wake()))
-            .flatten()
-            .map(|c| Box::new(c) as Box<dyn EngineClient>);
+            .flatten();
         let new_bridge = client.is_some();
         if new_bridge {
             setsuna_core::diagnostics::log("fcitx5 engine started");

@@ -698,8 +698,7 @@ fn trace(typed: &str, before: Option<&str>, no_mixed: bool, model: Option<String
     });
     let install =
         std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("setsuna-ime"));
-    let client = setsuna_core::child_daemon::spawn_with_config(&cfg, install.as_deref(), notify)
-        .map(|c| Box::new(c) as Box<dyn setsuna_core::engine_client::EngineClient>);
+    let client = setsuna_core::child_daemon::spawn_with_config(&cfg, install.as_deref(), notify);
     println!("engine: {}", client.is_some());
     let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
     bridge.set_live_conversion(cfg.frontend.live_conversion.unwrap_or(true));
