@@ -412,8 +412,7 @@ impl Session {
         self.view.reading = self.bridge.shown_reading().unwrap_or_default();
         self.view.form = self.bridge.shown_form().map(|f| f.label());
         let suggestions = self.bridge.suggestions();
-        // as many as a page of the conversion holds, so the panel keeps its
-        // height between typing and converting
+        // at most a page of the conversion, so the panel never grows past it
         self.view.suggestions = suggestions.iter().take(self.page_size).cloned().collect();
         self.view.suggestion_comments = self
             .view
