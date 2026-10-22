@@ -405,6 +405,7 @@ $ManifestItem = Get-Item -LiteralPath $Manifest
 $ManifestJson = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
 $ArtifactFiles = @($ManifestJson.proposal.path, $ManifestJson.vocab)
 if ($ManifestJson.proposal.external_data) { $ArtifactFiles += @($ManifestJson.proposal.external_data) }
+if ($ManifestJson.input_vocab) { $ArtifactFiles += @($ManifestJson.input_vocab) }
 foreach ($rel in $ArtifactFiles) {
     if ([IO.Path]::IsPathRooted($rel) -or $rel -match '(^|[\\/])\.\.([\\/]|$)') {
         Write-Log ERROR "manifest path $rel leaves the artifact directory"; exit 30
