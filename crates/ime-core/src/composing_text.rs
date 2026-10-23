@@ -351,6 +351,12 @@ impl ComposingText {
         }
     }
 
+    /// Whether `live_reading` ends in a pending `n` read as ん, which the
+    /// next key may still make な or にゃ.
+    pub fn n_pending(&self) -> bool {
+        self.pending == "n"
+    }
+
     /// The romaji shown after the conversion of `live_reading`: the pending
     /// romaji but an `n` the reading holds.
     pub fn live_pending(&self) -> &str {
