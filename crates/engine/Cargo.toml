@@ -21,9 +21,11 @@ clap = { workspace = true, features = ["derive"] }
 # The runtime is loaded at run time (`runtime.rs`): Microsoft's official
 # build, not the one `download-binaries` bundles, which was measurably slower.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
+rayon = "1"
 ndarray = "0.16"
 serde.workspace = true
 serde_json.workspace = true
+unicode-normalization = "0.1"
 
 # `serve`: the pipe shared with the IME's client (setsuna-core) and its server loop.
 [target.'cfg(windows)'.dependencies]

@@ -138,6 +138,16 @@ struct EngineArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     normalize_candidates: Option<bool>,
 
+    /// Weight of the rescoring's two-character term (the manifest's
+    /// `rescore.pairs`); 0 turns it off. Default the manifest's, else 0.
+    #[arg(long)]
+    pair_weight: Option<f32>,
+
+    /// Weight of the rescoring's word term (the manifest's `rescore.words`);
+    /// 0 turns it off. Default the manifest's, else 0.
+    #[arg(long)]
+    word_weight: Option<f32>,
+
     /// Include each candidate's score and source in each response.
     #[arg(long, default_value_t = false)]
     emit_meta: bool,
@@ -166,6 +176,8 @@ impl EngineArgs {
             symbol_token: self.symbol_token,
             digit_split: self.digit_split,
             normalize_candidates: self.normalize_candidates,
+            pair_weight: self.pair_weight,
+            word_weight: self.word_weight,
         }
     }
 }
@@ -196,6 +208,10 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
         "symbol_token": cfg.symbol_token,
         "digit_split": cfg.digit_split,
         "normalize_candidates": cfg.normalize_candidates,
+        "pair_weight": cfg.pair_weight,
+        "word_weight": cfg.word_weight,
+        "rescore_pairs": manifest.rescore_pairs,
+        "rescore_words": manifest.rescore_words,
     });
     eprintln!("[engine] effective {effective}");
     let artifact_format = match manifest.precision.as_str() {
@@ -343,6 +359,7 @@ struct PerfResponse {
     proposal_ms: f64,
     beam_ms: f64,
     post_ms: f64,
+    rescore_ms: f64,
     total_ms: f64,
     hyp_count: usize,
     candidate_count: usize,
@@ -355,6 +372,7 @@ impl From<ConvertPerf> for PerfResponse {
             proposal_ms: p.proposal_ms,
             beam_ms: p.beam_ms,
             post_ms: p.post_ms,
+            rescore_ms: p.rescore_ms,
             total_ms: p.total_ms,
             hyp_count: p.hyp_count,
             candidate_count: p.candidate_count,

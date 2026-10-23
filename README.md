@@ -299,6 +299,11 @@ cargo run --release -p setsuna-settings
   special token id、`decode_defaults`（beam 幅、記号の扱いなど）を持つ。
   CTC-CRF で学習したモデルは遷移表（`crf`、低ランクの ψ）も持ち、beam search が
   隣り合う文字の遷移のスコアを足す。
+  MoE のモデルは専門家の重みを int8 か int4 で持ち、エンジン自身のカーネル（op
+  domain `neo_ime` の `TokenMoE*`、`AddLayerNorm`）で動く。
+  候補を並べ直す表（`rescore`: `pairs` は 2 文字の共起、`words` は読みと語の
+  頻度）を持つモデルでは、`decode_defaults` の `pair_weight` / `word_weight` の
+  重みで beam の候補のスコアに足して並べ直す（0 か未指定ならその項は使わない）。
   公開モデル Aster-v1.2-small には int8 版（約 29 MB）と fp32 版（約 107 MB）がある。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の

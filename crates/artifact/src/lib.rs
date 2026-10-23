@@ -56,6 +56,18 @@ pub struct CrfArtifact {
     pub rank: usize,
 }
 
+/// Outside statistics the engine rescores a conversion's candidates with
+/// (each weighted by `decode_defaults`' `pair_weight` / `word_weight`):
+/// `pairs`, two-character counts (the research export's: magic
+/// `NIPAIRS1`, then the chars, row starts, columns and counts of a sparse
+/// count matrix); `words`, a (reading, word, count) TSV, the words NFKC.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescoreArtifact {
+    pub pairs: Option<PathBuf>,
+    pub words: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpecialIds {
@@ -89,6 +101,12 @@ pub struct DecodeDefaults {
     /// (`normalize_candidate`); unset or false, a candidate is the model's
     /// output as decoded (the research default).
     pub normalize_candidates: Option<bool>,
+    /// Weight of the two-character term of the rescoring (`rescore.pairs`);
+    /// unset or 0, off.
+    pub pair_weight: Option<f32>,
+    /// Weight of the word term of the rescoring (`rescore.words`); unset or
+    /// 0, off.
+    pub word_weight: Option<f32>,
 }
 
 /// Keys of the dictionary / n-gram fusion recipe that engine v1 read and v2
@@ -127,6 +145,9 @@ struct CtcNatManifestFile {
     /// adds them (decoding without them is another model).
     #[serde(default)]
     crf: Option<CrfArtifact>,
+    /// The candidates' rescoring tables.
+    #[serde(default)]
+    rescore: RescoreArtifact,
 }
 
 /// A CTC-NAT manifest with every artifact path resolved against the
@@ -144,6 +165,9 @@ pub struct CtcNatManifest {
     pub decode_defaults: DecodeDefaults,
     /// The CTC-CRF table (path resolved) and its rank.
     pub crf: Option<(PathBuf, usize)>,
+    /// The rescoring tables (`RescoreArtifact`), paths resolved.
+    pub rescore_pairs: Option<PathBuf>,
+    pub rescore_words: Option<PathBuf>,
 }
 
 impl CtcNatManifest {
@@ -187,7 +211,11 @@ impl CtcNatManifest {
                 path.display(),
                 full.display()
             );
-            Ok(full)
+            // absolute, without `..`: on Windows the `\\?\` form, which ONNX
+            // Runtime opens past MAX_PATH (an export path of 274 chars, or a
+            // shorter one through `../..`, was "File doesn't exist" to it)
+            std::fs::canonicalize(&full)
+                .with_context(|| format!("manifest {}: {what} {}", path.display(), full.display()))
         };
         for extra in &file.proposal.external_data {
             resolve(extra, "external data")?;
@@ -209,6 +237,18 @@ impl CtcNatManifest {
                 .crf
                 .as_ref()
                 .map(|c| resolve(&c.path, "CRF table").map(|p| (p, c.rank)))
+                .transpose()?,
+            rescore_pairs: file
+                .rescore
+                .pairs
+                .as_deref()
+                .map(|p| resolve(p, "rescore pairs"))
+                .transpose()?,
+            rescore_words: file
+                .rescore
+                .words
+                .as_deref()
+                .map(|p| resolve(p, "rescore words"))
                 .transpose()?,
         })
     }
@@ -394,7 +434,9 @@ mod tests {
             ),
         );
         let m = CtcNatManifest::load(&manifest).unwrap();
-        assert_eq!(m.proposal_path, dir.join("m.fp32.onnx"));
+        let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        assert_eq!(m.proposal_path, canon(dir.join("m.fp32.onnx")));
+        assert!(m.proposal_path.is_absolute());
         assert_eq!(m.special_ids.blank, 4);
         assert_eq!(m.decode_defaults.beam_width, Some(20));
         assert_eq!(m.decode_defaults.top_k, None);
@@ -416,7 +458,8 @@ mod tests {
             &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &crf("m.crf.f32")),
         );
         let m = CtcNatManifest::load(&manifest).unwrap();
-        assert_eq!(m.crf, Some((dir.join("m.crf.f32"), 8)));
+        let canon = std::fs::canonicalize(dir.join("m.crf.f32")).unwrap();
+        assert_eq!(m.crf, Some((canon, 8)));
         let missing = write(
             &dir,
             "missing.json",
@@ -431,11 +474,12 @@ mod tests {
         let dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ctc_nat_manifest");
         let m = CtcNatManifest::load(&dir.join("model.int4.manifest.json")).unwrap();
-        assert_eq!(m.proposal_path, dir.join("model.int4.onnx"));
+        let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        assert_eq!(m.proposal_path, canon(dir.join("model.int4.onnx")));
         assert_eq!(m.precision, "int4");
         assert_eq!(
             m.vocab_path,
-            dir.join("model.fp32.tokenizer.json.vocab.hex.tsv")
+            canon(dir.join("model.fp32.tokenizer.json.vocab.hex.tsv"))
         );
         assert_eq!(
             m.special_ids,
