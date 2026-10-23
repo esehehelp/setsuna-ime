@@ -322,6 +322,9 @@ struct RerankJob {
     context: String,
     raw: Vec<String>,
     scores: Vec<f32>,
+    /// Per candidate, whether it spells the reading out
+    /// (`order_engine_result`): those stay above the others when reranked.
+    spelled: Vec<bool>,
     reading_pos: Vec<Vec<u32>>,
     k: usize,
     req_id: u64,
@@ -1973,11 +1976,19 @@ impl EngineBridge {
         } else {
             Instant::now() + Duration::from_millis(self.rerank_cfg.idle_ms)
         };
+        let spelled = {
+            use unicode_normalization::UnicodeNormalization;
+            let r: Vec<char> = reading.nfkc().collect();
+            raw.iter()
+                .map(|c| crate::reading_align::spells_out(c, &r))
+                .collect()
+        };
         self.rerank = Some(RerankJob {
             reading: reading.to_string(),
             context: self.context.clone(),
             raw: raw.to_vec(),
             scores: scores.to_vec(),
+            spelled,
             reading_pos: reading_pos.to_vec(),
             k,
             req_id: 0,
@@ -2171,7 +2182,20 @@ impl EngineBridge {
         if result.req_id != job.req_id || result.logp.len() != job.k {
             return Vec::new();
         }
-        let order = rerank_order(&job.scores[..job.k], &result.logp, self.rerank_lambda());
+        let lambda = f64::from(self.rerank_lambda());
+        let order = rerank_order(
+            &job.scores[..job.k],
+            &result.logp,
+            self.rerank_lambda(),
+            &job.spelled[..job.k],
+        );
+        // the scored candidates far below the best go (`RERANK_GAP`)
+        let total = |i: usize| f64::from(job.scores[i]) + lambda * result.logp[i];
+        let best = total(order[0]);
+        let order: Vec<usize> = order
+            .into_iter()
+            .filter(|&i| best - total(i) <= RERANK_GAP)
+            .collect();
         let reorder = |v: &[String]| -> Vec<String> {
             order
                 .iter()
@@ -2286,6 +2310,7 @@ impl EngineBridge {
             processed
         };
         let processed = crate::postprocess::drop_changed_digits(reading, processed);
+        let processed = crate::postprocess::drop_script_flips(processed);
         // The English words of a mixed reading stay as typed.
         let processed = if self.composing.is_mixed() {
             processed
@@ -3223,13 +3248,29 @@ impl EngineBridge {
 
 /// The order of candidates by `score + lambda * logp`, best first; a tie
 /// keeps the converter's order.
-fn rerank_order(scores: &[f32], logp: &[f64], lambda: f32) -> Vec<usize> {
+/// How far below the reranked best (the engine's score plus lambda times the
+/// LM's log-probability) a scored candidate may be and stay in the list
+/// (user 2026-10-23: candidates as clean as Microsoft IME's). Most of the
+/// model's near-misses (でルタ, eルタ and デル多 for でるた, 続頭 for ぞくとう)
+/// score far below: with sarashina2.2's SentencePiece scores at lambda 0.8,
+/// over the engine's top 20 of wiki_fresh_v2 and AJIMEE 20 keeps 49% / 57%
+/// of the candidates and every gold among them, 15 loses one.
+const RERANK_GAP: f64 = 20.0;
+
+/// The first candidates by the engine's score plus lambda times the LM's,
+/// those that spell the reading out above those that do not (the LM lifted
+/// おしま村 for おおしまむら over おおしま村; kept below, EM1 over the top 20
+/// of wiki_fresh_v2 79.21 -> 79.27, AJIMEE 81.0 -> 81.5).
+fn rerank_order(scores: &[f32], logp: &[f64], lambda: f32, spelled: &[bool]) -> Vec<usize> {
     let total = |i: usize| f64::from(scores[i]) + f64::from(lambda) * logp[i];
+    let first = |i: usize| spelled.get(i).copied().unwrap_or(true);
     let mut order: Vec<usize> = (0..scores.len().min(logp.len())).collect();
     order.sort_by(|&a, &b| {
-        total(b)
-            .partial_cmp(&total(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        first(b).cmp(&first(a)).then(
+            total(b)
+                .partial_cmp(&total(a))
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     order
 }
@@ -5220,10 +5261,18 @@ mod tests {
     fn rerank_order_adds_the_weighted_lm_score() {
         // 0: -1 - 0.5*30 = -16, 1: -2 - 0.5*20 = -12, 2: -3 - 0.5*18 = -12
         assert_eq!(
-            rerank_order(&[-1.0, -2.0, -3.0], &[-30.0, -20.0, -18.0], 0.5),
+            rerank_order(&[-1.0, -2.0, -3.0], &[-30.0, -20.0, -18.0], 0.5, &[true; 3]),
             [1, 2, 0]
         );
-        assert_eq!(rerank_order(&[-1.0, -2.0], &[-30.0, -20.0], 0.0), [0, 1]);
+        assert_eq!(
+            rerank_order(&[-1.0, -2.0], &[-30.0, -20.0], 0.0, &[true; 2]),
+            [0, 1]
+        );
+        // one that does not spell the reading stays below one that does
+        assert_eq!(
+            rerank_order(&[-1.0, -2.0], &[-30.0, -10.0], 0.5, &[true, false]),
+            [0, 1]
+        );
     }
 
     #[test]
@@ -5261,6 +5310,21 @@ mod tests {
                 text: "笠の".into()
             }]
         );
+    }
+
+    #[test]
+    fn a_candidate_the_reranker_scores_far_below_the_best_goes() {
+        let (mut bridge, mock, rr) = bridge_with_reranker();
+        type_str(&mut bridge, "kasano");
+        answer_scored(&mock, &["傘の", "傘ノ", "嵩の"], &[-1.0, -1.5, -4.0]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        // 傘ノ: -1.5 - 0.5*70 is 21 below -1.0 - 0.5*30; 嵩の is not scored
+        rr.answer(&[-30.0, -70.0]);
+        bridge.apply_async_result();
+        rr.answer(&[-30.0, -70.0, -35.0]);
+        let (list, _) = shown(&bridge.apply_async_result()).unwrap();
+        assert_eq!(list, v(&["傘の", "嵩の", "かさの", "カサノ"]));
     }
 
     #[test]
