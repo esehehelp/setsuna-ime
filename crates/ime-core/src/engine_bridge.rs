@@ -2939,8 +2939,13 @@ impl EngineBridge {
         // handles the shrink case by trimming the cached kanji tail,
         // which preserves visual continuity until the next async result
         // lands. We only drop the cache explicitly (in commit / escape /
-        // empty-composition paths) elsewhere.
-        if hira != self.cached_prefix_reading {
+        // empty-composition paths) elsewhere. Space may find the list in for
+        // a reading the preview does not show (a pending n read as ん): it
+        // takes that list, and its rerank goes on.
+        let listed = force
+            && hira == self.list_reading
+            && matches!(&self.phase, Phase::Composing { candidates } if !candidates.is_empty());
+        if hira != self.cached_prefix_reading && !listed {
             self.stop_rerank();
             if let Some(client) = &self.client {
                 let req_id = self.req_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4013,6 +4018,14 @@ mod tests {
         mock.set_result("きょうはん", &["共犯"]);
         bridge.apply_async_result();
         assert_eq!(commits(&bridge.handle_enter().actions), vec!["共犯"]);
+        // and Space shows it, not asking the engine again
+        type_str(&mut bridge, "kyouhan");
+        mock.set_result("きょうはん", &["共犯"]);
+        bridge.apply_async_result();
+        let sent = mock.dispatched_readings().len();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "共犯");
+        assert_eq!(mock.dispatched_readings().len(), sent);
     }
 
     #[test]
