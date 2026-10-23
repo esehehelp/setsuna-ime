@@ -4061,8 +4061,8 @@ mod tests {
 
     #[test]
     fn mixed_a_slip_shown_as_english_reads_again_when_deleted() {
-        // the shipped model reads dr as an acronym; deleting the r leaves
-        // the d typed, which reads as romaji again (frozen as DR, the
+        // the shipped model reads sp as an acronym; deleting the p leaves
+        // the s typed, which reads as romaji again (frozen as SP, the
         // capitals kept it English)
         let (mut bridge, _mock) = bridge_with_mock();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
@@ -4073,12 +4073,12 @@ mod tests {
             &crate::config::default_symbol_map(),
             crate::mixed::Casing::default(),
         );
-        type_str(&mut bridge, "sekainotodr");
-        assert_eq!(bridge.composing.preedit(), "せかいのとDR");
+        type_str(&mut bridge, "nanidemosp");
+        assert_eq!(bridge.composing.preedit(), "なにでもSP");
         bridge.handle_backspace();
-        assert_eq!(bridge.composing.preedit(), "せかいのとd");
-        type_str(&mut bridge, "e");
-        assert_eq!(bridge.composing.preedit(), "せかいのとで");
+        assert_eq!(bridge.composing.preedit(), "なにでもs");
+        type_str(&mut bridge, "u");
+        assert_eq!(bridge.composing.preedit(), "なにでもす");
     }
 
     #[test]

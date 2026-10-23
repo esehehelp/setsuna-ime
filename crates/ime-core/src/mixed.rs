@@ -82,6 +82,10 @@ pub struct MixedParams {
     /// What a sentence is preferred by over a word it overlaps, typed in
     /// lowercase (`dlsite`: dl + して over the name DLsite).
     pub sentence: f64,
+    /// An English word typed in lowercase that is no word or name the model
+    /// knows (nor the start of one, while it is typed): as often a slip of
+    /// romaji (`kagriare` for かげりあれ) as a new word.
+    pub oov: f64,
 }
 
 impl Default for MixedParams {
@@ -100,12 +104,13 @@ impl Default for MixedParams {
             case_break: 8.0,
             name: 1e-4,
             sentence: 1.0,
+            oov: 0.0,
         }
     }
 }
 
 impl MixedParams {
-    pub const NAMES: [&'static str; 13] = [
+    pub const NAMES: [&'static str; 14] = [
         "switch_in",
         "switch_out",
         "en_en",
@@ -119,6 +124,7 @@ impl MixedParams {
         "case_break",
         "name",
         "sentence",
+        "oov",
     ];
 
     pub fn field(&mut self, name: &str) -> Option<&mut f64> {
@@ -136,6 +142,7 @@ impl MixedParams {
             "case_break" => &mut self.case_break,
             "name" => &mut self.name,
             "sentence" => &mut self.sentence,
+            "oov" => &mut self.oov,
             _ => return None,
         })
     }
@@ -937,7 +944,12 @@ impl MixedModel {
             (self.known(&piece.lower).unwrap_or(0.0), piece.letters + end)
         };
         let prob = p.known * known + (1.0 - p.known) * (-letters).exp();
-        breaks - prob.max(f64::MIN_POSITIVE).ln()
+        let oov = if known == 0.0 && !piece.typed.chars().any(|c| c.is_ascii_uppercase()) {
+            p.oov
+        } else {
+            0.0
+        };
+        breaks + oov - prob.max(f64::MIN_POSITIVE).ln()
     }
 
     /// The frequency of the words starting with `prefix` (lowercase).
@@ -1847,6 +1859,22 @@ pub(crate) mod tests {
     fn romaji_spelling_an_english_word_stays_japanese() {
         let m = model();
         assert_eq!(shown(&m, "ashitamadenikite", None), "あしたまでにきて");
+    }
+
+    #[test]
+    fn an_unknown_word_typed_in_lowercase_costs_oov() {
+        // a slip of the fingers among romaji is no word the model knows
+        let mut m = model();
+        m.params.leftover = 10.0;
+        let typed = "kaigihasanjikarakwdsu";
+        assert_eq!(shown(&m, typed, None), "かいぎはさんじからkwdsu");
+        m.params.oov = 8.0;
+        assert_eq!(shown(&m, typed, None), "かいぎはさんじからkwdす");
+        // typed with Shift it is English still
+        assert_eq!(
+            shown(&m, "kaigihasanjikaraKwdsu", None),
+            "かいぎはさんじからKwdsu"
+        );
     }
 
     #[test]
