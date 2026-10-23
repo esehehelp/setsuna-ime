@@ -61,10 +61,11 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
   読みに無い記号を含む候補の除外。モデルは候補を 1 文字ずつ出すので、どの辞書にも
   無い候補（ぞくとう → 続頭、きょう → き今日）が混じる：かなの 1 文字だけ文字種が
   違う候補（決まッた）と、リランカの点が最良より大きく低い候補を外す。読みの辞書
-  （`[lexicon] file`。表記・読み・コストの表を `examples/lexicon.rs build` で変換し
-  たもの）があれば、候補を辞書の語・打ったかな・数字・記号の並びとして読んだ最小の
-  コストを点から引き（よく使われる語でできた表記ほど上がる）、最小よりずっと高い
-  候補を外す。
+  （`[lexicon] file`。表記・読み・コスト・品詞の文脈 ID の表と接続コストの表を
+  `examples/lexicon.rs build` で変換したもの）があれば、候補を辞書の語・打ったかな・
+  数字・記号の並びとして読んだ最小のコスト（語のつながりのコストを含む）を点から引き
+  （よく使われる語でできた表記ほど上がる）、最小よりずっと高い候補を外す。辞書だけで
+  変換した候補のうち、モデルのどの候補より安いものも候補に足す。
 - **候補の窓** — テーマ（自動は Windows のアプリのモードに合わせてライト・
   ダーク）、大きさ、文字の大きさと太さ、角の丸み、不透明度（`[ui.candidate_window]`、
   設定 GUI の「候補の窓」）。
@@ -225,6 +226,7 @@ curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/ins
 # fp32 版: ... | sudo bash -s -- --precision fp32
 # リランカの LM も入れる場合: ... | sudo bash -s -- --rerank-manifest <LM scorer manifest>
 # 英日混在入力の名前の辞書も入れる場合: ... | sudo bash -s -- --name-dictionary <names tsv>
+# 読みの辞書も入れる場合: ... | sudo bash -s -- --lexicon <file.lexicon>
 # アンインストール: sudo /usr/lib/setsuna-ime/uninstall.sh
 ```
 
@@ -237,8 +239,10 @@ curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/ins
 `config.toml` は要らない）に、設定 GUI は WebKitGTK 4.1 があれば
 `/usr/bin/setsuna-settings` に入る。`--rerank-manifest` の LM は
 `/usr/lib/setsuna-ime/models/rerank`、`--name-dictionary` の辞書は
-`/usr/lib/setsuna-ime/names/latin-names.tsv` に入り、`config.toml` が `[rerank] manifest` /
-`name_dictionary_file` を決めていなければそれを使う（次の更新でオプションを付けなくても残る）。
+`/usr/lib/setsuna-ime/names/latin-names.tsv`、`--lexicon` の読みの辞書は
+`/usr/lib/setsuna-ime/lexicon/words.lexicon` に入り、`config.toml` が `[rerank] manifest` /
+`name_dictionary_file` / `[lexicon] file` を決めていなければそれを使う（次の更新でオプションを
+付けなくても残る）。
 最後に sudo（または pkexec）した利用者の fcitx5 の入力メソッドに Setsuna を足し、fcitx5 を
 再起動して読み込ませる（KDE Plasma の Wayland では `fcitx5-wayland-launcher` も
 起動し直させる）。`--no-register` ならファイルを置くだけ。

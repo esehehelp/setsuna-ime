@@ -5382,7 +5382,7 @@ mod tests {
             "setsuna-bridge-lexicon-{}.lexicon",
             std::process::id()
         ));
-        std::fs::write(&path, crate::lexicon::Lexicon::build(table).unwrap()).unwrap();
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
         let (mut bridge, mock) = bridge_with_mock();
         bridge.set_lexicon(&crate::config::LexiconCfg {
             file: Some(path.to_string_lossy().into_owned()),
