@@ -578,11 +578,11 @@ impl ComposingText {
     /// any still-pending romaji, on each side of the cursor), keeping the
     /// cursor where it is on screen. After this, one `raw` char is one shown
     /// char. Pending romaji stays raw, so a trailing `n` or `k` still combines
-    /// with the next letter typed.
+    /// with the next letter typed; English stays as typed (`frozen`).
     fn freeze_to_preedit(&mut self) {
         let split = byte_pos_for_char(&self.raw, self.cursor);
-        let left = self.convert(&self.raw[..split], false);
-        let right = self.convert(&self.raw[split..], false);
+        let left = self.frozen(&self.raw[..split], false);
+        let right = self.frozen(&self.raw[split..], false);
         let mut raw = left.text;
         raw.push_str(&left.pending);
         self.cursor = raw.chars().count();
@@ -656,10 +656,10 @@ impl ComposingText {
     /// model sees a clean reading even if the user pressed Space before
     /// typing the final vowel.
     pub fn commit_reading(&mut self) -> String {
-        let converted = self.convert(&self.raw, true);
-        let reading = converted.text.clone();
-        self.raw = converted.text;
-        self.raw.push_str(&converted.pending);
+        let reading = self.convert(&self.raw, true).text;
+        let frozen = self.frozen(&self.raw, true);
+        self.raw = frozen.text;
+        self.raw.push_str(&frozen.pending);
         self.cursor = self.raw.chars().count();
         // typing is done for this conversion: a mixed input reads as it did
         // above (`how` English, not ほ + a pending w)
@@ -688,6 +688,24 @@ impl ComposingText {
         self.hiragana.clear();
         self.pending.clear();
         self.cursor = 0;
+    }
+
+    /// `raw` as an edit writes it back: as shown, but the letters of an
+    /// English span as typed, not as cased. A capital a name, an acronym or
+    /// an English sentence's start gave it reads as no romaji, so the span
+    /// would stay English when its letters are deleted down to romaji
+    /// (`konnichiwq`, shown as English, then the q deleted).
+    fn frozen(&self, raw: &str, flush_final_n: bool) -> Converted {
+        let Some(mixed) = &self.mixed else {
+            return convert_raw(raw, flush_final_n);
+        };
+        let (_, spans) = mixed
+            .model
+            .cased(raw, Some(&mixed.before), flush_final_n, mixed.casing);
+        let chars: Vec<char> = raw.chars().collect();
+        let (text, pending) =
+            crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
+        Converted { text, pending }
     }
 
     /// `raw` as shown: romaji as kana, or with a mixed model its spans.
