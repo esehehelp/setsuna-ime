@@ -45,6 +45,7 @@ pub struct Config {
     pub learning: LearningCfg,
     pub rerank: RerankCfg,
     pub ngram: NgramCfg,
+    pub lexicon: LexiconCfg,
     pub rewriter: RewriterCfg,
     /// Settings for one application each (`[[apps]]`), over the others.
     pub apps: Vec<AppCfg>,
@@ -59,6 +60,7 @@ impl Default for Config {
             learning: LearningCfg::default(),
             rerank: RerankCfg::default(),
             ngram: NgramCfg::default(),
+            lexicon: LexiconCfg::default(),
             rewriter: RewriterCfg::default(),
             apps: Vec::new(),
         }
@@ -652,6 +654,16 @@ pub struct NgramCfg {
     pub trigram_weight: f32,
 }
 
+/// `[lexicon]`: the reading lexicon (`lexicon`), which scores the engine's
+/// candidates by the words text uses and drops the near-misses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LexiconCfg {
+    /// The compiled lexicon (`LEXICON1`). Unset or empty: off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
 impl Default for NgramCfg {
     fn default() -> Self {
         // picked on the distributed model's wiki-fresh conversions
@@ -1011,6 +1023,12 @@ impl Config {
              # Weights of the bigram and trigram terms against the converter's score.\n\
              bigram_weight = {ngram_bigram:?}\n\
              trigram_weight = {ngram_trigram:?}\n\
+             \n\
+             [lexicon]\n\
+             # Reading lexicon: candidates are scored by the words text uses,\n\
+             # and the model's near-misses (続頭 for ぞくとう) dropped. Off while\n\
+             # no file is set.\n\
+             # file = \"C:/path/to/words.lexicon\"\n\
              \n\
              [rewriter]\n\
              # Rewriting: the conversion key also asks a model to rewrite the\n\

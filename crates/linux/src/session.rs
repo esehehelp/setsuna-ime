@@ -158,6 +158,7 @@ impl Session {
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
         bridge.set_learning(Learning::open(&cfg.learning));
         bridge.set_ngram(&cfg.ngram);
+        bridge.set_lexicon(&cfg.lexicon);
         bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         bridge.use_user_dictionary_file();
         bridge.open_predictor(&cfg.frontend);
@@ -191,6 +192,7 @@ impl Session {
         }
         self.bridge.set_learning(Learning::open(&cfg.learning));
         self.bridge.set_ngram(&cfg.ngram);
+        self.bridge.set_lexicon(&cfg.lexicon);
         self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
         self.bridge.use_user_dictionary_file();
         self.bridge.open_predictor(&cfg.frontend);
