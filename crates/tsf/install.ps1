@@ -8,6 +8,7 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Force      # overwrite even if same
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -RerankManifest <r>  # also the reranker
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NameDictionary <tsv>  # also mixed input's names
+#   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Lexicon <file>  # also the reading lexicon
 #
 # Without -Manifest, fetch-model.ps1 downloads the public artifact pinned in
 # models.json, verifies its size/SHA-256, and reuses verified cache files offline.
@@ -48,6 +49,7 @@
 #   %LOCALAPPDATA%\setsuna-ime\models\mixed\kana.tsv, latin.tsv, params.txt  (crates\ime-core\data\mixed,
 #                                  or -MixedModel <dir>)
 #   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
+#   %LOCALAPPDATA%\setsuna-ime\models\lexicon\<lexicon>  (with -Lexicon)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
@@ -75,6 +77,9 @@ param(
     [string]$MixedModel,
     # Latin names dictionary for mixed input ([frontend] name_dictionary_file).
     [string]$NameDictionary,
+    # The reading lexicon (LEXICON1, [lexicon] file): candidates scored by
+    # the words text uses, near-misses dropped.
+    [string]$Lexicon,
     [switch]$Force,
     [switch]$NoElevate
 )
@@ -324,7 +329,8 @@ function Update-ExistingConfig {
         [string]$RerankExePath,
         [string]$RewriteExePath,
         [string]$MixedModelPath,
-        [string]$NameDictionaryPath
+        [string]$NameDictionaryPath,
+        [string]$LexiconPath
     )
 
     $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -ErrorAction Stop)
@@ -354,6 +360,10 @@ function Update-ExistingConfig {
     if ($NameDictionaryPath) {
         $q = '"' + ($NameDictionaryPath.Replace('\','/').Replace('"','\"')) + '"'
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'frontend' -Key 'name_dictionary_file' -Value $q
+    }
+    if ($LexiconPath) {
+        $q = '"' + ($LexiconPath.Replace('\','/').Replace('"','\"')) + '"'
+        $lines = Set-OrAppendConfigValue -Lines $lines -Section 'lexicon' -Key 'file' -Value $q
     }
     # The rewriter is found next to the DLL; a locked one's fallback is named.
     if ($RewriteExePath -and ($RewriteExePath -ne (Join-Path $InstallDir $RewriteExe))) {
@@ -465,6 +475,13 @@ if ($NameDictionary) {
     }
     Write-Log INFO "using names dictionary: $NameDictionary"
 }
+if ($Lexicon) {
+    $Lexicon = Resolve-Path-Safe $Lexicon
+    if (-not (Test-Path -LiteralPath $Lexicon)) {
+        Write-Log ERROR "lexicon not found: $Lexicon"; exit 30
+    }
+    Write-Log INFO "using lexicon: $Lexicon"
+}
 
 # ---- elevate when regsvr32 needed ----
 if (-not (Test-IsAdmin) -and -not $NoElevate) {
@@ -477,6 +494,7 @@ if (-not (Test-IsAdmin) -and -not $NoElevate) {
     # always: "" (none) would be the default again
     $argv += @('-MixedModel', ("`"$MixedModel`""))
     if ($NameDictionary) { $argv += @('-NameDictionary', ("`"$NameDictionary`"")) }
+    if ($Lexicon) { $argv += @('-Lexicon', ("`"$Lexicon`"")) }
     if ($Force) { $argv += '-Force' }
     try {
         $p = Start-Process $PsExe -ArgumentList $argv -Verb RunAs -Wait -PassThru
@@ -623,6 +641,7 @@ if ($RerankItem) {
 # Mixed input: read when the IME activates, so a file in use is not locked.
 $MixedInstalled = $null
 $NamesInstalled = $null
+$LexiconInstalled = $null
 try {
     if ($MixedModel) {
         $MixedInstalled = Join-Path $InstallDir 'models\mixed'
@@ -639,6 +658,12 @@ try {
         New-Item -ItemType Directory -Force -Path $NamesDir | Out-Null
         $NamesInstalled = Join-Path $NamesDir (Split-Path -Leaf $NameDictionary)
         Copy-InstallFile -Source $NameDictionary -Destination $NamesInstalled | Out-Null
+    }
+    if ($Lexicon) {
+        $LexiconDir = Join-Path $InstallDir 'models\lexicon'
+        New-Item -ItemType Directory -Force -Path $LexiconDir | Out-Null
+        # mapped by every app the IME runs in: a new one beside it when locked
+        $LexiconInstalled = Copy-InstallFile -Source $Lexicon -Destination (Join-Path $LexiconDir (Split-Path -Leaf $Lexicon)) -AllowLockedFallback
     }
 } catch {
     Write-Log ERROR "copy failed (mixed input): $_"; exit 50
@@ -696,8 +721,8 @@ shift_8 = "（"
 shift_9 = "）"
 "@
     Write-Utf8Lines -Path $ConfigPath -Lines ($DefaultConfig -split "`r?`n")
-    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled) {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled
+    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled -or $LexiconInstalled) {
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
@@ -706,7 +731,7 @@ shift_9 = "）"
         Write-Log WARN "NoElevate with fallback DLL: config preserved because registered DLL was not updated"
     } else {
         try {
-            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled
+            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled
             Write-Log INFO "updated engine config: $ConfigPath"
         } catch {
             Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"

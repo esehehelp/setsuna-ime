@@ -288,6 +288,8 @@ pub struct EngineBridge {
     /// The character n-gram table and its bigram and trigram weights
     /// (`[ngram]`); `None` when off.
     ngram: Option<(Arc<crate::char_ngram::CharNgram>, f32, f32)>,
+    /// The reading lexicon (`[lexicon]`): off without a file.
+    lexicon: Option<Arc<crate::lexicon::Lexicon>>,
     /// The reranker; `None` when reranking is off.
     reranker: Option<Box<dyn RerankClient>>,
     rerank_cfg: crate::config::RerankCfg,
@@ -396,6 +398,7 @@ impl EngineBridge {
             live_conversion: frontend.live_conversion.unwrap_or(true),
             form: None,
             ngram: None,
+            lexicon: None,
             reranker: None,
             rerank_cfg: crate::config::RerankCfg::default(),
             rerank: None,
@@ -713,14 +716,25 @@ impl EngineBridge {
             .map(|t| (t, cfg.bigram_weight, cfg.trigram_weight));
     }
 
+    /// Score the engine's candidates by the reading lexicon as `[lexicon]`
+    /// says (off without a file, or when it does not open).
+    pub fn set_lexicon(&mut self, cfg: &crate::config::LexiconCfg) {
+        self.lexicon = cfg
+            .file
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(crate::lexicon::shared);
+    }
+
     /// The engine's candidates that spell the reading out first, by their
     /// scores with the character n-gram terms added (`[ngram]`: those sums
-    /// become their scores, which the LM reranker then adds to), then those
-    /// that do not, in the engine's order and scored no higher than the
-    /// others. A candidate that does not has lost a char or put a kana out
-    /// of place (ゼロプラモデル for ぜろせんぷらもでる): never the gold over
-    /// wiki_fresh_v2 and AJIMEE, and one the n-gram would favour, with fewer
-    /// pairs to lose points on.
+    /// become their scores, which the LM reranker then adds to) and their
+    /// lexicon costs taken off (`[lexicon]`, which also drops those far
+    /// above the cheapest), then those that do not, in the engine's order
+    /// and scored no higher than the others. A candidate that does not has
+    /// lost a char or put a kana out of place (ゼロプラモデル for
+    /// ぜろせんぷらもでる): never the gold over wiki_fresh_v2 and AJIMEE,
+    /// and one the n-gram would favour, with fewer pairs to lose points on.
     fn order_engine_result(&self, result: &mut EngineResult) {
         use unicode_normalization::UnicodeNormalization;
         let n = result.candidates.len();
@@ -734,7 +748,7 @@ impl EngineBridge {
             std::mem::swap(&mut order, &mut rest);
         }
         let scored = result.scores.len() == n;
-        if rest.is_empty() && !(scored && self.ngram.is_some()) {
+        if rest.is_empty() && !(scored && (self.ngram.is_some() || self.lexicon.is_some())) {
             return;
         }
         let mut scores = result.scores.clone();
@@ -749,6 +763,29 @@ impl EngineBridge {
                 scores[i] = total[k];
             }
             order = by.iter().map(|&k| order[k]).collect();
+        }
+        if let (Some(lex), true) = (&self.lexicon, scored) {
+            let r: String = reading.iter().collect();
+            let costs: Vec<Option<f32>> = result
+                .candidates
+                .iter()
+                .map(|c| lex.cost(&c.nfkc().collect::<String>(), &r))
+                .collect();
+            let best = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
+            if best.is_finite() {
+                let worst = best + crate::lexicon::MARGIN;
+                // the engine's top stays whatever it costs
+                let keep = |i: &usize| *i == 0 || costs[*i].is_some_and(|c| c <= worst);
+                order.retain(keep);
+                rest.retain(keep);
+                if order.is_empty() {
+                    std::mem::swap(&mut order, &mut rest);
+                }
+                for (i, c) in costs.iter().enumerate() {
+                    scores[i] -= crate::lexicon::WEIGHT * c.unwrap_or(worst);
+                }
+                order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            }
         }
         if scored {
             let floor = order
@@ -5310,6 +5347,37 @@ mod tests {
                 text: "笠の".into()
             }]
         );
+    }
+
+    #[test]
+    fn the_lexicon_scores_the_candidates_and_drops_the_near_misses() {
+        let table = "続投\tぞくとう\t15.0\tnoun\n続\tぞく\t13.3\tpref\n頭\tとう\t11.0\tnoun\n\
+                     続騰\tぞくとう\t17.0\tnoun\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-lexicon-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table).unwrap()).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "zokutou");
+        // the engine liked 続頭 and a kanji no word reads (続当) best
+        answer_scored(
+            &mock,
+            &["続頭", "続当", "続投", "続騰"],
+            &[-0.5, -0.6, -1.0, -1.5],
+        );
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        // 続投 15.0 and 続騰 17.0 by words, 続頭 24.3 by a prefix and a noun:
+        // 続投 first; 続当 (30 for 当) is more than MARGIN above 15.0 and goes,
+        // 続頭 stays as the engine's top was
+        assert_eq!(list[0], "続投");
+        assert!(!list.contains(&"続当".to_string()), "{list:?}");
+        assert!(list.contains(&"続頭".to_string()), "{list:?}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

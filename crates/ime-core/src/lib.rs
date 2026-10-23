@@ -20,6 +20,7 @@ pub mod engine_client;
 pub mod hidden;
 pub mod kana_candidates;
 pub mod learning;
+pub mod lexicon;
 pub mod mixed;
 pub mod numbers;
 pub mod postprocess;
