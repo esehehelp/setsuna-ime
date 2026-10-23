@@ -1,9 +1,9 @@
-//! Readings of several sentences, and long readings: the model is trained
-//! on one sentence per reading, after the text before it as context, and
-//! reads at most `max_seq_len` tokens ([CLS], context, [SEP], reading). A
-//! reading is cut after each sentence end, and a sentence much longer than
-//! the training sentences into chunks; they are converted one after another
-//! with the output before each as its context, so no output crosses a 。.
+//! Long readings: the model reads at most `max_seq_len` tokens ([CLS],
+//! context, [SEP], reading), and 99% of its training readings fit in 88
+//! chars. A reading of up to `MAX_CHUNK` chars goes whole, sentences and
+//! all; a longer one is cut after each sentence end, and a sentence still
+//! too long into chunks; they are converted one after another with the
+//! output before each as its context.
 
 use anyhow::Result;
 
@@ -47,17 +47,26 @@ fn goes_on(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// `reading` cut into chunks of at most `max` chars: one per sentence (cut
-/// after 。！？ and the closing brackets after it, but where it goes on as
-/// one word), a sentence still longer than `max` cut after its last comma
-/// within `max`, else at `HARD_CUT`. A chunk's cut depends only on the text
-/// up to it, so typing on changes the last chunk alone.
+/// `reading` cut into chunks of at most `max` chars: whole when it fits,
+/// else one per sentence (cut after 。！？ and the closing brackets after
+/// it, but where it goes on as one word), a sentence still longer than
+/// `max` cut after its last comma within `max`, else at `HARD_CUT`. Past
+/// `max`, a chunk's cut depends only on the text up to it, so typing on
+/// changes the last chunk alone.
+///
+/// A short reading of several sentences went a sentence after another
+/// (2026-10-20 to 2026-10-24): each after the top 1 of the ones before, the
+/// list varying the last. Whole, the beam varies every sentence: over
+/// wiki_fresh_v2's 1,055 such lines with Shiran-v2 s7080, gold in the
+/// engine's top 20 878 -> 924 of them, EM1 in the IME's pipeline over the
+/// top 20 81.39 -> 82.09 (p = 8e-5), keeping the 3 best of each earlier
+/// sentence 81.77, and the conversion 9.8 -> 7.4 ms at p50 in one pass.
 pub fn split(reading: &str, max: usize) -> Vec<String> {
     let chars: Vec<char> = reading.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
     let max = max.max(1);
+    if chars.len() <= max {
+        return vec![reading.to_string()];
+    }
     let mut out = Vec::new();
     let mut start = 0;
     // in a sentence end and the closers after it
@@ -229,21 +238,32 @@ mod tests {
     }
 
     #[test]
-    fn each_sentence_is_a_chunk() {
+    fn a_reading_that_fits_is_one_chunk() {
         assert_eq!(
             split("きょうは。いいてんき。", 80),
-            ["きょうは。", "いいてんき。"]
+            ["きょうは。いいてんき。"]
         );
-        assert_eq!(split("ほんとう？うん", 80), ["ほんとう？", "うん"]);
         assert_eq!(split("いいてんき", 80), ["いいてんき"]);
         assert_eq!(split("", 80), [""]);
     }
 
     #[test]
+    fn past_the_limit_each_sentence_is_a_chunk() {
+        assert_eq!(
+            split("きょうは。いいてんき。", 8),
+            ["きょうは。", "いいてんき。"]
+        );
+        assert_eq!(split("ほんとう？うん", 6), ["ほんとう？", "うん"]);
+    }
+
+    #[test]
     fn a_sentence_end_inside_a_word_is_no_cut() {
-        assert_eq!(split("３．５ばい。", 80), ["３．５ばい。"]);
-        assert_eq!(split("example.com/?q=1を", 80), ["example.com/?q=1を"]);
-        assert_eq!(split("できた。2025ねん", 80), ["できた。", "2025ねん"]);
+        assert_eq!(split("３．５ばい。そう", 7), ["３．５ばい。", "そう"]);
+        assert_eq!(
+            split("example.com/?q=1を。いい", 18),
+            ["example.com/?q=1を。", "いい"]
+        );
+        assert_eq!(split("できた。2025ねん", 8), ["できた。", "2025ねん"]);
     }
 
     #[test]

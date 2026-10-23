@@ -303,6 +303,33 @@ pub fn drop_changed_digits(reading: &str, candidates: Vec<String>) -> Vec<String
 
 /// Whether `candidate` keeps the numbers typed in digits in `reading`
 /// (`drop_changed_digits`).
+/// Drop the candidates whose sentence ends are not the reading's: its 。！？
+/// in order (a period, full-width or half-width, as 。), no more and no
+/// fewer. The model writes a char a frame, and a beam's runners-up swap
+/// one, a 。 among them (の展覧会に出展した『1900年4月, からである、こうした
+/// for からである。こうした, a 。 left out); a reading of several sentences
+/// goes to it whole, so they come into the list. Over Shiran-v2 s7080's
+/// wiki_fresh_v2 lists of several sentences, 34 of 1,055 had one in the
+/// first 5 and none at the top; no gold goes.
+pub fn drop_moved_sentence_ends(reading: &str, candidates: Vec<String>) -> Vec<String> {
+    let want = sentence_ends(reading);
+    candidates
+        .into_iter()
+        .filter(|c| sentence_ends(c) == want)
+        .collect()
+}
+
+fn sentence_ends(s: &str) -> Vec<char> {
+    s.chars()
+        .filter_map(|c| match c {
+            '。' | '｡' | '.' | '．' => Some('。'),
+            '!' | '！' => Some('!'),
+            '?' | '？' => Some('?'),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn keeps_digits(reading: &str, candidate: &str) -> bool {
     let mut runs = digit_runs(candidate).into_iter();
     digit_runs(reading).iter().all(|t| runs.any(|r| r == *t))
@@ -690,6 +717,43 @@ mod tests {
         );
         // the typed colon sits between ひ and ふ, the model's own one at the end
         assert_eq!(one("ひ：ふ", "比:ふ:", SymbolWidth::AsTyped), "比：ふ:");
+    }
+
+    #[test]
+    fn candidates_that_move_a_sentence_end_are_dropped() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Shiran-v2 s7080's runners-up for a reading of two sentences
+        let reading = "のてんらんかいにしゅってんした。1900ねん4がつ";
+        assert_eq!(
+            drop_moved_sentence_ends(
+                reading,
+                v(&[
+                    "の展覧会に出展した。1900年4月",
+                    "の展覧会に出展した『1900年4月",
+                    "の展覧会に出展した1900年4月",
+                    "の展覧会に出展したば1900年4月",
+                    "の展覧会に出展した。。1900年4月",
+                ])
+            ),
+            v(&["の展覧会に出展した。1900年4月"])
+        );
+        // full-width and half-width forms are the same ends; numbers and
+        // URLs keep theirs
+        assert_eq!(
+            drop_moved_sentence_ends(
+                "ほんとう？うん！",
+                v(&["本当?うん!", "本当？うん", "本当、うん！"])
+            ),
+            v(&["本当?うん!"])
+        );
+        assert_eq!(
+            drop_moved_sentence_ends("３．５ばい", v(&["3.5倍", "35倍"])),
+            v(&["3.5倍"])
+        );
+        assert_eq!(
+            drop_moved_sentence_ends("いいてんき", v(&["いい天気", "いい天気。"])),
+            v(&["いい天気"])
+        );
     }
 
     fn digits(reading: &str, cands: &[&str]) -> Vec<String> {

@@ -2372,6 +2372,7 @@ impl EngineBridge {
             processed
         };
         let processed = crate::postprocess::drop_changed_digits(reading, processed);
+        let processed = crate::postprocess::drop_moved_sentence_ends(reading, processed);
         let processed = crate::postprocess::drop_script_flips(processed);
         // The English words of a mixed reading stay as typed.
         let processed = if self.composing.is_mixed() {
