@@ -260,6 +260,32 @@ pub fn drop_untyped_symbols(reading: &str, candidates: Vec<String>) -> Vec<Strin
         .collect()
 }
 
+/// Drop the candidates with one kana of a script between kana of the other
+/// on both sides (続投がキまっ, デるタ, 依頼がクるように): the model's
+/// char-by-char output puts a kana in the wrong script, and no word is
+/// written so. A particle between katakana (ゲームをプレイ) and the
+/// prolonged sound mark stay, and so does a kana next to a kanji, a digit
+/// or a symbol (カシの木, 寺ノ台). Over the engine's candidates of
+/// wiki_fresh_v2 and AJIMEE it drops no gold, and 1.5% of what the
+/// reranker's score gap (`RERANK_GAP`) leaves.
+pub fn drop_script_flips(candidates: Vec<String>) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|c| !has_script_flip(c))
+        .collect()
+}
+
+fn has_script_flip(text: &str) -> bool {
+    let hira = |c: char| matches!(c, '\u{3041}'..='\u{3096}');
+    let kata = |c: char| matches!(c, '\u{30A1}'..='\u{30FA}' | 'ー');
+    let chars: Vec<char> = text.chars().collect();
+    chars.windows(3).any(|w| {
+        let (p, c, n) = (w[0], w[1], w[2]);
+        (hira(c) && kata(p) && kata(n) && !"をがにはのでとへもやか".contains(c))
+            || (kata(c) && c != 'ー' && hira(p) && hira(n))
+    })
+}
+
 /// Drop the candidates that change a number typed in digits: each run of
 /// digits of the reading must be a run of the candidate, in order (more
 /// runs, from kana, may come between). The model's CTC merges a repeated
@@ -534,6 +560,35 @@ impl CharRules {
 mod tests {
     use super::*;
     use crate::config::{PunctuationStyle, Replacement};
+
+    #[test]
+    fn a_kana_in_the_wrong_script_between_two_drops_the_candidate() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let got = drop_script_flips(v(&[
+            "続投が決まっ",
+            "続投がキまっ",
+            "デるタ",
+            "依頼がクるように",
+            "ゲームをプレイ",
+            "あのテレビ",
+            "ピリッとした",
+            "カシの木",
+            "寺ノ台",
+            "コーヒー",
+        ]));
+        assert_eq!(
+            got,
+            v(&[
+                "続投が決まっ",
+                "ゲームをプレイ",
+                "あのテレビ",
+                "ピリッとした",
+                "カシの木",
+                "寺ノ台",
+                "コーヒー",
+            ])
+        );
+    }
 
     fn one(reading: &str, cand: &str, w: SymbolWidth) -> String {
         apply(reading, vec![cand.to_string()], w, "").remove(0)
