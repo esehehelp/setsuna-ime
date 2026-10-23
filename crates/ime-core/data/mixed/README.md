@@ -16,7 +16,8 @@ this directory; the Windows installer copies it to
   that identifies something (a run of five digits or more, twelve hex digits
   or more, more than 30 chars: ad ids, hashes, dated file names) and slurs.
 - `params.txt` — the segmenter's weights (`MixedParams`), tuned on held-apart
-  mixed sentences.
+  mixed sentences and on Japanese ones typed with a slip of the fingers (which
+  should not read as English).
 
 ## Sources
 

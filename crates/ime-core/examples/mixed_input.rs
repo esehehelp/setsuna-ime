@@ -7,10 +7,12 @@
 //! mixed_input run --cases <cases.jsonl> --out <predictions.jsonl>
 //!                 [--model <dir> [--names <latin-names.tsv>] [--param name=value]... [--bridge]]
 //!                 [--name-case acronyms|proper|off] [--no-sentence-case]
-//! mixed_input tune --cases <dev cases.jsonl> --model <dir> [--names <tsv>] [--fix name]... [--write]
+//! mixed_input tune --cases <dev cases.jsonl> --model <dir> [--names <tsv>] [--fix name]...
+//!                  [--typos <typo cases.jsonl> --typo-weight 1] [--write]
 //! mixed_input live --cases <cases.jsonl> --model <dir> [--names <tsv>] [--show 20]
 //! mixed_input trace <typed> [--before <text>] [--no-mixed | --model <dir>]
 //! mixed_input score --cases <cases.jsonl> --predictions <predictions.jsonl> [--show 20]
+//! mixed_input typos --cases <cases.jsonl> --out <typo cases.jsonl> [--seed 1]
 //! ```
 //!
 //! `prepare` writes the hand-made cases of `bench/mixed_input.tsv` and, with
@@ -33,8 +35,9 @@
 //! fused ones, `multi-*-mixed*`) less ten times the error rate on
 //! `corpus-ja` and `multi-ja` (Japanese turned English is worse than
 //! English left as kana); `--fix` keeps a parameter as it is (`known`:
-//! new names are rarer in the dev cases than in typing); `--write` saves
-//! them as the model's `params.txt`.
+//! new names are rarer in the dev cases than in typing); with `--typos`
+//! less `--typo-weight` times the error rate on those `typo-ja` cases (a
+//! slip read as English); `--write` saves them as the model's `params.txt`.
 //! `live` checks what typing shows: for each case whose expected text has
 //! no Latin letter, whether some preedit on the way showed letters other
 //! than the romaji still being typed (`。ko` while typing これ).
@@ -46,6 +49,10 @@
 //! new names.
 //! With both, `multi-*` cases type two sentences in one composition: two
 //! Japanese ones, and a Japanese one and a mixed one either way round.
+//! `typos` types each Japanese case (`corpus-ja`, `multi-ja`) again with one
+//! slip of the fingers among its letters (a neighbouring key instead, one
+//! more, a letter left out, two swapped) as a `typo-ja` case, which should
+//! still read as Japanese, the slip left in the kana.
 //! `score` compares any system's `{"id", "actual"}` lines with the cases,
 //! per category: with the case (a lowercase case's `cased`, its English as
 //! written, as a names dictionary would give it) and ignoring it (where the
@@ -180,7 +187,11 @@ fn main() -> Result<()> {
             write_jsonl(&need("--out")?, &predictions)?;
         }
         Some("tune") => {
-            let cases: Vec<Case> = read_jsonl(&need("--cases")?)?;
+            let mut cases: Vec<Case> = read_jsonl(&need("--cases")?)?;
+            if let Some(path) = flag("--typos") {
+                cases.extend(read_jsonl::<Case>(&path)?);
+            }
+            let typo_weight = flag("--typo-weight").map_or(Ok(1.0), |s| s.parse())?;
             let dir = need("--model")?;
             let mut model = load_model(&dir, &args)?;
             let fixed: Vec<&str> = args
@@ -189,7 +200,7 @@ fn main() -> Result<()> {
                 .filter(|(_, a)| *a == "--fix")
                 .filter_map(|(i, _)| args.get(i + 1).map(String::as_str))
                 .collect();
-            tune(&mut model, &cases, &fixed);
+            tune(&mut model, &cases, &fixed, typo_weight);
             print!("{}", model.params.to_text());
             if args.iter().any(|a| a == "--write") {
                 std::fs::write(
@@ -246,9 +257,118 @@ fn main() -> Result<()> {
             let show = flag("--show").map_or(Ok(20), |s| s.parse())?;
             score(&cases, &predictions, show);
         }
+        Some("typos") => {
+            let cases: Vec<Case> = read_jsonl(&need("--cases")?)?;
+            let seed = flag("--seed").map_or(Ok(1), |s| s.parse())?;
+            let typos = typo_cases(&cases, seed);
+            write_jsonl(&need("--out")?, &typos)?;
+            eprintln!("{} cases", typos.len());
+        }
         _ => bail!("usage: mixed_input prepare|run|score (see the source)"),
     }
     Ok(())
+}
+
+/// The keys next to each letter on a QWERTY keyboard.
+fn neighbours(c: char) -> &'static str {
+    match c {
+        'q' => "wa",
+        'w' => "qeas",
+        'e' => "wrsd",
+        'r' => "etdf",
+        't' => "ryfg",
+        'y' => "tugh",
+        'u' => "yihj",
+        'i' => "uojk",
+        'o' => "ipkl",
+        'p' => "ol",
+        'a' => "qwsz",
+        's' => "weadzx",
+        'd' => "erfsxc",
+        'f' => "rtdgcv",
+        'g' => "tyfhvb",
+        'h' => "yugjbn",
+        'j' => "uihknm",
+        'k' => "iojlm",
+        'l' => "opk",
+        'z' => "asx",
+        'x' => "zsdc",
+        'c' => "xdfv",
+        'v' => "cfgb",
+        'b' => "vghn",
+        'n' => "bhjm",
+        'm' => "njk",
+        _ => "",
+    }
+}
+
+/// `typo-ja` cases from the Japanese cases (see the module docs).
+fn typo_cases(cases: &[Case], seed: u64) -> Vec<Case> {
+    let mut state = seed.max(1);
+    let mut next = move |n: usize| {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let mut out = Vec::new();
+    for case in cases
+        .iter()
+        .filter(|c| matches!(c.cat.as_str(), "corpus-ja" | "multi-ja"))
+    {
+        let mut chars: Vec<char> = case.typed.chars().collect();
+        let letters: Vec<usize> = (0..chars.len())
+            .filter(|&i| chars[i].is_ascii_lowercase())
+            .collect();
+        if letters.len() < 2 {
+            continue;
+        }
+        let at = letters[next(letters.len())];
+        let near = |c: char, k: usize| neighbours(c).chars().nth(k);
+        match next(4) {
+            0 => {
+                let n = neighbours(chars[at]);
+                chars[at] = near(chars[at], next(n.len())).unwrap_or(chars[at]);
+            }
+            1 => {
+                let n = neighbours(chars[at]);
+                let c = near(chars[at], next(n.len())).unwrap_or(chars[at]);
+                chars.insert(at + 1, c);
+            }
+            2 => {
+                chars.remove(at);
+            }
+            _ if at + 1 < chars.len() && chars[at + 1].is_ascii_lowercase() => {
+                chars.swap(at, at + 1);
+            }
+            _ => {
+                chars.remove(at);
+            }
+        }
+        let typed: String = chars.iter().collect();
+        if typed == case.typed {
+            continue;
+        }
+        let expected = mixed::render(
+            &typed,
+            &[mixed::Span {
+                lang: mixed::Lang::Ja,
+                start: 0,
+                end: chars.len(),
+            }],
+            true,
+        );
+        out.push(Case {
+            id: format!("typo-{}", case.id),
+            cat: "typo-ja".to_string(),
+            typed,
+            expected,
+            before: case.before.clone(),
+            cased: None,
+        });
+    }
+    out
 }
 
 fn hand_made() -> Result<Vec<Case>> {
@@ -816,7 +936,7 @@ fn load_model(dir: &str, args: &[String]) -> Result<MixedModel> {
 }
 
 /// The tuning objective of `model` on `cases` (see the module docs).
-fn objective(model: &MixedModel, cases: &[Case]) -> f64 {
+fn objective(model: &MixedModel, cases: &[Case], typo_weight: f64) -> f64 {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let chunk = cases.len().div_ceil(threads).max(1);
     let mut by_cat: HashMap<String, (usize, usize)> = HashMap::new();
@@ -860,13 +980,14 @@ fn objective(model: &MixedModel, cases: &[Case]) -> f64 {
     let japanese = ["corpus-ja", "multi-ja"];
     mixed.iter().map(|c| acc(c)).sum::<f64>() / mixed.len() as f64
         - 10.0 * japanese.iter().map(|c| 1.0 - acc(c)).sum::<f64>()
+        - typo_weight * (1.0 - acc("typo-ja"))
 }
 
 /// Coordinate search: each parameter scaled up and down in turn, a change
 /// kept when it raises the objective; the step halves when a round keeps
 /// none.
-fn tune(model: &mut MixedModel, cases: &[Case], fixed: &[&str]) {
-    let mut best = objective(model, cases);
+fn tune(model: &mut MixedModel, cases: &[Case], fixed: &[&str], typo_weight: f64) {
+    let mut best = objective(model, cases, typo_weight);
     eprintln!("start {best:.4}");
     let mut step = 0.4;
     for round in 0..8 {
@@ -885,7 +1006,7 @@ fn tune(model: &mut MixedModel, cases: &[Case], fixed: &[&str]) {
                     old * (1.0 + step).powf(dir)
                 };
                 *model.params.field(name).expect("known name") = new;
-                let score = objective(model, cases);
+                let score = objective(model, cases, typo_weight);
                 if score > best + 1e-9 {
                     eprintln!("round {round}: {name} {old:.4} -> {new:.4}: {score:.4}");
                     best = score;
