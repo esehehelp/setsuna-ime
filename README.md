@@ -289,7 +289,10 @@ cargo run --release -p setsuna-settings
   special token id、`decode_defaults`（beam 幅、記号の扱いなど）を持つ。
   公開モデル Aster-v1.2-small には int8 版（約 29 MB）と fp32 版（約 107 MB）がある。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
-  `score_defaults` を持つ。
+  `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の
+  `tokenizer.model`）を持つ。書いてあればリランカはそれで区切る（sarashina2.2 は
+  Unigram のモデルで、llama.cpp は GGUF の語彙を別の方式として読み、日本語の
+  区切りが変わる）。書いていなければ GGUF の語彙で区切る。
 
 例は `tests/fixtures/` にある（中身は空の placeholder）。
 

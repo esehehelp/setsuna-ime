@@ -3,13 +3,15 @@
 //! (`score = converter + lambda * lm`).
 //!
 //! The model loads only through an LM scorer manifest
-//! (`setsuna_artifact::LmScorerManifest`); its tokenizer is the one in the
-//! weights file. A candidate is scored as `[BOS] + tokens(context +
-//! candidate)` from where the candidates part from `[BOS] +
-//! tokens(context)`, summing its tokens' log-probabilities.
+//! (`setsuna_artifact::LmScorerManifest`); its tokenizer is the manifest's
+//! SentencePiece model when it names one, else the one in the weights file.
+//! A candidate is scored as `[BOS] + tokens(context + candidate)` from where
+//! the candidates part from `[BOS] + tokens(context)`, summing its tokens'
+//! log-probabilities.
 //!
 //!   - trie: the candidates as one token trie
 //!   - scorer: the trie decoded with llama.cpp, the cache kept across requests
+//!   - spm: a SentencePiece Unigram tokenizer (the LM's own segmentation)
 //!   - protocol: the JSONL requests and responses of `daemon` and `serve`
 //!   - server: `serve`, one reranker for every app of a login over a named
 //!     pipe (Windows)
@@ -18,6 +20,7 @@ pub mod protocol;
 pub mod scorer;
 #[cfg(windows)]
 pub mod server;
+pub mod spm;
 pub mod trie;
 
 use std::path::Path;
@@ -60,6 +63,8 @@ pub struct Reranker {
     scorer: Option<scorer::TreeScorer>,
     n_ubatch: u32,
     bos: i32,
+    /// the manifest's SentencePiece tokenizer, else llama.cpp's vocabulary
+    spm: Option<spm::SentencePiece>,
     pub config: RerankConfig,
 }
 
@@ -111,6 +116,10 @@ impl Reranker {
         // the daemon keeps one model for its whole life
         let model: &'static LlamaModel = Box::leak(Box::new(model));
         let bos = manifest.special_ids.bos as i32;
+        let spm = match &manifest.tokenizer_path {
+            Some(p) => Some(spm::SentencePiece::load(p)?),
+            None => None,
+        };
         let n_ubatch = options.n_ubatch.unwrap_or(scorer::N_UBATCH);
         let scorer = scorer::TreeScorer::new(model, backend, config.threads, n_ubatch)?;
         Ok(Self {
@@ -119,6 +128,7 @@ impl Reranker {
             scorer: Some(scorer),
             n_ubatch,
             bos,
+            spm,
             config,
         })
     }
@@ -138,13 +148,16 @@ impl Reranker {
     /// `[BOS] + tokens(text)`, no other special token added or parsed.
     pub fn tokens(&self, text: &str) -> Vec<i32> {
         let mut ids = vec![self.bos];
-        ids.extend(
-            self.model
-                .vocab()
-                .tokenize(text.as_bytes(), false, false)
-                .into_iter()
-                .map(|t| t.0),
-        );
+        match &self.spm {
+            Some(sp) => ids.extend(sp.encode(text).into_iter().map(|t| t as i32)),
+            None => ids.extend(
+                self.model
+                    .vocab()
+                    .tokenize(text.as_bytes(), false, false)
+                    .into_iter()
+                    .map(|t| t.0),
+            ),
+        }
         ids
     }
 

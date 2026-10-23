@@ -206,6 +206,17 @@ pub struct WeightsArtifact {
     pub precision: String,
 }
 
+/// The LM's own tokenizer, when the weights file's vocabulary would segment
+/// otherwise (a Unigram model, which llama.cpp reads as a
+/// score-merge vocabulary).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LmTokenizerArtifact {
+    pub path: PathBuf,
+    /// `sentencepiece` (a Unigram `tokenizer.model`) is the only one.
+    pub format: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LmSpecialIds {
@@ -238,11 +249,13 @@ struct LmScorerManifestFile {
     special_ids: LmSpecialIds,
     #[serde(default)]
     score_defaults: ScoreDefaults,
+    #[serde(default)]
+    tokenizer: Option<LmTokenizerArtifact>,
 }
 
 /// A causal LM that scores conversion candidates (the reranker), its
-/// weights path resolved against the manifest's directory and checked to
-/// exist. Its tokenizer is the one in the weights file.
+/// weights (and tokenizer) path resolved against the manifest's directory
+/// and checked to exist. Without a tokenizer, the one in the weights file.
 #[derive(Debug, Clone)]
 pub struct LmScorerManifest {
     pub manifest_path: PathBuf,
@@ -251,6 +264,8 @@ pub struct LmScorerManifest {
     pub precision: String,
     pub special_ids: LmSpecialIds,
     pub score_defaults: ScoreDefaults,
+    /// a SentencePiece `tokenizer.model`
+    pub tokenizer_path: Option<PathBuf>,
 }
 
 impl LmScorerManifest {
@@ -285,6 +300,25 @@ impl LmScorerManifest {
             path.display(),
             weights_path.display()
         );
+        let tokenizer_path = match &file.tokenizer {
+            Some(t) => {
+                anyhow::ensure!(
+                    t.format == "sentencepiece",
+                    "manifest {}: unknown tokenizer format {:?}",
+                    path.display(),
+                    t.format
+                );
+                let p = base.join(&t.path);
+                anyhow::ensure!(
+                    p.is_file(),
+                    "manifest {}: tokenizer {} not found",
+                    path.display(),
+                    p.display()
+                );
+                Some(p)
+            }
+            None => None,
+        };
         Ok(Self {
             manifest_path: path.to_path_buf(),
             weights_path,
@@ -292,6 +326,7 @@ impl LmScorerManifest {
             precision: file.weights.precision,
             special_ids: file.special_ids,
             score_defaults: file.score_defaults,
+            tokenizer_path,
         })
     }
 }
@@ -440,6 +475,35 @@ mod tests {
         );
         let m = LmScorerManifest::load(&ok).unwrap();
         assert_eq!(m.score_defaults, ScoreDefaults::default());
+        assert_eq!(m.tokenizer_path, None);
+        // the LM's own SentencePiece tokenizer, beside the weights
+        write(&dir, "tokenizer.model", "");
+        let w = r#"{"path":"w.gguf","format":"gguf","precision":"f16"}"#;
+        let sp = write(
+            &dir,
+            "sp.json",
+            &body(
+                w,
+                r#","tokenizer":{"path":"tokenizer.model","format":"sentencepiece"}"#,
+            ),
+        );
+        assert_eq!(
+            LmScorerManifest::load(&sp).unwrap().tokenizer_path,
+            Some(dir.join("tokenizer.model"))
+        );
+        for (name, extra) in [
+            (
+                "tok-absent.json",
+                r#","tokenizer":{"path":"x.model","format":"sentencepiece"}"#,
+            ),
+            (
+                "tok-format.json",
+                r#","tokenizer":{"path":"tokenizer.model","format":"hf"}"#,
+            ),
+        ] {
+            let m = write(&dir, name, &body(w, extra));
+            assert!(LmScorerManifest::load(&m).is_err(), "{name}");
+        }
         for (name, weights, extra) in [
             (
                 "onnx.json",

@@ -12,8 +12,8 @@
 # Options:
 #   --precision int8|fp32   the model (default int8)
 #   --archive <file>        a local release archive instead of the download
-#   --rerank-manifest <m>   also the reranker's LM (an LM scorer manifest and
-#                           the weights it names): candidates are reranked
+#   --rerank-manifest <m>   also the reranker's LM (an LM scorer manifest, the
+#                           weights and tokenizer it names): candidates are reranked
 #   --name-dictionary <tsv> also mixed input's Latin names dictionary
 #   --no-register           install only; leave fcitx5 as it is
 #   --root <dir>            install under <dir> (staging, tests): no root
@@ -27,7 +27,7 @@
 #   /usr/lib/setsuna-ime/  the engine, reranker and rewriter daemons, libonnxruntime.so,
 #                          llama.cpp's libraries, mixed/, models/onnx/, licenses/,
 #                          uninstall.sh, installed-files
-#   /usr/lib/setsuna-ime/models/rerank/<manifest> + its weights  (with --rerank-manifest)
+#   /usr/lib/setsuna-ime/models/rerank/<manifest> + its weights (and tokenizer)  (with --rerank-manifest)
 #   /usr/lib/setsuna-ime/names/latin-names.tsv  (with --name-dictionary)
 # These are the addon's defaults where config.toml sets nothing.
 #   /usr/bin/setsuna-settings  (when WebKitGTK 4.1 is there)
@@ -101,25 +101,32 @@ for d in /usr/lib/fcitx5 /usr/lib64/fcitx5 /usr/lib/*/fcitx5; do
 done
 [[ -n $addon_dir ]] || fail 10 "fcitx5 not found: install fcitx5 first"
 
-# The reranker's LM: its manifest and the weights file it names, relative
-# to it (copied to the same relative path, so the manifest resolves).
-rerank_weights=
+# The reranker's LM: its manifest, the weights file it names and the LM's own
+# tokenizer when it names one, relative to it (copied to the same relative
+# paths, so the manifest resolves).
+rerank_files=()
 if [[ -n $rerank_manifest ]]; then
     [[ -f $rerank_manifest ]] || fail 30 "rerank manifest not found: $rerank_manifest"
-    if command -v jq >/dev/null; then
-        rerank_weights=$(jq -r '.weights.path // empty' "$rerank_manifest") ||
-            fail 30 "rerank manifest is not JSON: $rerank_manifest"
-    else
-        # weights.path is the manifest's only "path"
-        paths=$(grep -o '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$rerank_manifest" | sed 's/.*"\([^"]*\)"$/\1/')
-        [[ $(grep -c . <<<"$paths") == 1 ]] || fail 30 "cannot read the weights path without jq: $rerank_manifest"
-        rerank_weights=$paths
-    fi
-    if [[ -z $rerank_weights || $rerank_weights == /* || $rerank_weights =~ (^|/)\.\.(/|$) ]]; then
-        fail 30 "rerank manifest weights path leaves the artifact directory: $rerank_weights"
-    fi
-    [[ -f $(dirname "$rerank_manifest")/$rerank_weights ]] ||
-        fail 30 "rerank weights not found: $(dirname "$rerank_manifest")/$rerank_weights"
+    for key in weights tokenizer; do
+        if command -v jq >/dev/null; then
+            f=$(jq -r ".$key.path // empty" "$rerank_manifest") ||
+                fail 30 "rerank manifest is not JSON: $rerank_manifest"
+        else
+            # the "path" inside the key's object (neither object nests another)
+            f=$(tr -d '\n' <"$rerank_manifest" |
+                sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*{[^}]*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+        if [[ -z $f ]]; then
+            [[ $key == tokenizer ]] && continue
+            fail 30 "cannot read the weights path: $rerank_manifest"
+        fi
+        if [[ $f == /* || $f =~ (^|/)\.\.(/|$) ]]; then
+            fail 30 "rerank manifest $key path leaves the artifact directory: $f"
+        fi
+        [[ -f $(dirname "$rerank_manifest")/$f ]] ||
+            fail 30 "rerank $key not found: $(dirname "$rerank_manifest")/$f"
+        rerank_files+=("$f")
+    done
 fi
 if [[ -n $name_dictionary && ! -f $name_dictionary ]]; then
     fail 30 "names dictionary not found: $name_dictionary"
@@ -237,7 +244,9 @@ if [[ -n $rerank_manifest ]]; then
     # one LM: the reranker reads the only manifest there
     rm -f -- "$root$module"/models/rerank/*manifest.json
     put "$rerank_manifest" "$module/models/rerank/$(basename "$rerank_manifest")" 644
-    put "$(dirname "$rerank_manifest")/$rerank_weights" "$module/models/rerank/$rerank_weights" 644
+    for f in "${rerank_files[@]}"; do
+        put "$(dirname "$rerank_manifest")/$f" "$module/models/rerank/$f" 644
+    done
 fi
 if [[ -n $name_dictionary ]]; then
     put "$name_dictionary" "$module/names/latin-names.tsv" 644

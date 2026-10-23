@@ -427,12 +427,16 @@ if ($RerankManifest) {
     }
     $RerankItem = Get-Item -LiteralPath $RerankManifest
     $RerankJson = Get-Content -LiteralPath $RerankManifest -Raw | ConvertFrom-Json
-    $RerankWeights = $RerankJson.weights.path
-    if ([IO.Path]::IsPathRooted($RerankWeights) -or $RerankWeights -match '(^|[\\/])\.\.([\\/]|$)') {
-        Write-Log ERROR "rerank manifest path $RerankWeights leaves the artifact directory"; exit 30
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $RerankItem.Directory.FullName $RerankWeights))) {
-        Write-Log ERROR "rerank weights not found: $RerankWeights"; exit 30
+    # the weights, and the LM's own tokenizer when the manifest names one
+    $RerankFiles = @($RerankJson.weights.path)
+    if ($RerankJson.tokenizer) { $RerankFiles += $RerankJson.tokenizer.path }
+    foreach ($f in $RerankFiles) {
+        if ([IO.Path]::IsPathRooted($f) -or $f -match '(^|[\\/])\.\.([\\/]|$)') {
+            Write-Log ERROR "rerank manifest path $f leaves the artifact directory"; exit 30
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $RerankItem.Directory.FullName $f))) {
+            Write-Log ERROR "rerank file not found: $f"; exit 30
+        }
     }
     $RerankSrc = Join-Path $SourceDir $RerankExe
     if (-not (Test-Path -LiteralPath $RerankSrc)) {
@@ -604,9 +608,11 @@ if ($RerankItem) {
     $RerankManifestInstalled = Join-Path $RerankModelDir $RerankItem.Name
     try {
         Copy-InstallFile -Source $RerankItem.FullName -Destination $RerankManifestInstalled | Out-Null
-        $dst = Join-Path $RerankModelDir $RerankWeights
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
-        Copy-InstallFile -Source (Join-Path $RerankItem.Directory.FullName $RerankWeights) -Destination $dst | Out-Null
+        foreach ($f in $RerankFiles) {
+            $dst = Join-Path $RerankModelDir $f
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+            Copy-InstallFile -Source (Join-Path $RerankItem.Directory.FullName $f) -Destination $dst | Out-Null
+        }
     } catch {
         Write-Log ERROR "copy failed (rerank model): $_"; exit 50
     }
