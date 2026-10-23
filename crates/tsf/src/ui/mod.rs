@@ -51,10 +51,11 @@ pub trait CandidateUi {
     /// clears it.
     fn set_status(&mut self, _status: &str) {}
 
-    /// Show predictions while typing: no candidate highlighted, Tab picks.
+    /// Show suggestions while typing (live conversion off: the conversions
+    /// of the kana shown): no candidate highlighted.
     fn show_suggestions(&mut self, _list: &[String], _anchor: ScreenPos) {}
 
-    /// Whether what is shown is predictions (`show_suggestions`).
+    /// Whether what is shown is suggestions (`show_suggestions`).
     fn is_suggesting(&self) -> bool {
         false
     }
