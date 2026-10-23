@@ -429,9 +429,10 @@ if ($RerankManifest) {
     $RerankItem = Get-Item -LiteralPath $RerankManifest
     $RerankJson = Get-Content -LiteralPath $RerankManifest -Raw | ConvertFrom-Json
     # the weights, and the LM's own tokenizer when the manifest names one
-    $RerankFiles = @($RerankJson.weights.path)
-    if ($RerankJson.tokenizer) { $RerankFiles += $RerankJson.tokenizer.path }
-    foreach ($f in $RerankFiles) {
+    # (not $RerankFiles: the reranker's exe and DLLs further down)
+    $RerankModelFiles = @($RerankJson.weights.path)
+    if ($RerankJson.tokenizer) { $RerankModelFiles += $RerankJson.tokenizer.path }
+    foreach ($f in $RerankModelFiles) {
         if ([IO.Path]::IsPathRooted($f) -or $f -match '(^|[\\/])\.\.([\\/]|$)') {
             Write-Log ERROR "rerank manifest path $f leaves the artifact directory"; exit 30
         }
@@ -609,7 +610,7 @@ if ($RerankItem) {
     $RerankManifestInstalled = Join-Path $RerankModelDir $RerankItem.Name
     try {
         Copy-InstallFile -Source $RerankItem.FullName -Destination $RerankManifestInstalled | Out-Null
-        foreach ($f in $RerankFiles) {
+        foreach ($f in $RerankModelFiles) {
             $dst = Join-Path $RerankModelDir $f
             New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
             Copy-InstallFile -Source (Join-Path $RerankItem.Directory.FullName $f) -Destination $dst | Out-Null
