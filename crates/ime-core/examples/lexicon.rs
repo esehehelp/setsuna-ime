@@ -4,11 +4,13 @@
 //! ```text
 //! lexicon build <table.tsv> <out.lexicon>
 //! lexicon cost <file.lexicon> <reading> <surface>...
+//! lexicon convert <file.lexicon> <reading>...
 //! ```
 //!
 //! `build` compiles `surface<TAB>reading<TAB>cost<TAB>class` lines into the
 //! mapped file the IME reads; `cost` prints each surface's cheapest reading
-//! as the reading, and the lexicon's entries for it.
+//! as the reading, and the lexicon's entries for it; `convert` the
+//! lexicon's own conversions of each reading.
 
 use anyhow::{bail, Context, Result};
 use setsuna_core::lexicon::{Lexicon, CLASSES};
@@ -42,6 +44,16 @@ fn main() -> Result<()> {
                     .map(|e| format!("{} {:.2} {}", e.reading, e.cost, CLASSES[e.class as usize]))
                     .collect();
                 println!("{surface}: {cost:?} ({us} µs) {entries:?}");
+            }
+        }
+        Some("convert") if args.len() >= 3 => {
+            let lex = Lexicon::open(std::path::Path::new(&args[1]))?;
+            for reading in &args[2..] {
+                let t = std::time::Instant::now();
+                let out = lex.convert(reading, 10);
+                let us = t.elapsed().as_micros();
+                let shown: Vec<String> = out.iter().map(|(s, c)| format!("{s} {c:.1}")).collect();
+                println!("{reading} ({us} µs): {shown:?}");
             }
         }
         _ => bail!("usage: lexicon build <table.tsv> <out> | lexicon cost <lexicon> <reading> <surface>..."),
