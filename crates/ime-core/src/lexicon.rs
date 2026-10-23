@@ -9,13 +9,20 @@
 //! The source is a text table, `surface<TAB>reading<TAB>cost<TAB>class`
 //! (more columns ignored; cost in nats, the reading in hiragana), which
 //! `build` compiles into the file the IME maps (`LEXICON1`), little-endian:
-//! a 64-byte header (magic, version u32 = 1, keys u32, entries u32,
+//! a 64-byte header (magic, version u32 = 2, keys u32, entries u32,
 //! key_bytes u32, reading_bytes u32) and then, each padded to 8 bytes:
 //! key_off u32[keys + 1] and key_blob u8[key_bytes] (the surfaces, UTF-8,
 //! ascending by bytes), key_first u32[keys + 1] (each surface's entries),
 //! entry u64[entries] (reading offset 32 bits, reading length 8, class 8,
-//! cost in centinats 16) and reading_blob u8[reading_bytes]. The file is
-//! mapped, not read, so the processes the IME runs in share one copy.
+//! cost in centinats 16), reading_blob u8[reading_bytes] and by_reading
+//! u32[entries] (the entries by reading, ascending by bytes, then by cost).
+//! The file is mapped, not read, so the processes the IME runs in share one
+//! copy.
+//!
+//! `convert` goes the other way, as a dictionary IME does: the cheapest
+//! sequences of the lexicon's words (and kana as typed) that read as a
+//! reading, for the conversions the model does not find (大島村 for
+//! おおしまむら, where it gave おおしま村).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,11 +39,28 @@ pub const WEIGHT: f32 = 0.4;
 /// dropped, the engine's top kept: 59% / 54% of the candidates of
 /// wiki_fresh_v2 / AJIMEE go, and none of their golds.
 pub const MARGIN: f32 = 20.0;
+/// The lexicon's own conversions (`convert`) tried for the engine's list:
+/// a conversion `ADDED_UNDER` cheaper than every candidate of the engine is
+/// added, scored `ADDED_BELOW` under its top, for the lexicon's cost and
+/// the reranker to place. Picked on wiki_fresh_v2 (Shiran-v2 s14000, the
+/// reranker at lambda 0.8 over the top 20): golds in the list 4339 -> 4417,
+/// EM1 79.95 -> 81.05, by the engine's score and the lexicon 76.81 -> 76.83;
+/// AJIMEE 183 -> 185, 83.0 -> 84.5, 75.5 -> 74.5. Adding every conversion
+/// found more golds (4529) and put the unigram lexicon's own misses in the
+/// list (紙に各 for かみにかく beside 紙に書く).
+pub const CONVERSIONS: usize = 10;
+pub const ADDED_UNDER: f32 = 3.0;
+pub const ADDED_BELOW: f32 = 8.0;
 
 const MAGIC: &[u8; 8] = b"LEXICON1";
+const VERSION: usize = 2;
 const HEADER: usize = 64;
-/// The longest surface looked up, in chars.
+/// The longest surface (and reading) looked up, in chars.
 const MAX_KEY_CHARS: usize = 24;
+/// The surfaces of one reading `convert` tries, the cheapest.
+const PER_READING: usize = 8;
+/// The paths `convert` keeps at each reading position.
+const BEAM: usize = 8;
 
 /// A kana spelled as typed with no word of the lexicon over it.
 pub const KANA_COST: f32 = 9.0;
@@ -75,8 +99,9 @@ pub struct Lexicon {
     bytes: Bytes,
     keys: usize,
     entries: usize,
-    /// Byte offsets of key_off, key_blob, key_first, entry, reading_blob.
-    at: [usize; 5],
+    /// Byte offsets of key_off, key_blob, key_first, entry, reading_blob,
+    /// by_reading.
+    at: [usize; 6],
 }
 
 /// The coarse parts of speech of the table's class column, by index.
@@ -105,7 +130,11 @@ impl Lexicon {
             "not a lexicon"
         );
         let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
-        ensure!(u32_at(8) == 1, "lexicon version {}", u32_at(8));
+        ensure!(
+            u32_at(8) == VERSION,
+            "lexicon version {} (this IME reads {VERSION})",
+            u32_at(8)
+        );
         let (keys, entries, key_bytes, reading_bytes) =
             (u32_at(12), u32_at(16), u32_at(20), u32_at(24));
         let sizes = [
@@ -114,8 +143,9 @@ impl Lexicon {
             4 * (keys + 1),
             8 * entries,
             reading_bytes,
+            4 * entries,
         ];
-        let mut at = [0usize; 5];
+        let mut at = [0usize; 6];
         let mut o = HEADER;
         for (k, s) in sizes.iter().enumerate() {
             at[k] = o;
@@ -161,6 +191,28 @@ impl Lexicon {
         }
     }
 
+    fn reading_of(&self, i: usize) -> &[u8] {
+        let o = self.at[3] + 8 * i;
+        let v = u64::from_le_bytes(self.bytes[o..o + 8].try_into().unwrap());
+        let (off, len) = ((v >> 32) as usize, ((v >> 24) & 0xFF) as usize);
+        &self.bytes[self.at[4] + off..self.at[4] + off + len]
+    }
+
+    /// The surface entry `i` is of.
+    fn surface_of(&self, i: usize) -> &str {
+        // the last key whose first entry is not after `i`
+        let (mut lo, mut hi) = (0, self.keys);
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if self.u32_in(2, mid) <= i {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        std::str::from_utf8(self.key(lo)).unwrap_or("")
+    }
+
     /// The first key in `lo..hi` not below `probe`.
     fn lower_bound(&self, mut lo: usize, mut hi: usize, probe: &[u8]) -> usize {
         while lo < hi {
@@ -194,6 +246,103 @@ impl Lexicon {
                 }
             }
         }
+    }
+
+    /// Every reading of the lexicon that `text` starts with, as its length
+    /// in bytes and the surfaces read so with their entries, shortest first,
+    /// each reading's cheapest first.
+    pub fn reading_prefixes<'a>(
+        &'a self,
+        text: &str,
+        mut f: impl FnMut(usize, &'a str, Entry<'a>),
+    ) {
+        let at = |k: usize| self.u32_in(5, k);
+        let lower = |mut lo: usize, mut hi: usize, probe: &[u8]| {
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if self.reading_of(at(mid)) < probe {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        let (mut lo, mut hi) = (0, self.entries);
+        for (n, (i, c)) in text.char_indices().enumerate() {
+            if n == MAX_KEY_CHARS || lo == hi {
+                break;
+            }
+            let prefix = &text.as_bytes()[..i + c.len_utf8()];
+            lo = lower(lo, hi, prefix);
+            let mut upper = prefix.to_vec();
+            *upper.last_mut().unwrap() += 1;
+            hi = lower(lo, hi, &upper);
+            let mut k = lo;
+            while k < hi && self.reading_of(at(k)) == prefix {
+                let e = at(k);
+                f(prefix.len(), self.surface_of(e), self.entry(e));
+                k += 1;
+            }
+        }
+    }
+
+    /// Up to `n` conversions of `reading` (hiragana, as typed) by the
+    /// lexicon alone, cheapest first, with their costs: sequences of its
+    /// words (each reading's `PER_READING` cheapest), kana as typed
+    /// (`KANA_COST`) and digits, letters and symbols as typed (`TYPED_COST`),
+    /// `BEAM` paths kept at each reading position.
+    pub fn convert(&self, reading: &str, n: usize) -> Vec<(String, f32)> {
+        let r: Vec<(usize, char)> = reading.char_indices().collect();
+        let m = r.len();
+        let byte = |j: usize| r.get(j).map_or(reading.len(), |&(b, _)| b);
+        // paths ending at each reading position: (cost, surface)
+        let mut paths: Vec<Vec<(f32, String)>> = vec![Vec::new(); m + 1];
+        paths[0].push((0.0, String::new()));
+        for j in 0..m {
+            if paths[j].is_empty() {
+                continue;
+            }
+            paths[j].sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut seen = std::collections::HashSet::new();
+            paths[j].retain(|p| seen.insert(p.1.clone()));
+            paths[j].truncate(BEAM);
+            let mut steps: Vec<(usize, String, f32)> = Vec::new();
+            let mut per: (usize, usize) = (usize::MAX, 0);
+            self.reading_prefixes(&reading[byte(j)..], |len, surface, e| {
+                // each reading's cheapest few
+                per = if per.0 == len {
+                    (len, per.1 + 1)
+                } else {
+                    (len, 1)
+                };
+                if per.1 <= PER_READING {
+                    let chars = reading[byte(j)..byte(j) + len].chars().count();
+                    steps.push((j + chars, surface.to_string(), e.cost));
+                }
+            });
+            let c = r[j].1;
+            let typed = if is_kana(c) { KANA_COST } else { TYPED_COST };
+            steps.push((j + 1, c.to_string(), typed));
+            let here = std::mem::take(&mut paths[j]);
+            for (cost, surface) in &here {
+                for (to, piece, c) in &steps {
+                    paths[*to].push((cost + c, format!("{surface}{piece}")));
+                }
+            }
+        }
+        let mut done = std::mem::take(&mut paths[m]);
+        done.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out: Vec<(String, f32)> = Vec::new();
+        for (cost, surface) in done {
+            if out.len() == n {
+                break;
+            }
+            if !out.iter().any(|(s, _)| *s == surface) {
+                out.push((surface, cost));
+            }
+        }
+        out
     }
 
     /// The entries of `surface`.
@@ -320,7 +469,19 @@ impl Lexicon {
         let keys = key_off.len() - 1;
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        for v in [1, keys, rows.len(), key_blob.len(), reading_blob.len()] {
+        // the entries by reading, then cost
+        let mut by_reading: Vec<u32> = (0..rows.len() as u32).collect();
+        by_reading.sort_by(|&a, &b| {
+            let (a, b) = (&rows[a as usize], &rows[b as usize]);
+            a.1.as_bytes().cmp(b.1.as_bytes()).then(a.2.cmp(&b.2))
+        });
+        for v in [
+            VERSION,
+            keys,
+            rows.len(),
+            key_blob.len(),
+            reading_blob.len(),
+        ] {
             out.extend_from_slice(&(v as u32).to_le_bytes());
         }
         out.resize(HEADER, 0);
@@ -342,6 +503,10 @@ impl Lexicon {
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<_>>());
         put(&reading_blob);
+        put(&by_reading
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>());
         Ok(out)
     }
 
@@ -423,6 +588,30 @@ mod tests {
         assert!(extra >= KANA_COST + UNKNOWN_COST, "{extra}");
         // a kana out of place spells nothing
         assert_eq!(lex.cost("続投を", "ぞくとうが"), None);
+    }
+
+    #[test]
+    fn a_reading_converts_to_the_cheapest_words() {
+        let table = format!(
+            "{TABLE}大島\tおおしま\t12.0\tpropn\n村\tむら\t10.0\tnoun\n大島村\tおおしまむら\t18.3\tpropn\n\
+             大\tおお\t14.0\tpref\n島\tしま\t11.0\tnoun\n"
+        );
+        let lex = Lexicon::from_table(&table);
+        let mut got = Vec::new();
+        lex.reading_prefixes("おおしまむら", |len, s, e| {
+            got.push((len, s.to_string(), e.cost))
+        });
+        assert_eq!(got[0], (6, "大".to_string(), 14.0));
+        assert!(got.iter().any(|(_, s, _)| s == "大島村"));
+        let out = lex.convert("おおしまむら", 3);
+        assert_eq!(out[0].0, "大島村");
+        assert!((out[0].1 - 18.3).abs() < 1e-4);
+        // 大島 + 村 is the same surface again, not repeated
+        assert_eq!(out[1].0, "大島むら");
+        // kana the lexicon has no word for come as typed
+        let out = lex.convert("ぞくとうがきまった", 1);
+        assert_eq!(out[0].0, "続投が決まった");
+        assert_eq!(lex.convert("ん", 2)[0].0, "ん");
     }
 
     #[test]

@@ -737,7 +737,7 @@ impl EngineBridge {
     /// and one the n-gram would favour, with fewer pairs to lose points on.
     fn order_engine_result(&self, result: &mut EngineResult) {
         use unicode_normalization::UnicodeNormalization;
-        let n = result.candidates.len();
+        let mut n = result.candidates.len();
         if n < 2 {
             return;
         }
@@ -766,11 +766,36 @@ impl EngineBridge {
         }
         if let (Some(lex), true) = (&self.lexicon, scored) {
             let r: String = reading.iter().collect();
-            let costs: Vec<Option<f32>> = result
+            let mut costs: Vec<Option<f32>> = result
                 .candidates
                 .iter()
                 .map(|c| lex.cost(&c.nfkc().collect::<String>(), &r))
                 .collect();
+            // the lexicon's own conversions the engine missed (大島村 for
+            // おおしまむら, where it gave おおしま村), those `ADDED_UNDER`
+            // cheaper than every candidate of the engine, scored
+            // `ADDED_BELOW` under its top: the lexicon's cost and the
+            // reranker place them
+            let top = result.scores[0];
+            let cheapest = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
+            for (surface, cost) in lex.convert(&r, crate::lexicon::CONVERSIONS) {
+                if cost > cheapest - crate::lexicon::ADDED_UNDER
+                    || result
+                        .candidates
+                        .iter()
+                        .any(|c| c.nfkc().eq(surface.chars()))
+                {
+                    continue;
+                }
+                order.push(result.candidates.len());
+                result.candidates.push(surface);
+                scores.push(top - crate::lexicon::ADDED_BELOW);
+                costs.push(Some(cost));
+                if result.reading_pos.len() == n {
+                    result.reading_pos.push(Vec::new());
+                }
+                n += 1;
+            }
             let best = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
             if best.is_finite() {
                 let worst = best + crate::lexicon::MARGIN;
