@@ -296,7 +296,8 @@ unsafe fn with_outer(s: *mut SetsunaSession, f: impl FnOnce(&mut SetsunaSession)
 /// `config.toml` over what the addon's install supplies, each where
 /// config.toml sets nothing (the Windows installer writes them into it): the
 /// mixed input model (`<module_dir>/mixed`), the Latin names dictionary
-/// (`<module_dir>/names/latin-names.tsv`) and the reranker's model (the one
+/// (`<module_dir>/names/latin-names.tsv`), the reading lexicon
+/// (`<module_dir>/lexicon/words.lexicon`) and the reranker's model (the one
 /// `*manifest.json` of `<module_dir>/models/rerank`). Every (re)load goes
 /// through here, so a reload on activation or focus keeps them.
 fn load_config(module_dir: Option<&Path>) -> Config {
@@ -315,6 +316,10 @@ fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
     if cfg.frontend.name_dictionary_file.is_none() {
         let names = dir.join("names").join("latin-names.tsv");
         cfg.frontend.name_dictionary_file = names.is_file().then(|| path(names));
+    }
+    if cfg.lexicon.file.is_none() {
+        let lexicon = dir.join("lexicon").join("words.lexicon");
+        cfg.lexicon.file = lexicon.is_file().then(|| path(lexicon));
     }
     if cfg.rerank.manifest.is_none() {
         cfg.rerank.manifest = the_manifest_in(&dir.join("models").join("rerank"));
@@ -565,12 +570,14 @@ mod tests {
     }
 
     #[test]
-    fn an_installed_names_dictionary_and_rerank_model_are_defaults() {
+    fn an_installed_names_dictionary_lexicon_and_rerank_model_are_defaults() {
         let dir = std::env::temp_dir().join(format!("setsuna-ffi-rr-{}", std::process::id()));
         let rerank = dir.join("models/rerank");
         std::fs::create_dir_all(&rerank).unwrap();
         std::fs::create_dir_all(dir.join("names")).unwrap();
+        std::fs::create_dir_all(dir.join("lexicon")).unwrap();
         std::fs::write(dir.join("names/latin-names.tsv"), "GitHub\t1\n").unwrap();
+        std::fs::write(dir.join("lexicon/words.lexicon"), "LEXICON1").unwrap();
         std::fs::write(rerank.join("lm.manifest.json"), "{}").unwrap();
         let cfg = with_module_defaults(Config::default(), Some(&dir));
         let names = dir
@@ -579,6 +586,11 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(cfg.frontend.name_dictionary_file, Some(names));
+        let lexicon = dir.join("lexicon").join("words.lexicon");
+        assert_eq!(
+            cfg.lexicon.file,
+            Some(lexicon.to_string_lossy().into_owned())
+        );
         assert_eq!(cfg.rerank.manifest, Some(rerank.join("lm.manifest.json")));
         // config.toml's own wins
         let mut own = Config::default();

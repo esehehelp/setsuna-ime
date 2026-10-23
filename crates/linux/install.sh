@@ -15,11 +15,13 @@
 #   --rerank-manifest <m>   also the reranker's LM (an LM scorer manifest, the
 #                           weights and tokenizer it names): candidates are reranked
 #   --name-dictionary <tsv> also mixed input's Latin names dictionary
+#   --lexicon <file>        also the reading lexicon (a compiled .lexicon):
+#                           candidates are scored by the words text uses
 #   --no-register           install only; leave fcitx5 as it is
 #   --root <dir>            install under <dir> (staging, tests): no root
 #                           needed, implies --no-register
-# A reranker model or names dictionary installed before stays when the
-# option is not given again.
+# A reranker model, names dictionary or lexicon installed before stays when
+# the option is not given again.
 #
 # Layout:
 #   <fcitx5 addon dir>/setsuna.so
@@ -29,6 +31,7 @@
 #                          uninstall.sh, installed-files
 #   /usr/lib/setsuna-ime/models/rerank/<manifest> + its weights (and tokenizer)  (with --rerank-manifest)
 #   /usr/lib/setsuna-ime/names/latin-names.tsv  (with --name-dictionary)
+#   /usr/lib/setsuna-ime/lexicon/words.lexicon  (with --lexicon)
 # These are the addon's defaults where config.toml sets nothing.
 #   /usr/bin/setsuna-settings  (when WebKitGTK 4.1 is there)
 #   /var/cache/setsuna-ime/models  (verified model downloads, reused offline)
@@ -54,6 +57,7 @@ register=1
 root=
 rerank_manifest=
 name_dictionary=
+lexicon=
 
 log() { echo "setsuna-install: $*" >&2; }
 fail() {
@@ -69,6 +73,7 @@ while (($#)); do
         --archive) archive=${2:?}; shift 2 ;;
         --rerank-manifest) rerank_manifest=${2:?}; shift 2 ;;
         --name-dictionary) name_dictionary=${2:?}; shift 2 ;;
+        --lexicon) lexicon=${2:?}; shift 2 ;;
         --no-register) register=0; shift ;;
         --root) root=${2:?}; register=0; shift 2 ;;
         -h | --help) sed -n '1d; /^#/!q; s/^# \{0,1\}//p' "$0"; exit 0 ;;
@@ -130,6 +135,10 @@ if [[ -n $rerank_manifest ]]; then
 fi
 if [[ -n $name_dictionary && ! -f $name_dictionary ]]; then
     fail 30 "names dictionary not found: $name_dictionary"
+fi
+if [[ -n $lexicon ]]; then
+    [[ -f $lexicon ]] || fail 30 "lexicon not found: $lexicon"
+    [[ $(head -c 8 -- "$lexicon") == LEXICON1 ]] || fail 30 "not a compiled lexicon: $lexicon"
 fi
 
 work=$(mktemp -d)
@@ -251,14 +260,19 @@ fi
 if [[ -n $name_dictionary ]]; then
     put "$name_dictionary" "$module/names/latin-names.tsv" 644
 fi
+if [[ -n $lexicon ]]; then
+    # renamed over the old one, which a running fcitx5 keeps mapped
+    put "$lexicon" "$module/lexicon/words.lexicon" 644
+fi
 # Files of the previous install that this one no longer has (another model);
-# its reranker model and names dictionary stay unless replaced.
+# its reranker model, names dictionary and lexicon stay unless replaced.
 if [[ -f $root$module/installed-files ]]; then
     while IFS= read -r f; do
         [[ $f == /* && ! -d $root$f ]] || continue
         printf '%s\n' "${installed[@]}" | grep -qxF -- "$f" && continue
         if [[ ($f == "$module"/models/rerank/* && -z $rerank_manifest) ||
-            ($f == "$module"/names/* && -z $name_dictionary) ]] && [[ -f $root$f ]]; then
+            ($f == "$module"/names/* && -z $name_dictionary) ||
+            ($f == "$module"/lexicon/* && -z $lexicon) ]] && [[ -f $root$f ]]; then
             installed+=("$f")
             continue
         fi
