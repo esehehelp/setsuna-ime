@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::mixed::{Lang, MixedModel};
+use crate::mixed::{Lang, MixedModel, Span};
 
 const ROMAJI_TABLE: &[(&str, &str)] = &[
     // four-letter — explicit small-tsu spellings (`ltsu` / `xtsu`). Without
@@ -420,9 +420,24 @@ impl ComposingText {
 
     /// The whole input read as romaji, English or not, with a pending `n`
     /// as ん (what F6–F8 convert, and the other reading of a mixed one).
+    /// With mixed input, whose typed symbols are in the input as ASCII, the
+    /// symbols as the Japanese spans show them: a `.` is 。, so a reading of
+    /// Japanese only is the mixed reading itself (with the `.` left in, it
+    /// was another reading, and its candidates, 今日はいい天気ですね.どこかに
+    /// 行きませんか, came into the list after the first three).
     pub fn kana_reading(&self) -> String {
-        let converted = convert_raw(&self.raw, true);
-        converted.text + &converted.pending
+        let Some(mixed) = &self.mixed else {
+            let converted = convert_raw(&self.raw, true);
+            return converted.text + &converted.pending;
+        };
+        let chars: Vec<char> = self.raw.chars().collect();
+        let all = [Span {
+            lang: Lang::Ja,
+            start: 0,
+            end: chars.len(),
+        }];
+        let (text, pending) = crate::mixed::render_parts(&chars, &all, true, &mixed.symbols);
+        text + &pending
     }
 
     /// Whether the whole input is one word the mixed model has seen as
@@ -1209,6 +1224,34 @@ mod tests {
             assert_eq!(c.commit_tail(), expected, "{word}");
             assert!(c.is_empty());
         }
+    }
+
+    #[test]
+    fn the_all_romaji_reading_shows_symbols_as_the_mixed_one_does() {
+        let model = Arc::new(crate::mixed::tests::model());
+        let mut c = ComposingText::new();
+        c.set_mixed(
+            Some(model),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
+        // a typed period is in the input as `.`
+        for ch in "kyouha.ii,tenki".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(c.kana_reading(), "きょうは。いい、てんき");
+        assert_eq!(c.kana_reading(), c.full_reading());
+        // the decimal point of a number stays
+        let mut c = ComposingText::new();
+        c.set_mixed(
+            Some(Arc::new(crate::mixed::tests::model())),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
+        for ch in "3.5bai".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(c.kana_reading(), "3.5ばい");
     }
 
     // ---- backspace / cursor act on shown characters ----
