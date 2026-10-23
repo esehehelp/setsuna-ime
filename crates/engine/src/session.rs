@@ -175,6 +175,8 @@ pub struct EngineSession {
     /// The last span's proposal: a `continue_beam` request (or the same
     /// request again) decodes it again without running the model.
     last_proposal: Option<LastProposal>,
+    /// The model's CTC-CRF transitions (manifest `crf`), added by the beam.
+    crf: Option<crate::pipeline::crf::CrfTables>,
 }
 
 /// A proposal with what it was computed for.
@@ -217,6 +219,13 @@ impl EngineSession {
                 );
             }
         }
+        let crf = manifest
+            .crf
+            .as_ref()
+            .map(|(path, rank)| {
+                crate::pipeline::crf::CrfTables::load(path, *rank, tokenizer.vocab_size())
+            })
+            .transpose()?;
         Ok(Self {
             tokenizer,
             proposal,
@@ -226,6 +235,7 @@ impl EngineSession {
             inspect: 0,
             chunk_cache: HashMap::new(),
             last_proposal: None,
+            crf,
         })
     }
 
@@ -496,6 +506,7 @@ impl EngineSession {
             self.tokenizer.blank_id,
             cfg.beam_width,
             cfg.top_k_per_step,
+            self.crf.as_ref(),
         );
         let beam_ms = beam_t0.elapsed().as_secs_f64() * 1000.0;
         let hyp_count = hyps.len();

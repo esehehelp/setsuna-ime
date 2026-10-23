@@ -1,7 +1,8 @@
 //! The conversion pipeline, one module per stage:
 //!
 //!   proposal (encode + ONNX forward + log-softmax)
-//!   -> decode (greedy / prefix beam)
+//!   -> decode (greedy / prefix beam, with a CTC-CRF's transitions when the
+//!      artifact has them)
 //!   -> pool (detokenize, normalize, dedup, fallback)
 //!
 //! with symbol split wrapping the whole pipeline per kana span (or symbol
@@ -11,6 +12,7 @@
 
 pub mod artifact_load;
 pub mod chunk;
+pub mod crf;
 pub mod decode;
 pub mod digitsplit;
 pub mod lse;
