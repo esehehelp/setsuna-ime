@@ -600,6 +600,7 @@ fn to_line(response: &Response) -> String {
 }
 
 fn run_daemon(args: EngineArgs) -> Result<()> {
+    pin_cpus();
     let (mut daemon, ready) = Daemon::load(args)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -634,6 +635,7 @@ fn run_serve(
     exit_after_secs: u64,
     log: Option<PathBuf>,
 ) -> Result<()> {
+    pin_cpus();
     let user = setsuna_pipe::win::user_sid().context("this process's user")?;
     let exit_after = std::time::Duration::from_secs(exit_after_secs);
     setsuna_pipe::server::serve(
@@ -648,6 +650,13 @@ fn run_serve(
         },
         move || Daemon::load(args),
     )
+}
+
+/// The daemon's threads on one L3 (`setsuna_engine::cpu`), before the session starts any.
+fn pin_cpus() {
+    if let Some(cpus) = setsuna_engine::cpu::pin_to_one_l3() {
+        eprintln!("[engine] pinned to CPUs {cpus:?} (one L3)");
+    }
 }
 
 fn run_convert(

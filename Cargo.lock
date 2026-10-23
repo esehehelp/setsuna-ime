@@ -2659,6 +2659,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "ndarray 0.16.1",
  "ort",
  "rayon",
@@ -2667,6 +2668,7 @@ dependencies = [
  "setsuna-artifact",
  "setsuna-pipe",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
