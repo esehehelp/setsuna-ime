@@ -133,7 +133,8 @@ struct RenderData {
     notes: Vec<String>,
     /// A line about the list after its position (a rewrite in progress).
     status: String,
-    /// Predictions while typing: none highlighted, Tab picks.
+    /// Suggestions while typing (live conversion off: the conversions of
+    /// the kana shown): none highlighted.
     suggest: bool,
     selected: usize,
     page_size: usize,
@@ -226,7 +227,8 @@ impl CandidateWindow {
         self.render(candidates, selected);
     }
 
-    /// Show predictions while typing: none highlighted, Tab picks.
+    /// Show suggestions while typing (live conversion off: the conversions
+    /// of the kana shown): none highlighted.
     pub fn show_suggestions(&mut self, list: &[String]) {
         if let Some(d) = self.data() {
             d.suggest = true;

@@ -426,8 +426,8 @@ private:
                                                             v->suggestion_comments[i]),
                           "");
             }
-            // not padded: the predictions come and go as the reading is
-            // typed, and a page-high panel for one of them flickers
+            // not padded: the suggestions (live conversion off) come and go
+            // as the reading is typed, and a page-high panel flickers
             panel.setCandidateList(std::move(list));
             panel.setAuxUp(Text("[Tabキーで選択]"));
         }

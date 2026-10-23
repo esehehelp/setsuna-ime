@@ -504,8 +504,8 @@ pub(crate) fn apply_actions(
         }
     }
 
-    // typing: the predictions beside the preedit, or none (unless the list
-    // was opened or closed just now)
+    // typing without live conversion: its conversions beside the kana, or
+    // none (unless the list was opened or closed just now)
     let typing = {
         let inner = service.inner.borrow();
         inner.engine.is_active() && !inner.engine.is_converting()

@@ -298,9 +298,9 @@ pub struct FrontendCfg {
     /// Emoji and kaomoji candidates (`emoji`): にこにこ -> 😊 …, えもじ /
     /// かおもじ list them all.
     pub emoji_candidates: bool,
-    /// Prediction from what was committed (`predict`): typing a reading's
-    /// start offers the longer conversions committed for it, beside the
-    /// preedit; Tab opens them.
+    /// Prediction from what was committed (`predict`): Tab while typing a
+    /// reading's start opens the longer conversions committed for it (no
+    /// window comes up by itself).
     pub prediction: bool,
     /// The romaji table: "standard" (built in), "azik", "kana_jis" (kana
     /// input on the JIS layout) or the path of a table in Mozc's format.
@@ -924,7 +924,7 @@ impl Config {
              number_candidates = true\n\
              # Emoji and kaomoji candidates (にこにこ, えもじ, かおもじ).\n\
              emoji_candidates = true\n\
-             # Prediction from what was committed (Tab picks).\n\
+             # Prediction from what was committed (Tab opens it).\n\
              prediction = true\n\
              # The romaji table: \"standard\", \"azik\", \"kana_jis\" (kana input on the\n\
              # JIS layout) or the path of a table in Mozc's format.\n\

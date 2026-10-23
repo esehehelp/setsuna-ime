@@ -508,7 +508,9 @@ impl EngineBridge {
 
     /// The conversions of what is typed, for a suggestion window beside a
     /// kana preedit: the typing phase's candidates when they are for the
-    /// whole reading. Empty otherwise (and with live conversion on).
+    /// whole reading. Empty otherwise, and with live conversion on: no
+    /// window comes up while typing, the predictions open with Tab only
+    /// (user 2026-10-23).
     pub fn suggestions(&self) -> Vec<String> {
         match &self.phase {
             Phase::Composing { candidates }
@@ -518,10 +520,6 @@ impl EngineBridge {
                     && self.list_reading == self.composing.live_reading() =>
             {
                 candidates.clone()
-            }
-            // with live conversion, the predictions (Tab opens them)
-            Phase::Composing { .. } if self.live_conversion => {
-                self.predictions().into_iter().map(|p| p.surface).collect()
             }
             _ => Vec::new(),
         }
@@ -2668,13 +2666,6 @@ impl EngineBridge {
     /// While typing it picks from [`Self::suggestions`]: the conversion
     /// opens on that candidate.
     pub fn handle_select(&mut self, index: usize) -> KeyOutcome {
-        // a prediction picked from the suggestion window
-        if matches!(self.phase, Phase::Composing { .. }) && self.live_conversion {
-            if let Some(mut out) = self.open_predictions(index) {
-                out.actions.extend(self.handle_enter().actions);
-                return out;
-            }
-        }
         if matches!(self.phase, Phase::Composing { .. }) && index < self.suggestions().len() {
             let mut actions = self.handle_space().actions;
             actions.extend(self.handle_select(index).actions);
@@ -3130,7 +3121,7 @@ impl EngineBridge {
     }
 
     /// Open the predictions as the candidate list, `selected` chosen: Tab
-    /// (or a pick from the suggestion window) while typing.
+    /// while typing.
     fn open_predictions(&mut self, selected: usize) -> Option<KeyOutcome> {
         let preds = self.predictions();
         if preds.is_empty() {
@@ -3857,9 +3848,11 @@ mod tests {
         mock.set_result("かさのした", &["傘の下"]);
         bridge.apply_async_result();
         assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘の下"]);
-        // its start typed: predicted, in the suggestion window too
+        // its start typed: predicted, but no window comes up by itself;
+        // Tab opens them
         type_str(&mut bridge, "kasanos");
-        assert_eq!(bridge.suggestions(), ["傘の下"]);
+        assert_eq!(bridge.predictions().len(), 1);
+        assert!(bridge.suggestions().is_empty());
         let out = bridge.handle_tab(false);
         assert_eq!(preedit(&out.actions).as_deref(), Some("傘の下"));
         // the s still being typed is no part of it
