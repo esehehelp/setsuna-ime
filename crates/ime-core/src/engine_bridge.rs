@@ -961,6 +961,11 @@ impl EngineBridge {
             self.list_starts = starts;
             // the conversion of all that is typed: rerank it once typing pauses
             let whole = result.reading == current_hira;
+            // one that reads a pending n as ん is what Enter commits; the
+            // preview keeps the conversion before it and shows the n, as
+            // the next key may make it な (共犯 for きょうはn, then the whole
+            // in kana while きょうはな was converted)
+            let n_read = whole && self.composing.n_pending();
             if whole {
                 self.start_rerank(
                     &result.reading,
@@ -974,7 +979,9 @@ impl EngineBridge {
                 .rerank
                 .as_ref()
                 .is_some_and(|j| j.reading == result.reading);
-            if whole && reranking && self.rerank_cfg.defer_ms > 0 {
+            if n_read {
+                self.deferred = None;
+            } else if whole && reranking && self.rerank_cfg.defer_ms > 0 {
                 // shown once the reranked top is in, or at the deadline: the
                 // preedit changes once (what was shown stays meanwhile)
                 self.deferred = Some(Deferred {
@@ -2961,43 +2968,44 @@ impl EngineBridge {
     ///   `kanji → raw → kanji` flash that the naive "drop cache" version
     ///   caused.
     ///
-    /// * **Diverge** (cache unrelated to current hira): fall back to raw
-    ///   `hira + pending`.
+    /// * **Diverge** (the end of the reading changed, mixed input reading
+    ///   letters otherwise): the shrink of the cache to the reading they
+    ///   share, then the rest as raw kana; raw `hira + pending` only when
+    ///   they share nothing.
+    ///
+    /// `hira` is the kana typed, without the ん `live_reading` reads a
+    /// pending n as: the n shows as typed (今日はn), and a conversion with
+    /// that ん is never cached (`apply_async_result`).
     fn live_preedit(&self) -> String {
         // editing mid-composition: the kana as typed, so the caret has
         // something to sit between
         if !self.composing.cursor_at_end() || !self.live_conversion {
             return self.composing.preedit();
         }
-        let hira = self.composing.live_reading();
-        let pending = self.composing.live_pending();
+        let hira = self.composing.hiragana();
+        let pending = self.composing.pending_romaji();
         if hira.is_empty() {
             return pending.to_string();
         }
         let cached_r = &self.cached_prefix_reading;
         let cached_k = &self.cached_prefix_kanji;
         if !cached_r.is_empty() && !cached_k.is_empty() {
-            if hira.starts_with(cached_r.as_str()) {
-                let tail = &hira[cached_r.len()..];
-                return format!("{}{}{}", cached_k, tail, pending);
-            }
-            if cached_r.starts_with(hira.as_str()) {
-                let shrink_chars = cached_r
-                    .chars()
-                    .count()
-                    .saturating_sub(hira.chars().count());
+            let common = cached_r
+                .chars()
+                .zip(hira.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if common > 0 {
+                let shrink_chars = cached_r.chars().count() - common;
                 let kanji_chars: Vec<char> = cached_k.chars().collect();
                 let keep = kanji_chars.len().saturating_sub(shrink_chars);
                 let trimmed: String = kanji_chars[..keep].iter().collect();
-                return format!("{}{}", trimmed, pending);
+                let tail: String = hira.chars().skip(common).collect();
+                return format!("{trimmed}{tail}{pending}");
             }
         }
         // nothing converted yet: as typed (けっこn)
-        format!(
-            "{}{}",
-            self.composing.hiragana(),
-            self.composing.pending_romaji()
-        )
+        format!("{hira}{pending}")
     }
 
     fn invalidate_engine_results(&mut self) {
@@ -3953,15 +3961,72 @@ mod tests {
         let (mut bridge, mock) = bridge_with_mock();
         bridge.live_conversion = true;
         type_str(&mut bridge, "kekkon");
-        // the engine converts けっこん, not けっこ
+        // the engine converts けっこん, not けっこ, for Enter; the preview
+        // shows the n as typed
         assert_eq!(mock.dispatched_readings().last().unwrap(), "けっこん");
         mock.set_result("けっこん", &["結婚"]);
         let out = bridge.apply_async_result();
-        assert_eq!(preedit(&out).as_deref(), Some("結婚"));
+        assert_eq!(preedit(&out).as_deref(), Some("けっこn"));
         assert_eq!(commits(&bridge.handle_enter().actions), vec!["結婚"]);
         // a vowel after it converts again
         type_str(&mut bridge, "kekkona");
         assert_eq!(mock.dispatched_readings().last().unwrap(), "けっこな");
+        // typed to its end (nn), the conversion of けっこん is shown
+        bridge.handle_escape();
+        type_str(&mut bridge, "kekkonn");
+        mock.set_result("けっこん", &["結婚"]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("結婚")
+        );
+    }
+
+    #[test]
+    fn a_pending_n_shows_as_typed_after_the_conversion_before_it() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "kyouha");
+        mock.set_result("きょうは", &["今日は"]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("今日は")
+        );
+        let out = bridge.handle_char('n');
+        assert_eq!(preedit(&out.actions).as_deref(), Some("今日はn"));
+        // the conversion of きょうはん does not take its place
+        mock.set_result("きょうはん", &["共犯"]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("今日はn")
+        );
+        // nor does the whole go back to kana when the n becomes な
+        let out = bridge.handle_char('a');
+        assert_eq!(preedit(&out.actions).as_deref(), Some("今日はな"));
+        mock.set_result("きょうはな", &["今日花"]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("今日花")
+        );
+        // Enter on a pending n commits the conversion with ん
+        bridge.handle_escape();
+        type_str(&mut bridge, "kyouhan");
+        mock.set_result("きょうはん", &["共犯"]);
+        bridge.apply_async_result();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["共犯"]);
+    }
+
+    #[test]
+    fn a_reading_whose_end_changed_keeps_the_conversion_it_shares() {
+        // mixed input reading letters otherwise, a kana replaced: the shared
+        // start stays converted while the new end is
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "watashiha");
+        mock.set_result("わたしは", &["私は"]);
+        bridge.apply_async_result();
+        bridge.cached_prefix_reading = "わたしわ".into();
+        bridge.cached_prefix_kanji = "私わ".into();
+        assert_eq!(bridge.live_preedit(), "私は");
     }
 
     #[test]
