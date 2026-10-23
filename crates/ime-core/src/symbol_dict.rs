@@ -236,6 +236,14 @@ mod tests {
     }
 
     #[test]
+    fn greek_letters_follow_their_katakana_word() {
+        let got = builtin().insert("あるふぁ", v(&["アルファ", "或ファ", "あるふぁ"]));
+        assert_eq!(got, v(&["アルファ", "或ファ", "あるふぁ", "α", "Α"]));
+        let got = builtin().insert("しぐま", v(&["シグマ", "仕熊", "しぐま"]));
+        assert_eq!(&got[3..], &v(&["σ", "Σ", "ς"])[..]);
+    }
+
+    #[test]
     fn other_readings_are_left_alone() {
         let c = v(&["記号", "号", "きごう", "キゴウ"]);
         assert_eq!(builtin().insert("きごう", c.clone()), c);

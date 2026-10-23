@@ -73,3 +73,32 @@
 しめ	after	〆
 かぶしきがいしゃ	after	㈱
 ゆうげんがいしゃ	after	㈲
+# Greek letters, also words in katakana (アルファ): small letter first
+あるふぁ	after	α Α
+べーた	after	β Β
+がんま	after	γ Γ
+でるた	after	δ Δ
+いぷしろん	after	ε Ε
+ぜーた	after	ζ Ζ
+いーた	after	η Η
+えーた	after	η Η
+しーた	after	θ Θ
+いおた	after	ι Ι
+かっぱ	after	κ Κ
+らむだ	after	λ Λ
+みゅー	after	μ Μ
+にゅー	after	ν Ν
+くしー	after	ξ Ξ
+ぐざい	after	ξ Ξ
+おみくろん	after	ο Ο
+ぱい	after	π Π
+ろー	after	ρ Ρ
+しぐま	after	σ Σ ς
+たう	after	τ Τ
+うぷしろん	after	υ Υ
+ゆぷしろん	after	υ Υ
+ふぁい	after	φ Φ
+かい	after	χ Χ
+ぷさい	after	ψ Ψ
+ぷしー	after	ψ Ψ
+おめが	after	ω Ω
