@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+use crate::pipeline::crf::CrfTables;
 use crate::pipeline::proposal::{FrameLogProbs, ProposalOutput};
 
 const NEG_INF: f32 = f32::NEG_INFINITY;
@@ -175,6 +176,20 @@ pub fn prefix_beam_search(
     beam_width: usize,
     top_k_per_step: usize,
 ) -> Vec<BeamHypothesis> {
+    prefix_beam_search_crf(steps, blank_id, beam_width, top_k_per_step, None)
+}
+
+/// [`prefix_beam_search`] with a CTC-CRF's transitions: a path that emits a
+/// new token `c` after the prefix's last token (the start symbol for the
+/// first) adds log ψ(last, c), so a hypothesis' score is its CTC mass times
+/// the transitions of its tokens (as the research side's reference decoder).
+pub fn prefix_beam_search_crf(
+    steps: &[FrameLogProbs],
+    blank_id: u32,
+    beam_width: usize,
+    top_k_per_step: usize,
+    crf: Option<&CrfTables>,
+) -> Vec<BeamHypothesis> {
     assert!(beam_width > 0, "beam_width must be positive");
     let top_k = top_k_per_step.max(1);
     let mut trie = Trie::new();
@@ -214,17 +229,18 @@ pub fn prefix_beam_search(
                     continue;
                 }
                 let child = trie.child(s.node, c);
+                let psi = crf.map_or(0.0, |t| t.log_psi(last, c));
                 let mut extended = || {
                     frame_list.push((frame, s.frames));
                     frame_list.len() as u32 - 1
                 };
                 if last == Some(c) {
                     // A new occurrence of `c` needs a blank in between.
-                    next.merge(mark, child, NEG_INF, pb + c_logp, &mut extended);
+                    next.merge(mark, child, NEG_INF, pb + c_logp + psi, &mut extended);
                     // Repeat collapse: same prefix, more non-blank mass.
                     next.merge(mark, s.node, NEG_INF, pnb + c_logp, || s.frames);
                 } else {
-                    let new_pnb = logsumexp(pb, pnb) + c_logp;
+                    let new_pnb = logsumexp(pb, pnb) + c_logp + psi;
                     next.merge(mark, child, NEG_INF, new_pnb, &mut extended);
                 }
             }
@@ -293,12 +309,14 @@ pub fn collapse_with_frames(frame_ids: &[u32], blank_id: u32) -> (Vec<u32>, Vec<
 
 /// Decode the proposal: a true CTC greedy collapse when `beam_width <= 1`
 /// (per-frame argmax, then collapse; a width-1 prefix beam is NOT
-/// equivalent), prefix beam search otherwise. The greedy hypothesis scores 0.
+/// equivalent), prefix beam search otherwise (with the CTC-CRF's
+/// transitions when `crf` is given). The greedy hypothesis scores 0.
 pub fn hypotheses(
     proposal: &ProposalOutput,
     blank_id: u32,
     beam_width: usize,
     top_k_per_step: usize,
+    crf: Option<&CrfTables>,
 ) -> Vec<BeamHypothesis> {
     if beam_width <= 1 {
         let (tokens, frames) = proposal.collapsed_with_frames(blank_id);
@@ -308,7 +326,7 @@ pub fn hypotheses(
             frames,
         }]
     } else {
-        prefix_beam_search(&proposal.steps, blank_id, beam_width, top_k_per_step)
+        prefix_beam_search_crf(&proposal.steps, blank_id, beam_width, top_k_per_step, crf)
     }
 }
 
@@ -551,6 +569,33 @@ mod tests {
         let logits = arr2(&[[-3.0, -0.1], [-0.1, -3.0]]);
         let out = prefix_beam_search(&steps(&logits, 2), 0, 2, 0);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn crf_at_zero_is_the_plain_beam() {
+        // ψ = 1 everywhere: the same hypotheses and scores
+        let logits = arr2(&[[-0.5, -1.2, -2.0], [-1.0, -0.4, -2.5], [-0.3, -2.0, -1.1]]);
+        let crf = crate::pipeline::crf::CrfTables::from_tables(&[0.0; 4 * 2], &[0.0; 3 * 2], 2, 3);
+        let plain = prefix_beam_search(&steps(&logits, 3), 0, 4, 3);
+        let with = prefix_beam_search_crf(&steps(&logits, 3), 0, 4, 3, Some(&crf));
+        assert_eq!(plain.len(), with.len());
+        for (p, w) in plain.iter().zip(&with) {
+            assert_eq!(p.tokens, w.tokens);
+            assert!((p.score - w.score).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn crf_transition_reorders_the_beam() {
+        // [1, 2] wins by the frames; rank 1 with a_1 = -20 makes every
+        // token after 1 nearly impossible, so it loses
+        let logits = arr2(&[[-3.0, -0.1, -3.0], [-3.0, -3.0, -0.1]]);
+        let plain = prefix_beam_search(&steps(&logits, 3), 0, 4, 3);
+        assert_eq!(plain[0].tokens, vec![1, 2]);
+        let crf =
+            crate::pipeline::crf::CrfTables::from_tables(&[0.0, -20.0, 0.0, 0.0], &[0.0; 3], 1, 3);
+        let with = prefix_beam_search_crf(&steps(&logits, 3), 0, 4, 3, Some(&crf));
+        assert_ne!(with[0].tokens, vec![1, 2]);
     }
 
     #[test]

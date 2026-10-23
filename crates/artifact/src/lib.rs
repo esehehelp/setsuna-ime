@@ -46,6 +46,16 @@ pub struct ProposalArtifact {
     pub external_data: Vec<PathBuf>,
 }
 
+/// A CTC-CRF's transition table (the research export's): `a` ((V+1) x
+/// rank, the last row the start symbol) then `b` (V x rank), f32 little
+/// endian; ψ(c, d) = mean_j exp(a_cj + b_dj).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrfArtifact {
+    pub path: PathBuf,
+    pub rank: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpecialIds {
@@ -113,6 +123,10 @@ struct CtcNatManifestFile {
     max_seq_len: usize,
     #[serde(default)]
     decode_defaults: DecodeDefaults,
+    /// The model's CTC-CRF transitions, when it has them: the beam search
+    /// adds them (decoding without them is another model).
+    #[serde(default)]
+    crf: Option<CrfArtifact>,
 }
 
 /// A CTC-NAT manifest with every artifact path resolved against the
@@ -128,6 +142,8 @@ pub struct CtcNatManifest {
     pub special_ids: SpecialIds,
     pub max_seq_len: usize,
     pub decode_defaults: DecodeDefaults,
+    /// The CTC-CRF table (path resolved) and its rank.
+    pub crf: Option<(PathBuf, usize)>,
 }
 
 impl CtcNatManifest {
@@ -189,6 +205,11 @@ impl CtcNatManifest {
             special_ids: file.special_ids,
             max_seq_len: file.max_seq_len,
             decode_defaults: file.decode_defaults,
+            crf: file
+                .crf
+                .as_ref()
+                .map(|c| resolve(&c.path, "CRF table").map(|p| (p, c.rank)))
+                .transpose()?,
         })
     }
 }
@@ -379,6 +400,29 @@ mod tests {
         assert_eq!(m.decode_defaults.top_k, None);
         assert_eq!(m.decode_defaults.symbol_token, Some(true));
         assert_eq!(m.decode_defaults.digit_split, Some(true));
+        assert_eq!(m.crf, None);
+    }
+
+    #[test]
+    fn a_ctc_crf_table_resolves_beside_the_manifest() {
+        let dir = temp_dir("crf");
+        write(&dir, "m.fp32.onnx", "");
+        write(&dir, "m.vocab.hex.tsv", "");
+        write(&dir, "m.crf.f32", "");
+        let crf = |path: &str| format!(r#","crf":{{"path":"{path}","rank":8}}"#);
+        let manifest = write(
+            &dir,
+            "m.json",
+            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &crf("m.crf.f32")),
+        );
+        let m = CtcNatManifest::load(&manifest).unwrap();
+        assert_eq!(m.crf, Some((dir.join("m.crf.f32"), 8)));
+        let missing = write(
+            &dir,
+            "missing.json",
+            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &crf("x.crf.f32")),
+        );
+        assert!(CtcNatManifest::load(&missing).is_err());
     }
 
     /// The fixture the Python writer test reproduces byte for byte.

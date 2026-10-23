@@ -287,6 +287,8 @@ cargo run --release -p setsuna-settings
 
 - 変換モデル: schema `neo-ime-ctc-nat-export-v1`。proposal の ONNX、語彙、
   special token id、`decode_defaults`（beam 幅、記号の扱いなど）を持つ。
+  CTC-CRF で学習したモデルは遷移表（`crf`、低ランクの ψ）も持ち、beam search が
+  隣り合う文字の遷移のスコアを足す。
   公開モデル Aster-v1.2-small には int8 版（約 29 MB）と fp32 版（約 107 MB）がある。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の

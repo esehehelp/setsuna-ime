@@ -131,7 +131,7 @@ if ! jq -e --arg p "$precision" \
 fi
 # All names remain relative to the manifest, including nested artifact paths.
 manifest_dir=$(dirname "$manifest_rel")
-list=$(jq -r '[.proposal.path, .vocab] + ([.proposal.external_data // empty] | flatten) + [.input_vocab // empty]
+list=$(jq -r '[.proposal.path, .vocab] + ([.proposal.external_data // empty] | flatten) + [.input_vocab // empty, .crf.path // empty]
     | .[] | if type == "string" then . else error("not a string") end' "$manifest_path") ||
     die "manifest lists an invalid artifact path"
 artifacts=()
