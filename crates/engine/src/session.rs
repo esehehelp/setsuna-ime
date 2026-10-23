@@ -14,7 +14,7 @@ use setsuna_artifact::{CtcNatManifest, DecodeDefaults};
 use crate::candidate::Candidate;
 use crate::pipeline::proposal::{FrameReduce, ProposalRunner};
 use crate::pipeline::{
-    artifact_load, chunk, decode, digitsplit, pool, proposal, symsplit, symtoken,
+    artifact_load, chunk, decode, digitsplit, pool, proposal, rescore, symsplit, symtoken,
 };
 use crate::tokenizer::SharedCharTokenizer;
 
@@ -24,6 +24,8 @@ pub struct ConvertPerf {
     pub proposal_ms: f64,
     pub beam_ms: f64,
     pub post_ms: f64,
+    /// The rescoring of the candidates (`pipeline::rescore`).
+    pub rescore_ms: f64,
     pub total_ms: f64,
     pub hyp_count: usize,
     pub candidate_count: usize,
@@ -120,6 +122,10 @@ pub struct DecodeConfig {
     /// (`normalize_candidate`); off, a candidate is the model's output as
     /// decoded (the research default: what training and the bench compare).
     pub normalize_candidates: bool,
+    /// Weights of the rescoring's two-character and word terms
+    /// (`pipeline::rescore`); 0 leaves a term out (and its table unloaded).
+    pub pair_weight: f32,
+    pub word_weight: f32,
 }
 
 impl DecodeConfig {
@@ -148,6 +154,8 @@ impl DecodeConfig {
                 .normalize_candidates
                 .or(d.normalize_candidates)
                 .unwrap_or(false),
+            pair_weight: explicit.pair_weight.or(d.pair_weight).unwrap_or(0.0),
+            word_weight: explicit.word_weight.or(d.word_weight).unwrap_or(0.0),
         }
     }
 
@@ -177,6 +185,8 @@ pub struct EngineSession {
     last_proposal: Option<LastProposal>,
     /// The model's CTC-CRF transitions (manifest `crf`), added by the beam.
     crf: Option<crate::pipeline::crf::CrfTables>,
+    /// The candidates' rescoring (manifest `rescore`), when a weight is set.
+    rescorer: Option<rescore::Rescorer>,
 }
 
 /// A proposal with what it was computed for.
@@ -226,6 +236,12 @@ impl EngineSession {
                 crate::pipeline::crf::CrfTables::load(path, *rank, tokenizer.vocab_size())
             })
             .transpose()?;
+        let rescorer = rescore::Rescorer::load(
+            manifest.rescore_pairs.as_deref(),
+            config.pair_weight,
+            manifest.rescore_words.as_deref(),
+            config.word_weight,
+        )?;
         Ok(Self {
             tokenizer,
             proposal,
@@ -236,6 +252,7 @@ impl EngineSession {
             chunk_cache: HashMap::new(),
             last_proposal: None,
             crf,
+            rescorer,
         })
     }
 
@@ -305,6 +322,12 @@ impl EngineSession {
         } else {
             self.convert_piece(request.context, request.reading)?
         };
+        if let Some(r) = &self.rescorer {
+            let t0 = Instant::now();
+            r.rescore(request.context, request.reading, &mut candidates);
+            perf.rescore_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            perf.total_ms += perf.rescore_ms;
+        }
         candidates.truncate(self.config.max_candidates);
         perf.candidate_count = candidates.len();
         Ok(CandidateSet {
@@ -527,6 +550,7 @@ impl EngineSession {
             proposal_ms,
             beam_ms,
             post_ms: post_t0.elapsed().as_secs_f64() * 1000.0,
+            rescore_ms: 0.0,
             total_ms: total_t0.elapsed().as_secs_f64() * 1000.0,
             hyp_count,
             candidate_count: candidates.len(),
@@ -617,6 +641,7 @@ mod tests {
         assert_eq!(cfg.max_context, 64);
         assert_eq!(cfg.top_k_per_step, 16);
         assert_eq!(cfg.pool_limit(), 10);
+        assert_eq!((cfg.pair_weight, cfg.word_weight), (0.0, 0.0));
     }
 
     #[test]

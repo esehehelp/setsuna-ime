@@ -417,6 +417,9 @@ $ArtifactFiles = @($ManifestJson.proposal.path, $ManifestJson.vocab)
 if ($ManifestJson.proposal.external_data) { $ArtifactFiles += @($ManifestJson.proposal.external_data) }
 if ($ManifestJson.input_vocab) { $ArtifactFiles += @($ManifestJson.input_vocab) }
 if ($ManifestJson.crf) { $ArtifactFiles += @($ManifestJson.crf.path) }
+# the candidates' rescoring tables
+if ($ManifestJson.rescore.pairs) { $ArtifactFiles += @($ManifestJson.rescore.pairs) }
+if ($ManifestJson.rescore.words) { $ArtifactFiles += @($ManifestJson.rescore.words) }
 foreach ($rel in $ArtifactFiles) {
     if ([IO.Path]::IsPathRooted($rel) -or $rel -match '(^|[\\/])\.\.([\\/]|$)') {
         Write-Log ERROR "manifest path $rel leaves the artifact directory"; exit 30
