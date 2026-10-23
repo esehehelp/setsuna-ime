@@ -6,6 +6,13 @@
 //! typing a reading's start offers the longer surfaces committed for it,
 //! the more often and the more recently the higher, and higher still after
 //! the same commit as before (Mozc's bigram links: the next word).
+//!
+//! As Mozc's IsValidSuggestion, a surface committed once is offered from
+//! three chars typed, one committed again or after the same commit as
+//! before from two. Live conversion commits whole sentences, which are
+//! seldom typed again: a reading longer than a phrase (`MAX_READING`) is
+//! neither recorded nor offered, or a sentence's first chars would bring
+//! the whole of an earlier input back.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -47,6 +54,11 @@ pub struct Predictor {
 
 /// Readings shorter than this are not predicted from (too many surfaces).
 pub const MIN_PREFIX: usize = 2;
+/// What has to be typed of a surface committed only once, after another
+/// commit than the one before it then.
+const MIN_PREFIX_ONCE: usize = 3;
+/// The longest reading recorded and offered: a phrase, not a sentence.
+const MAX_READING: usize = 16;
 /// Entries kept (the least recently used are forgotten on load).
 const CAP: usize = 10_000;
 
@@ -120,11 +132,12 @@ impl Predictor {
     }
 
     /// Whether a commit is worth predicting: it differs from its reading
-    /// (kana alone needs no prediction), the reading is not too short, and
-    /// it keeps the numbers typed in digits (a commit the model garbled,
-    /// 19911225 -> 199125, before `postprocess::drop_changed_digits`).
+    /// (kana alone needs no prediction), the reading is neither too short
+    /// nor a sentence's, and it keeps the numbers typed in digits (a commit
+    /// the model garbled, 19911225 -> 199125, before
+    /// `postprocess::drop_changed_digits`).
     pub fn worth(reading: &str, surface: &str) -> bool {
-        reading.chars().count() > MIN_PREFIX
+        (MIN_PREFIX + 1..=MAX_READING).contains(&reading.chars().count())
             && surface != reading
             && !surface.trim().is_empty()
             && crate::postprocess::keeps_digits(reading, surface)
@@ -164,7 +177,8 @@ impl Predictor {
     /// committed for a longer reading that starts with it, best first.
     pub fn complete(&mut self, prefix: &str, prev: &str, n: usize) -> Vec<Prediction> {
         self.sync();
-        if prefix.chars().count() < MIN_PREFIX {
+        let typed = prefix.chars().count();
+        if typed < MIN_PREFIX {
             return Vec::new();
         }
         let prev: String = prev
@@ -179,21 +193,25 @@ impl Predictor {
         let mut scored: Vec<(f64, &(String, String))> = self
             .stats
             .iter()
-            .filter(|((r, s), _)| {
-                r.len() > prefix.len() && r.starts_with(prefix) && Self::worth(r, s)
-            })
-            .map(|(k, s)| {
+            .filter_map(|(k, s)| {
+                let (r, surface) = k;
+                if !(r.len() > prefix.len() && r.starts_with(prefix) && Self::worth(r, surface)) {
+                    return None;
+                }
                 let after = if prev.is_empty() {
                     0
                 } else {
                     *s.after.get(&prev).unwrap_or(&0)
                 };
+                if s.count < 2 && after == 0 && typed < MIN_PREFIX_ONCE {
+                    return None;
+                }
                 let score = (1.0 + s.count as f64).ln()
                     + 2.0 * (1.0 + after as f64).ln()
                     + 0.3 * s.last as f64 / seq
                     // the less is left to type, the likelier
-                    - 0.02 * (k.0.chars().count() - prefix.chars().count()) as f64;
-                (score, k)
+                    - 0.02 * (r.chars().count() - typed) as f64;
+                Some((score, k))
             })
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
@@ -245,7 +263,7 @@ mod tests {
         assert_eq!(out, ["よろしくお願いします", "宜しく"]);
         // kana alone and short readings are not recorded
         p.record("よろしく", "よろしく", "").unwrap();
-        assert_eq!(p.complete("よろ", "", 5).len(), 3);
+        assert_eq!(p.complete("よろ", "", 5).len(), 1);
         assert!(p.complete("よ", "", 5).is_empty());
         // another process sees them
         let mut q = Predictor::at(path.clone());
@@ -282,6 +300,53 @@ mod tests {
         p.record("かいぎろく", "会議録", "議事").unwrap();
         assert_eq!(p.complete("かいぎ", "", 1)[0].surface, "会議室");
         assert_eq!(p.complete("かいぎ", "議事", 1)[0].surface, "会議録");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_surface_committed_once_needs_three_chars_or_the_same_commit_before() {
+        let path = temp("once");
+        let mut p = Predictor::at(path.clone());
+        p.record("あとで", "後で", "").unwrap();
+        p.record("あとがき", "後書き", "本文").unwrap();
+        let surfaces = |p: &mut Predictor, prefix: &str, prev: &str| -> Vec<String> {
+            p.complete(prefix, prev, 5)
+                .into_iter()
+                .map(|x| x.surface)
+                .collect()
+        };
+        assert!(surfaces(&mut p, "あと", "").is_empty());
+        assert_eq!(surfaces(&mut p, "あと", "本文"), ["後書き"]);
+        assert_eq!(surfaces(&mut p, "あとで", ""), Vec::<String>::new());
+        assert_eq!(surfaces(&mut p, "あとが", ""), ["後書き"]);
+        p.record("あとで", "後で", "").unwrap();
+        assert_eq!(surfaces(&mut p, "あと", ""), ["後で"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_sentence_is_neither_recorded_nor_offered() {
+        let path = temp("sentence");
+        // one recorded before sentences were left out
+        let old = "あとこれはどうようのもんだいがあるっぽい";
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"r\":\"{old}\",\"s\":\"あとこれは同様の問題があるっぽい\"}}
+"
+            ),
+        )
+        .unwrap();
+        let mut p = Predictor::at(path.clone());
+        for _ in 0..3 {
+            p.record(old, "あとこれは同様の問題があるっぽい", "")
+                .unwrap();
+        }
+        assert!(p.complete("あとこれは", "", 5).is_empty());
+        let len = std::fs::metadata(&path).unwrap().len();
+        p.record("よろしくおねがいいたします", "よろしくお願いいたします", "")
+            .unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > len);
         let _ = std::fs::remove_file(&path);
     }
 }
