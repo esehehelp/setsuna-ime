@@ -319,6 +319,9 @@ cargo run --release -p setsuna-settings
   で読み込み（ready の後に裏で読む）、`{"id":1,"analyze":["今日は晴れ"]}` に
   各文の語（表層、文字の範囲、読み、品詞、別の読みとそれで経路が何コスト高くなるか）
   を返す。辞書はメモリに展開するので、ログインで 1 つのエンジンのプロセスが持つ。
+  IME は `[engine] analyzer_manifest`（`install.ps1 -Analyzer <manifest>`）で
+  使い、文節編集（← / →）で変換をその語で区切る（`crates/ime-core/src/bunsetsu.rs`。
+  KWDLC の文節境界の F1 は test で 83.4 → 94.4）。
 
 例は `tests/fixtures/` にある（中身は空の placeholder）。
 

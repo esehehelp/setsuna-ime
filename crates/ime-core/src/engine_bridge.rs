@@ -152,6 +152,10 @@ const ALT_EARLY: usize = 3;
 /// Predictions offered while typing.
 const PREDICTIONS: usize = 3;
 
+/// How long segment editing waits for the engine's analysis of the
+/// conversion it cuts (`bunsetsu`) before cutting it by the char alignment.
+const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// The engine's top of what is typed, waiting for the reranked one
 /// (`[rerank] defer_ms`).
 struct Deferred {
@@ -1807,7 +1811,20 @@ impl EngineBridge {
                 r.cancel();
             }
         }
-        *seg = Segmented::build(&self.list_reading, candidates, *selected, &self.list_starts);
+        // the engine's analysis of the conversion cut, when it has an analyzer
+        let words = candidates.get(*selected).and_then(|chosen| {
+            let client = self.client.as_ref()?;
+            client
+                .analyze(std::slice::from_ref(chosen), ANALYSIS_WAIT)?
+                .pop()
+        });
+        *seg = Segmented::build(
+            &self.list_reading,
+            candidates,
+            *selected,
+            &self.list_starts,
+            words.as_deref(),
+        );
         if let Some(s) = seg.as_mut() {
             // each segment offers its own hiragana / katakana, as a whole
             // conversion does
@@ -3374,6 +3391,8 @@ mod tests {
         next: RefCell<Option<EngineResult>>,
         /// The backend has exited.
         gone: std::cell::Cell<bool>,
+        /// What `analyze` answers for a text (none: no analyzer).
+        analyses: RefCell<HashMap<String, Vec<crate::engine_client::Word>>>,
     }
 
     /// In-memory `EngineClient` for phase-machine tests. Cloning shares the
@@ -3465,6 +3484,14 @@ mod tests {
         }
         fn is_alive(&self) -> bool {
             !self.state.gone.get()
+        }
+        fn analyze(
+            &self,
+            texts: &[String],
+            _timeout: std::time::Duration,
+        ) -> Option<Vec<Vec<crate::engine_client::Word>>> {
+            let a = self.state.analyses.borrow();
+            texts.iter().map(|t| a.get(t).cloned()).collect()
         }
     }
 
@@ -5202,6 +5229,36 @@ mod tests {
                 text: "記者の汽車".into()
             }
         );
+    }
+
+    #[test]
+    fn segment_editing_cuts_by_the_engines_analysis() {
+        let segments_of = |words: Option<Vec<crate::engine_client::Word>>| {
+            let (mut bridge, mock) = bridge_with_mock();
+            if let Some(w) = words {
+                mock.state
+                    .analyses
+                    .borrow_mut()
+                    .insert("申し出る".into(), w);
+            }
+            type_str(&mut bridge, "moushideru");
+            mock.set_aligned("もうしでる", &["申し出る"], &[&[0, 2, 3, 4]]);
+            bridge.apply_async_result();
+            bridge.handle_space();
+            segments_shown(&bridge.handle_move_cursor(1).actions).0
+        };
+        // the char alignment cuts the compound verb
+        assert_eq!(segments_of(None), v(&["申し", "出る"]));
+        let word = crate::engine_client::Word {
+            surface: "申し出る".into(),
+            start: 0,
+            end: 4,
+            reading: Some("もうしでる".into()),
+            pos: "動詞".into(),
+            pos2: "一般".into(),
+            ..Default::default()
+        };
+        assert_eq!(segments_of(Some(vec![word])), v(&["申し出る"]));
     }
 
     #[test]

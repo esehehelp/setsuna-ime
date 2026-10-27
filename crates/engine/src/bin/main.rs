@@ -511,7 +511,7 @@ fn backend_manifest() -> BackendManifest {
                 "string[]",
                 false,
                 "Texts to analyze instead of a conversion (with --analyzer): the response has \
-                 `analyses`, each text's words {surface, start, end, reading?, pos, alts?}.",
+                 `analyses`, each text's words {surface, start, end, reading?, pos, pos2, alts?, cost}.",
             ),
         ],
         response_fields: vec![
@@ -883,7 +883,9 @@ mod tests {
                 end: 2,
                 reading: Some("きょう".into()),
                 pos: "名詞".into(),
+                pos2: "普通名詞".into(),
                 alts: vec![("こんにち".into(), 1348)],
+                cost: 100,
             }]],
             engine_ms: 0.1,
             error: None,

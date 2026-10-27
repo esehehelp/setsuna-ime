@@ -12,6 +12,8 @@
 //! Clobbering: only the latest dispatched request matters. `dispatch`
 //! overwrites a single `pending` slot, and the writer holds at most one
 //! request in flight, so a burst of keystrokes collapses to one backend run.
+//! An analysis (`EngineClient::analyze`) has a slot of its own that goes
+//! first, and its caller waits for the answer.
 //!
 //!   - pipe: the same protocol with the login's shared `setsuna-engine
 //!     serve` (Windows), which `spawn_with_config` prefers to a child
@@ -19,7 +21,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -27,7 +29,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::engine_client::{EngineClient, EngineResult, Notify};
+use crate::engine_client::{EngineClient, EngineResult, Notify, Word};
 
 #[cfg(windows)]
 mod pipe;
@@ -63,7 +65,12 @@ struct DaemonRequest<'a> {
     reading: &'a str,
     #[serde(skip_serializing_if = "is_zero")]
     continue_beam: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    analyze: Option<&'a [String]>,
 }
+
+/// Ids of analyses: above the bridge's conversion ids.
+const ANALYZE_IDS: u64 = 1 << 62;
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -83,6 +90,9 @@ struct DaemonResponse {
     engine_ms: Option<f64>,
     #[serde(default)]
     frames: Option<serde_json::Value>,
+    /// An analysis's words, each text's.
+    #[serde(default)]
+    analyses: Option<Vec<Vec<Word>>>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -93,6 +103,8 @@ struct Pending {
     context: String,
     reading: String,
     continue_beam: u32,
+    /// The texts of an analysis; empty for a conversion.
+    analyze: Vec<String>,
     dispatched_at: Instant,
 }
 
@@ -102,11 +114,14 @@ struct InFlight {
     /// The context as sent (NFKC).
     context: String,
     dispatched_at: Instant,
+    analyze: bool,
 }
 
 #[derive(Default)]
 struct State {
     pending: Option<Pending>,
+    /// An analysis its caller waits for: sent before `pending`.
+    analysis: Option<Pending>,
     in_flight: Option<InFlight>,
 }
 
@@ -116,6 +131,88 @@ struct Shared {
     latest: Mutex<Option<EngineResult>>,
     ready: AtomicBool,
     alive: AtomicBool,
+    /// The engine was started with an analyzer.
+    has_analyzer: bool,
+    /// The last analysis answered: its id and words (none on an error).
+    analyzed: Mutex<Option<(u64, Option<Vec<Vec<Word>>>)>>,
+    analyzed_cv: Condvar,
+    next_analysis: AtomicU64,
+}
+
+impl Shared {
+    fn new(cfg: &crate::config::EngineCfg) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            cv: Condvar::new(),
+            latest: Mutex::new(None),
+            ready: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            has_analyzer: analyzer_of(cfg).is_some(),
+            analyzed: Mutex::new(None),
+            analyzed_cv: Condvar::new(),
+            next_analysis: AtomicU64::new(ANALYZE_IDS),
+        }
+    }
+
+    /// Queue an analysis of `texts` before any conversion and wait for it,
+    /// at most `timeout`.
+    fn analyze(&self, texts: &[String], timeout: Duration) -> Option<Vec<Vec<Word>>> {
+        if !self.has_analyzer
+            || texts.is_empty()
+            || !self.ready.load(Ordering::SeqCst)
+            || !self.alive.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let id = self.next_analysis.fetch_add(1, Ordering::SeqCst);
+        let deadline = Instant::now() + timeout;
+        self.state.lock().unwrap().analysis = Some(Pending {
+            req_id: id,
+            context: String::new(),
+            reading: String::new(),
+            continue_beam: 0,
+            analyze: texts.to_vec(),
+            dispatched_at: Instant::now(),
+        });
+        self.cv.notify_all();
+        let mut slot = self.analyzed.lock().unwrap();
+        loop {
+            if let Some((answered, _)) = slot.as_ref() {
+                if *answered == id {
+                    let words = slot.take().and_then(|(_, w)| w);
+                    crate::diagnostics::log(format!(
+                        "analysis id={id} texts={} words={:?} in {:.1} ms",
+                        texts.len(),
+                        words
+                            .as_ref()
+                            .map(|w| w.iter().map(Vec::len).sum::<usize>()),
+                        (timeout - deadline.saturating_duration_since(Instant::now()))
+                            .as_secs_f64()
+                            * 1000.0
+                    ));
+                    // a list for each text sent
+                    return words.filter(|w| w.len() == texts.len());
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline || !self.alive.load(Ordering::SeqCst) {
+                break;
+            }
+            slot = self
+                .analyzed_cv
+                .wait_timeout(slot, deadline - now)
+                .unwrap()
+                .0;
+        }
+        drop(slot);
+        // not sent yet: it goes no more
+        let mut st = self.state.lock().unwrap();
+        if st.analysis.as_ref().is_some_and(|p| p.req_id == id) {
+            st.analysis = None;
+        }
+        crate::diagnostics::log(format!("analysis id={id} unanswered in {timeout:?}"));
+        None
+    }
 }
 
 pub struct ChildDaemonClient {
@@ -179,13 +276,7 @@ impl ChildDaemonClient {
             .take()
             .ok_or_else(|| std::io::Error::other("child stdout not piped"))?;
 
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::default()),
-            cv: Condvar::new(),
-            latest: Mutex::new(None),
-            ready: AtomicBool::new(false),
-            alive: AtomicBool::new(true),
-        });
+        let shared = Arc::new(Shared::new(engine_cfg));
 
         let writer = {
             let shared = shared.clone();
@@ -251,6 +342,7 @@ impl EngineClient for ChildDaemonClient {
                 context: context.to_string(),
                 reading: reading.to_string(),
                 continue_beam,
+                analyze: Vec::new(),
                 dispatched_at: Instant::now(),
             });
         }
@@ -259,6 +351,10 @@ impl EngineClient for ChildDaemonClient {
 
     fn take_latest(&self) -> Option<EngineResult> {
         self.shared.latest.lock().ok()?.take()
+    }
+
+    fn analyze(&self, texts: &[String], timeout: Duration) -> Option<Vec<Vec<Word>>> {
+        self.shared.analyze(texts, timeout)
     }
 
     fn is_ready(&self) -> bool {
@@ -295,17 +391,20 @@ impl Drop for ChildDaemonClient {
 /// flight; `None` once the client is gone.
 fn next_request(shared: &Shared) -> Option<Pending> {
     let mut st = shared.state.lock().unwrap();
-    while shared.alive.load(Ordering::SeqCst) && !(st.pending.is_some() && st.in_flight.is_none()) {
+    while shared.alive.load(Ordering::SeqCst)
+        && !((st.pending.is_some() || st.analysis.is_some()) && st.in_flight.is_none())
+    {
         st = shared.cv.wait(st).unwrap();
     }
     if !shared.alive.load(Ordering::SeqCst) {
         return None;
     }
-    let p = st.pending.take().unwrap();
+    let p = st.analysis.take().or_else(|| st.pending.take()).unwrap();
     st.in_flight = Some(InFlight {
         reading: p.reading.clone(),
         context: p.context.nfkc().collect(),
         dispatched_at: p.dispatched_at,
+        analyze: !p.analyze.is_empty(),
     });
     Some(p)
 }
@@ -323,6 +422,7 @@ fn request_line(shared: &Shared, pending: &Pending) -> Option<String> {
         context: &context,
         reading: &reading,
         continue_beam: pending.continue_beam,
+        analyze: (!pending.analyze.is_empty()).then_some(&pending.analyze[..]),
     };
     crate::diagnostics::log(format!(
         "writer send req_id={} reading={}",
@@ -436,6 +536,13 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
     ));
     let inflight = shared.state.lock().unwrap().in_flight.take();
     shared.cv.notify_all();
+    if inflight.as_ref().is_some_and(|f| f.analyze) {
+        // to its caller, not the frontend
+        let words = resp.analyses.filter(|_| resp.error.is_none());
+        *shared.analyzed.lock().unwrap() = Some((resp.id, words));
+        shared.analyzed_cv.notify_all();
+        return None;
+    }
     if resp.error.is_some() {
         return None;
     }
@@ -674,6 +781,13 @@ fn daemon_args(manifest: &Path, engine_cfg: &crate::config::EngineCfg) -> Vec<st
     args
 }
 
+/// The analyzer manifest `cfg` names, when it is set.
+fn analyzer_of(cfg: &crate::config::EngineCfg) -> Option<&Path> {
+    cfg.analyzer_manifest
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// The flags after the manifest, `daemon`'s and `serve`'s: what changes the
 /// engine's answers, and so what a shared server is named by.
 fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
@@ -701,6 +815,7 @@ fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
     flag("symbol-token", c.symbol_token.map(|v| v.to_string()));
     flag("digit-split", c.digit_split.map(|v| v.to_string()));
     flag("emit-frames", c.emit_frames.map(|v| v.to_string()));
+    flag("analyzer", analyzer_of(c).map(|p| p.display().to_string()));
     match &c.vocab_blacklist {
         // The bare flag clears a manifest blacklist.
         Some(ids) if ids.is_empty() => args.push("--vocab-blacklist".to_string()),
@@ -782,6 +897,81 @@ mod tests {
             ..EngineCfg::default()
         };
         assert_eq!(args_of(&cleared).last().unwrap(), "--vocab-blacklist");
+        let analyzer = EngineCfg {
+            analyzer_manifest: Some(PathBuf::from("a/analyzer.manifest.json")),
+            ..EngineCfg::default()
+        };
+        assert_eq!(
+            args_of(&analyzer).last().unwrap(),
+            &format!(
+                "--analyzer={}",
+                Path::new("a/analyzer.manifest.json").display()
+            )
+        );
+        let empty = EngineCfg {
+            analyzer_manifest: Some(PathBuf::new()),
+            ..EngineCfg::default()
+        };
+        assert_eq!(args_of(&empty), args_of(&EngineCfg::default()));
+    }
+
+    #[test]
+    fn an_analysis_goes_first_and_returns_to_its_caller() {
+        let cfg = EngineCfg {
+            analyzer_manifest: Some(PathBuf::from("a.json")),
+            ..EngineCfg::default()
+        };
+        let shared = Arc::new(Shared::new(&cfg));
+        shared.ready.store(true, Ordering::SeqCst);
+        shared.state.lock().unwrap().pending = Some(Pending {
+            req_id: 7,
+            context: String::new(),
+            reading: "きょう".into(),
+            continue_beam: 0,
+            analyze: Vec::new(),
+            dispatched_at: Instant::now(),
+        });
+        // the engine's side: the analysis is sent first, then the conversion
+        let engine = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                let first = next_request(&shared).unwrap();
+                let line = request_line(&shared, &first).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(v["analyze"][0], "今日");
+                let answer = format!(
+                    r#"{{"id":{},"analyses":[[{{"surface":"今日","start":0,"end":2,"reading":"きょう","pos":"名詞","pos2":"普通名詞","cost":100}}]],"engine_ms":0.1}}"#,
+                    first.req_id
+                );
+                assert!(take_response(&shared, &answer).is_none());
+                let second = next_request(&shared).unwrap();
+                assert_eq!((second.req_id, second.analyze.len()), (7, 0));
+            })
+        };
+        let words = shared
+            .analyze(&["今日".to_string()], Duration::from_secs(5))
+            .unwrap();
+        engine.join().unwrap();
+        assert_eq!(words[0][0].reading.as_deref(), Some("きょう"));
+        assert_eq!(words[0][0].pos2, "普通名詞");
+        // no analyzer, or not ready: nothing asked
+        let none = Shared::new(&EngineCfg::default());
+        none.ready.store(true, Ordering::SeqCst);
+        assert!(none
+            .analyze(&["今日".to_string()], Duration::from_secs(1))
+            .is_none());
+        assert!(none.state.lock().unwrap().analysis.is_none());
+        // unanswered in time: taken back
+        shared.state.lock().unwrap().in_flight = Some(InFlight {
+            reading: String::new(),
+            context: String::new(),
+            dispatched_at: Instant::now(),
+            analyze: false,
+        });
+        assert!(shared
+            .analyze(&["今日".to_string()], Duration::from_millis(20))
+            .is_none());
+        assert!(shared.state.lock().unwrap().analysis.is_none());
     }
 
     struct TempDir(PathBuf);

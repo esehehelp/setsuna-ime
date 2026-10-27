@@ -41,12 +41,18 @@ pub struct Token {
     /// Hiragana; none for a word the dictionary does not hold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reading: Option<String>,
-    /// The part of speech (the dictionary's first feature column).
+    /// The part of speech (the feature column `pos1`, else the first).
     pub pos: String,
+    /// Its subdivision (`pos2`, else the second column; `*` for none):
+    /// 普通名詞, 係助詞, 非自立可能.
+    pub pos2: String,
     /// Other readings and how much more the path costs with each (in the
     /// dictionary's cost units), cheapest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alts: Vec<(String, i32)>,
+    /// The path's cost from the text's start through this word (the
+    /// dictionary's units): the last word's is the analysis's.
+    pub cost: i32,
 }
 
 /// Analysis settings: the manifest's, else the defaults above.
@@ -61,6 +67,7 @@ pub struct Analyzer {
     tokenizer: vibrato::Tokenizer,
     alternates: Option<Alternates>,
     reading_col: usize,
+    pos_cols: (usize, usize),
     pub config: AnalyzeConfig,
 }
 
@@ -85,6 +92,10 @@ impl Analyzer {
                 .transpose()?,
             // checked by the manifest
             reading_col: manifest.feature("reading").unwrap_or(0),
+            pos_cols: (
+                manifest.feature("pos1").unwrap_or(0),
+                manifest.feature("pos2").unwrap_or(1),
+            ),
             config,
         })
     }
@@ -124,8 +135,10 @@ impl Analyzer {
                     start: range.start,
                     end: range.end,
                     reading,
-                    pos: features.first().unwrap_or(&"").to_string(),
+                    pos: features.get(self.pos_cols.0).unwrap_or(&"").to_string(),
+                    pos2: features.get(self.pos_cols.1).unwrap_or(&"*").to_string(),
                     alts,
+                    cost: t.total_cost(),
                 }
             })
             .collect()
@@ -246,7 +259,10 @@ mod tests {
                 ("晴れ", Some("はれ"), 3, 5)
             ]
         );
-        assert_eq!(t[0].pos, "名詞");
+        assert_eq!(
+            (t[0].pos.as_str(), t[0].pos2.as_str()),
+            ("名詞", "普通名詞")
+        );
         // こんにち: 1500 against 100, the same connections
         assert_eq!(t[0].alts, [("こんにち".to_string(), 1400)]);
         assert!(t[1].alts.is_empty());

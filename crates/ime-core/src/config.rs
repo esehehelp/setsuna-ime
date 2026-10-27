@@ -185,6 +185,10 @@ pub struct EngineCfg {
     /// for the IME: it only costs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emit_frames: Option<usize>,
+    /// Analyzer manifest the engine loads (`--analyzer`): segment editing
+    /// cuts a conversion by its words (`bunsetsu`). Empty = none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analyzer_manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

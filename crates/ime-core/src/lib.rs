@@ -7,6 +7,7 @@
 //! `crates/tsf`, the fcitx5 addon in `crates/linux`) turns its key events
 //! into `engine_bridge::KeyKind`s and renders the `Action`s that come back.
 
+pub mod bunsetsu;
 pub mod char_forms;
 pub mod char_ngram;
 pub mod child_daemon;
