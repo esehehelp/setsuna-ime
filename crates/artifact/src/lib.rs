@@ -392,6 +392,116 @@ impl LmScorerManifest {
     }
 }
 
+pub const ANALYZER_SCHEMA: &str = "neo-ime-analyzer-export-v1";
+pub const ANALYZER_FAMILY: &str = "lattice_crf";
+
+/// The analyzer's compiled dictionary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzerDictionaryArtifact {
+    pub path: PathBuf,
+    /// `vibrato-zstd` (a vibrato system dictionary, zstd-compressed) is the
+    /// only one.
+    pub format: String,
+}
+
+/// Analysis settings the analyzer was verified with. Every field is
+/// optional; an unset one falls back to the runtime default.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzeDefaults {
+    /// Longest unknown word grouped from one character class (0: no limit).
+    pub max_grouping_len: Option<usize>,
+    /// Other readings of a token that cost the path at most this much more.
+    pub alt_max_cost: Option<i32>,
+    /// Other readings per token at most.
+    pub max_alts: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyzerManifestFile {
+    #[allow(dead_code)] // checked through the envelope
+    schema: String,
+    #[allow(dead_code)] // checked through the envelope
+    model_family: String,
+    dictionary: AnalyzerDictionaryArtifact,
+    /// The other readings' table (each surface's entries and the connection
+    /// costs), when the analyzer gives them.
+    #[serde(default)]
+    alternates: Option<PathBuf>,
+    /// The names of the dictionary's feature columns, in order; `reading`
+    /// (hiragana, `*` when unknown) is required.
+    features: Vec<String>,
+    #[serde(default)]
+    analyze_defaults: AnalyzeDefaults,
+}
+
+/// A morphological analyzer (a lattice of dictionary words and a CRF's
+/// costs), its files resolved against the manifest's directory and checked
+/// to exist.
+#[derive(Debug, Clone)]
+pub struct AnalyzerManifest {
+    pub manifest_path: PathBuf,
+    pub dictionary_path: PathBuf,
+    pub alternates_path: Option<PathBuf>,
+    pub features: Vec<String>,
+    pub analyze_defaults: AnalyzeDefaults,
+}
+
+impl AnalyzerManifest {
+    pub fn load(path: &Path) -> Result<Self> {
+        let (envelope, value) = read_manifest(path)?;
+        anyhow::ensure!(
+            envelope.schema == ANALYZER_SCHEMA && envelope.model_family == ANALYZER_FAMILY,
+            "manifest {} is {}/{}, expected {ANALYZER_SCHEMA}/{ANALYZER_FAMILY}",
+            path.display(),
+            envelope.schema,
+            envelope.model_family
+        );
+        let file: AnalyzerManifestFile = serde_json::from_value(value)
+            .with_context(|| format!("parse analyzer manifest {}", path.display()))?;
+        anyhow::ensure!(
+            file.dictionary.format == "vibrato-zstd",
+            "manifest {}: unknown dictionary format {:?}",
+            path.display(),
+            file.dictionary.format
+        );
+        anyhow::ensure!(
+            file.features.iter().any(|f| f == "reading"),
+            "manifest {}: features name no reading",
+            path.display()
+        );
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        let resolve = |p: &Path, what: &str| -> Result<PathBuf> {
+            let full = base.join(p);
+            anyhow::ensure!(
+                full.is_file(),
+                "manifest {}: {what} {} not found",
+                path.display(),
+                full.display()
+            );
+            Ok(full)
+        };
+        Ok(Self {
+            manifest_path: path.to_path_buf(),
+            dictionary_path: resolve(&file.dictionary.path, "dictionary")?,
+            alternates_path: file
+                .alternates
+                .as_deref()
+                .map(|p| resolve(p, "alternates"))
+                .transpose()?,
+            features: file.features,
+            analyze_defaults: file.analyze_defaults,
+        })
+    }
+
+    /// The column of feature `name`.
+    pub fn feature(&self, name: &str) -> Option<usize> {
+        self.features.iter().position(|f| f == name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +746,42 @@ mod tests {
             let m = write(&dir, "m.json", &manifest_body("p.onnx", "v.tsv", extra));
             let err = CtcNatManifest::load(&m).unwrap_err().to_string();
             assert!(err.contains("re-export"), "{err}");
+        }
+    }
+
+    #[test]
+    fn analyzer_loads_and_refuses_bad_manifests() {
+        let dir = temp_dir("analyzer");
+        write(&dir, "system.dic.zst", "");
+        write(&dir, "alternates.bin", "");
+        let body = |extra: &str| {
+            format!(
+                r#"{{"schema":"{ANALYZER_SCHEMA}","model_family":"lattice_crf",
+                "dictionary":{{"path":"system.dic.zst","format":"vibrato-zstd"}},
+                "features":["pos1","pos2","cType","cForm","reading","orth"]{extra}}}"#
+            )
+        };
+        let m = write(
+            &dir,
+            "ok.json",
+            &body(r#","alternates":"alternates.bin","analyze_defaults":{"max_alts":8}"#),
+        );
+        let a = AnalyzerManifest::load(&m).unwrap();
+        assert_eq!(a.dictionary_path, dir.join("system.dic.zst"));
+        assert_eq!(a.alternates_path, Some(dir.join("alternates.bin")));
+        assert_eq!(a.feature("reading"), Some(4));
+        assert_eq!(a.analyze_defaults.max_alts, Some(8));
+        let bare = write(&dir, "bare.json", &body(""));
+        assert_eq!(AnalyzerManifest::load(&bare).unwrap().alternates_path, None);
+        for (name, text) in [
+            ("absent.json", body(r#","alternates":"x.bin""#)),
+            ("format.json", body("").replace("vibrato-zstd", "mecab")),
+            ("noreading.json", body("").replace("\"reading\",", "")),
+            ("unknown.json", body(r#","extra":1"#)),
+            ("schema.json", body("").replace("lattice_crf", "ctc_nat")),
+        ] {
+            let m = write(&dir, name, &text);
+            assert!(AnalyzerManifest::load(&m).is_err(), "{name}");
         }
     }
 }

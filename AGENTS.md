@@ -14,11 +14,13 @@ Dependencies point one way: artifact -> runtime -> platform.
 | layer    | where                                  | may use                                                 |
 |----------|----------------------------------------|---------------------------------------------------------|
 | artifact | `crates/artifact`                      | manifest schemas only                                   |
-| runtime  | `crates/engine`, `crates/rerank`, `crates/pipe` | `crates/artifact`, and `crates/pipe` for `serve`; models load only through a manifest  |
+| runtime  | `crates/engine`, `crates/rerank`, `crates/analyzer`, `crates/pipe` | `crates/artifact`, `crates/pipe` for `serve`, and `crates/analyzer` for the engine's `--analyzer`; models load only through a manifest  |
 | platform | `crates/ime-core`, `crates/tsf`, `crates/linux`, `crates/rewrite`, `crates/settings`, `crates/demo` | the engine, reranker and rewriter daemons' stdio protocol, and the shared engine's and reranker's named pipes (`crates/pipe`, Windows); `crates/settings` also links `crates/rewrite` (sign-in, keys, models) |
 
 The engine does inference only (proposal -> CTC beam -> candidates), and so
-does the reranker (an LM's log-probability of each candidate). IME-level
+does the reranker (an LM's log-probability of each candidate), and so does
+the analyzer (text -> words with their readings), which the engine's daemon
+hosts so that a login's one process holds its dictionary. IME-level
 behaviour (romaji composition, which kana candidates to show and where, when
 to rerank and how to combine the scores) lives in `crates/ime-core` and
 `crates/tsf`. The rewriter (`crates/rewrite`) only talks to a model server

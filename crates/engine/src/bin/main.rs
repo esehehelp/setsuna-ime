@@ -4,15 +4,19 @@
 //! a named pipe shared by every app of a Windows login (serve mode, the same
 //! lines) or a single CLI invocation (convert mode). Hosts (the IME frontend,
 //! the research bench) talk to the daemon only through this protocol; see
-//! `backend-manifest`.
+//! `backend-manifest`. With `--analyzer`, the daemon also answers `analyze`
+//! requests (text -> words with their readings, `setsuna_analyzer`), so the
+//! one process a login shares holds the analyzer's dictionary once.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use setsuna_analyzer::{Analyzer, Token};
 use setsuna_artifact::{CtcNatManifest, DecodeDefaults};
 use setsuna_engine::candidate::identity_pos;
 use setsuna_engine::session::{ConvertPerf, FrameView};
@@ -162,6 +166,12 @@ struct EngineArgs {
     /// inspection. Default 0: left out.
     #[arg(long, default_value_t = 0)]
     emit_frames: usize,
+
+    /// Analyzer manifest: answer `analyze` requests with its analysis.
+    /// Loaded after the ready line; a request before it is ready is answered
+    /// with an error. Default none.
+    #[arg(long)]
+    analyzer: Option<PathBuf>,
 }
 
 impl EngineArgs {
@@ -265,9 +275,24 @@ struct Request {
     id: u64,
     #[serde(default)]
     context: String,
-    reading: String,
+    /// Required but for an `analyze` request.
+    #[serde(default)]
+    reading: Option<String>,
     #[serde(default)]
     continue_beam: usize,
+    /// Texts to analyze instead of a conversion.
+    #[serde(default)]
+    analyze: Option<Vec<String>>,
+}
+
+/// The response to an `analyze` request: each text's words.
+#[derive(Serialize, Debug)]
+struct AnalyzeResponse<'a> {
+    id: u64,
+    analyses: Vec<Vec<Token>>,
+    engine_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
 }
 
 #[derive(Serialize, Debug)]
@@ -387,6 +412,8 @@ struct Ready {
     artifact_format: &'static str,
     beam_width: usize,
     top_k: usize,
+    /// `analyze` requests are answered (once the analyzer has loaded).
+    analyzer: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -454,6 +481,7 @@ fn backend_manifest() -> BackendManifest {
             "candidate-meta",
             "perf-metrics",
             "candidate-alignment",
+            "analyze",
         ],
         request_fields: vec![
             field("id", "u64", true, "Caller-owned request id echoed in the response."),
@@ -461,7 +489,8 @@ fn backend_manifest() -> BackendManifest {
                 "reading",
                 "string",
                 true,
-                "Hiragana reading to convert. Empty string returns one empty candidate.",
+                "Hiragana reading to convert. Empty string returns one empty candidate. \
+                 Not read in an analyze request.",
             ),
             field(
                 "context",
@@ -476,6 +505,13 @@ fn backend_manifest() -> BackendManifest {
                 "n > 0: more candidates of the same request, the beam and the candidate limit \
                  widened by 10 per step (the model is not run again for the last request). \
                  Omitted or 0: a conversion.",
+            ),
+            field(
+                "analyze",
+                "string[]",
+                false,
+                "Texts to analyze instead of a conversion (with --analyzer): the response has \
+                 `analyses`, each text's words {surface, start, end, reading?, pos, alts?}.",
             ),
         ],
         response_fields: vec![
@@ -532,11 +568,48 @@ fn backend_manifest() -> BackendManifest {
     }
 }
 
+/// The analyzer, once its background load has finished.
+#[derive(Clone, Default)]
+struct AnalyzerSlot(Arc<Mutex<Option<Result<Arc<Analyzer>, String>>>>);
+
+impl AnalyzerSlot {
+    /// Load `manifest` on a thread of its own: the dictionary takes about
+    /// half a second, which the first conversion does not wait for.
+    fn load_in_background(manifest: PathBuf) -> Self {
+        let slot = Self::default();
+        let s = slot.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let loaded = Analyzer::from_manifest_path(&manifest)
+                .map(Arc::new)
+                .map_err(|e| format!("{e:#}"));
+            match &loaded {
+                Ok(_) => eprintln!(
+                    "[engine] analyzer {} loaded in {:.2} s",
+                    manifest.display(),
+                    t0.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("[engine] analyzer {}: {e}", manifest.display()),
+            }
+            *s.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(loaded);
+        });
+        slot
+    }
+
+    fn get(&self) -> Result<Arc<Analyzer>, String> {
+        match &*self.0.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some(r) => r.clone(),
+            None => Err("analyzer loading".to_string()),
+        }
+    }
+}
+
 /// A loaded session answering request lines, the daemon's and the server's.
 struct Daemon {
     session: EngineSession,
     args: EngineArgs,
     perf_enabled: bool,
+    analyzer: Option<AnalyzerSlot>,
 }
 
 impl Daemon {
@@ -549,11 +622,14 @@ impl Daemon {
             artifact_format: af,
             beam_width: session.config.beam_width,
             top_k: session.config.max_candidates,
+            analyzer: args.analyzer.is_some(),
         })?;
+        let analyzer = args.analyzer.clone().map(AnalyzerSlot::load_in_background);
         let daemon = Self {
             session,
             args,
             perf_enabled: env_flag("SETSUNA_PERF"),
+            analyzer,
         };
         Ok((daemon, ready))
     }
@@ -568,12 +644,13 @@ impl Daemon {
             }
         };
         let t0 = Instant::now();
-        let result = decode_one(
-            &mut self.session,
-            &req.context,
-            &req.reading,
-            req.continue_beam,
-        );
+        if let Some(texts) = &req.analyze {
+            return self.analyze(req.id, texts, t0);
+        }
+        let Some(reading) = &req.reading else {
+            return to_line(&Response::err(req.id, 0.0, "missing field `reading`"));
+        };
+        let result = decode_one(&mut self.session, &req.context, reading, req.continue_beam);
         let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok((cands, perf, frames)) => {
@@ -590,6 +667,28 @@ impl Daemon {
             }
             Err(e) => to_line(&Response::err(req.id, engine_ms, &e.to_string())),
         }
+    }
+}
+
+impl Daemon {
+    /// The response line to an `analyze` request.
+    fn analyze(&self, id: u64, texts: &[String], t0: Instant) -> String {
+        let analyzer = match &self.analyzer {
+            Some(slot) => slot.get(),
+            None => Err("no analyzer (--analyzer)".to_string()),
+        };
+        let (analyses, error) = match &analyzer {
+            Ok(a) => (texts.iter().map(|t| a.analyze(t)).collect(), None),
+            Err(e) => (Vec::new(), Some(e.as_str())),
+        };
+        let response = AnalyzeResponse {
+            id,
+            analyses,
+            engine_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            error,
+        };
+        serde_json::to_string(&response)
+            .unwrap_or_else(|e| serde_json::json!({ "id": id, "error": e.to_string() }).to_string())
     }
 }
 
@@ -765,5 +864,36 @@ mod tests {
         let json =
             serde_json::to_value(Response::ok(7, cands, 1.0, None, false, true, None)).unwrap();
         assert_eq!(json["candidate_reading_pos"][0], serde_json::json!([0, 2]));
+    }
+
+    #[test]
+    fn analyze_requests_need_no_reading() {
+        let r: Request = serde_json::from_str(r#"{"id":3,"analyze":["今日は"]}"#).unwrap();
+        assert_eq!(r.analyze.as_deref(), Some(&["今日は".to_string()][..]));
+        assert_eq!(r.reading, None);
+        let r: Request = serde_json::from_str(r#"{"id":4,"reading":"きょう"}"#).unwrap();
+        assert_eq!((r.reading.as_deref(), r.analyze), (Some("きょう"), None));
+        let slot = AnalyzerSlot::default();
+        assert_eq!(slot.get().err().as_deref(), Some("analyzer loading"));
+        let json = serde_json::to_value(AnalyzeResponse {
+            id: 3,
+            analyses: vec![vec![Token {
+                surface: "今日".into(),
+                start: 0,
+                end: 2,
+                reading: Some("きょう".into()),
+                pos: "名詞".into(),
+                alts: vec![("こんにち".into(), 1348)],
+            }]],
+            engine_ms: 0.1,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(json["analyses"][0][0]["reading"], "きょう");
+        assert_eq!(
+            json["analyses"][0][0]["alts"][0],
+            serde_json::json!(["こんにち", 1348])
+        );
+        assert!(json.get("error").is_none());
     }
 }

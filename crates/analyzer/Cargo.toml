@@ -1,0 +1,23 @@
+[package]
+name = "setsuna-analyzer"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version = "0.1.0"
+description = "Morphological analysis (a vibrato lattice and CRF costs), loaded through an analyzer manifest: text -> words with their readings."
+
+[lib]
+name = "setsuna_analyzer"
+path = "src/lib.rs"
+
+[dependencies]
+setsuna-artifact = { path = "../artifact" }
+anyhow.workspace = true
+serde.workspace = true
+vibrato = "0.5"
+zstd = "0.13"
+# the other readings' table is mapped, not read
+memmap2 = "0.9"
+
+[dev-dependencies]
+serde_json.workspace = true
