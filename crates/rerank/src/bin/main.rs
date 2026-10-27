@@ -65,7 +65,7 @@ struct Args {
     /// LM scorer manifest (`neo-ime-lm-scorer-export-v1`).
     #[arg(long)]
     manifest: PathBuf,
-    /// Threads llama.cpp computes with. Default: half the logical cores.
+    /// Threads llama.cpp computes with. Default: 1.
     #[arg(long)]
     threads: Option<usize>,
     /// Left context chars read before a candidate. Default: the manifest's, else 40.

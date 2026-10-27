@@ -6,7 +6,7 @@
 //! 6.0 / 11.0 ms, pinned so 5.0 / 10.6 (the readings live conversion sends 6.0 -> 4.7); with other work on the
 //! machine, unpinned 8.9 / 17.6, the V-cache CCD's 8 cores 5.4 / 10.5, its 16 logical CPUs 5.9 / 17.6, the other
 //! CCD 10.6 / 21.4. (The reranker's 16 llama.cpp threads want every core: pinned to 8 they took 48 -> 89 ms.)
-//! `SETSUNA_CPU_AFFINITY=0` leaves the process where the OS puts it.
+//! Off unless `SETSUNA_CPU_AFFINITY=1`: an IME's conversion runs on one thread, which the OS places.
 
 /// The logical CPUs that share one L3, and its size.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +65,7 @@ fn is_zen() -> bool {
 /// it did nothing. Call it before any thread is started: on Linux later threads inherit the affinity, earlier ones
 /// keep theirs.
 pub fn pin_to_one_l3() -> Option<Vec<usize>> {
-    if std::env::var("SETSUNA_CPU_AFFINITY").is_ok_and(|v| v == "0") || !is_zen() {
+    if !std::env::var("SETSUNA_CPU_AFFINITY").is_ok_and(|v| v == "1") || !is_zen() {
         return None;
     }
     let (domains, cores, allowed) = sys::topology()?;

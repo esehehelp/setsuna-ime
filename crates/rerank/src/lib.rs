@@ -89,10 +89,9 @@ impl Reranker {
     pub fn load(manifest: &LmScorerManifest, options: &RerankOptions) -> Result<Self> {
         let d = &manifest.score_defaults;
         let config = RerankConfig {
-            threads: options.threads.unwrap_or_else(|| {
-                // the logical cores' half: the physical ones on an SMT CPU
-                std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1))
-            }),
+            // one: an IME's rerank runs on one core, not on every core to
+            // make it faster
+            threads: options.threads.unwrap_or(1),
             max_context_chars: options
                 .max_context_chars
                 .or(d.max_context_chars)

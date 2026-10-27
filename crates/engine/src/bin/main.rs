@@ -751,7 +751,8 @@ fn run_serve(
     )
 }
 
-/// The daemon's threads on one L3 (`setsuna_engine::cpu`), before the session starts any.
+/// The daemon's threads on one L3 (`setsuna_engine::cpu`, with SETSUNA_CPU_AFFINITY=1), before the session starts
+/// any.
 fn pin_cpus() {
     if let Some(cpus) = setsuna_engine::cpu::pin_to_one_l3() {
         eprintln!("[engine] pinned to CPUs {cpus:?} (one L3)");
