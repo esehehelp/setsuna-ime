@@ -16,6 +16,8 @@ path = "src/bin/main.rs"
 
 [dependencies]
 setsuna-artifact = { path = "../artifact" }
+# `--analyzer`: the daemon answers `analyze` requests too
+setsuna-analyzer = { path = "../analyzer" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 # The runtime is loaded at run time (`runtime.rs`): Microsoft's official

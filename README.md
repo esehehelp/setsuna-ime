@@ -122,6 +122,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 | `crates/artifact` | artifact | manifest reader |
 | `crates/engine` | runtime | 推論エンジン（`setsuna-engine`、library / CLI / daemon） |
 | `crates/rerank` | runtime | LM リランカ（`setsuna-rerank`、llama.cpp） |
+| `crates/analyzer` | runtime | 形態素解析（vibrato の辞書と CRF のコスト。文 → 語と読み。`setsuna-engine --analyzer` が持つ） |
 | `crates/pipe` | runtime | 共有エンジン・共有リランカの名前付きパイプ（名前、Win32 の呼び出し、サーバのループ。Windows） |
 | `crates/ime-core` | platform | 各 frontend 共通の IME ロジック（ローマ字合成、状態遷移、後処理、学習、設定、daemon client） |
 | `crates/tsf` | platform | Windows TSF IME（DLL） |
@@ -310,6 +311,14 @@ cargo run --release -p setsuna-settings
   `tokenizer.model`）を持つ。書いてあればリランカはそれで区切る（sarashina2.2 は
   Unigram のモデルで、llama.cpp は GGUF の語彙を別の方式として読み、日本語の
   区切りが変わる）。書いていなければ GGUF の語彙で区切る。
+- 解析器: schema `neo-ime-analyzer-export-v1`。vibrato の辞書（`dictionary`、
+  zstd 圧縮）、素性の列の名前（`features`、`reading` は必須）、任意で別の読みの表
+  （`alternates`、読みが複数ある語の項目と連接コスト。`examples/analyzer.rs
+  alternates` が学習済みの `lex.csv` と `matrix.def` から作る）と
+  `analyze_defaults` を持つ。`setsuna-engine daemon|serve --analyzer <manifest>`
+  で読み込み（ready の後に裏で読む）、`{"id":1,"analyze":["今日は晴れ"]}` に
+  各文の語（表層、文字の範囲、読み、品詞、別の読みとそれで経路が何コスト高くなるか）
+  を返す。辞書はメモリに展開するので、ログインで 1 つのエンジンのプロセスが持つ。
 
 例は `tests/fixtures/` にある（中身は空の placeholder）。
 
