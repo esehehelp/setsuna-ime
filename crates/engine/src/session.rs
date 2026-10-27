@@ -77,7 +77,8 @@ pub struct FrameView {
 /// the caller and the manifest.
 #[derive(Debug, Clone)]
 struct RuntimeEnv {
-    /// `SETSUNA_ORT_INTRA_THREADS` (default 4).
+    /// `SETSUNA_ORT_INTRA_THREADS` (default 1: an IME's conversion runs on
+    /// one core; more cores are for other work, not to make one faster).
     ort_intra_threads: usize,
     /// `SETSUNA_TOP_K_PER_STEP` (default 16): beam expansion breadth when
     /// neither the caller nor the manifest sets one.
@@ -87,7 +88,7 @@ struct RuntimeEnv {
 impl RuntimeEnv {
     fn read() -> Self {
         Self {
-            ort_intra_threads: env_usize("SETSUNA_ORT_INTRA_THREADS", 4),
+            ort_intra_threads: env_usize("SETSUNA_ORT_INTRA_THREADS", 1),
             top_k_per_step: env_usize("SETSUNA_TOP_K_PER_STEP", 16),
         }
     }

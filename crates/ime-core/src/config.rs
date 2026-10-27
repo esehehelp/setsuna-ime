@@ -1009,7 +1009,7 @@ impl Config {
              # pauses. Off while no manifest is set.\n\
              # manifest = \"models/rerank/model.q8_0.manifest.json\"\n\
              # exe = \"setsuna-rerank.exe\"\n\
-             # threads = 16\n\
+             # threads = 1\n\
              # Candidates reranked first; doubled while typing stays paused,\n\
              # up to max_candidates (default: the manifest's).\n\
              first_candidates = {rerank_first}\n\
