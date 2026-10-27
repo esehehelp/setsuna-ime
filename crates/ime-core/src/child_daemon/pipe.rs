@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,9 +27,9 @@ use setsuna_pipe::{engine_pipe_name, exe_identity};
 
 use super::{
     decode_flags, deliver, next_request, request_line, take_response, ChildDaemonClient,
-    DaemonResponse, InFlight, Pending, Shared, State,
+    DaemonResponse, InFlight, Pending, Shared,
 };
-use crate::engine_client::{EngineClient, EngineResult, Notify};
+use crate::engine_client::{EngineClient, EngineResult, Notify, Word};
 
 /// How long a connection may take, the server's start and model load included.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,13 +77,7 @@ impl PipeEngineClient {
         };
         crate::diagnostics::log(format!("engine pipe={} exe={}", target.name, exe.display()));
         let notify = Arc::new(Mutex::new(notify));
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::default()),
-            cv: Condvar::new(),
-            latest: Mutex::new(None),
-            ready: false.into(),
-            alive: true.into(),
-        });
+        let shared = Arc::new(Shared::new(cfg));
         let fallback = Arc::new(Fallback {
             manifest: manifest.to_path_buf(),
             exe: exe.to_path_buf(),
@@ -211,6 +205,7 @@ impl EngineClient for PipeEngineClient {
             context: context.to_string(),
             reading: reading.to_string(),
             continue_beam,
+            analyze: Vec::new(),
             dispatched_at: Instant::now(),
         });
         drop(child);
@@ -220,6 +215,13 @@ impl EngineClient for PipeEngineClient {
     fn take_latest(&self) -> Option<EngineResult> {
         let ours = self.shared.latest.lock().ok()?.take();
         ours.or_else(|| self.fallback.child.lock().ok()?.as_ref()?.take_latest())
+    }
+
+    fn analyze(&self, texts: &[String], timeout: Duration) -> Option<Vec<Vec<Word>>> {
+        if let Some(child) = self.fallback.child.lock().unwrap().as_ref() {
+            return child.analyze(texts, timeout);
+        }
+        self.shared.analyze(texts, timeout)
     }
 
     fn is_ready(&self) -> bool {

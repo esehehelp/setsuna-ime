@@ -41,6 +41,30 @@ pub struct EngineResult {
     pub frames: Option<serde_json::Value>,
 }
 
+/// A word of the engine's analysis of a text (`--analyzer`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Word {
+    pub surface: String,
+    /// The surface's chars `[start, end)` in the text.
+    pub start: usize,
+    pub end: usize,
+    /// Hiragana; none for a word the analyzer's dictionary does not hold.
+    #[serde(default)]
+    pub reading: Option<String>,
+    /// The part of speech and its subdivision (名詞 / 普通名詞, 動詞 /
+    /// 非自立可能).
+    #[serde(default)]
+    pub pos: String,
+    #[serde(default)]
+    pub pos2: String,
+    /// Other readings and how much more the analysis costs with each.
+    #[serde(default)]
+    pub alts: Vec<(String, i32)>,
+    /// The analysis's cost from the text's start through this word.
+    #[serde(default)]
+    pub cost: i32,
+}
+
 /// Backend the `EngineBridge` dispatches conversions to.
 ///
 /// All methods take `&self`: the production client owns background threads
@@ -75,5 +99,13 @@ pub trait EngineClient {
     /// new one on its next activation.
     fn is_alive(&self) -> bool {
         true
+    }
+
+    /// The engine's analysis of each of `texts`, waiting at most `timeout`
+    /// (it goes before any queued conversion). `None` when the engine has
+    /// no analyzer, is not ready, or does not answer in time.
+    fn analyze(&self, texts: &[String], timeout: std::time::Duration) -> Option<Vec<Vec<Word>>> {
+        let _ = (texts, timeout);
+        None
     }
 }

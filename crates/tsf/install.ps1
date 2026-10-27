@@ -9,6 +9,7 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -RerankManifest <r>  # also the reranker
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NameDictionary <tsv>  # also mixed input's names
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Lexicon <file>  # also the reading lexicon
+#   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Analyzer <a>  # also the analyzer (segment editing)
 #
 # Without -Manifest, fetch-model.ps1 downloads the public artifact pinned in
 # models.json, verifies its size/SHA-256, and reuses verified cache files offline.
@@ -50,6 +51,7 @@
 #                                  or -MixedModel <dir>)
 #   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
 #   %LOCALAPPDATA%\setsuna-ime\models\lexicon\<lexicon>  (with -Lexicon)
+#   %LOCALAPPDATA%\setsuna-ime\models\analyzer\<its directory's name>\<manifest> + its files  (with -Analyzer)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
@@ -80,6 +82,10 @@ param(
     # The reading lexicon (LEXICON1, [lexicon] file): candidates scored by
     # the words text uses, near-misses dropped.
     [string]$Lexicon,
+    # Analyzer manifest (neo-ime-analyzer-export-v1, [engine]
+    # analyzer_manifest): the engine analyzes a conversion segment editing
+    # cuts, which then cuts it by its words.
+    [string]$Analyzer,
     [switch]$Force,
     [switch]$NoElevate
 )
@@ -330,7 +336,8 @@ function Update-ExistingConfig {
         [string]$RewriteExePath,
         [string]$MixedModelPath,
         [string]$NameDictionaryPath,
-        [string]$LexiconPath
+        [string]$LexiconPath,
+        [string]$AnalyzerPath
     )
 
     $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -ErrorAction Stop)
@@ -364,6 +371,10 @@ function Update-ExistingConfig {
     if ($LexiconPath) {
         $q = '"' + ($LexiconPath.Replace('\','/').Replace('"','\"')) + '"'
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'lexicon' -Key 'file' -Value $q
+    }
+    if ($AnalyzerPath) {
+        $q = '"' + ($AnalyzerPath.Replace('\','/').Replace('"','\"')) + '"'
+        $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'analyzer_manifest' -Value $q
     }
     # The rewriter is found next to the DLL; a locked one's fallback is named.
     if ($RewriteExePath -and ($RewriteExePath -ne (Join-Path $InstallDir $RewriteExe))) {
@@ -485,6 +496,22 @@ if ($Lexicon) {
     }
     Write-Log INFO "using lexicon: $Lexicon"
 }
+$AnalyzerFiles = @()
+if ($Analyzer) {
+    $Analyzer = Resolve-Path-Safe $Analyzer
+    if (-not (Test-Path -LiteralPath $Analyzer)) {
+        Write-Log ERROR "analyzer manifest not found: $Analyzer"; exit 30
+    }
+    $AnalyzerJson = Get-Content -LiteralPath $Analyzer -Raw -Encoding UTF8 | ConvertFrom-Json
+    $AnalyzerFiles = @($AnalyzerJson.dictionary.path)
+    if ($AnalyzerJson.alternates) { $AnalyzerFiles += @($AnalyzerJson.alternates) }
+    foreach ($f in $AnalyzerFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Analyzer) $f))) {
+            Write-Log ERROR "analyzer file not found: $f"; exit 30
+        }
+    }
+    Write-Log INFO "using analyzer: $Analyzer"
+}
 
 # ---- elevate when regsvr32 needed ----
 if (-not (Test-IsAdmin) -and -not $NoElevate) {
@@ -498,6 +525,7 @@ if (-not (Test-IsAdmin) -and -not $NoElevate) {
     $argv += @('-MixedModel', ("`"$MixedModel`""))
     if ($NameDictionary) { $argv += @('-NameDictionary', ("`"$NameDictionary`"")) }
     if ($Lexicon) { $argv += @('-Lexicon', ("`"$Lexicon`"")) }
+    if ($Analyzer) { $argv += @('-Analyzer', ("`"$Analyzer`"")) }
     if ($Force) { $argv += '-Force' }
     try {
         $p = Start-Process $PsExe -ArgumentList $argv -Verb RunAs -Wait -PassThru
@@ -645,6 +673,7 @@ if ($RerankItem) {
 $MixedInstalled = $null
 $NamesInstalled = $null
 $LexiconInstalled = $null
+$AnalyzerInstalled = $null
 try {
     if ($MixedModel) {
         $MixedInstalled = Join-Path $InstallDir 'models\mixed'
@@ -667,6 +696,17 @@ try {
         New-Item -ItemType Directory -Force -Path $LexiconDir | Out-Null
         # mapped by every app the IME runs in: a new one beside it when locked
         $LexiconInstalled = Copy-InstallFile -Source $Lexicon -Destination (Join-Path $LexiconDir (Split-Path -Leaf $Lexicon)) -AllowLockedFallback
+    }
+    if ($Analyzer) {
+        # its directory named as the source's: a running engine maps the
+        # alternates, so another analyzer goes beside it
+        $AnalyzerSrcDir = Split-Path -Parent $Analyzer
+        $AnalyzerDir = Join-Path $InstallDir ('models\analyzer\' + (Split-Path -Leaf $AnalyzerSrcDir))
+        New-Item -ItemType Directory -Force -Path $AnalyzerDir | Out-Null
+        foreach ($f in $AnalyzerFiles) {
+            Copy-InstallFile -Source (Join-Path $AnalyzerSrcDir $f) -Destination (Join-Path $AnalyzerDir $f) | Out-Null
+        }
+        $AnalyzerInstalled = Copy-InstallFile -Source $Analyzer -Destination (Join-Path $AnalyzerDir (Split-Path -Leaf $Analyzer))
     }
 } catch {
     Write-Log ERROR "copy failed (mixed input): $_"; exit 50
@@ -724,8 +764,8 @@ shift_8 = "（"
 shift_9 = "）"
 "@
     Write-Utf8Lines -Path $ConfigPath -Lines ($DefaultConfig -split "`r?`n")
-    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled -or $LexiconInstalled) {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled
+    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled -or $LexiconInstalled -or $AnalyzerInstalled) {
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
@@ -734,7 +774,7 @@ shift_9 = "）"
         Write-Log WARN "NoElevate with fallback DLL: config preserved because registered DLL was not updated"
     } else {
         try {
-            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled
+            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
             Write-Log INFO "updated engine config: $ConfigPath"
         } catch {
             Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"

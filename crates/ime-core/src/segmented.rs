@@ -3,7 +3,8 @@
 //! candidates and choice of each, and the focused one.
 //!
 //! Built from the whole-sentence list: the chosen sentence is cut into
-//! segments (`segments::segment`) and every candidate of the list with an
+//! segments (by its words, `bunsetsu::cut`, when the engine analyzed it; else
+//! `segments::segment`) and every candidate of the list with an
 //! alignment is cut at the same reading ranges, so a segment starts out with
 //! the alternatives the sentence beam already had. Converting a segment's
 //! own reading (with the segments before it as left context) adds more;
@@ -47,12 +48,14 @@ pub(crate) struct Segmented {
 impl Segmented {
     /// Cut `list[selected]` into segments. `starts` gives the reading start
     /// of each char of a candidate (`segments::char_starts`); candidates
-    /// without one contribute nothing to the segments' lists.
+    /// without one contribute nothing to the segments' lists. `words`, the
+    /// engine's analysis of `list[selected]`, cuts it by its words.
     pub fn build(
         reading: &str,
         list: &[String],
         selected: usize,
         starts: &HashMap<String, Vec<usize>>,
+        words: Option<&[crate::engine_client::Word]>,
     ) -> Option<Self> {
         let chosen = list.get(selected)?;
         let reading_chars: Vec<char> = reading.chars().collect();
@@ -60,7 +63,14 @@ impl Segmented {
             Some(s) => s.clone(),
             None => segments::char_starts(reading, chosen, None)?,
         };
-        let cut = segments::segment(chosen, &chosen_starts, reading_chars.len());
+        let by_words = words.and_then(|w| crate::bunsetsu::cut(chosen, reading, w, &chosen_starts));
+        let (chosen_starts, cut) = match by_words {
+            Some(cut) => cut,
+            None => {
+                let cut = segments::segment(chosen, &chosen_starts, reading_chars.len());
+                (chosen_starts, cut)
+            }
+        };
         if cut.is_empty() {
             return None;
         }
@@ -258,7 +268,7 @@ mod tests {
         for c in &list {
             starts.insert(c.clone(), vec![0, 2, 3, 4, 6]);
         }
-        Segmented::build(reading, &list, 0, &starts).unwrap()
+        Segmented::build(reading, &list, 0, &starts, None).unwrap()
     }
 
     #[test]
