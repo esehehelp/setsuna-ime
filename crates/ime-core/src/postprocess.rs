@@ -366,7 +366,7 @@ fn is_kanji_numeral(c: char) -> bool {
 /// after 196, 09月, 戦後0年). A digit before 千万億兆 stays (3千人, 1万5000),
 /// and so does a 0 where the reading has ぜろ, れい or a typed 0. Readings
 /// spelling their numbers in kana are AJIMEE's; over wiki_fresh_v2, whose
-/// numbers are typed in digits, Bletila-v0.1-small's lists lost 1,090
+/// numbers are typed in digits, Bletilla-v0.1-small's lists lost 1,090
 /// candidates and no gold.
 pub fn drop_broken_numbers(reading: &str, candidates: Vec<String>) -> Vec<String> {
     let zero_read = reading.contains("ぜろ")
@@ -400,7 +400,7 @@ pub const MIXED_NUMERALS: f32 = 5.0;
 /// kanji right before 年, 月 or 日 (新暦八月1日, 一日の…10時間). A runner-up
 /// writes them in digits throughout as the text does (8月1日, 1日), and the
 /// one with both is scored down (`MIXED_NUMERALS`): on AJIMEE, whose
-/// readings spell numbers in kana, Bletila-v0.1-small's top 1 with the
+/// readings spell numbers in kana, Bletilla-v0.1-small's top 1 with the
 /// lexicon 76.0 -> 77.5 together with `drop_broken_numbers` (+3, none lost),
 /// with the reranker over the top 20 86.5 -> 87.0; wiki_fresh_v2 unchanged.
 pub fn mixes_numerals(candidate: &str) -> bool {
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn numbers_half_in_digits_half_in_kanji_are_dropped() {
-        // Bletila-v0.1-small's lists on AJIMEE
+        // Bletilla-v0.1-small's lists on AJIMEE
         assert_eq!(
             numbers(
                 "じゅうろくばんがい",

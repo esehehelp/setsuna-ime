@@ -122,6 +122,7 @@ $artifacts = @($manifest.proposal.path, $manifest.vocab)
 if ($manifest.proposal.external_data) { $artifacts += @($manifest.proposal.external_data) }
 if ($manifest.input_vocab) { $artifacts += @($manifest.input_vocab) }
 if ($manifest.crf) { $artifacts += @($manifest.crf.path) }
+foreach ($table in @($manifest.rescore.pairs, $manifest.rescore.words)) { if ($table) { $artifacts += $table } }
 $relativeFiles = @($artifacts | ForEach-Object {
     Assert-ArtifactPath $_
     if ($manifestDir) { "$($manifestDir.Replace('\', '/'))/$_" } else { $_ }

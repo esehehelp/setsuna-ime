@@ -46,12 +46,15 @@ function New-Fixture {
         schema = $Schema
         proposal = @{ path = $ProposalPath; precision = 'int8'; external_data = @('graphs/weights.bin') }
         vocab = 'vocab.tsv'
+        rescore = @{ pairs = 'pairs.bin'; words = 'words.tsv' }
     } | ConvertTo-Json -Depth 5
     $state.payloads = @{
         'bundle/model.manifest.json' = [Text.Encoding]::UTF8.GetBytes($manifest)
         'bundle/graphs/model.onnx' = [Text.Encoding]::UTF8.GetBytes('tiny-onnx')
         'bundle/graphs/weights.bin' = [Text.Encoding]::UTF8.GetBytes('tiny-weights')
         'bundle/vocab.tsv' = [Text.Encoding]::UTF8.GetBytes('tiny-vocab')
+        'bundle/pairs.bin' = [Text.Encoding]::UTF8.GetBytes('tiny-pairs')
+        'bundle/words.tsv' = [Text.Encoding]::UTF8.GetBytes('tiny-words')
     }
     $files = @($state.payloads.Keys | Sort-Object | ForEach-Object {
         @{ path = $_; size = $state.payloads[$_].Length; sha256 = Get-Hash $state.payloads[$_] }
@@ -91,7 +94,7 @@ function Invoke-WebRequest {
 New-Fixture 'fresh'
 $path = @(& $fetch -CacheDir $cache -CatalogPath $catalogPath)
 Assert ($path.Count -eq 1 -and (Test-Path -LiteralPath $path[0])) 'returns exactly one manifest path'
-Assert ($state.requests.Count -eq 4) 'fetches manifest, ONNX, external data and vocabulary'
+Assert ($state.requests.Count -eq 6) 'fetches manifest, ONNX, external data, vocabulary and rescore tables'
 Assert ($path[0] -eq (Join-Path $cache "example/converter/$revision/bundle/model.manifest.json")) 'uses revision-scoped cache'
 foreach ($relative in $state.payloads.Keys) {
     $placed = Join-Path $cache "example/converter/$revision/$relative"
