@@ -752,10 +752,28 @@ impl EngineBridge {
             std::mem::swap(&mut order, &mut rest);
         }
         let scored = result.scores.len() == n;
-        if rest.is_empty() && !(scored && (self.ngram.is_some() || self.lexicon.is_some())) {
+        // numbers in digits and in kanji in one candidate (postprocess::mixes_numerals)
+        let mixed: Vec<bool> = result
+            .candidates
+            .iter()
+            .map(|c| scored && crate::postprocess::mixes_numerals(c))
+            .collect();
+        let any_mixed = mixed.iter().any(|&m| m);
+        if rest.is_empty()
+            && !any_mixed
+            && !(scored && (self.ngram.is_some() || self.lexicon.is_some()))
+        {
             return;
         }
         let mut scores = result.scores.clone();
+        for (s, &m) in scores.iter_mut().zip(&mixed) {
+            if m {
+                *s -= crate::postprocess::MIXED_NUMERALS;
+            }
+        }
+        if any_mixed {
+            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        }
         if let (Some((table, w2, w3)), true) = (&self.ngram, scored && order.len() >= 2) {
             let cands: Vec<String> = order
                 .iter()
@@ -2389,6 +2407,7 @@ impl EngineBridge {
             processed
         };
         let processed = crate::postprocess::drop_changed_digits(reading, processed);
+        let processed = crate::postprocess::drop_broken_numbers(reading, processed);
         let processed = crate::postprocess::drop_moved_sentence_ends(reading, processed);
         let processed = crate::postprocess::drop_script_flips(processed);
         // The English words of a mixed reading stay as typed.
@@ -5464,6 +5483,29 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_with_numbers_in_digits_and_kanji_goes_below_one_in_digits() {
+        let (mut bridge, mock, _rr) = bridge_with_reranker();
+        type_str(&mut bridge, "itinitijuujikan");
+        bridge.handle_space();
+        answer_scored(
+            &mock,
+            &["一日10時間", "1日10時間", "一日十時間"],
+            &[-1.0, -1.5, -2.0],
+        );
+        let actions = bridge.apply_async_result();
+        let list = match &actions[1] {
+            Action::ShowCandidates { list, .. } => list.clone(),
+            _ => panic!(),
+        };
+        assert_eq!(list[..2], ["1日10時間", "一日十時間"]);
+        let pos = |c: &str| list.iter().position(|x| x == c).unwrap();
+        assert!(pos("一日10時間") > pos("一日十時間"), "{list:?}");
+        let job = bridge.rerank.as_ref().unwrap();
+        assert_eq!(job.raw[0], "1日10時間");
+        assert!(job.scores[2] < -2.0, "{:?}", job.scores);
+    }
+
+    #[test]
     fn a_candidate_the_reranker_scores_far_below_the_best_goes() {
         let (mut bridge, mock, rr) = bridge_with_reranker();
         type_str(&mut bridge, "kasano");
@@ -5594,7 +5636,7 @@ mod tests {
     fn converting_many(n: usize) -> (EngineBridge, MockClient) {
         let (mut bridge, mock) = bridge_with_mock();
         type_str(&mut bridge, "kasano");
-        let cands: Vec<String> = (0..n).map(|i| format!("候補{i}")).collect();
+        let cands: Vec<String> = (0..n).map(|i| format!("候補{}", i + 1)).collect();
         let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
         mock.set_result("かさの", &refs);
         bridge.apply_async_result();
@@ -5667,14 +5709,14 @@ mod tests {
         let (mut bridge, _mock) = converting_many(15);
         // off by default: a digit commits and starts typing
         let out = bridge.handle_char('2');
-        assert_eq!(commits(&out.actions), vec!["候補0"]);
+        assert_eq!(commits(&out.actions), vec!["候補1"]);
         bridge.handle_escape();
 
         let (mut bridge, _mock) = converting_many(15);
         bridge.set_candidate_paging(9, true);
         // the reading and its katakana are 3rd and 4th
         let out = bridge.handle_char('5');
-        assert_eq!(commits(&out.actions), vec!["候補2"]);
+        assert_eq!(commits(&out.actions), vec!["候補3"]);
         assert!(!bridge.is_active());
 
         // on the second page, 1 is the page's first
@@ -5682,7 +5724,7 @@ mod tests {
         bridge.set_candidate_paging(9, true);
         bridge.handle_page_down();
         let out = bridge.handle_char('1');
-        assert_eq!(commits(&out.actions), vec!["候補7"]);
+        assert_eq!(commits(&out.actions), vec!["候補8"]);
 
         // past the list: nothing
         let (mut bridge, _mock) = converting_many(3);
@@ -5698,25 +5740,25 @@ mod tests {
 
     #[test]
     fn page_keys_step_by_the_window_page() {
-        // 候補0, 候補1, かさの, カサノ, 候補2, …, 候補11: 14 candidates
+        // 候補1, 候補2, かさの, カサノ, 候補3, …, 候補12: 14 candidates
         let (mut bridge, _mock) = converting_many(12);
         bridge.set_candidate_paging(5, false);
         bridge.handle_down();
         let out = bridge.handle_page_down();
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補4"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補5"));
         // the last page is short: its last candidate
         bridge.handle_down();
         bridge.handle_down();
         bridge.handle_down();
         let out = bridge.handle_page_down();
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補11"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補12"));
         // and it wraps
         let out = bridge.handle_page_down();
         assert_eq!(preedit(&out.actions).as_deref(), Some("カサノ"));
         let out = bridge.handle_home_end(true);
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補11"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補12"));
         let out = bridge.handle_home_end(false);
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補0"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補1"));
     }
 
     #[test]
