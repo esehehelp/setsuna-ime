@@ -15,12 +15,12 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 ## 状態
 
 研究段階のプロジェクト。変換モデル
-[Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small)
-（Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定で int8 版を自動取得する。
+[Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)
+（Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定でこれを自動取得する。
 
 - エンジンと IME はこの変換モデルを前提に調整している（記号分割、
-  前の文脈 64 トークン、読みは文末（。！？）ごとに区切り、前の文の変換結果を文脈に
-  一文ずつ変換、80 文字を超える文はさらに区切る）。
+  前の文脈 64 トークン、読みは 80 文字までなら文をまたいで一度に変換し、それより長い
+  読みは文末（。！？）と読点で区切って前の区切りの変換結果を文脈に順に変換する）。
 - 辞書データは、生成元は公開せず辞書ファイルとして配布し、エンジンと IME は
   それを読んで使う予定。今読むのは記号辞書（`[frontend] symbol_dictionary_file`）
   と英字の名前の辞書（`name_dictionary_file`）、読みの辞書（`[lexicon] file`）。
@@ -173,7 +173,6 @@ x64 の Windows 10 / 11 なら release から入れられる（Windows PowerShel
 
 ```powershell
 irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
-# fp32 版: & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -ModelPrecision fp32
 ```
 
 `setup.ps1` は自分と組になった release の zip（SHA-256 固定）を取ってきて、その中の
@@ -198,8 +197,7 @@ pwsh target/dist/setup.ps1 -Archive target/dist/setsuna-ime-<version>-windows-x6
 ```powershell
 cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
-pwsh crates/tsf/install.ps1                  # 公開モデルの int8 版を自動取得してインストール
-# fp32 版: pwsh crates/tsf/install.ps1 -ModelPrecision fp32
+pwsh crates/tsf/install.ps1                  # 公開モデルを自動取得してインストール
 # 取得済み・独自のモデル（ネット接続不要）:
 # pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 # リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
@@ -212,8 +210,8 @@ pwsh crates/tsf/install.ps1                  # 公開モデルの int8 版を自
 `%LOCALAPPDATA%\setsuna-ime\uninstall.ps1`。
 
 モデルはログイン不要で Hugging Face から取得する。取得元・commit・各ファイルの
-サイズと SHA-256 は `crates/tsf/models.json` に固定し、manifest と参照先の ONNX・語彙を
-検証してから配置する。キャッシュは `%LOCALAPPDATA%\setsuna-ime\cache\models`。
+サイズと SHA-256 は `crates/tsf/models.json` に固定し、manifest と参照先の ONNX・語彙・
+並べ直しの表を検証してから配置する。キャッシュは `%LOCALAPPDATA%\setsuna-ime\cache\models`。
 再実行では検証済みファイルを再利用するので、取得完了後はオフラインでも使える。
 通信・検証に失敗するとインストールを中止する（終了コード 30）。`-Manifest` と
 `-ModelPrecision` は併用できない。ビルドと ONNX Runtime の取得は上記の手順が別途必要。
@@ -232,7 +230,6 @@ fcitx5（5.1 以上）が入った x86_64 の環境（glibc 2.39 以上: Arch、
 
 ```sh
 curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
-# fp32 版: ... | sudo bash -s -- --precision fp32
 # リランカの LM も入れる場合: ... | sudo bash -s -- --rerank-manifest <LM scorer manifest>
 # 英日混在入力の名前の辞書も入れる場合: ... | sudo bash -s -- --name-dictionary <names tsv>
 # 読みの辞書も入れる場合: ... | sudo bash -s -- --lexicon <file.lexicon>
@@ -313,7 +310,8 @@ cargo run --release -p setsuna-settings
   候補を並べ直す表（`rescore`: `pairs` は 2 文字の共起、`words` は読みと語の
   頻度）を持つモデルでは、`decode_defaults` の `pair_weight` / `word_weight` の
   重みで beam の候補のスコアに足して並べ直す（0 か未指定ならその項は使わない）。
-  公開モデル Aster-v1.2-small には int8 版（約 29 MB）と fp32 版（約 107 MB）がある。
+  公開モデル Bletilla-v0.1-small は int8 版（MoE の専門家は int4、約 116 MB）と
+  並べ直しの表（約 28 MB）。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の
   `tokenizer.model`）を持つ。書いてあればリランカはそれで区切る（sarashina2.2 は
@@ -395,7 +393,7 @@ MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）か�
 （`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
 出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と
 THIRD_PARTY_NOTICES.md）。かな漢字変換モデルは
-[Aster-v1.2-small](https://huggingface.co/esehe/Aster-v1.2-small)（Apache-2.0）。
+[Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（Apache-2.0）。
 辞書データとかな漢字変換モデルの重みはこのリポジトリに含まない。
 配布する辞書ファイルのライセンスと出典表示は、
 それぞれの辞書ファイルに同梱する。

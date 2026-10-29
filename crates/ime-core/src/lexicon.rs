@@ -69,7 +69,7 @@ pub const MARGIN: f32 = 20.0;
 /// 2026-10-28). Up to 8 dearer, over wiki_fresh_v2 with Shiran-v2 s7080 (the
 /// reranker over the top 20): golds in the list 4528 -> 4592, EM1 82.09 ->
 /// 82.17, 4.7 -> 6.6 candidates after the rerank (at 4: 4580, 82.19, 5.8);
-/// AJIMEE with Bletila-v0.1-small 189 -> 192, 86.5 -> 87.0, 5.8 -> 8.2 (at
+/// AJIMEE with Bletilla-v0.1-small 189 -> 192, 86.5 -> 87.0, 5.8 -> 8.2 (at
 /// 4 the same, 7.3); by the engine's score and the lexicon EM1 is the same.
 pub const CONVERSIONS: usize = 10;
 pub const ADDED_OVER: f32 = 8.0;
@@ -92,7 +92,7 @@ pub const WORD_MARGIN: f32 = 12.0;
 /// Where the IME puts the words the model left out: after its first three
 /// and the reading's kana forms (`kana_candidates`). Over wiki_fresh_v2's
 /// golds cut into bunsetsu (21,842, each converted alone after the text
-/// before it, as segment editing asks; Bletila-v0.1-small), the gold is in
+/// before it, as segment editing asks; Bletilla-v0.1-small), the gold is in
 /// the segment's list 98.34% -> 98.90% and on its first page (9) 98.10%
 /// -> 98.31% (98.10% with the words at the end of the list); AJIMEE's 999:
 /// 98.40% -> 99.30%, first page 98.30% -> 99.00% (98.30%).

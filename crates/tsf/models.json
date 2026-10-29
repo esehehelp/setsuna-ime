@@ -1,46 +1,36 @@
 {
   "schema": "setsuna-model-download-v1",
-  "repository": "esehe/Aster-v1.2-small",
-  "revision": "d04a0314a6d56030968526e1babe705aceea45c6",
+  "repository": "esehe/Bletilla-v0.1-small",
+  "revision": "8485bd1dcbe97e120024f570598b95acde39456d",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
-      "manifest": "Aster-v1.2-small.int8.manifest.json",
+      "manifest": "Bletilla-v0.1-small.int8.manifest.json",
       "files": [
         {
-          "path": "Aster-v1.2-small.int8.manifest.json",
-          "size": 608,
-          "sha256": "18fd9cffc4f9b7d398143d9d0c9f2387793d0404f90a8a6e0dcbf8c03ed4628a"
+          "path": "Bletilla-v0.1-small.int8.manifest.json",
+          "size": 697,
+          "sha256": "01c5f1657efada677685a7aa20064e472deaefd19a82d22e8d1181fb706e964b"
         },
         {
-          "path": "Aster-v1.2-small.int8.onnx",
-          "size": 29041490,
-          "sha256": "7700c8106962d1fc0b48ee33bcda7a6cfbc507d0da919e99af1a6c645373db11"
+          "path": "Bletilla-v0.1-small.int8.onnx",
+          "size": 115989185,
+          "sha256": "2424da819ac2377ce336a631bee8ea79c86acd151ae3d2b37ae94da5fe653d3b"
         },
         {
-          "path": "Aster-v1.2-small.vocab.hex.tsv",
-          "size": 57588,
-          "sha256": "6b13d02c32acf9d6ea8002efb2b2a6153af7191c1cec09cfe1760931ce56bfa8"
-        }
-      ]
-    },
-    "fp32": {
-      "manifest": "Aster-v1.2-small.fp32.manifest.json",
-      "files": [
-        {
-          "path": "Aster-v1.2-small.fp32.manifest.json",
-          "size": 608,
-          "sha256": "8f2fe3dfb7d2fc9dd6d593cb64088380ce28fb6e2b7b20da9a5f80f891b2a4e5"
+          "path": "Bletilla-v0.1-small.vocab.hex.tsv",
+          "size": 95166,
+          "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
         },
         {
-          "path": "Aster-v1.2-small.fp32.onnx",
-          "size": 107286996,
-          "sha256": "820ed816c1520bbf15460cf74465a3309d5e2f815e31357d5d8cf843d246ef73"
+          "path": "Bletilla-v0.1-small.pairs.bin",
+          "size": 14908280,
+          "sha256": "b781f34fcb598244f8230bae80c5bea996b8d37a0fabffab0254e8b497c94976"
         },
         {
-          "path": "Aster-v1.2-small.vocab.hex.tsv",
-          "size": 57588,
-          "sha256": "6b13d02c32acf9d6ea8002efb2b2a6153af7191c1cec09cfe1760931ce56bfa8"
+          "path": "Bletilla-v0.1-small.words.tsv",
+          "size": 13153598,
+          "sha256": "ed56c407ad4512954dee62b5b122901b1194272d32e39643f8b895adec27d110"
         }
       ]
     }
