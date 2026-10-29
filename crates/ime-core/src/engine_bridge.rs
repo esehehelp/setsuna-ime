@@ -287,6 +287,13 @@ pub struct EngineBridge {
     /// Typing shows the conversion in the preedit (else the kana, with the
     /// conversions offered by [`Self::suggestions`]).
     live_conversion: bool,
+    /// `[frontend] backspace_deletes_shown` (`backspace_shown`).
+    backspace_deletes_shown: bool,
+    /// What Backspace left of a conversion shown, with its reading and its
+    /// chars' reading starts: the list of that reading keeps it first, so
+    /// the preview stays as it was (until the reading changes), with those
+    /// starts.
+    kept: Option<(String, String, Vec<usize>)>,
     /// The last F6–F10 conversion, while its text is what Converting shows.
     form: Option<FormShown>,
     /// The character n-gram table and its bigram and trigram weights
@@ -400,6 +407,8 @@ impl EngineBridge {
             full_width_space: frontend.full_width_space,
             sentence_case: frontend.sentence_case,
             live_conversion: frontend.live_conversion.unwrap_or(true),
+            backspace_deletes_shown: frontend.backspace_deletes_shown,
+            kept: None,
             form: None,
             ngram: None,
             lexicon: None,
@@ -872,6 +881,7 @@ impl EngineBridge {
         self.last_applied_reading.clear();
         self.cached_prefix_reading.clear();
         self.cached_prefix_kanji.clear();
+        self.kept = None;
         self.stop_rerank();
         self.stop_rewrite();
         self.forget_context();
@@ -1460,12 +1470,16 @@ impl EngineBridge {
                 }
             }
             Phase::Composing { .. } => {
+                if let Some(out) = self.backspace_shown() {
+                    return out;
+                }
                 self.composing.delete_left();
                 if self.composing.is_empty() {
                     self.phase = Phase::Empty;
                     self.last_applied_reading.clear();
                     self.cached_prefix_reading.clear();
                     self.cached_prefix_kanji.clear();
+                    self.kept = None;
                     return KeyOutcome {
                         consumed: true,
                         actions: vec![Action::EndComposition],
@@ -1481,6 +1495,83 @@ impl EngineBridge {
                 }
             }
         }
+    }
+
+    /// Live conversion, Backspace on a conversion shown whole: its last char
+    /// goes with the reading under it (行 of 東京に行く takes い and く's
+    /// く), the rest stays as shown (`kept`) and the shorter reading is
+    /// converted for the list. The chars' reading starts are the engine's,
+    /// or those Backspace kept; a kanji run placed as one (no engine
+    /// positions: a candidate of the lexicon) is split by the lexicon's
+    /// readings of its chars (東京 as とう|きょう). `None` where Backspace
+    /// deletes the last kana typed: the setting off, the caret moved, romaji
+    /// pending, a kana tail not converted yet, a text the reading does not
+    /// align with, and a last char read only with the one before it (日 of
+    /// 今日, きょう: user 2026-10-28, rather a kana than two chars).
+    fn backspace_shown(&mut self) -> Option<KeyOutcome> {
+        if !self.backspace_deletes_shown
+            || !self.live_conversion
+            || !self.composing.cursor_at_end()
+            || !self.composing.pending_romaji().is_empty()
+        {
+            return None;
+        }
+        let reading = self.composing.hiragana().to_string();
+        if reading.is_empty() || self.cached_prefix_reading != reading {
+            return None;
+        }
+        let shown = self.live_preedit();
+        let mut starts = self
+            .kept
+            .as_ref()
+            .filter(|(r, t, _)| *r == reading && *t == shown)
+            .map(|(_, _, s)| s.clone())
+            .or_else(|| self.list_starts.get(&shown).cloned())
+            .or_else(|| crate::segments::char_starts(&reading, &shown, None))?;
+        let n = reading.chars().count();
+        if starts.len() != shown.chars().count() {
+            return None;
+        }
+        if let Some(lex) = &self.lexicon {
+            split_runs(lex, &reading, &shown, &mut starts);
+        }
+        let last = *starts.last()?;
+        if last >= n {
+            return None;
+        }
+        let rest: String = shown
+            .chars()
+            .zip(&starts)
+            .take_while(|&(_, &s)| s < last)
+            .map(|(c, _)| c)
+            .collect();
+        if rest.chars().count() + 1 < starts.len() {
+            return None;
+        }
+        let rest_starts = starts[..rest.chars().count()].to_vec();
+        for _ in last..n {
+            self.composing.delete_left();
+        }
+        self.invalidate_engine_results();
+        self.stop_rerank();
+        if self.composing.is_empty() || rest.is_empty() {
+            self.composing.reset();
+            self.phase = Phase::Empty;
+            self.last_applied_reading.clear();
+            self.cached_prefix_reading.clear();
+            self.cached_prefix_kanji.clear();
+            self.kept = None;
+            return Some(consumed(vec![Action::EndComposition]));
+        }
+        let left = self.composing.hiragana().to_string();
+        self.kept = Some((left.clone(), rest.clone(), rest_starts));
+        let candidates = self.dispatch_live();
+        self.cached_prefix_reading = left;
+        self.cached_prefix_kanji = rest;
+        self.phase = Phase::Composing { candidates };
+        Some(consumed(vec![Action::UpdatePreedit {
+            text: self.live_preedit(),
+        }]))
     }
 
     pub fn handle_space(&mut self) -> KeyOutcome {
@@ -1657,6 +1748,7 @@ impl EngineBridge {
                 self.last_applied_reading.clear();
                 self.cached_prefix_reading.clear();
                 self.cached_prefix_kanji.clear();
+                self.kept = None;
                 KeyOutcome {
                     consumed: true,
                     actions,
@@ -1693,6 +1785,7 @@ impl EngineBridge {
                 self.last_applied_reading.clear();
                 self.cached_prefix_reading.clear();
                 self.cached_prefix_kanji.clear();
+                self.kept = None;
                 if text.is_empty() {
                     return KeyOutcome {
                         consumed: true,
@@ -1740,6 +1833,7 @@ impl EngineBridge {
                 self.last_applied_reading.clear();
                 self.cached_prefix_reading.clear();
                 self.cached_prefix_kanji.clear();
+                self.kept = None;
                 KeyOutcome {
                     consumed: true,
                     actions: vec![Action::EndComposition],
@@ -2462,6 +2556,11 @@ impl EngineBridge {
         if let Some(hidden) = self.hidden.as_mut() {
             list = hidden.filter(reading, list);
         }
+        // what Backspace left of the conversion shown stays first
+        if let Some((_, text, _)) = self.kept.as_ref().filter(|(r, _, _)| r == reading) {
+            list.retain(|c| c != text);
+            list.insert(0, text.clone());
+        }
         list
     }
 
@@ -2529,6 +2628,12 @@ impl EngineBridge {
         for c in self.char_rules.apply(self.date_time_candidates(reading)) {
             if list.contains(&c) {
                 out.insert(c.clone(), vec![0; c.chars().count()]);
+            }
+        }
+        // what Backspace left, at the starts it had
+        if let Some((_, text, starts)) = self.kept.as_ref().filter(|(r, _, _)| r == reading) {
+            if list.contains(text) {
+                out.insert(text.clone(), starts.clone());
             }
         }
         for c in list {
@@ -3049,10 +3154,14 @@ impl EngineBridge {
         } else {
             self.composing.live_reading()
         };
+        if self.kept.as_ref().is_some_and(|(r, _, _)| *r != hira) {
+            self.kept = None;
+        }
         if hira.is_empty() {
             self.last_applied_reading.clear();
             self.cached_prefix_reading.clear();
             self.cached_prefix_kanji.clear();
+            self.kept = None;
             return Vec::new();
         }
         // Skip OOD partial-input conversions during live typing.
@@ -3350,6 +3459,7 @@ impl EngineBridge {
         self.last_applied_reading.clear();
         self.cached_prefix_reading.clear();
         self.cached_prefix_kanji.clear();
+        self.kept = None;
         if !text.is_empty() {
             self.append_context(&text);
             vec![Action::Commit { text }]
@@ -3406,6 +3516,33 @@ fn not_consumed() -> KeyOutcome {
     KeyOutcome {
         consumed: false,
         actions: vec![],
+    }
+}
+
+/// Split each run of chars `starts` places at one reading char (a kanji
+/// run without the engine's positions: 東京 both at the と of とう) by the
+/// lexicon's readings of its chars (`Lexicon::split_reading`), where they
+/// split it.
+fn split_runs(lex: &crate::lexicon::Lexicon, reading: &str, text: &str, starts: &mut [usize]) {
+    let r: Vec<char> = reading.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < t.len() {
+        let mut j = i + 1;
+        while j < t.len() && starts[j] == starts[i] {
+            j += 1;
+        }
+        let end = if j < t.len() { starts[j] } else { r.len() };
+        if j - i > 1 && starts[i] < end {
+            let run: String = t[i..j].iter().collect();
+            let read: String = r[starts[i]..end].iter().collect();
+            if let Some(split) = lex.split_reading(&run, &read) {
+                for (k, s) in split.into_iter().enumerate() {
+                    starts[i + k] = starts[i] + s;
+                }
+            }
+        }
+        i = j;
     }
 }
 
@@ -4606,14 +4743,159 @@ mod tests {
     }
 
     #[test]
+    fn backspace_deletes_the_last_char_shown_and_keeps_the_rest() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "toukyouniiku");
+        mock.set_result("とうきょうにいく", &["東京に行く", "東京二行く"]);
+        bridge.apply_async_result();
+        assert_eq!(bridge.live_preedit(), "東京に行く");
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "東京に行"
+        );
+        // the shorter reading is converted for its list
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "とうきょうにい");
+        // its conversion does not change what is shown, and lists it first
+        mock.set_result("とうきょうにい", &["東京に胃", "東京二位"]);
+        bridge.apply_async_result();
+        assert_eq!(bridge.live_preedit(), "東京に行");
+        // 行 goes with its い, に with its に
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "東京に"
+        );
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "東京");
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "東京");
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["東京"]);
+    }
+
+    #[test]
+    fn backspace_deletes_a_kanji_with_all_its_reading() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "toukyou");
+        let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id,
+            reading,
+            candidates: vec!["東京".into()],
+            // the engine's positions: 東 at と, 京 at き
+            reading_pos: vec![vec![0, 2]],
+            ..Default::default()
+        });
+        bridge.apply_async_result();
+        // 京 takes きょう
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "東");
+        assert_eq!(bridge.composing.hiragana(), "とう");
+        // and the last char goes with the composition
+        let out = bridge.handle_backspace();
+        assert!(
+            out.actions.contains(&Action::EndComposition),
+            "{:?}",
+            out.actions
+        );
+        assert!(!bridge.is_active());
+        // without the engine's positions a kanji run is placed as one: the
+        // lexicon's readings of its chars split it
+        let table = "東\tとう\t10.0\tnoun\n京\tきょう\t10.0\tnoun\n今日\tきょう\t8.0\tnoun\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-split-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+        let lexicon = crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        };
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&lexicon);
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "toukyouno");
+        mock.set_result("とうきょうの", &["東京の"]);
+        bridge.apply_async_result();
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "東京");
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "東");
+        // one its chars do not split (今日, read きょう whole): a kana of
+        // the reading goes, not both chars
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&lexicon);
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "kyouha");
+        mock.set_result("きょうは", &["今日は"]);
+        bridge.apply_async_result();
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "今日");
+        bridge.handle_backspace();
+        assert_eq!(bridge.composing.hiragana(), "きょ");
+        assert!(bridge.is_active());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn backspace_again_takes_the_reading_starts_the_engine_gave() {
+        // 東京都庁 placed by the engine; what is left keeps its starts
+        // though the shorter reading's list has none
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "toukyoutotyou");
+        let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id,
+            reading,
+            candidates: vec!["東京都庁".into()],
+            reading_pos: vec![vec![0, 2, 5, 6]],
+            ..Default::default()
+        });
+        bridge.apply_async_result();
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "東京都"
+        );
+        mock.set_result("とうきょうと", &["東京と"]);
+        bridge.apply_async_result();
+        assert_eq!(bridge.live_preedit(), "東京都");
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "東京");
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "東");
+        assert_eq!(bridge.composing.hiragana(), "とう");
+    }
+
+    #[test]
+    fn backspace_deletes_a_kana_not_converted_yet_or_romaji_as_typed() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の"]);
+        bridge.apply_async_result();
+        type_str(&mut bridge, "amek");
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "傘のあめ"
+        );
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "傘のあ"
+        );
+    }
+
+    #[test]
     fn enter_does_not_commit_a_deleted_or_edited_reading() {
+        // Backspace deleting the last kana typed: the conversion of the
+        // longer reading is not committed
         let (mut bridge, _) = converted_kasano();
+        bridge.backspace_deletes_shown = false;
         bridge.handle_backspace();
         assert_eq!(
             bridge.handle_enter().actions,
             vec![Action::Commit {
                 text: "かさ".into()
             }]
+        );
+        // deleting the last char shown: what is left of it is
+        let (mut bridge, _) = converted_kasano();
+        bridge.handle_backspace();
+        assert_eq!(
+            bridge.handle_enter().actions,
+            vec![Action::Commit { text: "傘".into() }]
         );
         let (mut bridge, _) = converted_kasano();
         bridge.handle_home_end(false);
