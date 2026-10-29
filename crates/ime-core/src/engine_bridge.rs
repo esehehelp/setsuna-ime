@@ -794,14 +794,15 @@ impl EngineBridge {
                 .map(|c| lex.cost(&c.nfkc().collect::<String>(), &r))
                 .collect();
             // the lexicon's own conversions the engine missed (大島村 for
-            // おおしまむら, where it gave おおしま村), those `ADDED_UNDER`
-            // cheaper than every candidate of the engine, scored
-            // `ADDED_BELOW` under its top: the lexicon's cost and the
+            // おおしまむら, where it gave おおしま村) and the homophones
+            // of its words (検収担当者 for 研修担当者), those no more than
+            // `ADDED_OVER` dearer than the engine's cheapest candidate,
+            // scored `ADDED_BELOW` under its top: the lexicon's cost and the
             // reranker place them
             let top = result.scores[0];
             let cheapest = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
             for (surface, cost) in lex.convert(&r, crate::lexicon::CONVERSIONS) {
-                if cost > cheapest - crate::lexicon::ADDED_UNDER
+                if cost > cheapest + crate::lexicon::ADDED_OVER
                     || result
                         .candidates
                         .iter()
@@ -5515,6 +5516,29 @@ mod tests {
         // after the model's and the kana forms, the word it did not give;
         // 献酬 once, where the model put it
         assert_eq!(list, ["研修", "献酬", "けんしゅう", "ケンシュウ", "検収"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_homophone_of_a_word_in_the_engines_top_is_listed() {
+        let table = "研修\tけんしゅう\t9.4\tnoun\n検収\tけんしゅう\t14.6\tnoun\n\
+                     担当\tたんとう\t8.0\tnoun\n者\tしゃ\t5.0\tsuff\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-homophone-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "kensyuutantousya");
+        answer_scored(&mock, &["研修担当者", "研修担当社"], &[-0.5, -3.0]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        // 検収担当者 costs 5.2 more than 研修担当者, within ADDED_OVER
+        assert_eq!(list[0], "研修担当者");
+        assert!(list.contains(&"検収担当者".to_string()), "{list:?}");
         let _ = std::fs::remove_file(&path);
     }
 
