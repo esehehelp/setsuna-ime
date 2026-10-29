@@ -48,12 +48,13 @@ new_fixture() {
     printf '00\t<pad>\n' >"$served/vocab.tsv"
     printf 'pairs' >"$served/pairs.bin"
     printf 'words' >"$served/words.tsv"
+    printf '{}' >"$served/config.json"
     jq -n --arg s "$schema" --arg p "$proposal" \
         '{schema: $s, proposal: {path: $p, precision: "int8"}, vocab: "vocab.tsv",
           rescore: {pairs: "pairs.bin", words: "words.tsv"}}' \
         >"$served/model.int8.manifest.json"
     local files=()
-    for f in model.int8.manifest.json "$proposal" vocab.tsv pairs.bin words.tsv; do
+    for f in model.int8.manifest.json "$proposal" vocab.tsv pairs.bin words.tsv config.json; do
         files+=("$(jq -n --arg p "$f" --argjson n "$(size "$served/$f")" --arg h "$(sha "$served/$f")" \
             '{path: $p, size: $n, sha256: $h}')")
     done
@@ -77,6 +78,7 @@ assert "prints the manifest path" [ "$out" = "$cached/model.int8.manifest.json" 
 assert "downloads the nested proposal" cmp -s "$served/graphs/model.onnx" "$cached/graphs/model.onnx"
 assert "downloads the vocab" cmp -s "$served/vocab.tsv" "$cached/vocab.tsv"
 assert "downloads the rescore tables" cmp -s "$served/words.tsv" "$cached/words.tsv"
+assert "downloads every pinned file (config.json, the Hub's download count)" cmp -s "$served/config.json" "$cached/config.json"
 assert "leaves no staged file" [ -z "$(find "$root/cache" -name '*.part')" ]
 
 # Offline: verified cache files are reused.
