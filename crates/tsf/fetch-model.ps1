@@ -127,6 +127,11 @@ $relativeFiles = @($artifacts | ForEach-Object {
     Assert-ArtifactPath $_
     if ($manifestDir) { "$($manifestDir.Replace('\', '/'))/$_" } else { $_ }
 })
+# Every other file the variant pins comes too: config.json, the file the Hub
+# counts a model's downloads by.
+foreach ($pinned in @($specs.Keys | Sort-Object)) {
+    if ($pinned -ne $variant.manifest -and $relativeFiles -notcontains $pinned) { $relativeFiles += $pinned }
+}
 # Check the whole set before downloading any payload.
 foreach ($relative in $relativeFiles) {
     if (-not $specs.ContainsKey($relative)) { throw "manifest references an unpinned file: $relative" }

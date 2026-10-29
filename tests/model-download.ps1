@@ -55,6 +55,7 @@ function New-Fixture {
         'bundle/vocab.tsv' = [Text.Encoding]::UTF8.GetBytes('tiny-vocab')
         'bundle/pairs.bin' = [Text.Encoding]::UTF8.GetBytes('tiny-pairs')
         'bundle/words.tsv' = [Text.Encoding]::UTF8.GetBytes('tiny-words')
+        'bundle/config.json' = [Text.Encoding]::UTF8.GetBytes('{}')
     }
     $files = @($state.payloads.Keys | Sort-Object | ForEach-Object {
         @{ path = $_; size = $state.payloads[$_].Length; sha256 = Get-Hash $state.payloads[$_] }
@@ -94,7 +95,7 @@ function Invoke-WebRequest {
 New-Fixture 'fresh'
 $path = @(& $fetch -CacheDir $cache -CatalogPath $catalogPath)
 Assert ($path.Count -eq 1 -and (Test-Path -LiteralPath $path[0])) 'returns exactly one manifest path'
-Assert ($state.requests.Count -eq 6) 'fetches manifest, ONNX, external data, vocabulary and rescore tables'
+Assert ($state.requests.Count -eq 7) 'fetches manifest, ONNX, external data, vocabulary, rescore tables and config.json'
 Assert ($path[0] -eq (Join-Path $cache "example/converter/$revision/bundle/model.manifest.json")) 'uses revision-scoped cache'
 foreach ($relative in $state.payloads.Keys) {
     $placed = Join-Path $cache "example/converter/$revision/$relative"

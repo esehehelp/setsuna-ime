@@ -1,7 +1,7 @@
 {
   "schema": "setsuna-model-download-v1",
   "repository": "esehe/Bletilla-v0.1-small",
-  "revision": "8485bd1dcbe97e120024f570598b95acde39456d",
+  "revision": "002b3a59ab97d3ed46576ad1f773d7e7ee1af3be",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
@@ -31,6 +31,11 @@
           "path": "Bletilla-v0.1-small.words.tsv",
           "size": 13153598,
           "sha256": "ed56c407ad4512954dee62b5b122901b1194272d32e39643f8b895adec27d110"
+        },
+        {
+          "path": "config.json",
+          "size": 116,
+          "sha256": "e0fd510a0b2a1b13f65eb77e0b29a47501b267d37f04301c2d939171cd5f82b2"
         }
       ]
     }

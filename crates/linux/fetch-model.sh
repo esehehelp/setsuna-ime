@@ -140,6 +140,15 @@ while IFS= read -r rel; do
     [[ $manifest_dir == . ]] || rel=$manifest_dir/$rel
     artifacts+=("$rel")
 done <<<"$list"
+# Every other file the variant pins comes too: config.json, the file the Hub
+# counts a model's downloads by.
+while IFS= read -r rel; do
+    listed=0
+    for a in "$manifest_rel" "${artifacts[@]}"; do
+        [[ $a != "$rel" ]] || listed=1
+    done
+    ((listed)) || artifacts+=("$rel")
+done < <(printf '%s\n' "${!spec_size[@]}" | sort)
 # Check the whole set before downloading any payload.
 for rel in "${artifacts[@]}"; do
     [[ -n ${spec_size[$rel]+x} ]] || die "manifest references an unpinned file: $rel"
