@@ -2420,6 +2420,19 @@ impl EngineBridge {
             processed
         };
         let mut arranged = crate::kana_candidates::arrange(reading, processed);
+        // a reading of one word: the lexicon's words for it that the model
+        // left out (検収 for けんしゅう), after its first candidates
+        if let (Some(lex), false) = (&self.lexicon, self.composing.is_mixed()) {
+            use unicode_normalization::UnicodeNormalization;
+            let words: Vec<String> = lex
+                .word_candidates(reading)
+                .into_iter()
+                .map(|(w, _)| w)
+                .filter(|w| !arranged.iter().any(|c| c.nfkc().eq(w.nfkc())))
+                .collect();
+            let at = crate::lexicon::WORDS_AT.min(arranged.len());
+            arranged.splice(at..at, words);
+        }
         if let Some(dict) = &self.symbol_dict {
             arranged = dict.insert(reading, arranged);
         }
@@ -5479,6 +5492,29 @@ mod tests {
         assert_eq!(list[0], "続投");
         assert!(!list.contains(&"続当".to_string()), "{list:?}");
         assert!(list.contains(&"続頭".to_string()), "{list:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reading_of_one_word_lists_the_lexicons_words_the_model_left_out() {
+        let table = "研修\tけんしゅう\t9.4\tnoun\n検収\tけんしゅう\t14.6\tnoun\n\
+                     献酬\tけんしゅう\t20.2\tnoun\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-words-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "kensyuu");
+        answer_scored(&mock, &["研修", "献酬"], &[-0.5, -3.0]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        // after the model's and the kana forms, the word it did not give;
+        // 献酬 once, where the model put it
+        assert_eq!(list, ["研修", "献酬", "けんしゅう", "ケンシュウ", "検収"]);
         let _ = std::fs::remove_file(&path);
     }
 

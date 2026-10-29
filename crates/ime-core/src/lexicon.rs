@@ -75,6 +75,20 @@ pub const CONNECTION_WEIGHT: f32 = 1.0;
 /// weigh (its end of sentence follows anything at 0): 神に各 for かみにかく
 /// cost less than 紙に書く.
 pub const PREFIX_LAST: f32 = 6.0;
+/// The lexicon's words `word_candidates` lists for a reading of one word,
+/// the chars of particle or okurigana it takes after the word, and how much
+/// dearer than the cheapest a word may be (12: of ない's, 凪い in, 地震 out).
+pub const WORDS: usize = 30;
+pub const WORD_REST: usize = 3;
+pub const WORD_MARGIN: f32 = 12.0;
+/// Where the IME puts the words the model left out: after its first three
+/// and the reading's kana forms (`kana_candidates`). Over wiki_fresh_v2's
+/// golds cut into bunsetsu (21,842, each converted alone after the text
+/// before it, as segment editing asks; Bletila-v0.1-small), the gold is in
+/// the segment's list 98.34% -> 98.90% and on its first page (9) 98.10%
+/// -> 98.31% (98.10% with the words at the end of the list); AJIMEE's 999:
+/// 98.40% -> 99.30%, first page 98.30% -> 99.00% (98.30%).
+pub const WORDS_AT: usize = 5;
 
 const MAGIC: &[u8; 8] = b"LEXICON1";
 const VERSION: usize = 3;
@@ -445,6 +459,68 @@ impl Lexicon {
             }
         }
         out
+    }
+
+    /// Up to `n` of the lexicon's surfaces read `reading` whole, cheapest
+    /// first, with their costs.
+    pub fn words(&self, reading: &str, n: usize) -> Vec<(&str, f32)> {
+        let mut out: Vec<(&str, f32)> = Vec::new();
+        self.reading_prefixes(reading, |len, surface, e| {
+            if len == reading.len() && out.len() < n && !out.iter().any(|(s, _)| *s == surface) {
+                out.push((surface, e.cost));
+            }
+        });
+        out
+    }
+
+    /// The words a dictionary IME lists for a reading of one word, maybe
+    /// with a particle or okurigana after it (けんしゅうを, なんい？): up to
+    /// `WORDS` of the lexicon's surfaces read as the longest start of the
+    /// reading that is a word of it (a noun, verb, ...: not a particle or an
+    /// affix, unless it is the whole reading), each followed by the rest as
+    /// typed, `WORD_REST` chars at most (kana or punctuation, not starting
+    /// with a small kana, ん or ー: 見込みっと for みこみっと) and no more than
+    /// the word's, those costing `WORD_MARGIN` more than the cheapest left
+    /// out (地震 for ない). Empty for a longer reading: a sentence's list is
+    /// the model's.
+    pub fn word_candidates(&self, reading: &str) -> Vec<(String, f32)> {
+        let m = reading.chars().count();
+        let mut best: Option<usize> = None;
+        self.reading_prefixes(reading, |len, _, e| {
+            let whole = len == reading.len();
+            let content = !matches!(
+                CLASSES.get(usize::from(e.class)).copied(),
+                Some("part" | "aux" | "suff" | "pref" | "sym")
+            );
+            if (whole || content) && best.is_none_or(|b| len > b) {
+                best = Some(len);
+            }
+        });
+        let Some(len) = best else {
+            return Vec::new();
+        };
+        let rest = &reading[len..];
+        let rest_chars = rest.chars().count();
+        let leans = rest
+            .chars()
+            .next()
+            .is_some_and(|c| "ぁぃぅぇぉっゃゅょゎんー".contains(c));
+        if rest_chars > WORD_REST
+            || rest_chars > m - rest_chars
+            || leans
+            || !rest
+                .chars()
+                .all(|c| is_kana(c) || (!c.is_alphanumeric() && !c.is_whitespace()))
+        {
+            return Vec::new();
+        }
+        let words = self.words(&reading[..len], WORDS);
+        let floor = words.first().map_or(0.0, |w| w.1) + WORD_MARGIN;
+        words
+            .into_iter()
+            .filter(|w| w.1 <= floor)
+            .map(|(s, c)| (format!("{s}{rest}"), c))
+            .collect()
     }
 
     /// The entries of `surface`.
@@ -846,5 +922,31 @@ mod tests {
         let lex = Lexicon::from_table(TABLE);
         assert_eq!(lex.cost("3、", "3、"), Some(2.0 * TYPED_COST));
         assert!(lex.cost("今日。", "きょう。").is_some());
+    }
+
+    #[test]
+    fn a_reading_of_one_word_lists_its_words() {
+        let table = format!(
+            "{TABLE}研修\tけんしゅう\t9.4\tnoun\n検収\tけんしゅう\t14.6\tnoun\n\
+             謙\tけんしゅう\t25.7\tnoun\n見込み\tみこみ\t10.0\tnoun\n"
+        );
+        let lex = Lexicon::from_table(&table);
+        let words = |r: &str| -> Vec<String> {
+            lex.word_candidates(r).into_iter().map(|(w, _)| w).collect()
+        };
+        // cheapest first, those WORD_MARGIN dearer than the cheapest left out
+        assert_eq!(words("けんしゅう"), ["研修", "検収"]);
+        assert_eq!(lex.words("けんしゅう", 2), [("研修", 9.4), ("検収", 14.6)]);
+        // a particle, okurigana or punctuation after the word, as typed
+        assert_eq!(words("けんしゅうを"), ["研修を", "検収を"]);
+        assert_eq!(words("きょう？"), ["今日？"]);
+        // a particle alone is its own word; after a word it is the rest
+        assert_eq!(words("が"), ["が"]);
+        // more after the word than it has, or a rest that leans on it, is no
+        // reading of one word
+        assert!(words("ぞくとうがきまった").is_empty());
+        assert!(words("みこみっと").is_empty());
+        assert!(words("ぞくがきまった").is_empty());
+        assert!(words("ほげ").is_empty());
     }
 }
