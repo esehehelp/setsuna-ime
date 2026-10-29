@@ -351,6 +351,66 @@ fn digit_runs(s: &str) -> Vec<String> {
     runs
 }
 
+/// A kanji numeral of a number below 万: a digit, 十, 百 or 千.
+fn is_kanji_numeral(c: char) -> bool {
+    matches!(
+        c,
+        '〇' | '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '千'
+    )
+}
+
+/// Drop the candidates with a number spelled half in digits and half in
+/// kanji, or with a 0 the reading does not have. The model writes a char a
+/// frame, and its runners-up swap one digit of a number for a kanji one
+/// (1六番街, 五0年, 50歩1百歩, 十3歳) or put a 0 before it (03年 for さんねん
+/// after 196, 09月, 戦後0年). A digit before 千万億兆 stays (3千人, 1万5000),
+/// and so does a 0 where the reading has ぜろ, れい or a typed 0. Readings
+/// spelling their numbers in kana are AJIMEE's; over wiki_fresh_v2, whose
+/// numbers are typed in digits, Bletila-v0.1-small's lists lost 1,090
+/// candidates and no gold.
+pub fn drop_broken_numbers(reading: &str, candidates: Vec<String>) -> Vec<String> {
+    let zero_read = reading.contains("ぜろ")
+        || reading.contains("れい")
+        || reading.chars().any(|c| to_half(c) == '0');
+    candidates
+        .into_iter()
+        .filter(|c| !breaks_a_number(c, zero_read))
+        .collect()
+}
+
+fn breaks_a_number(candidate: &str, zero_read: bool) -> bool {
+    let chars: Vec<char> = candidate.chars().map(to_half).collect();
+    let mixed = chars.windows(2).any(|w| {
+        (w[0].is_ascii_digit() && is_kanji_numeral(w[1]) && w[1] != '千')
+            || (is_kanji_numeral(w[0]) && w[1].is_ascii_digit())
+    });
+    // a run of digits that starts with 0 (not a decimal's digits)
+    let zero = !zero_read
+        && chars.iter().enumerate().any(|(i, &c)| {
+            c == '0' && (i == 0 || !(chars[i - 1].is_ascii_digit() || chars[i - 1] == '.'))
+        });
+    mixed || zero
+}
+
+/// What `order_engine_result` takes off the score of a candidate that
+/// `mixes_numerals`.
+pub const MIXED_NUMERALS: f32 = 5.0;
+
+/// Whether a candidate writes its numbers both ways: in digits, and in
+/// kanji right before 年, 月 or 日 (新暦八月1日, 一日の…10時間). A runner-up
+/// writes them in digits throughout as the text does (8月1日, 1日), and the
+/// one with both is scored down (`MIXED_NUMERALS`): on AJIMEE, whose
+/// readings spell numbers in kana, Bletila-v0.1-small's top 1 with the
+/// lexicon 76.0 -> 77.5 together with `drop_broken_numbers` (+3, none lost),
+/// with the reranker over the top 20 86.5 -> 87.0; wiki_fresh_v2 unchanged.
+pub fn mixes_numerals(candidate: &str) -> bool {
+    let chars: Vec<char> = candidate.chars().map(to_half).collect();
+    chars.iter().any(|c| c.is_ascii_digit())
+        && chars
+            .windows(2)
+            .any(|w| is_kanji_numeral(w[0]) && matches!(w[1], '年' | '月' | '日'))
+}
+
 /// Half-width form of a full-width ASCII char (U+FF01..U+FF5E), else `c`.
 pub(crate) fn to_half(c: char) -> char {
     match c {
@@ -796,6 +856,72 @@ mod tests {
         assert_eq!(digits("2がつついたち", &["2月1日"]), ["2月1日"]);
         // no digit typed: nothing to keep
         assert_eq!(digits("いちばん", &["1番", "一番"]), ["1番", "一番"]);
+    }
+
+    fn numbers(reading: &str, cands: &[&str]) -> Vec<String> {
+        drop_broken_numbers(reading, cands.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn numbers_half_in_digits_half_in_kanji_are_dropped() {
+        // Bletila-v0.1-small's lists on AJIMEE
+        assert_eq!(
+            numbers(
+                "じゅうろくばんがい",
+                &["16番街", "1六番街", "十六番街", "十6番街"]
+            ),
+            ["16番街", "十六番街"]
+        );
+        assert_eq!(
+            numbers(
+                "ごじゅっぽひゃっぽ",
+                &["50歩100歩", "50歩1百歩", "5十歩100歩", "五十歩百歩"]
+            ),
+            ["50歩100歩", "五十歩百歩"]
+        );
+        // digits before 千万億兆 are how numbers are written
+        assert_eq!(
+            numbers(
+                "さんぜんにん、いちまんごせん",
+                &["3千人、1万5000", "3千人、1万5〇〇〇"]
+            ),
+            ["3千人、1万5000"]
+        );
+        // full-width digits too
+        assert_eq!(numbers("じゅうさんさい", &["１３歳", "十３歳"]), ["１３歳"]);
+    }
+
+    #[test]
+    fn a_zero_the_reading_does_not_have_is_dropped() {
+        assert_eq!(
+            numbers(
+                "さんねんくがつじゅうごにち",
+                &["03年9月15日", "3年9月15日", "3年09月15日"]
+            ),
+            ["3年9月15日"]
+        );
+        assert_eq!(
+            numbers("せんごじゅうねん", &["戦後0年", "戦後10年"]),
+            ["戦後10年"]
+        );
+        // read or typed, and a decimal's digits, stay
+        assert_eq!(numbers("れいじ", &["0時", "零時"]), ["0時", "零時"]);
+        assert_eq!(numbers("ぜろてんご", &["0.5"]), ["0.5"]);
+        assert_eq!(numbers("0ばん", &["0番"]), ["0番"]);
+        assert_eq!(numbers("いってんまるご", &["1.05"]), ["1.05"]);
+        assert_eq!(numbers("にせんねん", &["2000年"]), ["2000年"]);
+    }
+
+    #[test]
+    fn numbers_in_digits_and_kanji_before_a_date_unit_mix() {
+        assert!(mixes_numerals("は新暦八月1日もしくは月遅れの九月1日"));
+        assert!(mixes_numerals("、一日の将棋の勉強時間が10時間を超える"));
+        assert!(mixes_numerals("一日の勉強時間が１０時間"));
+        assert!(!mixes_numerals("は新暦8月1日もしくは月遅れの9月1日"));
+        assert!(!mixes_numerals("九月一日"));
+        // kanji numerals elsewhere are words
+        assert!(!mixes_numerals("一人前になり、30も半ばにして"));
+        assert!(!mixes_numerals("一時的に10人"));
     }
 
     fn drop(reading: &str, cands: &[&str]) -> Vec<String> {
