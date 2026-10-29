@@ -6,13 +6,15 @@
 //! lexicon cost <file.lexicon> <reading> <surface>...
 //! lexicon convert <file.lexicon> <reading>...
 //! lexicon words <file.lexicon> <reading>...
+//! lexicon split <file.lexicon> <reading> <text>
 //! ```
 //!
 //! `build` compiles the table and the connection costs (the module docs say
 //! what they hold) into the mapped file the IME reads; `cost` prints each
 //! surface's cheapest reading as the reading, and the lexicon's entries for
 //! it; `convert` the lexicon's own conversions of each reading; `words` the
-//! words it lists for a reading of one word (`word_candidates`).
+//! words it lists for a reading of one word (`word_candidates`); `split`
+//! where each char of a kanji run starts in its reading (`split_reading`).
 //! `SETSUNA_CONNECTION_WEIGHT` weighs the connection costs otherwise.
 
 use anyhow::{bail, Context, Result};
@@ -77,9 +79,14 @@ fn main() -> Result<()> {
                 println!("{reading} ({us} µs): {shown:?}");
             }
         }
+        Some("split") if args.len() == 4 => {
+            let lex = open(&args[1])?;
+            let starts = lex.split_reading(&args[3], &args[2]);
+            println!("{} {}: {starts:?}", args[2], args[3]);
+        }
         _ => bail!(
             "usage: lexicon build <table.tsv> [connection.txt] <out> | lexicon cost <lexicon> <reading> <surface>... \
-             | lexicon convert <lexicon> <reading>... | lexicon words <lexicon> <reading>..."
+             | lexicon convert <lexicon> <reading>... | lexicon words <lexicon> <reading>... \n             | lexicon split <lexicon> <reading> <text>"
         ),
     }
     Ok(())

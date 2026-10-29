@@ -329,6 +329,11 @@ pub struct FrontendCfg {
     /// (false, as Mozc does). Unset: true on every frontend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_conversion: Option<bool>,
+    /// With live conversion, Backspace on a conversion shown deletes its
+    /// last char and the reading under it, the rest staying as shown (true;
+    /// user 2026-10-28: delete what is seen), or the last kana of the
+    /// reading, the rest converted again (false).
+    pub backspace_deletes_shown: bool,
     /// Keep the preedit caret at the start of the composition (fcitx5-mozc's
     /// "preedit cursor position at beginning"). Apps put the candidate
     /// window at the caret, so it then stays put while typing, converting
@@ -466,6 +471,7 @@ impl Default for FrontendCfg {
             pass_through_commands: false,
             full_width_space: false,
             live_conversion: None,
+            backspace_deletes_shown: true,
             preedit_cursor_at_start: false,
             mixed_model: None,
             name_dictionary_file: None,
@@ -957,6 +963,10 @@ impl Config {
              # typed kana with the conversions in a suggestion window (false).\n\
              # Default true.\n\
              # live_conversion = false\n\
+             # With live conversion, Backspace deletes the last char shown and\n\
+             # the reading under it, the rest staying as shown (true), or the\n\
+             # last kana typed, the rest converted again (false).\n\
+             backspace_deletes_shown = true\n\
              # fcitx5: keep the preedit caret at the start of the composition,\n\
              # so the candidate window stays put (the caret is then not seen\n\
              # to move while typing). Default false.\n\

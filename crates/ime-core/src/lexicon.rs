@@ -531,6 +531,68 @@ impl Lexicon {
             .collect()
     }
 
+    /// Where each char of `text` (a run of kanji the engine placed as one,
+    /// 東京 for とうきょう) starts in `reading`, by the readings the lexicon
+    /// has for each char alone, voiced at its start (人 of 恋人, びと) or
+    /// with a small っ at its end (学 of 学校, がっ), 々 reading as the char
+    /// before it; the cheapest such split. `None` when there is none.
+    pub fn split_reading(&self, text: &str, reading: &str) -> Option<Vec<usize>> {
+        let t: Vec<char> = text.chars().collect();
+        let r: Vec<char> = reading.chars().collect();
+        let (n, m) = (t.len(), r.len());
+        if n == 0 || m < n {
+            return None;
+        }
+        // each char's readings (chars) and costs
+        let mut options: Vec<Vec<(Vec<char>, f32)>> = Vec::with_capacity(n);
+        for (i, &c) in t.iter().enumerate() {
+            let mut o: Vec<(Vec<char>, f32)> = if c == '々' && i > 0 {
+                options[i - 1].clone()
+            } else {
+                self.get(c.encode_utf8(&mut [0; 4]))
+                    .iter()
+                    .map(|e| (e.reading.chars().collect(), e.cost))
+                    .collect()
+            };
+            let base = o.clone();
+            for (w, cost) in &base {
+                for v in w.first().map_or(Vec::new(), |&k| voicings(k)) {
+                    let mut w2 = w.clone();
+                    w2[0] = v;
+                    o.push((w2, cost + 1.0));
+                }
+                if w.len() > 1 && matches!(w.last(), Some('つ' | 'く' | 'ち' | 'き')) {
+                    let mut w2 = w.clone();
+                    *w2.last_mut().unwrap() = 'っ';
+                    o.push((w2, cost + 1.0));
+                }
+            }
+            options.push(o);
+        }
+        // best[i][j]: the cheapest split of t[..i] over r[..j], with its starts
+        let mut best: Vec<Vec<Option<(f32, Vec<usize>)>>> = vec![vec![None; m + 1]; n + 1];
+        best[0][0] = Some((0.0, Vec::new()));
+        for i in 0..n {
+            for j in 0..m {
+                let Some((cost, starts)) = best[i][j].clone() else {
+                    continue;
+                };
+                for (w, c) in &options[i] {
+                    let k = j + w.len();
+                    if w.is_empty() || k > m || r[j..k] != w[..] {
+                        continue;
+                    }
+                    if best[i + 1][k].as_ref().is_none_or(|b| cost + c < b.0) {
+                        let mut s = starts.clone();
+                        s.push(j);
+                        best[i + 1][k] = Some((cost + c, s));
+                    }
+                }
+            }
+        }
+        best[n][m].take().map(|(_, s)| s)
+    }
+
     /// The entries of `surface`.
     pub fn get(&self, surface: &str) -> Vec<Entry<'_>> {
         let mut out = Vec::new();
@@ -808,6 +870,17 @@ fn is_kana(c: char) -> bool {
     matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' | 'ー')
 }
 
+/// The voiced kana of `c` (か -> が, は -> ば and ぱ).
+fn voicings(c: char) -> Vec<char> {
+    let at = |k: u32| char::from_u32(c as u32 + k);
+    match c {
+        'か' | 'き' | 'く' | 'け' | 'こ' | 'さ' | 'し' | 'す' | 'せ' | 'そ' | 'た' | 'ち'
+        | 'つ' | 'て' | 'と' => at(1).into_iter().collect(),
+        'は' | 'ひ' | 'ふ' | 'へ' | 'ほ' => [at(1), at(2)].into_iter().flatten().collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn to_hira(c: char) -> char {
     match c {
         '\u{30A1}'..='\u{30F6}' => char::from_u32(c as u32 - 0x60).unwrap_or(c),
@@ -930,6 +1003,18 @@ mod tests {
         let lex = Lexicon::from_table(TABLE);
         assert_eq!(lex.cost("3、", "3、"), Some(2.0 * TYPED_COST));
         assert!(lex.cost("今日。", "きょう。").is_some());
+    }
+
+    #[test]
+    fn a_kanji_run_splits_by_its_chars_readings() {
+        let table = "東\tとう\t10.0\tnoun\n京\tきょう\t10.0\tnoun\n学\tがく\t10.0\tnoun\n校\tこう\t10.0\tnoun\n人\tひと\t10.0\tnoun\n今日\tきょう\t8.0\tnoun\n";
+        let lex = Lexicon::from_table(table);
+        assert_eq!(lex.split_reading("東京", "とうきょう"), Some(vec![0, 2]));
+        // a small っ at a char's end, a voiced start, 々 as the char before
+        assert_eq!(lex.split_reading("学校", "がっこう"), Some(vec![0, 2]));
+        assert_eq!(lex.split_reading("人々", "ひとびと"), Some(vec![0, 2]));
+        // a word read whole (今日) has no reading of its chars
+        assert_eq!(lex.split_reading("今日", "きょう"), None);
     }
 
     #[test]
