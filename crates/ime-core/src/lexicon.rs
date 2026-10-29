@@ -54,17 +54,25 @@ pub const WEIGHT: f32 = 0.4;
 /// wiki_fresh_v2 / AJIMEE go, and none of their golds.
 pub const MARGIN: f32 = 20.0;
 /// The lexicon's own conversions (`convert`) tried for the engine's list:
-/// a conversion `ADDED_UNDER` cheaper than every candidate of the engine is
-/// added, scored `ADDED_BELOW` under its top, for the lexicon's cost and
-/// the reranker to place. Picked on wiki_fresh_v2 (Shiran-v2 s14000, the
+/// a conversion no more than `ADDED_OVER` dearer than the engine's cheapest
+/// candidate is added, scored `ADDED_BELOW` under its top, for the lexicon's
+/// cost and the reranker to place. Picked on wiki_fresh_v2 (Shiran-v2 s14000, the
 /// reranker at lambda 0.8 over the top 20) with the connection costs: golds
 /// in the list 4339 -> 4494, EM1 79.95 -> 81.57, by the engine's score and
 /// the lexicon 76.81 -> 76.95; AJIMEE 183 -> 186, 83.0 -> 84.5, 75.5 ->
 /// 74.5. Adding every conversion found more golds (4563, EM1 up to 82.29)
 /// and left more of the lexicon's own misses in the list (about 8
-/// candidates after the rerank against 4.9).
+/// candidates after the rerank against 4.9), so only the cheaper ones went
+/// in at first (`ADDED_OVER` 0). That left out a word's homophones where it
+/// costs more than the word (検収担当者 24.0 for けんしゅうたんとうしゃ, the
+/// model giving 研修担当者 18.7), which the user then could not reach (user
+/// 2026-10-28). Up to 8 dearer, over wiki_fresh_v2 with Shiran-v2 s7080 (the
+/// reranker over the top 20): golds in the list 4528 -> 4592, EM1 82.09 ->
+/// 82.17, 4.7 -> 6.6 candidates after the rerank (at 4: 4580, 82.19, 5.8);
+/// AJIMEE with Bletila-v0.1-small 189 -> 192, 86.5 -> 87.0, 5.8 -> 8.2 (at
+/// 4 the same, 7.3); by the engine's score and the lexicon EM1 is the same.
 pub const CONVERSIONS: usize = 10;
-pub const ADDED_UNDER: f32 = 0.0;
+pub const ADDED_OVER: f32 = 8.0;
 pub const ADDED_BELOW: f32 = 8.0;
 /// How much of the connection table's cost a path pays where one word
 /// follows another: 0.5, 1 and 1.5 within 0.1 EM1 of each other on
