@@ -7,8 +7,8 @@
 //! beam_width, the polluted-vocab blacklist, the candidate window font,
 //! the engine binary path — and every change would need a rebuild and
 //! a reinstall. With Config:
-//!   - daemon parameters are picked up at IME activation, so a config
-//!     edit + Win+Space (re-activate) takes effect immediately
+//!   - the Windows IME reads the file again when an input starts after it
+//!     was saved (and at activation); fcitx5 at activation
 //!   - unset engine knobs are not filled in here: the daemon takes them from
 //!     the model manifest's `decode_defaults`, then from its own defaults,
 //!     so the recommended decode recipe travels with the model
@@ -334,6 +334,11 @@ pub struct FrontendCfg {
     /// user 2026-10-28: delete what is seen), or the last kana of the
     /// reading, the rest converted again (false).
     pub backspace_deletes_shown: bool,
+    /// Escape steps back as MS-IME's does: on a conversion shown (live or
+    /// in the candidate window) it shows the kana typed, and Escape again
+    /// clears the composition (true); false goes from the candidate window
+    /// back to the live conversion and clears from there.
+    pub escape_to_kana: bool,
     /// Keep the preedit caret at the start of the composition (fcitx5-mozc's
     /// "preedit cursor position at beginning"). Apps put the candidate
     /// window at the caret, so it then stays put while typing, converting
@@ -363,6 +368,16 @@ pub struct FrontendCfg {
     /// English word stay as typed in a sentence with no Japanese
     /// (`mixed::english_after`).
     pub sentence_case: bool,
+    /// Keys that turn the IME on or off (Windows): a key name with
+    /// `Ctrl+` / `Shift+` / `Alt+` / `Win+` before it, such as `Zenkaku`
+    /// (半角/全角), `Alt+\``, `Henkan`, `Muhenkan`, `Ctrl+Space`. Ctrl+Space
+    /// is not in by default: it is a shortcut of many apps.
+    pub toggle_keys: Vec<String>,
+    /// Keys that only turn it on (`ImeOn`: VK_IME_ON, which some keyboards
+    /// send).
+    pub on_keys: Vec<String>,
+    /// Keys that only turn it off (`ImeOff`: VK_IME_OFF).
+    pub off_keys: Vec<String>,
 }
 
 /// How far mixed input cases English typed in lowercase
@@ -472,11 +487,17 @@ impl Default for FrontendCfg {
             full_width_space: false,
             live_conversion: None,
             backspace_deletes_shown: true,
+            escape_to_kana: true,
             preedit_cursor_at_start: false,
             mixed_model: None,
             name_dictionary_file: None,
             name_case: NameCase::Acronyms,
             sentence_case: true,
+            toggle_keys: ["Zenkaku", "Alt+Zenkaku", "Alt+`"]
+                .map(String::from)
+                .to_vec(),
+            on_keys: vec!["ImeOn".to_string()],
+            off_keys: vec!["ImeOff".to_string()],
         }
     }
 }
@@ -581,15 +602,7 @@ fn full_width(c: char) -> char {
 /// (`data/symbol_width.tsv`): `！？（）：％` full-width, `" ' # _ | { }`
 /// half-width.
 pub fn default_symbol_map() -> BTreeMap<String, String> {
-    let japanese = [
-        ("comma", "、"),
-        ("period", "。"),
-        ("slash", "・"),
-        ("left_bracket", "「"),
-        ("right_bracket", "」"),
-        ("yen", "￥"),
-    ];
-    let mut map: BTreeMap<String, String> = japanese
+    let mut map: BTreeMap<String, String> = JAPANESE_SYMBOLS
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
@@ -604,6 +617,68 @@ pub fn default_symbol_map() -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// The Japanese symbols the comma, period, slash, bracket and yen keys type
+/// by default.
+const JAPANESE_SYMBOLS: [(&str, &str); 6] = [
+    ("comma", "、"),
+    ("period", "。"),
+    ("slash", "・"),
+    ("left_bracket", "「"),
+    ("right_bracket", "」"),
+    ("yen", "￥"),
+];
+
+/// What the symbol key `name` (a `SYMBOL_CHARS` one) may type, as the
+/// settings app offers it: its Japanese symbol (、。・「」 for , . / [ ]),
+/// its full-width form and its half-width one (the yen key: ￥ and `\`).
+pub struct SymbolForms {
+    pub japanese: Option<&'static str>,
+    pub full: String,
+    pub half: String,
+}
+
+pub fn symbol_forms(name: &str) -> Option<SymbolForms> {
+    let &(_, c) = SYMBOL_CHARS.iter().find(|(k, _)| *k == name)?;
+    if name == "yen" {
+        return Some(SymbolForms {
+            japanese: None,
+            full: "￥".into(),
+            half: c.to_string(),
+        });
+    }
+    Some(SymbolForms {
+        japanese: JAPANESE_SYMBOLS
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|&(_, s)| s),
+        full: full_width(c).to_string(),
+        half: c.to_string(),
+    })
+}
+
+/// `symbols` with every symbol key typing its full-width form (`full`:
+/// ！（）＃) or its half-width one (! ( ) #), but those that type their
+/// Japanese symbol (、。・「」), which stay: the settings app's 全角 / 半角
+/// for the typed symbols. Other keys are kept.
+pub fn symbols_in_width(
+    symbols: &BTreeMap<String, String>,
+    full: bool,
+) -> BTreeMap<String, String> {
+    let mut out = symbols.clone();
+    for (name, _) in SYMBOL_CHARS {
+        let Some(forms) = symbol_forms(name) else {
+            continue;
+        };
+        let now = symbols.get(name).map(String::as_str);
+        if now.is_some() && now == forms.japanese {
+            continue;
+        }
+        let to = if full { forms.full } else { forms.half };
+        out.insert(name.to_string(), to);
+    }
+    out
 }
 
 /// The reranker: a causal LM (`setsuna-rerank daemon`) rescoring the
@@ -875,8 +950,8 @@ impl Config {
     pub fn emit_default_toml() -> String {
         let d = Self::default();
         format!(
-            "# Setsuna TSF IME configuration. Edit and save; activations\n\
-             # after the save pick up the new values (Win+Space twice).\n\
+            "# Setsuna TSF IME configuration. Edit and save; the IME picks up\n\
+             # the new values when the next input starts.\n\
              \n\
              [engine]\n\
              # Model artifact manifest written by export. Edit this to switch\n\
@@ -967,6 +1042,10 @@ impl Config {
              # the reading under it, the rest staying as shown (true), or the\n\
              # last kana typed, the rest converted again (false).\n\
              backspace_deletes_shown = true\n\
+             # Escape on a conversion shown (live or in the candidate window)\n\
+             # shows the kana typed, and Escape again clears (true); false goes\n\
+             # from the candidate window back to the live conversion.\n\
+             escape_to_kana = true\n\
              # fcitx5: keep the preedit caret at the start of the composition,\n\
              # so the candidate window stays put (the caret is then not seen\n\
              # to move while typing). Default false.\n\
@@ -986,6 +1065,14 @@ impl Config {
              # world), and . , ! ? after English stay as typed where no\n\
              # Japanese is in the sentence.\n\
              sentence_case = true\n\
+             # Keys that turn the IME on and off (Windows): Zenkaku (半角/全角),\n\
+             # Henkan, Muhenkan, Eisu, Kana, Space, `, a letter, F1-F24, ...\n\
+             # after Ctrl+ / Shift+ / Alt+ / Win+. Ctrl+Space is a shortcut of\n\
+             # many apps (VS Code, Excel, Emacs): add it only if you want it.\n\
+             toggle_keys = [\"Zenkaku\", \"Alt+Zenkaku\", \"Alt+`\"]\n\
+             # Keys that only turn it on / off (ImeOn, ImeOff: VK_IME_ON / OFF).\n\
+             on_keys = [\"ImeOn\"]\n\
+             off_keys = [\"ImeOff\"]\n\
              # Literal replacements applied to every candidate, in order:\n\
              # [[frontend.replacements]]\n\
              # from = \"～\"\n\
@@ -1294,6 +1381,22 @@ digit_split = true
         assert!(c.engine.model_manifest.is_none());
         assert_eq!(c.engine.beam_width, None);
         assert_eq!(c.ui.candidate_window.font_pt, 16);
+        assert_eq!(
+            c.frontend.toggle_keys,
+            Config::default().frontend.toggle_keys
+        );
+    }
+
+    #[test]
+    fn on_off_keys_default_and_parse() {
+        let d = Config::default().frontend;
+        assert!(d.toggle_keys.iter().all(|k| !k.contains("Ctrl")));
+        assert_eq!(d.on_keys, ["ImeOn"]);
+        let c = Config::load_from_str("[frontend]\ntoggle_keys = [\"Ctrl+Space\"]\noff_keys = []")
+            .unwrap();
+        assert_eq!(c.frontend.toggle_keys, ["Ctrl+Space"]);
+        assert!(c.frontend.off_keys.is_empty());
+        assert_eq!(c.frontend.on_keys, ["ImeOn"]);
     }
 
     #[test]
@@ -1305,6 +1408,52 @@ slash = "・"
         let c = Config::load_from_str(s).expect("parse");
         assert_eq!(c.frontend.symbols.get("slash"), Some(&"・".to_string()));
         assert_eq!(c.frontend.symbols.get("comma"), Some(&"、".to_string()));
+    }
+
+    #[test]
+    fn typed_symbols_go_full_or_half_width_but_the_japanese_ones() {
+        // as the installer writes them: ／ for the slash key, （ ） ？
+        let mut symbols = default_symbol_map();
+        for (k, v) in [("slash", "／"), ("shift_8", "（"), ("question", "？")] {
+            symbols.insert(k.into(), v.into());
+        }
+        let half = symbols_in_width(&symbols, false);
+        let typed = |m: &BTreeMap<String, String>, c: char| typed_symbol(c, false, m);
+        for (c, s) in [
+            ('(', "("),
+            (')', ")"),
+            ('?', "?"),
+            ('!', "!"),
+            ('/', "/"),
+            ('\\', "\\"),
+        ] {
+            assert_eq!(typed(&half, c), s);
+        }
+        // 、。「」 stay
+        for (c, s) in [(',', "、"), ('.', "。"), ('[', "「"), (']', "」")] {
+            assert_eq!(typed(&half, c), s);
+        }
+        let full = symbols_in_width(&half, true);
+        for (c, s) in [
+            ('(', "（"),
+            ('?', "？"),
+            ('#', "＃"),
+            ('/', "／"),
+            ('\\', "￥"),
+            ('[', "「"),
+        ] {
+            assert_eq!(typed(&full, c), s);
+        }
+        // the slash key typing ・ keeps it
+        let mut dot = symbols.clone();
+        dot.insert("slash".into(), "・".into());
+        assert_eq!(typed(&symbols_in_width(&dot, false), '/'), "・");
+        // every key types a symbol of its own, which mixed input reads back
+        for m in [&half, &full] {
+            let outs: std::collections::HashSet<&String> =
+                SYMBOL_CHARS.iter().map(|(k, _)| &m[*k]).collect();
+            assert_eq!(outs.len(), SYMBOL_CHARS.len());
+        }
     }
 
     #[test]

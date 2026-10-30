@@ -25,6 +25,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The TSF DLL itself is Windows-only; on other platforms the crate builds
 # (nearly) empty.
 [target.'cfg(windows)'.dependencies]
+# Whether the host is an AppContainer (a Store app's sandbox).
+setsuna-pipe = { path = "../pipe" }
 windows = { version = "0.58", features = [
     "implement",
     "Win32_Foundation",

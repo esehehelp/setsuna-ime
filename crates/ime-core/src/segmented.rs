@@ -33,6 +33,9 @@ pub(crate) struct Seg {
     /// Stepped past its last candidate: select the first new one when the
     /// continuation arrives.
     pub advance: bool,
+    /// The conversion of its letters read as romaji (an English segment's
+    /// other reading, `composing_text::romaji_to_kana`) was asked for.
+    pub kana_queried: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +118,7 @@ impl Segmented {
                 more: 0,
                 exhausted: false,
                 advance: false,
+                kana_queried: false,
             })
             .collect();
         Some(Self {
@@ -176,6 +180,7 @@ impl Segmented {
         s.more = 0;
         s.exhausted = false;
         s.advance = false;
+        s.kana_queried = false;
     }
 
     /// Grow (`delta` > 0) or shrink the focused segment by one reading char,
@@ -214,6 +219,7 @@ impl Segmented {
                     more: 0,
                     exhausted: false,
                     advance: false,
+                    kana_queried: false,
                 });
                 self.reset(k + 1);
             }

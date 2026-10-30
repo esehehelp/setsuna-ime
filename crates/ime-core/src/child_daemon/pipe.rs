@@ -13,6 +13,12 @@
 //! server started again, and the request sent again; when that fails, the
 //! client starts a child of this app's own and passes it everything from
 //! then on, so conversion never stops for want of the server.
+//!
+//! In an AppContainer (a Store app's sandbox, the Start menu's search) the
+//! client only connects ([`PipeEngineClient::connect_only`]): it never
+//! starts a server (it would run in the sandbox, out of the other apps'
+//! reach) nor a child (a model loaded per sandbox). With no server to reach
+//! it gives up, and the frontend tries again later.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
@@ -40,6 +46,9 @@ struct Target {
     user: String,
     exe: PathBuf,
     args: Vec<OsString>,
+    /// Start the server when there is none, and a child when it cannot be
+    /// had (false: connect only).
+    start: bool,
 }
 
 /// What the I/O thread needs to start the child it falls back to.
@@ -71,7 +80,28 @@ impl PipeEngineClient {
         notify: Notify,
         cfg: &crate::config::EngineCfg,
     ) -> Result<Self, (io::Error, Notify)> {
-        let target = match target(manifest, exe, cfg) {
+        Self::open(manifest, exe, notify, cfg, true)
+    }
+
+    /// The client of a server some other app started: never a server or a
+    /// child of its own. It stops being alive when there is none to reach.
+    pub fn connect_only(
+        manifest: &Path,
+        exe: &Path,
+        notify: Notify,
+        cfg: &crate::config::EngineCfg,
+    ) -> Result<Self, (io::Error, Notify)> {
+        Self::open(manifest, exe, notify, cfg, false)
+    }
+
+    fn open(
+        manifest: &Path,
+        exe: &Path,
+        notify: Notify,
+        cfg: &crate::config::EngineCfg,
+        start: bool,
+    ) -> Result<Self, (io::Error, Notify)> {
+        let target = match target(manifest, exe, cfg, start) {
             Ok(t) => t,
             Err(e) => return Err((e, notify)),
         };
@@ -152,7 +182,12 @@ fn take_notify(fallback: Arc<Fallback>) -> Notify {
 }
 
 /// The pipe's name and the server's command line for this config.
-fn target(manifest: &Path, exe: &Path, cfg: &crate::config::EngineCfg) -> io::Result<Target> {
+fn target(
+    manifest: &Path,
+    exe: &Path,
+    cfg: &crate::config::EngineCfg,
+    start: bool,
+) -> io::Result<Target> {
     let user = win::user_sid()?;
     let flags = decode_flags(cfg);
     let name = engine_pipe_name(
@@ -178,6 +213,7 @@ fn target(manifest: &Path, exe: &Path, cfg: &crate::config::EngineCfg) -> io::Re
         user,
         exe: exe.to_path_buf(),
         args,
+        start,
     })
 }
 
@@ -283,7 +319,7 @@ fn io_loop(
     // starts typing
     let mut conn = match connect(shared, server, target) {
         Ok(c) => Some(c),
-        Err(e) => return give_up(shared, fallback, &e),
+        Err(e) => return give_up(shared, fallback, target, &e),
     };
     while let Some(pending) = next_request(shared) {
         let Some(mut line) = request_line(shared, &pending) else {
@@ -299,7 +335,7 @@ fn io_loop(
                     Err(e) => {
                         // what was queued since goes to the child too
                         shared.state.lock().unwrap().pending.get_or_insert(pending);
-                        return give_up(shared, fallback, &e);
+                        return give_up(shared, fallback, target, &e);
                     }
                 }
             }
@@ -336,9 +372,18 @@ fn io_loop(
 }
 
 /// The server cannot be had: start a child of this app's own and pass it
-/// the queued request; every call goes to it from then on.
-fn give_up(shared: &Shared, fallback: &Fallback, e: &io::Error) {
+/// the queued request; every call goes to it from then on. Connecting only,
+/// the client is no longer alive instead.
+fn give_up(shared: &Shared, fallback: &Fallback, target: &Target, e: &io::Error) {
     if !shared.alive.load(Ordering::SeqCst) {
+        return;
+    }
+    if !target.start {
+        crate::diagnostics::log(format!(
+            "engine pipe unusable: {e}; no shared engine to reach from here, kana only"
+        ));
+        shared.alive.store(false, Ordering::SeqCst);
+        shared.cv.notify_all();
         return;
     }
     crate::diagnostics::log(format!(
@@ -402,6 +447,13 @@ fn connect(shared: &Shared, server: &AtomicU32, target: &Target) -> io::Result<B
                     return Ok(reader);
                 }
                 // it left before (exiting idle as we came): again
+            }
+            // no server, and this client may not start one
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !target.start => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no server on {}", target.name),
+                ));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => match started {
                 None => {

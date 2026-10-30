@@ -5,7 +5,7 @@
 #
 # Usage (Windows PowerShell 5.1 or pwsh):
 #   irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
-#   & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -ModelPrecision fp32
+#   & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -RerankManifest <LM scorer manifest>
 #   powershell -ExecutionPolicy Bypass -File setup.ps1 -Archive setsuna-ime-<version>-windows-x64.zip
 #
 # Options are install.ps1's (-ModelPrecision, -RerankManifest,

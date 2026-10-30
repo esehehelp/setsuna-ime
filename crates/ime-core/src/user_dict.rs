@@ -78,27 +78,34 @@ impl Entry {
 pub const DEFAULT_POS: &str = "名詞";
 
 /// A reading as the dictionary keys it: hiragana (katakana folded, romaji
-/// typed as an IME would read it), or `None` when it is no reading.
+/// typed as an IME would read it), or `None` when it is no reading. A
+/// reading of ASCII letters, digits and symbols only that is no romaji
+/// (`w`, `lol`, `:)`; full-width folded to half-width) stays as typed, in
+/// lowercase, as MS-IME takes one: Space on the input typed so matches it
+/// (`EngineBridge::handle_space`).
 pub fn normalize_reading(reading: &str) -> Option<String> {
     let reading = reading.trim();
     if reading.is_empty() {
         return None;
     }
-    let kana = if reading
+    let folded: String = reading
+        .chars()
+        .map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            c => c,
+        })
+        .collect();
+    let kana: String = if folded
         .chars()
         .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'')
     {
         let mut c = crate::composing_text::ComposingText::new();
-        for ch in reading.chars() {
+        for ch in folded.chars() {
             c.input_char(ch.to_ascii_lowercase());
         }
-        let k = c.kana_reading();
-        if k.chars().any(|c| c.is_ascii_alphabetic()) {
-            return None;
-        }
-        k
+        c.kana_reading()
     } else {
-        reading
+        folded
             .chars()
             .map(|c| match c {
                 'ァ'..='ヶ' => char::from_u32(c as u32 - 0x60).unwrap_or(c),
@@ -106,9 +113,25 @@ pub fn normalize_reading(reading: &str) -> Option<String> {
             })
             .collect()
     };
-    kana.chars()
+    if kana
+        .chars()
         .all(|c| ('ぁ'..='ゖ').contains(&c) || "ーゝゞ".contains(c) || c.is_ascii_digit())
-        .then_some(kana)
+    {
+        Some(kana)
+    } else if is_typed_reading(&folded) {
+        Some(folded.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Whether `reading` is one of ASCII letters or symbols (not digits only,
+/// which the engine converts as a reading): what is typed is looked up
+/// whole for it, not converted.
+pub fn is_typed_reading(reading: &str) -> bool {
+    !reading.is_empty()
+        && reading.chars().all(|c| c.is_ascii_graphic())
+        && !reading.chars().all(|c| c.is_ascii_digit())
 }
 
 /// The entries of a dictionary text (any format `import` reads), with the
@@ -219,8 +242,12 @@ impl UserDict {
                         .entry(e.reading.clone())
                         .or_default()
                         .push((e.word.clone(), kind));
-                    // one char matches too much inside a reading
-                    if kind == Kind::Word && e.reading.chars().count() >= 2 {
+                    // one char matches too much inside a reading; a reading of
+                    // letters or symbols matches what is typed, whole
+                    if kind == Kind::Word
+                        && e.reading.chars().count() >= 2
+                        && !is_typed_reading(&e.reading)
+                    {
                         d.inner.push((e.reading.clone(), e.word.clone()));
                     }
                 }
@@ -235,6 +262,21 @@ impl UserDict {
         self.by_reading.is_empty()
             && self.suppressed.is_empty()
             && self.suppressed_anywhere.is_empty()
+    }
+
+    /// The words of `reading` as a whole (shortcuts too), in file order,
+    /// the suppressed ones left out.
+    pub fn words(&self, reading: &str) -> Vec<String> {
+        self.apply(reading, Vec::new())
+    }
+
+    /// Whether `word` is a shortcut (短縮よみ) of `reading`, and no plain
+    /// word of it too.
+    pub fn is_shortcut(&self, reading: &str, word: &str) -> bool {
+        self.by_reading.get(reading).is_some_and(|words| {
+            words.iter().any(|(w, k)| w == word && *k == Kind::Shortcut)
+                && !words.iter().any(|(w, k)| w == word && *k == Kind::Word)
+        })
     }
 
     /// `candidates` for `reading` with the user's words: those of the whole
@@ -460,5 +502,41 @@ mod tests {
         assert_eq!(normalize_reading("セツナ").as_deref(), Some("せつな"));
         assert_eq!(normalize_reading("setsuna").as_deref(), Some("せつな"));
         assert_eq!(normalize_reading("漢字"), None);
+        // letters and symbols that are no romaji stay as typed, lowercase
+        // and half-width (MS-IME takes `w` for (笑))
+        assert_eq!(normalize_reading("w").as_deref(), Some("w"));
+        assert_eq!(normalize_reading("ｗ").as_deref(), Some("w"));
+        assert_eq!(normalize_reading("LOL").as_deref(), Some("lol"));
+        assert_eq!(normalize_reading("ok").as_deref(), Some("ok"));
+        assert_eq!(normalize_reading(":)").as_deref(), Some(":)"));
+        assert_eq!(normalize_reading("2ch").as_deref(), Some("2ch"));
+        assert_eq!(normalize_reading("110").as_deref(), Some("110"));
+        assert_eq!(
+            normalize_reading("ｓｅｔｓｕｎａ").as_deref(),
+            Some("せつな")
+        );
+        assert_eq!(normalize_reading("わ").as_deref(), Some("わ"));
+        assert_eq!(normalize_reading("wあ"), None);
+        assert_eq!(normalize_reading("a b"), None);
+    }
+
+    #[test]
+    fn a_reading_of_letters_is_whole_only() {
+        let (e, skipped) = parse("w\t(笑)\t名詞\nlol\t(爆笑)\t名詞\n");
+        assert!(skipped.is_empty());
+        let d = UserDict::new(&e);
+        assert_eq!(d.words("w"), list(&["(笑)"]));
+        assert_eq!(d.apply("lol", list(&["lol"])), list(&["(爆笑)", "lol"]));
+        // not put inside a longer reading of letters
+        assert_eq!(d.apply("lolです", list(&["lolです"])), list(&["lolです"]));
+    }
+
+    #[test]
+    fn shortcuts_are_told_from_words() {
+        let d = dict("じゅうしょ\t東京都千代田区1-1\t短縮よみ\nじゅうしょ\t住所\t名詞\n");
+        assert!(d.is_shortcut("じゅうしょ", "東京都千代田区1-1"));
+        assert!(!d.is_shortcut("じゅうしょ", "住所"));
+        assert!(!d.is_shortcut("じゅうしょを", "東京都千代田区1-1"));
+        assert_eq!(d.words("じゅうしょ"), list(&["東京都千代田区1-1", "住所"]));
     }
 }

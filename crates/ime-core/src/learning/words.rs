@@ -20,7 +20,7 @@
 /// One word choice: `chosen` over `rejected` for the reading `span`, seen
 /// with the reading chars `left` / `right` next to it (up to `CONTEXT` each,
 /// fewer at an end of the reading).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct Word {
     pub span: String,
     pub chosen: String,

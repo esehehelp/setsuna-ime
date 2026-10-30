@@ -11,6 +11,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::placement::{place_on_screen, Rect};
 use crate::tsf::candidate_window::{
     dpi_scale, draw_text, font, gradient, palette, sc, text_width, Palette, ACCENT, RADIUS,
 };
@@ -75,9 +76,11 @@ impl ModePopup {
         Self { hwnd }
     }
 
-    /// Show the mode for a moment: below `at` (the caret, screen
-    /// coordinates), else in the middle of the foreground window.
-    pub fn show(&mut self, on: bool, at: Option<(i32, i32)>) {
+    /// Show the mode for a moment: below `at` (the caret's rect on screen;
+    /// above it near the bottom of the screen), else in the middle of the
+    /// foreground window. Without a conversion engine (`converts` false)
+    /// on says so: the IME types kana only.
+    pub fn show(&mut self, on: bool, converts: bool, at: Option<Rect>) {
         let hwnd = self.hwnd;
         if hwnd.0 as usize == 0 {
             return;
@@ -86,10 +89,10 @@ impl ModePopup {
         let Some(d) = (unsafe { ptr.as_mut() }) else {
             return;
         };
-        let (glyph, label) = if on {
-            ("あ", "ひらがな")
-        } else {
-            ("A", "直接入力")
+        let (glyph, label) = match (on, converts) {
+            (true, true) => ("あ", "ひらがな"),
+            (true, false) => ("あ", "ひらがな（変換エンジンなし）"),
+            (false, _) => ("A", "直接入力"),
         };
         d.glyph = glyph.to_string();
         d.label = label.to_string();
@@ -118,12 +121,19 @@ impl ModePopup {
         }
         let (w, h) = (d.width, d.height);
         let (x, y) = match at {
-            Some((x, y)) => (x, y + sc(6, s)),
+            Some(caret) => place_on_screen(caret, w, h, sc(6, s)),
             None => unsafe {
                 let mut r = RECT::default();
                 let fg = GetForegroundWindow();
                 if GetWindowRect(fg, &mut r).is_ok() {
-                    ((r.left + r.right - w) / 2, (r.top + r.bottom - h) / 2)
+                    // in the middle of the window, inside its monitor
+                    let middle = Rect {
+                        left: (r.left + r.right - w) / 2,
+                        top: (r.top + r.bottom - h) / 2,
+                        right: (r.left + r.right + w) / 2,
+                        bottom: (r.top + r.bottom - h) / 2,
+                    };
+                    place_on_screen(middle, w, h, 0)
                 } else {
                     (
                         GetSystemMetrics(SM_CXSCREEN) / 2 - w / 2,
@@ -189,6 +199,13 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // a panic never unwinds into the host's message loop
+    crate::guard::catch("mode popup", LRESULT(0), || unsafe {
+        handle_message(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
             unsafe { paint(hwnd) };

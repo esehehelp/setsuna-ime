@@ -131,6 +131,21 @@ input[type=range] { width: 180px; accent-color: var(--accent); }
 .rep .arrow { color: var(--ink-3); }
 .reps .empty { color: var(--ink-3); padding: 8px 0; }
 
+/* ---- typed symbols ------------------------------------------------------ */
+.syms { border-top: 1px solid var(--line); padding: 10px 18px; }
+.syms + .row { border-top: 1px solid var(--line); }
+.syms summary { cursor: pointer; font-size: 13px; color: var(--ink-2); }
+.symgrid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px 16px; padding: 10px 0 4px;
+}
+.sym { display: flex; align-items: center; gap: 8px; }
+.sym .key {
+  width: 2em; text-align: center; font-family: Consolas, monospace;
+  border: 1px solid var(--field-line); border-radius: 4px; padding: 2px 0;
+}
+.sym select { flex: 1; min-width: 0; }
+
 /* ---- action bar --------------------------------------------------------- */
 .bar {
   position: fixed; left: 0; right: 0; bottom: 0;
@@ -257,6 +272,27 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control" data-switch="frontend.pass_through_commands"></div>
   </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">オン・オフを切り替えるキー</div>
+      <div class="desc">カンマ区切り。Zenkaku（半角/全角）、Henkan、Muhenkan、Eisu、Kana、Space、英字、F1〜F24 などに Ctrl+ / Shift+ / Alt+ を付けて書きます。Ctrl+Space は多くのアプリのショートカットなので、使うときだけ足してください</div>
+    </div>
+    <div class="control"><input type="text" class="wide" data-keys="toggle_keys" placeholder="Zenkaku, Alt+Zenkaku, Alt+`"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">オンにするキー</div>
+      <div class="desc">ImeOn はオンにする専用のキー（VK_IME_ON）を送るキーボードのためのものです（例: Henkan）</div>
+    </div>
+    <div class="control"><input type="text" class="wide" data-keys="on_keys" placeholder="ImeOn"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">オフにするキー</div>
+      <div class="desc">ImeOff はオフにする専用のキー（VK_IME_OFF）です（例: Muhenkan）</div>
+    </div>
+    <div class="control"><input type="text" class="wide" data-keys="off_keys" placeholder="ImeOff"></div>
+  </div>
 </div>
 
 <h2>記号・句読点</h2>
@@ -268,6 +304,17 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control"><div class="segmented" id="symbol_width"></div></div>
   </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">入力する記号</div>
+      <div class="desc">記号キーで入力する文字です。全角：！（）＃、半角：! ( ) #（どちらも 、。・「」 はそのまま）。下の表で記号ごとにも選べます</div>
+    </div>
+    <div class="control"><div class="segmented" id="symbol_preset"></div></div>
+  </div>
+  <details class="syms">
+    <summary>記号ごとに選ぶ</summary>
+    <div class="symgrid" id="symbols"></div>
+  </details>
   <div class="row">
     <div class="text">
       <div class="title">句読点</div>
@@ -370,7 +417,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row">
     <div class="text">
       <div class="title">登録した語</div>
-      <div class="desc" id="dict_desc">読みはひらがな（ローマ字でも入力できます）。読み全体のほか、長い読みの一部に一致しても候補に入ります。品詞「短縮よみ」は読み全体だけ、「抑制単語」はその語を出さなくなります</div>
+      <div class="desc" id="dict_desc">読みはひらがな（ローマ字でも入力できます）。英字・記号だけの読み（w → (笑)）は、そのとおり打って Space で出ます。読み全体のほか、長い読みの一部に一致しても候補に入ります。品詞「短縮よみ」は読み全体だけ、「抑制単語」はその語を出さなくなります</div>
     </div>
     <div class="control">
       <input type="text" id="dict_search" placeholder="検索">
@@ -671,7 +718,59 @@ $("romaji_path").addEventListener("input", () => {
   changed();
 });
 
+// The on / off keys: cfg.frontend[key] as a comma-separated list.
+function renderKeys() {
+  for (const input of document.querySelectorAll("[data-keys]")) {
+    input.value = (cfg.frontend[input.dataset.keys] || []).join(", ");
+  }
+}
+
+for (const input of document.querySelectorAll("[data-keys]")) {
+  input.addEventListener("input", () => {
+    cfg.frontend[input.dataset.keys] = input.value.split(",").map((k) => k.trim()).filter((k) => k);
+    changed();
+  });
+}
+
+// What each symbol key may type ({name, key, japanese, full, half}).
+let symbolKeys = [];
+
+// The typed symbols, cfg.frontend.symbols: 全角 / 半角 set every key to its
+// full- / half-width form but those typing their Japanese symbol (、。・「」),
+// as config::symbols_in_width does; the table sets one key.
+function renderSymbols() {
+  const syms = (cfg.frontend.symbols ??= {});
+  const inWidth = (full) => symbolKeys.every((k) =>
+    syms[k.name] === (full ? k.full : k.half) || (k.japanese && syms[k.name] === k.japanese));
+  const current = inWidth(true) ? "full" : inWidth(false) ? "half" : null;
+  const seg = $("symbol_preset");
+  seg.replaceChildren(...[["full", "全角"], ["half", "半角"]].map(([value, label]) => {
+    const b = el("button", { textContent: label });
+    b.setAttribute("aria-pressed", value === current);
+    b.addEventListener("click", () => {
+      for (const k of symbolKeys) {
+        if (!(k.japanese && syms[k.name] === k.japanese)) syms[k.name] = value === "full" ? k.full : k.half;
+      }
+      renderSymbols();
+      changed();
+    });
+    return b;
+  }));
+  $("symbols").replaceChildren(...symbolKeys.map((k) => {
+    const value = syms[k.name] ?? "";
+    const list = [];
+    if (k.japanese) list.push([k.japanese, k.japanese]);
+    list.push([k.full, `${k.full}　全角`], [k.half, `${k.half}　半角`]);
+    if (value && !list.some(([v]) => v === value)) list.push([value, value]);
+    const sel = el("select", { title: k.name });
+    options(sel, list, value);
+    sel.addEventListener("change", () => { syms[k.name] = sel.value; renderSymbols(); changed(); });
+    return el("label", { className: "sym" }, el("span", { className: "key", textContent: k.key }), sel);
+  }));
+}
+
 function render() {
+  renderSymbols();
   for (const slot of document.querySelectorAll("[data-switch]")) {
     const path = slot.dataset.switch;
     slot.replaceChildren(toggle(at(path), (v) => { setAt(path, v); changed(); }));
@@ -680,6 +779,7 @@ function render() {
   segmented("symbol_width", WIDTHS);
   segmented("name_case", NAME_CASES);
   renderRomaji();
+  renderKeys();
   renderApps();
   renderWindow();
 
@@ -1056,6 +1156,7 @@ window.setsuna = {
       return;
     }
     if (msg.type !== "state") return;
+    symbolKeys = msg.symbol_keys ?? [];
     learned = msg.learned;
     renderLearned();
     hidden = msg.hidden ?? [];

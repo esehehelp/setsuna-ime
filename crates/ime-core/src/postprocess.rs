@@ -392,6 +392,167 @@ fn breaks_a_number(candidate: &str, zero_read: bool) -> bool {
     mixed || zero
 }
 
+/// Drop the candidates with digits that stand for kana the reading does not
+/// read as that number: the model writes a char a frame, and its
+/// runners-up put a digit for a kana that sounds like one (学校に行ったとき2
+/// and 学校に1たときに for がっこうにいったときに, 4路 and 4ろ for よろ, 9形状
+/// for くけいじょう). Each run of digits not typed as such must be read, in
+/// a way the candidate fits the reading (`reading_align`), as its number
+/// (`numbers::reading_ends`): said alone (にがつ, さんぜんにん, こたえはに)
+/// or in a form a counter takes, then before a char that is no hiragana (or
+/// か, こ, つ: 1か月, 1つ) whose reading starts as the form asks (いっかい,
+/// よにん, くがつ; ひとり, ついたち, はつか). A run beside a Latin letter
+/// (MI6) and a candidate that does not fit its reading at all stay. With no
+/// digit typed, a run between a hiragana that is no particle and the end or
+/// a hiragana that is no particle or counter goes too (とき2 for ときに: the
+/// 2 is read に, as a number may be). Over Bletilla-v0.1-small's lists
+/// (without the reranker / with it over the top 20) it drops 46 candidates
+/// of AJIMEE, EM1 76.5 -> 77.0 / 87.0 -> 87.0, and 720 of wiki_fresh_v2,
+/// 78.65 / 82.65 unchanged; no gold of either goes.
+pub fn drop_misread_digits(reading: &str, candidates: Vec<String>) -> Vec<String> {
+    let reading: Vec<char> = reading.chars().map(to_half).collect();
+    let typed = reading.iter().any(|c| c.is_ascii_digit());
+    candidates
+        .into_iter()
+        .filter(|c| !misreads_digits(c, &reading, typed))
+        .collect()
+}
+
+fn misreads_digits(candidate: &str, reading: &[char], typed: bool) -> bool {
+    let s: Vec<char> = candidate.chars().map(to_half).collect();
+    if !s.iter().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if !typed && digits_among_kana(&s) {
+        return true;
+    }
+    if crate::reading_align::align(&s, reading).is_none() {
+        return false;
+    }
+    let mut memo = HashMap::new();
+    !reads_numbers(&s, reading, 0, 0, &mut memo)
+}
+
+/// A run of digits after a hiragana that is no particle, at the end or
+/// before a hiragana that is no particle or counter (ため2, よう9, これ2より).
+fn digits_among_kana(s: &[char]) -> bool {
+    const PARTICLES: &str = "とのはがをにでもやへ";
+    let hira = |c: Option<&char>| c.is_some_and(|&c| matches!(c, '\u{3041}'..='\u{3096}'));
+    let mut i = 0;
+    while i < s.len() {
+        if !s[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        let before = start.checked_sub(1).and_then(|b| s.get(b));
+        let after = s.get(i);
+        if hira(before)
+            && !before.is_some_and(|&c| PARTICLES.contains(c))
+            && (after.is_none()
+                || (hira(after)
+                    && !after.is_some_and(|&c| PARTICLES.contains(c) || "つかこず".contains(c))))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `s[i..]` reads as `r[j..]` with each run of digits not typed read
+/// as its number (`drop_misread_digits`); kana and symbols as
+/// `reading_align` matches them, other chars 1 to 4 reading chars each.
+fn reads_numbers(
+    s: &[char],
+    r: &[char],
+    i: usize,
+    j: usize,
+    memo: &mut HashMap<(usize, usize), bool>,
+) -> bool {
+    use crate::reading_align::{anchor_matches, is_free};
+    if i == s.len() {
+        return j == r.len();
+    }
+    if let Some(&ok) = memo.get(&(i, j)) {
+        return ok;
+    }
+    let ok = if !is_free(s[i]) {
+        j < r.len() && anchor_matches(s[i], r[j]) && reads_numbers(s, r, i + 1, j + 1, memo)
+    } else if s[i].is_ascii_digit() {
+        let k = (i..s.len())
+            .find(|&k| !s[k].is_ascii_digit())
+            .unwrap_or(s.len());
+        let digits: String = s[i..k].iter().collect();
+        let n = k - i;
+        let latin = |c: Option<&char>| c.is_some_and(|c| c.is_ascii_alphabetic());
+        let typed = r.get(j..j + n).is_some_and(|t| t == &s[i..k]);
+        if typed && reads_numbers(s, r, k, j + n, memo) {
+            true
+        } else if latin(i.checked_sub(1).and_then(|b| s.get(b))) || latin(s.get(k)) {
+            // a name (MI6, えむあいしっくす): read as it may be
+            (j + 1..=r.len().min(j + 4 * n)).any(|l| reads_numbers(s, r, k, l, memo))
+        } else {
+            let follower = s.get(k).copied();
+            crate::numbers::reading_ends(&digits, r, j)
+                .into_iter()
+                .any(|(end, said)| {
+                    let fits = match said {
+                        crate::numbers::Said::Alone => true,
+                        crate::numbers::Said::BeforeCounter(next) => {
+                            follower.is_some_and(|f| {
+                                !matches!(f, '\u{3041}'..='\u{3096}') || "かこつ".contains(f)
+                            }) && (next.is_empty() || r.get(end).is_some_and(|c| next.contains(*c)))
+                        }
+                    };
+                    fits && reads_numbers(s, r, k, end, memo)
+                })
+        }
+    } else {
+        let k = (i..s.len())
+            .find(|&k| !is_free(s[k]) || s[k].is_ascii_digit())
+            .unwrap_or(s.len());
+        (j + 1..=r.len().min(j + 4 * (k - i))).any(|l| reads_numbers(s, r, k, l, memo))
+    };
+    memo.insert((i, j), ok);
+    ok
+}
+
+/// Drop the candidates of kana alone with a katakana char between hiragana
+/// (or at an end next to one) that is no part of a katakana word: よロ and
+/// ヨろ for よろ, コれまで, アり. `drop_script_flips` takes a kana between
+/// two of the other script; these are the model's flips at a candidate's
+/// end or before a small kana. A candidate with a kanji, a digit or a
+/// symbol stays (ソ連), and so does a katakana word with hiragana after it
+/// (メモる, ナントカしないとね). Over Bletilla-v0.1-small's lists it drops
+/// 368 candidates of wiki_fresh_v2 and 10 of AJIMEE, no gold, EM1 the same.
+pub fn drop_lone_katakana(candidates: Vec<String>) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|c| !has_lone_katakana(c))
+        .collect()
+}
+
+fn has_lone_katakana(text: &str) -> bool {
+    let hira = |c: char| matches!(c, '\u{3041}'..='\u{3096}');
+    let kata = |c: char| matches!(c, '\u{30A1}'..='\u{30FA}') && !matches!(c, 'ヵ' | 'ヶ');
+    let chars: Vec<char> = text.chars().collect();
+    if !chars.iter().all(|&c| hira(c) || kata(c) || c == 'ー') {
+        return false;
+    }
+    (0..chars.len()).any(|i| {
+        let near = [
+            i.checked_sub(1).map(|b| chars[b]),
+            chars.get(i + 1).copied(),
+        ];
+        kata(chars[i])
+            && !near.iter().flatten().any(|&c| kata(c) || c == 'ー')
+            && near.iter().flatten().any(|&c| hira(c))
+    })
+}
+
 /// What `order_engine_result` takes off the score of a candidate that
 /// `mixes_numerals`.
 pub const MIXED_NUMERALS: f32 = 5.0;
@@ -922,6 +1083,110 @@ mod tests {
         // kanji numerals elsewhere are words
         assert!(!mixes_numerals("一人前になり、30も半ばにして"));
         assert!(!mixes_numerals("一時的に10人"));
+    }
+
+    fn misread(reading: &str, cands: &[&str]) -> Vec<String> {
+        drop_misread_digits(reading, cands.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn digits_standing_for_kana_are_dropped() {
+        assert_eq!(
+            misread(
+                "がっこうにいったときに",
+                &[
+                    "学校に行ったときに",
+                    "学校に行ったとき2",
+                    "学校にいったとき2",
+                    "学校に1たときに",
+                ]
+            ),
+            ["学校に行ったときに"]
+        );
+        assert_eq!(misread("よろ", &["よろ", "4路", "4ろ", "4炉"]), ["よろ"]);
+        assert_eq!(misread("くけいじょう", &["9形状", "矩形状"]), ["矩形状"]);
+        // the wrong number for its reading (AJIMEE)
+        assert_eq!(
+            misread("ごじゅっぽひゃっぽ", &["50歩100歩", "50歩10歩"]),
+            ["50歩100歩"]
+        );
+        assert_eq!(
+            misread("じゃっかんじゅうさんさい", &["若干13歳", "若干103歳"]),
+            ["若干13歳"]
+        );
+    }
+
+    #[test]
+    fn numbers_read_as_numbers_stay() {
+        for (reading, cand) in [
+            ("にがつ", "2月"),
+            ("よにん", "4人"),
+            ("いっかい", "1回"),
+            ("さんぜんにん", "3千人"),
+            ("ついたち", "1日"),
+            ("はつか", "20日"),
+            ("みっか", "3日"),
+            ("よっか", "4日"),
+            ("じゅうよっか", "14日"),
+            ("ひとつ", "1つ"),
+            ("もうひとつ", "もう1つ"),
+            ("ふたり", "2人"),
+            ("はたち", "20歳"),
+            ("よじ", "4時"),
+            ("しがつ", "4月"),
+            ("くがつ", "9月"),
+            ("しちじ", "7時"),
+            ("にじゅうよじかん", "24時間"),
+            ("ひゃっかい", "100回"),
+            ("いっかげつ", "1か月"),
+            ("いっかげつ", "1ヶ月"),
+            ("しじゅうかた", "40肩"),
+            ("いちまん", "1万"),
+            ("いっちょう", "1兆"),
+            ("じゅっぷん", "10分"),
+            ("はっさい", "8歳"),
+            ("ろっぴゃくにん", "600人"),
+            ("はっせんえん", "8000円"),
+            ("にせんごねん", "2005年"),
+            ("せんきゅうひゃくきゅうじゅういちねん", "1991年"),
+            ("いちきゅうはちよん", "1984"),
+            ("ぜろいちにぜろ", "0120"),
+            ("いったいいち", "1対1"),
+            ("こたえはに", "答えは2"),
+            ("えむあいしっくす", "MI6"),
+            ("ごじゅっせんちめーとる", "50cm"),
+            ("さんてんご", "3.5"),
+            ("2がつ", "2月"),
+            ("じゅうさんさい", "１３歳"),
+        ] {
+            assert_eq!(misread(reading, &[cand]), [cand], "{reading}");
+        }
+    }
+
+    #[test]
+    fn a_lone_katakana_among_hiragana_is_dropped() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            drop_lone_katakana(v(&[
+                "よろ",
+                "よロ",
+                "ヨろ",
+                "ヨロ",
+                "コれまで",
+                "メモる",
+                "ナントカしないとね",
+                "ソ連",
+                "ピリッとした",
+            ])),
+            v(&[
+                "よろ",
+                "ヨロ",
+                "メモる",
+                "ナントカしないとね",
+                "ソ連",
+                "ピリッとした"
+            ])
+        );
     }
 
     fn drop(reading: &str, cands: &[&str]) -> Vec<String> {

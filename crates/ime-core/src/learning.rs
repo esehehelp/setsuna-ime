@@ -37,6 +37,22 @@
 //! same file and reads the lines others appended before reranking, so a
 //! choice made in one application applies in the others. Deleting or
 //! truncating the file (the settings GUI's "clear") resets the learning.
+//!
+//! The same choice made again is a line again, and one cancelled (chosen
+//! back, Ctrl+Delete) stays in the file, so the file grows for good while
+//! what it holds does not. Loading it compacts it (`compact`) when it has
+//! more than `COMPACT_FLOOR` lines and more than twice the lines of what is
+//! in effect: a first line `{"compacted": <ns>}`, each sentence choice in
+//! effect once with its `count` (and `no_words`: its word choices are lines
+//! of their own), and each word choice in effect as `{"word": {...},
+//! "count": n}`; nothing cancelled or forgotten. It is written to a file of
+//! its own and moved over the log, unless the log changed meanwhile (another
+//! process appended: compacted another time). Another process sees that
+//! the file is another one by its first bytes (or its length going down)
+//! and reads it again from the start. A version from before compaction
+//! reads a compacted file too: it skips the first line and the word lines,
+//! and takes each sentence line as one choice with its word choices, so
+//! going back to it loses the counts (each choice is as if made once).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -92,16 +108,38 @@ fn cosine(a: &Vector, b: &Vector) -> f32 {
 /// One line of `learning.jsonl`: a choice, or (`forget`) that the choices
 /// of `chosen` for `reading`, and the word choices inside it, are
 /// forgotten (Ctrl+Delete on the candidate, as Mozc deletes it from its
-/// history).
-#[derive(Debug, Serialize, Deserialize)]
+/// history); in a compacted file also its first line (`compacted`) and the
+/// word choices (`word`).
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Record {
+    // without them, a line versions before compaction skip
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     reading: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     chosen: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     rejected: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     forget: bool,
+    /// Times the choice was made (1 when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    count: Option<u32>,
+    /// A sentence choice whose word choices are lines of their own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    no_words: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    word: Option<words::Word>,
+    /// The first line of a compacted file: when it was compacted (ns since
+    /// the Unix epoch), which tells it from the file it replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compacted: Option<u128>,
 }
+
+/// A file of fewer lines is not compacted.
+const COMPACT_FLOOR: usize = 500;
+/// The first bytes of the file kept to tell a compacted file from the one
+/// read before (`sync`).
+const HEAD: usize = 64;
 
 struct Entry {
     /// Times this choice was made; 0 once the opposite choice cancelled it.
@@ -133,6 +171,9 @@ pub struct Learning {
     use_words: bool,
     /// Bytes of the file already applied.
     offset: u64,
+    /// Its first bytes (up to `HEAD`) and lines, as read.
+    head: Vec<u8>,
+    lines: usize,
     entries: Vec<Entry>,
     by_key: HashMap<(String, String, String), usize>,
     /// Reading bigram -> entries whose reading has it.
@@ -151,14 +192,29 @@ impl Learning {
         crate::config::Config::learning_path().map(|p| Self::at(p, cfg))
     }
 
-    /// The learning stored at `path` (which need not exist yet).
+    /// The learning stored at `path` (which need not exist yet), the file
+    /// compacted when it is due (the module docs).
     pub fn at(path: PathBuf, cfg: &LearningCfg) -> Self {
+        let mut l = Self::load(path, cfg);
+        let live = l.entries.iter().filter(|e| e.count > 0).count()
+            + l.words.iter().filter(|w| w.count > 0).count()
+            + 1;
+        if l.lines > COMPACT_FLOOR && l.lines > 2 * live {
+            // a failure leaves the log as it was
+            let _ = l.compact();
+        }
+        l
+    }
+
+    fn load(path: PathBuf, cfg: &LearningCfg) -> Self {
         let mut l = Self {
             path,
             strength: cfg.strength,
             threshold: cfg.similarity_threshold,
             use_words: cfg.words,
             offset: 0,
+            head: Vec::new(),
+            lines: 0,
             entries: Vec::new(),
             by_key: HashMap::new(),
             postings: HashMap::new(),
@@ -185,6 +241,8 @@ impl Learning {
 
     fn reset(&mut self) {
         self.offset = 0;
+        self.head.clear();
+        self.lines = 0;
         self.entries.clear();
         self.by_key.clear();
         self.postings.clear();
@@ -193,7 +251,8 @@ impl Learning {
     }
 
     /// Apply the lines appended to the file since the last sync. A file that
-    /// shrank or disappeared was cleared: start over.
+    /// shrank or disappeared was cleared, and one that starts otherwise than
+    /// it did was compacted (by another process): start over.
     fn sync(&mut self) {
         let len = match std::fs::metadata(&self.path) {
             Ok(m) => m.len(),
@@ -208,11 +267,19 @@ impl Learning {
         if len == self.offset {
             return;
         }
+        let Ok(mut f) = File::open(&self.path) else {
+            return;
+        };
+        if self.offset > 0 {
+            let mut head = vec![0; self.head.len()];
+            if f.read_exact(&mut head).is_err() || head != self.head {
+                self.reset();
+            }
+        }
         let mut buf = Vec::new();
-        let read = File::open(&self.path).and_then(|mut f| {
-            f.seek(SeekFrom::Start(self.offset))?;
-            f.read_to_end(&mut buf)
-        });
+        let read = f
+            .seek(SeekFrom::Start(self.offset))
+            .and_then(|_| f.read_to_end(&mut buf));
         if read.is_err() {
             return;
         }
@@ -220,7 +287,14 @@ impl Learning {
         let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
             return;
         };
+        if self.offset == 0 {
+            self.head = buf[..(end + 1).min(HEAD)].to_vec();
+        }
         for line in buf[..end].split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            self.lines += 1;
             if let Ok(rec) = serde_json::from_slice::<Record>(line) {
                 self.apply(rec);
             }
@@ -228,7 +302,87 @@ impl Learning {
         self.offset += end as u64 + 1;
     }
 
+    /// Write what is in effect as a compacted file (the module docs) and
+    /// move it over the log; false when the log changed meanwhile (another
+    /// process appended a line) and was left as it is.
+    fn compact(&mut self) -> std::io::Result<bool> {
+        let len = std::fs::metadata(&self.path)?.len();
+        if len != self.offset {
+            // a line being appended
+            return Ok(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut out = Vec::new();
+        let mut line = |r: &Record| -> std::io::Result<()> {
+            serde_json::to_writer(&mut out, r)?;
+            out.push(b'\n');
+            Ok(())
+        };
+        line(&Record {
+            compacted: Some(now),
+            ..Record::default()
+        })?;
+        let mut keys: Vec<(&(String, String, String), usize)> =
+            self.by_key.iter().map(|(k, &i)| (k, i)).collect();
+        keys.sort_unstable_by_key(|&(_, i)| i);
+        let count = |n: u32| (n > 1).then_some(n);
+        for ((reading, chosen, rejected), i) in keys {
+            let n = self.entries[i].count;
+            if n > 0 {
+                line(&Record {
+                    reading: reading.clone(),
+                    chosen: chosen.clone(),
+                    rejected: rejected.clone(),
+                    count: count(n),
+                    no_words: true,
+                    ..Record::default()
+                })?;
+            }
+        }
+        for w in self.words.iter().filter(|w| w.count > 0) {
+            line(&Record {
+                word: Some(w.word.clone()),
+                count: count(w.count),
+                ..Record::default()
+            })?;
+        }
+        let name = self
+            .path
+            .file_name()
+            .map_or("learning.jsonl".into(), |n| n.to_string_lossy());
+        let tmp = self
+            .path
+            .with_file_name(format!("{name}.{}.{now}.tmp", std::process::id()));
+        let moved = std::fs::write(&tmp, &out).and_then(|()| {
+            // another process appended meanwhile: its line stays, compacted
+            // another time
+            if std::fs::metadata(&self.path)?.len() != len {
+                return Ok(false);
+            }
+            std::fs::rename(&tmp, &self.path).map(|()| true)
+        });
+        if !matches!(moved, Ok(true)) {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        if moved? {
+            self.reset();
+            self.sync();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn apply(&mut self, r: Record) {
+        let n = r.count.unwrap_or(1);
+        if r.compacted.is_some() || n == 0 {
+            return;
+        }
+        if let Some(w) = r.word {
+            self.apply_word(w, n);
+            return;
+        }
         if r.forget {
             for i in self.learned(&r.reading, &r.chosen) {
                 match i {
@@ -241,13 +395,16 @@ impl Learning {
         if r.reading.is_empty() || r.chosen.is_empty() || r.chosen == r.rejected {
             return;
         }
-        for w in words::derive(&r.reading, &r.chosen, &r.rejected) {
-            self.apply_word(w);
+        if !r.no_words {
+            for w in words::derive(&r.reading, &r.chosen, &r.rejected) {
+                self.apply_word(w, n);
+            }
         }
-        self.apply_sentence(r);
+        self.apply_sentence(r, n);
     }
 
-    fn apply_word(&mut self, w: words::Word) {
+    /// Apply a word choice made `n` times.
+    fn apply_word(&mut self, w: words::Word, n: u32) {
         let opposite = words::Word {
             chosen: w.rejected.clone(),
             rejected: w.chosen.clone(),
@@ -257,14 +414,15 @@ impl Learning {
             self.words[i].count = 0;
         }
         if let Some(&i) = self.word_key.get(&w) {
-            self.words[i].count += 1;
+            self.words[i].count += n;
             return;
         }
         self.word_key.insert(w.clone(), self.words.len());
-        self.words.push(WordEntry { count: 1, word: w });
+        self.words.push(WordEntry { count: n, word: w });
     }
 
-    fn apply_sentence(&mut self, r: Record) {
+    /// Apply a sentence choice made `n` times.
+    fn apply_sentence(&mut self, r: Record, n: u32) {
         // Choosing back what was rejected cancels the earlier choice.
         let opposite = (r.reading.clone(), r.rejected.clone(), r.chosen.clone());
         if let Some(&i) = self.by_key.get(&opposite) {
@@ -272,7 +430,7 @@ impl Learning {
         }
         let key = (r.reading, r.chosen, r.rejected);
         if let Some(&i) = self.by_key.get(&key) {
-            self.entries[i].count += 1;
+            self.entries[i].count += n;
             return;
         }
         let reading = bigrams(&key.0);
@@ -284,7 +442,7 @@ impl Learning {
             self.postings.entry(*k).or_default().push(id);
         }
         self.entries.push(Entry {
-            count: 1,
+            count: n,
             reading,
             chosen,
             rejected,
@@ -294,8 +452,12 @@ impl Learning {
     }
 
     /// The choices in effect that put `surface` up for `reading`: the
-    /// sentence choices of it, and the word choices of a word inside it.
+    /// sentence choices of it, and the word choices of a word inside it
+    /// that apply to the reading (`words::applies`, as reranking takes
+    /// them): a word learned elsewhere is no part of it (傘 learned before
+    /// のし stays when 傘の下 is deleted for かさの).
     fn learned(&self, reading: &str, surface: &str) -> Vec<Learned> {
+        let reading_chars: Vec<char> = reading.chars().collect();
         let mut out: Vec<Learned> = self
             .by_key
             .iter()
@@ -309,7 +471,12 @@ impl Learning {
                 .filter(|(_, w)| {
                     w.count > 0
                         && surface.contains(&w.word.chosen)
-                        && reading.contains(&w.word.span)
+                        && (words::applies(&w.word, &reading_chars)
+                            // the word of a choice of the whole reading,
+                            // which has no context to apply by
+                            || (w.word.span == reading
+                                && w.word.left.is_empty()
+                                && w.word.right.is_empty()))
                 })
                 .map(|(i, _)| Learned::Word(i)),
         );
@@ -328,6 +495,7 @@ impl Learning {
             chosen: surface.to_string(),
             rejected: String::new(),
             forget: true,
+            ..Record::default()
         })?;
         Ok(true)
     }
@@ -342,7 +510,7 @@ impl Learning {
             reading: reading.to_string(),
             chosen: chosen.to_string(),
             rejected: rejected.to_string(),
-            forget: false,
+            ..Record::default()
         })
     }
 
@@ -367,7 +535,10 @@ impl Learning {
     /// Without an applicable choice the order is kept.
     pub fn rerank(&mut self, reading: &str, candidates: Vec<String>) -> Vec<String> {
         self.sync();
-        if candidates.len() < 2 || self.entries.is_empty() || reading.is_empty() {
+        if candidates.len() < 2
+            || (self.entries.is_empty() && self.words.is_empty())
+            || reading.is_empty()
+        {
             return candidates;
         }
         let reading_chars: Vec<char> = reading.chars().collect();
@@ -586,6 +757,21 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_leaves_a_word_learned_elsewhere() {
+        let t = TempFile::new("forget-word");
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        l.record("かさのした", "傘の下", "笠の下").unwrap();
+        // 傘 was learned before のし: not what put 傘の下 up for かさの
+        assert!(!l.forget("かさの", "傘の下").unwrap());
+        assert_eq!(
+            l.rerank("かさのしたで", list(&["笠の下で", "傘の下で"]))[0],
+            "傘の下で"
+        );
+        // where it applies, it goes
+        assert!(l.forget("かさのしたで", "傘の下で").unwrap());
+    }
+
+    #[test]
     fn choosing_back_cancels_and_other_processes_see_appends() {
         let t = TempFile::new("share");
         let mut a = Learning::at(t.0.clone(), &cfg());
@@ -612,5 +798,154 @@ mod tests {
         let mut f = OpenOptions::new().append(true).open(&t.0).unwrap();
         f.write_all(b"\n").unwrap();
         assert_eq!(l.len(), 1);
+    }
+
+    /// The choices and word choices in effect, with their counts.
+    fn in_effect(l: &Learning) -> (Vec<(String, u32)>, Vec<(String, u32)>) {
+        let mut s: Vec<(String, u32)> = l
+            .by_key
+            .iter()
+            .filter(|(_, &i)| l.entries[i].count > 0)
+            .map(|(k, &i)| (format!("{k:?}"), l.entries[i].count))
+            .collect();
+        let mut w: Vec<(String, u32)> = l
+            .words
+            .iter()
+            .filter(|w| w.count > 0)
+            .map(|w| (format!("{:?}", w.word), w.count))
+            .collect();
+        s.sort();
+        w.sort();
+        (s, w)
+    }
+
+    fn line(reading: &str, chosen: &str, rejected: &str) -> String {
+        format!(
+            "{{\"reading\":\"{reading}\",\"chosen\":\"{chosen}\",\"rejected\":\"{rejected}\"}}\n"
+        )
+    }
+
+    /// A log of many lines and few choices: the same ones made again and
+    /// again, one chosen back, one forgotten.
+    fn long_log() -> String {
+        let mut log = String::new();
+        for _ in 0..300 {
+            log += &line("きしゃにれんらく", "貴社に連絡", "記者に連絡");
+            log += &line("かみをきる", "紙を切る", "髪を切る");
+        }
+        log += &line("かみ", "紙", "神");
+        log += &line("かみ", "神", "紙");
+        log += &line("こうえん", "公演", "公園");
+        log += "{\"reading\":\"こうえん\",\"chosen\":\"公演\",\"forget\":true}\n";
+        log
+    }
+
+    #[test]
+    fn a_long_log_is_compacted_to_what_is_in_effect() {
+        let t = TempFile::new("compact");
+        std::fs::create_dir_all(t.0.parent().unwrap()).unwrap();
+        std::fs::write(&t.0, long_log()).unwrap();
+        let before = Learning::load(t.0.clone(), &cfg());
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        let text = std::fs::read_to_string(&t.0).unwrap();
+        // a first line, two choices and their word choices (and 神 over 紙)
+        assert!(text.lines().count() < 10, "{text}");
+        assert!(text.starts_with("{\"compacted\":"), "{text}");
+        assert!(text.contains("\"count\":300"), "{text}");
+        assert!(!text.contains("公演"), "{text}");
+        assert_eq!(in_effect(&l), in_effect(&before));
+        // read again, it is the same, and is not compacted again
+        let again = Learning::at(t.0.clone(), &cfg());
+        assert_eq!(in_effect(&again), in_effect(&before));
+        assert_eq!(std::fs::read_to_string(&t.0).unwrap(), text);
+        // and reranks as before
+        let cands = list(&["髪を切っておく", "紙を切っておく"]);
+        assert_eq!(l.rerank("かみをきっておく", cands)[0], "紙を切っておく");
+        // no file of its own is left
+        let files = std::fs::read_dir(t.0.parent().unwrap()).unwrap().count();
+        assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn a_short_or_tight_log_is_left_as_it_is() {
+        let t = TempFile::new("no-compact");
+        std::fs::create_dir_all(t.0.parent().unwrap()).unwrap();
+        let log = line("かみ", "紙", "神").repeat(COMPACT_FLOOR / 2);
+        std::fs::write(&t.0, &log).unwrap();
+        Learning::at(t.0.clone(), &cfg());
+        assert_eq!(std::fs::read_to_string(&t.0).unwrap(), log);
+    }
+
+    #[test]
+    fn other_processes_read_a_compacted_log_again() {
+        let t = TempFile::new("compact-share");
+        std::fs::create_dir_all(t.0.parent().unwrap()).unwrap();
+        // `short` read the log while it was a line, `long` while it was
+        // long: the compacted file is longer than the one and shorter than
+        // the other
+        std::fs::write(&t.0, line("かみ", "神", "紙")).unwrap();
+        let mut short = Learning::load(t.0.clone(), &cfg());
+        let log = long_log();
+        let mut f = OpenOptions::new().append(true).open(&t.0).unwrap();
+        f.write_all(log.as_bytes()).unwrap();
+        let mut long = Learning::load(t.0.clone(), &cfg());
+        let before = in_effect(&long);
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        assert_eq!(in_effect(&l), before);
+        assert!(std::fs::metadata(&t.0).unwrap().len() > short.offset);
+        assert!(std::fs::metadata(&t.0).unwrap().len() < long.offset);
+        short.sync();
+        long.sync();
+        assert_eq!(in_effect(&short), before);
+        assert_eq!(in_effect(&long), before);
+        // a choice after it is appended as before and seen by all
+        l.record("てんき", "転機", "天気").unwrap();
+        assert_eq!(short.rerank("てんき", list(&["天気", "転機"]))[0], "転機");
+    }
+
+    #[test]
+    fn a_log_appended_to_meanwhile_is_not_replaced() {
+        let t = TempFile::new("compact-race");
+        std::fs::create_dir_all(t.0.parent().unwrap()).unwrap();
+        std::fs::write(&t.0, long_log()).unwrap();
+        let mut l = Learning::load(t.0.clone(), &cfg());
+        // another process appends after this one read the log
+        let mut f = OpenOptions::new().append(true).open(&t.0).unwrap();
+        f.write_all(line("てんき", "転機", "天気").as_bytes())
+            .unwrap();
+        let text = std::fs::read_to_string(&t.0).unwrap();
+        assert!(!l.compact().unwrap());
+        assert_eq!(std::fs::read_to_string(&t.0).unwrap(), text);
+        let files = std::fs::read_dir(t.0.parent().unwrap()).unwrap().count();
+        assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn a_version_before_compaction_reads_a_compacted_log() {
+        // what the lines of the log were to it
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Before {
+            reading: String,
+            chosen: String,
+            #[serde(default)]
+            rejected: String,
+            #[serde(default)]
+            forget: bool,
+        }
+        let t = TempFile::new("compact-old");
+        std::fs::create_dir_all(t.0.parent().unwrap()).unwrap();
+        std::fs::write(&t.0, long_log()).unwrap();
+        Learning::at(t.0.clone(), &cfg());
+        let text = std::fs::read_to_string(&t.0).unwrap();
+        let read: Vec<Before> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Before>(l).ok())
+            .collect();
+        // the sentence choices, each once; the first line and the word
+        // choices skipped
+        let mut chosen: Vec<&str> = read.iter().map(|r| r.chosen.as_str()).collect();
+        chosen.sort();
+        assert_eq!(chosen, ["神", "紙を切る", "貴社に連絡"]);
     }
 }

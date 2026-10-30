@@ -4,12 +4,15 @@
 //! (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux), so the text
 //! is drawn by the system's own font rendering. The page edits the candidate
 //! post-processing (symbol width, touten / kuten, middle dot, literal
-//! replacements), the date / time candidates, the learning and the
+//! replacements), what the symbol keys type (`[frontend.symbols]`, full- or
+//! half-width), the date / time candidates, the learning and the
 //! rewriter of `config.toml`, clears the learned choices, and signs the
 //! rewriter in (`rewriter`). Saving keeps the file's comments and every key
-//! the page does not show. The IME reads the file when it is activated, so
-//! a change applies from the next activation (Win+Space twice on Windows,
-//! switching the input method away and back on fcitx5).
+//! the page does not show. The Windows IME reads the file again when an
+//! input starts after it was saved, so a change applies from the next input
+//! (on fcitx5, from the next activation: switching the input method away and
+//! back). On Windows the saved file stays readable by AppContainers, as the
+//! installer made it (`grant_app_containers`).
 //!
 //! The page and this process talk in JSON messages: the page posts
 //! `{"type": "init" | "save" | "clear_learning" | "show_hidden", ...}`, the
@@ -191,6 +194,25 @@ fn dictionary(action: &str, message: &Value) -> Value {
     }
 }
 
+/// Each `[frontend.symbols]` key the page lists: its name, the ASCII
+/// symbol of its key and what it may type (`config::symbol_forms`); the
+/// page's 全角 / 半角 do as `config::symbols_in_width`.
+fn symbol_keys() -> Value {
+    setsuna_core::config::SYMBOL_CHARS
+        .iter()
+        .filter_map(|&(name, c)| {
+            let f = setsuna_core::config::symbol_forms(name)?;
+            Some(json!({
+                "name": name,
+                "key": c.to_string(),
+                "japanese": f.japanese,
+                "full": f.full,
+                "half": f.half,
+            }))
+        })
+        .collect()
+}
+
 struct Settings {
     path: Option<PathBuf>,
     cfg: Config,
@@ -264,6 +286,7 @@ impl Settings {
             "learned": self.learned(),
             "hidden": self.hidden(),
             "default_instructions": setsuna_rewrite::DEFAULT_INSTRUCTIONS,
+            "symbol_keys": symbol_keys(),
         })
     }
 
@@ -278,8 +301,10 @@ impl Settings {
             .map_err(|e| format!("保存できませんでした: {e}"))?;
         cfg.save_to_path(&path)
             .map_err(|e| format!("保存できませんでした: {e:#}"))?;
+        #[cfg(windows)]
+        grant_app_containers(&path);
         self.cfg = cfg;
-        Ok("保存しました。IME を再度有効にすると反映されます。".into())
+        Ok("保存しました。次の入力から反映されます。".into())
     }
 
     fn clear_learning(&mut self) -> Result<String, String> {
@@ -294,6 +319,22 @@ impl Settings {
             Err(e) => Err(format!("消去できませんでした: {e}")),
         }
     }
+}
+
+/// Let AppContainers read `path` again, as install.ps1 does: the IME in
+/// the Start menu's search and in Store apps reads `config.toml` there, and
+/// a save replaces the file (written beside it, then renamed), which drops
+/// the grant. The file only: its directory holds the learning and the
+/// rewriter's credentials.
+#[cfg(windows)]
+fn grant_app_containers(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/grant", "*S-1-15-2-1:(R)", "*S-1-15-2-2:(R)"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 #[cfg(test)]

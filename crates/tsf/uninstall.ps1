@@ -41,6 +41,19 @@ function Test-IsAdmin {
     $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# What install.ps1 granted AppContainers (ALL APPLICATION PACKAGES, ALL
+# RESTRICTED APPLICATION PACKAGES) on the install dir and config.toml.
+function Revoke-AppContainerRead {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        & icacls $Path /remove:g '*S-1-15-2-1' '*S-1-15-2-2' 2>&1 | Out-Null
+        Write-Log INFO "AppContainers may no longer read $Path"
+    } catch {
+        Write-Log WARN "icacls could not take AppContainers' read of $Path back: $_"
+    }
+}
+
 function Get-RegisteredDllPath {
     try {
         $registered = (Get-ItemProperty -LiteralPath $ClsidReg -ErrorAction Stop).'(default)'
@@ -105,6 +118,7 @@ if (Test-Path -LiteralPath $InstallDir) {
         Write-Log INFO "removed install dir: $InstallDir"
     } else {
         Write-Log WARN "could not remove install dir after retries: $InstallDir"
+        Revoke-AppContainerRead -Path $InstallDir
     }
 }
 
@@ -135,6 +149,8 @@ if ($KeepConfig) {
         Write-Log INFO "config preserved (user opt-out)"
     }
 }
+# a kept config.toml is closed to AppContainers again
+Revoke-AppContainerRead -Path (Join-Path $ConfigDir 'config.toml')
 
 Write-Log INFO 'uninstall complete'
 Write-Host ''

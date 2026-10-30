@@ -26,7 +26,7 @@ pub(crate) fn is_free(c: char) -> bool {
     !is_kana(c) && c.is_alphanumeric()
 }
 
-fn anchor_matches(s: char, r: char) -> bool {
+pub(crate) fn anchor_matches(s: char, r: char) -> bool {
     if is_kana(s) {
         // ケ is が in place names (栗ケ沢)
         is_kana(r) && (to_hira(s) == to_hira(r) || (s == 'ケ' && r == 'が'))

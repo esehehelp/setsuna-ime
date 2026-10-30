@@ -13,7 +13,8 @@
 //! what they hold) into the mapped file the IME reads; `cost` prints each
 //! surface's cheapest reading as the reading, and the lexicon's entries for
 //! it; `convert` the lexicon's own conversions of each reading; `words` the
-//! words it lists for a reading of one word (`word_candidates`); `split`
+//! words it lists for a reading of one word (`word_candidates`) and, for a
+//! reading of one or two kana, its one-char words (`char_words`); `split`
 //! where each char of a kanji run starts in its reading (`split_reading`).
 //! `SETSUNA_CONNECTION_WEIGHT` weighs the connection costs otherwise.
 
@@ -77,6 +78,14 @@ fn main() -> Result<()> {
                 let us = t.elapsed().as_micros();
                 let shown: Vec<String> = out.iter().map(|(s, c)| format!("{s} {c:.1}")).collect();
                 println!("{reading} ({us} µs): {shown:?}");
+                let chars: Vec<String> = lex
+                    .char_words(reading)
+                    .iter()
+                    .map(|(s, c)| format!("{s} {c:.1}"))
+                    .collect();
+                if !chars.is_empty() {
+                    println!("  one-char words: {chars:?}");
+                }
             }
         }
         Some("split") if args.len() == 4 => {

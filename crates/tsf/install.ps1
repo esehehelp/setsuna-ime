@@ -55,6 +55,13 @@
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
+# AppContainers (the Start menu's search, Store apps: ALL APPLICATION
+# PACKAGES and ALL RESTRICTED APPLICATION PACKAGES) may read and run what is
+# in %LOCALAPPDATA%\setsuna-ime, and read config.toml: that one file, never
+# %APPDATA%\setsuna-ime (the learning, the history and credentials.bin stay
+# closed to them). The IME in such an app then reaches the login's shared
+# engine; it never starts an engine of its own there.
+#
 # Idempotent: re-running converges to the desired state. Per-user file layout
 # under %LOCALAPPDATA%; regsvr32 still requires admin because registration.rs
 # writes HKEY_CLASSES_ROOT (admin-mapped); registering under
@@ -139,6 +146,30 @@ function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pri = [Security.Principal.WindowsPrincipal] $id
     $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# The SIDs of every AppContainer (ALL APPLICATION PACKAGES) and of the
+# less privileged ones (ALL RESTRICTED APPLICATION PACKAGES).
+$AppContainerSids = @('*S-1-15-2-1', '*S-1-15-2-2')
+
+# Let AppContainers read (and run) $Path: a directory with what it holds
+# and what is put in it later (inherited), or one file.
+function Grant-AppContainerRead {
+    param([string]$Path, [switch]$Directory)
+    $perm = if ($Directory) { '(OI)(CI)(RX)' } else { '(R)' }
+    $grants = $AppContainerSids | ForEach-Object { "$_`:$perm" }
+    try {
+        $out = & icacls $Path /grant @grants 2>&1
+        $ok = ($LASTEXITCODE -eq 0)
+    } catch {
+        $out = $_
+        $ok = $false
+    }
+    if ($ok) {
+        Write-Log INFO "AppContainers may read $Path"
+    } else {
+        Write-Log WARN "icacls could not let AppContainers read $Path (the Start menu and Store apps get no conversion): $out"
+    }
 }
 
 # config.toml is UTF-8 without a BOM whichever PowerShell writes it
@@ -716,6 +747,10 @@ try {
 # settings GUI started from the language bar would get SmartScreen's prompt.
 Get-ChildItem -LiteralPath $InstallDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
 
+# The IME in an AppContainer reads the models, the engine's path and the
+# manifest from here to name the shared engine's pipe.
+Grant-AppContainerRead -Path $InstallDir -Directory
+
 # ---- config.toml ----
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 $ConfigPath = Join-Path $ConfigDir 'config.toml'
@@ -725,8 +760,8 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
     $EngineConfigExe = $EngineInstalled.Replace('\','/').Replace('"','\"')
     $OrtConfigDll = $OrtInstalled.Replace('\','/').Replace('"','\"')
     $DefaultConfig = @"
-# Setsuna TSF IME configuration. Edit and save; activations after the save
-# pick up new values (Win+Space twice).
+# Setsuna TSF IME configuration. Edit and save; the IME picks up new values
+# when the next input starts.
 # Missing fields fall back to built-in defaults.
 
 [engine]
@@ -751,6 +786,14 @@ footer_color = "#707070"
 [frontend]
 live_min_dispatch_chars = 3
 force_convert_on_space = true
+# Keys that turn the IME on and off: Zenkaku (Hankaku/Zenkaku), Henkan, Muhenkan,
+# Eisu, Kana, Space, a letter, F1-F24, ... after Ctrl+ / Shift+ / Alt+.
+# Ctrl+Space is a shortcut of many apps (VS Code, Excel, Emacs): add it only
+# if you want it.
+toggle_keys = ["Zenkaku", "Alt+Zenkaku", "Alt+``"]
+# Keys that only turn it on / off (ImeOn, ImeOff: VK_IME_ON / VK_IME_OFF).
+on_keys = ["ImeOn"]
+off_keys = ["ImeOff"]
 
 [frontend.symbols]
 comma = "、"
@@ -780,6 +823,12 @@ shift_9 = "）"
             Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"
         }
     }
+}
+
+# the file only: the directory holds the learning and credentials.bin (the
+# settings GUI keeps the grant when it saves)
+if (Test-Path -LiteralPath $ConfigPath) {
+    Grant-AppContainerRead -Path $ConfigPath
 }
 
 # ---- regsvr32 ----

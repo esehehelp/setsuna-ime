@@ -13,8 +13,10 @@
 
 #[cfg(target_os = "windows")]
 pub mod globals;
+pub mod guard;
 #[cfg(target_os = "windows")]
 pub mod keymap;
+pub mod placement;
 pub mod registration;
 pub mod ui;
 
@@ -42,9 +44,7 @@ mod dll_exports {
         if reason == DLL_PROCESS_ATTACH {
             let _ = DLL_INSTANCE.set(SyncHmodule(hinstance));
             setsuna_core::diagnostics::init("tsf.log");
-            std::panic::set_hook(Box::new(|info| {
-                eprintln!("setsuna-tsf panic: {}", info);
-            }));
+            crate::guard::install_hook();
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
