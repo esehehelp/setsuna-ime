@@ -213,7 +213,11 @@ irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 
 `install.ps1` を動かす。zip（`setsuna-ime-<version>-windows-x64.zip`）を展開して
 `install.cmd` をダブルクリックしても同じ（オプションは `install.ps1` と同じ）。zip には
 DLL・エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・設定 GUI・ONNX Runtime
-1.28.0・英日混在のモデルが入り、変換モデルはインストール時に取得する。バイナリが使う
+1.28.0・英日混在のモデルが入り、変換モデルはインストール時に取得する。読みの辞書
+（lexicon-v1、222 MB）と解析器（nid-ma v2-600k-tb、288 MB）も
+[esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)（CC BY-SA 4.0）の
+固定した revision から取得して入れる（`models.json` の `components`。取得できなければ
+それなしで入れる。要らなければ `-NoDictionaries`）。バイナリが使う
 Visual C++ ランタイム（14.44 以上）が無ければ Microsoft から取得して入れる。
 
 release は `crates/tsf/package.ps1` が作る:
@@ -231,11 +235,12 @@ pwsh target/dist/setup.ps1 -Archive target/dist/setsuna-ime-<version>-windows-x6
 ```powershell
 cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
-pwsh crates/tsf/install.ps1                  # 公開モデルを自動取得してインストール
+pwsh crates/tsf/install.ps1                  # 公開モデルと辞書を自動取得してインストール
 # 取得済み・独自のモデル（ネット接続不要）:
 # pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 # リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
 # 英日混在入力の名前の辞書も入れる場合: -NameDictionary <names tsv>
+# 手元の読みの辞書・解析器を使う場合: -Lexicon <file.lexicon> / -Analyzer <analyzer manifest>
 ```
 
 `%LOCALAPPDATA%\setsuna-ime` に DLL・エンジン・モデルを置き、`regsvr32` で登録する

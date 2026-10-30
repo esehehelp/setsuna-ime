@@ -7,10 +7,12 @@ $repo = Split-Path -Parent $PSScriptRoot
 $fetch = Join-Path $repo 'crates/tsf/fetch-model.ps1'
 $root = Join-Path $repo "local/model-download-tests-$([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $root | Out-Null
-$state = @{ requests = @(); offline = $false; badDownload = $false; interrupt = $false; payloads = @{} }
+$state = @{ requests = @(); offline = $false; badDownload = $false; interrupt = $false; payloads = @{}; dict = @{} }
 $script:checks = 0
 $revision = '0123456789abcdef0123456789abcdef01234567'
 $prefix = "https://huggingface.co/example/converter/resolve/$revision/"
+$dictRevision = 'fedcba9876543210fedcba9876543210fedcba98'
+$dictPrefix = "https://huggingface.co/example/dict/resolve/$dictRevision/"
 
 function Assert {
     param([bool]$Condition, [string]$Message)
@@ -78,6 +80,12 @@ function Invoke-WebRequest {
           [int]$ConnectionTimeoutSeconds, [int]$OperationTimeoutSeconds)
     $state.requests += $Uri
     if ($state.offline) { throw 'network disabled by test' }
+    if ($Uri.StartsWith($dictPrefix)) {
+        $relative = [Uri]::UnescapeDataString($Uri.Substring($dictPrefix.Length))
+        if (-not $state.dict.ContainsKey($relative)) { throw "unexpected artifact: $relative" }
+        [IO.File]::WriteAllBytes($OutFile, $state.dict[$relative])
+        return
+    }
     if (-not $Uri.StartsWith($prefix)) { throw "unexpected URL: $Uri" }
     $relative = [Uri]::UnescapeDataString($Uri.Substring($prefix.Length))
     if (-not $state.payloads.ContainsKey($relative)) { throw "unexpected artifact: $relative" }
@@ -159,6 +167,51 @@ New-Fixture 'unsupported-schema' 'graphs/model.onnx' 'wrong-schema'
 Assert-Throws { & $fetch -CacheDir $cache -CatalogPath $catalogPath } 'unsupported schema or precision'
 Assert ($state.requests.Count -eq 1) 'schema checked before payloads'
 
+# Components: the lexicon and the analyzer, each with a repository and
+# revision of its own; every pinned file comes, the entry's path is returned.
+New-Fixture 'components'
+$state.dict = @{
+    'words.lexicon' = [Text.Encoding]::UTF8.GetBytes('tiny-lexicon')
+    'ma/analyzer.manifest.json' = [Text.Encoding]::UTF8.GetBytes('{}')
+    'ma/system.dic.zst' = [Text.Encoding]::UTF8.GetBytes('tiny-dic')
+    'ma/alternates.bin' = [Text.Encoding]::UTF8.GetBytes('tiny-alternates')
+}
+function Get-Specs { param([string[]]$Paths) @($Paths | ForEach-Object { @{ path = $_; size = $state.dict[$_].Length; sha256 = Get-Hash $state.dict[$_] } }) }
+$catalog.components = @{
+    lexicon = @{ repository = 'example/dict'; revision = $dictRevision; entry = 'words.lexicon'; files = (Get-Specs @('words.lexicon')) }
+    analyzer = @{ repository = 'example/dict'; revision = $dictRevision; entry = 'ma/analyzer.manifest.json'
+                  files = (Get-Specs @('ma/alternates.bin', 'ma/analyzer.manifest.json', 'ma/system.dic.zst')) }
+}
+Save-Catalog
+$lexicon = @(& $fetch -Component lexicon -CacheDir $cache -CatalogPath $catalogPath)
+Assert ($lexicon.Count -eq 1 -and $lexicon[0] -eq (Join-Path $cache "example/dict/$dictRevision/words.lexicon")) 'component returns its entry in its own revision-scoped cache'
+Assert ($state.requests.Count -eq 1 -and $state.requests[0].StartsWith($dictPrefix)) 'component fetches its own repository only'
+$state.requests = @()
+$analyzer = @(& $fetch -Component analyzer -CacheDir $cache -CatalogPath $catalogPath)
+Assert ($analyzer.Count -eq 1 -and $analyzer[0] -eq (Join-Path $cache "example/dict/$dictRevision/ma/analyzer.manifest.json")) 'analyzer returns its manifest'
+Assert ($state.requests.Count -eq 3) 'analyzer fetches every pinned file'
+foreach ($relative in $state.dict.Keys) {
+    $placed = Join-Path $cache "example/dict/$dictRevision/$relative"
+    Assert ((Get-FileHash -LiteralPath $placed -Algorithm SHA256).Hash -eq (Get-Hash $state.dict[$relative])) "verified component file $relative"
+}
+$state.offline = $true
+$state.requests = @()
+$again = & $fetch -Component analyzer -CacheDir $cache -CatalogPath $catalogPath
+Assert ($again -eq $analyzer[0] -and $state.requests.Count -eq 0) 'verified component cache works offline'
+$state.offline = $false
+$catalog.components.lexicon.entry = 'other.lexicon'
+Save-Catalog
+Assert-Throws { & $fetch -Component lexicon -CacheDir $cache -CatalogPath $catalogPath } 'is not pinned in the catalog'
+$catalog.components.lexicon.entry = 'words.lexicon'
+$catalog.components.lexicon.revision = 'main'
+Save-Catalog
+$state.requests = @()
+Assert-Throws { & $fetch -Component lexicon -CacheDir $cache -CatalogPath $catalogPath } 'invalid model catalog'
+Assert ($state.requests.Count -eq 0) 'component floating revision rejected before HTTP'
+$catalog.Remove('components')
+Save-Catalog
+Assert-Throws { & $fetch -Component analyzer -CacheDir $cache -CatalogPath $catalogPath } 'has no analyzer component'
+
 # Installer parameter sets preserve local/offline installs without ambiguity.
 $installer = Join-Path $repo 'crates/tsf/install.ps1'
 $sets = (Get-Command $installer).ParameterSets
@@ -166,6 +219,7 @@ Assert (@($sets | Where-Object { $_.Name -eq 'Download' -and $_.IsDefault }).Cou
 $local = $sets | Where-Object { $_.Name -eq 'Local' }
 Assert (@($local.Parameters | Where-Object { $_.Name -eq 'Manifest' -and $_.IsMandatory }).Count -eq 1) 'local manifest remains supported'
 Assert (@($local.Parameters | Where-Object { $_.Name -eq 'ModelPrecision' }).Count -eq 0) 'local manifest and download precision are mutually exclusive'
+Assert (@($local.Parameters | Where-Object { $_.Name -eq 'NoDictionaries' }).Count -eq 0) 'local manifest downloads no dictionaries'
 
 # A real child installer must propagate network failure as code 30, without
 # publishing models, writing config or reaching COM/registry operations.

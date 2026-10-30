@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "setsuna-artifact"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "setsuna-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2831,7 +2831,7 @@ dependencies = [
 
 [[package]]
 name = "setsuna-demo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "setsuna-core",
@@ -2860,14 +2860,14 @@ dependencies = [
 
 [[package]]
 name = "setsuna-linux"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "setsuna-core",
 ]
 
 [[package]]
 name = "setsuna-pipe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "windows-sys 0.61.2",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "setsuna-rewrite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "setsuna-settings"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "setsuna-core",
@@ -2918,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "setsuna-tsf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "once_cell",
  "setsuna-core",
