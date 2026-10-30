@@ -102,6 +102,144 @@ pub fn layout_char(vk: u32, shift: bool) -> Option<char> {
     char::from_u32(u32::from(buf[0]))
 }
 
+/// What a key of `[frontend] toggle_keys` / `on_keys` / `off_keys` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnOff {
+    Toggle,
+    On,
+    Off,
+}
+
+/// The modifiers held with a key, or named in a key's spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub win: bool,
+}
+
+impl Mods {
+    /// `TF_PRESERVEDKEY::uModifiers` of these (`TF_MOD_ALT` 1,
+    /// `TF_MOD_CONTROL` 2, `TF_MOD_SHIFT` 4); `None` with Win, which TSF has
+    /// no modifier for.
+    pub fn tf_modifiers(self) -> Option<u32> {
+        (!self.win)
+            .then_some(u32::from(self.alt) | u32::from(self.ctrl) << 1 | u32::from(self.shift) << 2)
+    }
+}
+
+/// A key of the config: its virtual-key codes (one physical key may send
+/// several: 半角/全角 sends VK_KANJI, or VK_OEM_AUTO / VK_OEM_ENLW by
+/// turns) with exactly these modifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySpec {
+    pub vks: Vec<u32>,
+    pub mods: Mods,
+}
+
+/// Read a key spec: `Zenkaku`, `Alt+\``, `Ctrl+Space`, `Shift+Muhenkan`,
+/// `F12`, `0x1C`. Names ignore case; `None` for one this does not know.
+pub fn parse_key(spec: &str) -> Option<KeySpec> {
+    let parts: Vec<String> = spec.split('+').map(|p| p.trim().to_lowercase()).collect();
+    let (key, modifiers) = parts.split_last()?;
+    let mut mods = Mods::default();
+    for m in modifiers {
+        match m.as_str() {
+            "ctrl" | "control" => mods.ctrl = true,
+            "shift" => mods.shift = true,
+            "alt" => mods.alt = true,
+            "win" | "windows" => mods.win = true,
+            _ => return None,
+        }
+    }
+    let vks = match key.as_str() {
+        // 半角/全角: VK_KANJI, and VK_OEM_AUTO / VK_OEM_ENLW, which the
+        // Japanese layout sends by turns
+        "zenkaku" | "hankaku" | "hankaku/zenkaku" | "kanji" | "半角/全角" | "半角" | "全角" =>
+        {
+            vec![0x19, 0xF3, 0xF4]
+        }
+        "henkan" | "convert" | "変換" => vec![0x1C],
+        "muhenkan" | "nonconvert" | "無変換" => vec![0x1D],
+        // VK_DBE_ALPHANUMERIC
+        "eisu" | "英数" => vec![0xF0],
+        // カタカナ/ひらがな: VK_DBE_HIRAGANA, VK_KANA
+        "kana" | "hiragana" | "katakana" | "かな" | "カタカナ/ひらがな" => {
+            vec![0xF2, 0x15]
+        }
+        "imeon" | "ime_on" => vec![0x16],
+        "imeoff" | "ime_off" => vec![0x1A],
+        "capslock" => vec![0x14],
+        "space" => vec![0x20],
+        "enter" | "return" => vec![0x0D],
+        "tab" => vec![0x09],
+        "esc" | "escape" => vec![0x1B],
+        "backspace" => vec![0x08],
+        // the key left of 1 on the US layout (@ on the Japanese one)
+        "`" | "backquote" | "grave" => vec![0xC0],
+        k if k.starts_with("0x") => vec![u32::from_str_radix(&k[2..], 16).ok()?],
+        k if k.starts_with('f') && k.len() > 1 => {
+            let n: u32 = k[1..].parse().ok()?;
+            if !(1..=24).contains(&n) {
+                return None;
+            }
+            vec![0x70 + n - 1]
+        }
+        k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            vec![u32::from(k.as_bytes()[0].to_ascii_uppercase())]
+        }
+        _ => return None,
+    };
+    Some(KeySpec { vks, mods })
+}
+
+/// The keys that turn the IME on and off, as the config names them.
+#[derive(Debug, Clone, Default)]
+pub struct OnOffKeys {
+    keys: Vec<(KeySpec, OnOff)>,
+}
+
+impl OnOffKeys {
+    /// `[frontend] toggle_keys`, `on_keys`, `off_keys`; a spec that does not
+    /// read is left out (and returned, for the log).
+    pub fn from_config(f: &setsuna_core::config::FrontendCfg) -> (Self, Vec<String>) {
+        let mut keys = Vec::new();
+        let mut bad = Vec::new();
+        for (specs, role) in [
+            (&f.toggle_keys, OnOff::Toggle),
+            (&f.on_keys, OnOff::On),
+            (&f.off_keys, OnOff::Off),
+        ] {
+            for spec in specs {
+                match parse_key(spec) {
+                    Some(k) => keys.push((k, role)),
+                    None => bad.push(spec.clone()),
+                }
+            }
+        }
+        (Self { keys }, bad)
+    }
+
+    /// What `vk` held with exactly `mods` does, if it is one of the keys.
+    pub fn role(&self, vk: u32, mods: Mods) -> Option<OnOff> {
+        self.keys
+            .iter()
+            .find(|(k, _)| k.mods == mods && k.vks.contains(&vk))
+            .map(|(_, role)| *role)
+    }
+
+    /// Each key TSF can preserve: its role, virtual-key code and
+    /// `TF_MOD_*` modifiers.
+    pub fn preservable(&self) -> Vec<(OnOff, u32, u32)> {
+        self.keys
+            .iter()
+            .filter_map(|(k, role)| Some((*role, k.mods.tf_modifiers()?, &k.vks)))
+            .flat_map(|(role, mods, vks)| vks.iter().map(move |&vk| (role, vk, mods)))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 fn default_symbols() -> BTreeMap<String, String> {
     setsuna_core::config::default_symbol_map()
@@ -244,6 +382,73 @@ mod tests {
         assert_eq!(ctrl_form(0x49), Some(Form::Katakana));
         assert_eq!(ctrl_form(0x54), Some(Form::HalfAlnum));
         assert_eq!(ctrl_form(0x43), None); // Ctrl+C stays the app's
+    }
+
+    #[test]
+    fn key_specs_read() {
+        let k = parse_key("Zenkaku").unwrap();
+        assert_eq!(k.vks, [0x19, 0xF3, 0xF4]);
+        assert_eq!(k.mods, Mods::default());
+        let k = parse_key("ctrl + Space").unwrap();
+        assert_eq!(k.vks, [0x20]);
+        assert!(k.mods.ctrl && !k.mods.shift);
+        assert_eq!(k.mods.tf_modifiers(), Some(2));
+        assert_eq!(parse_key("Alt+`").unwrap().vks, [0xC0]);
+        assert_eq!(parse_key("Alt+`").unwrap().mods.tf_modifiers(), Some(1));
+        assert_eq!(parse_key("Shift+Muhenkan").unwrap().vks, [0x1D]);
+        assert_eq!(parse_key("Henkan").unwrap().vks, [0x1C]);
+        assert_eq!(parse_key("F12").unwrap().vks, [0x7B]);
+        assert_eq!(parse_key("0x1c").unwrap().vks, [0x1C]);
+        assert_eq!(parse_key("j").unwrap().vks, [0x4A]);
+        assert_eq!(parse_key("Win+Space").unwrap().mods.tf_modifiers(), None);
+        assert_eq!(parse_key("Hyper+Space"), None);
+        assert_eq!(parse_key("F25"), None);
+        assert_eq!(parse_key(""), None);
+    }
+
+    #[test]
+    fn default_on_off_keys() {
+        let (keys, bad) = OnOffKeys::from_config(&setsuna_core::config::FrontendCfg::default());
+        assert!(bad.is_empty(), "{bad:?}");
+        let none = Mods::default();
+        let alt = Mods { alt: true, ..none };
+        let ctrl = Mods { ctrl: true, ..none };
+        for vk in [0x19, 0xF3, 0xF4] {
+            assert_eq!(keys.role(vk, none), Some(OnOff::Toggle));
+            assert_eq!(keys.role(vk, alt), Some(OnOff::Toggle));
+        }
+        assert_eq!(keys.role(0xC0, alt), Some(OnOff::Toggle));
+        // ` / @ typed without Alt is a char
+        assert_eq!(keys.role(0xC0, none), None);
+        assert_eq!(keys.role(0x16, none), Some(OnOff::On));
+        assert_eq!(keys.role(0x1A, none), Some(OnOff::Off));
+        // Ctrl+Space stays the app's unless the config asks for it
+        assert_eq!(keys.role(0x20, ctrl), None);
+        let preserved = keys.preservable();
+        assert!(preserved.contains(&(OnOff::Toggle, 0x19, 0)));
+        assert!(preserved.contains(&(OnOff::Toggle, 0xC0, 1)));
+        assert!(preserved.contains(&(OnOff::On, 0x16, 0)));
+    }
+
+    #[test]
+    fn configured_on_off_keys() {
+        let f = setsuna_core::config::FrontendCfg {
+            toggle_keys: vec!["Ctrl+Space".into(), "nonsense".into()],
+            on_keys: vec!["Henkan".into()],
+            off_keys: vec!["Muhenkan".into()],
+            ..Default::default()
+        };
+        let (keys, bad) = OnOffKeys::from_config(&f);
+        assert_eq!(bad, ["nonsense"]);
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        assert_eq!(keys.role(0x20, ctrl), Some(OnOff::Toggle));
+        assert_eq!(keys.role(0x20, Mods::default()), None);
+        assert_eq!(keys.role(0x1C, Mods::default()), Some(OnOff::On));
+        assert_eq!(keys.role(0x1D, Mods::default()), Some(OnOff::Off));
+        assert_eq!(keys.role(0x19, Mods::default()), None);
     }
 
     #[test]

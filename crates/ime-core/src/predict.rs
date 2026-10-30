@@ -6,6 +6,8 @@
 //! typing a reading's start offers the longer surfaces committed for it,
 //! the more often and the more recently the higher, and higher still after
 //! the same commit as before (Mozc's bigram links: the next word).
+//! Ctrl+Delete on a prediction appends the same with `"d": true`: its
+//! commits are forgotten.
 //!
 //! As Mozc's IsValidSuggestion, a surface committed once is offered from
 //! three chars typed, one committed again or after the same commit as
@@ -21,12 +23,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// One line of `prediction.jsonl`: a commit, or (`d`) that the commits of
+/// `s` for `r` are forgotten (Ctrl+Delete on the prediction).
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
     r: String,
     s: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     p: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    d: bool,
 }
 
 #[derive(Default)]
@@ -113,6 +119,10 @@ impl Predictor {
         };
         for line in buf[..end].split(|&b| b == b'\n') {
             if let Ok(r) = serde_json::from_slice::<Record>(line) {
+                if r.d {
+                    self.stats.remove(&(r.r, r.s));
+                    continue;
+                }
                 self.seq += 1;
                 let s = self.stats.entry((r.r, r.s)).or_default();
                 s.count += 1;
@@ -148,10 +158,7 @@ impl Predictor {
         if !Self::worth(reading, surface) {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut line = serde_json::to_vec(&Record {
+        self.append(&Record {
             r: reading.to_string(),
             s: surface.to_string(),
             p: prev
@@ -162,7 +169,35 @@ impl Predictor {
                 .into_iter()
                 .rev()
                 .collect(),
+            d: false,
+        })
+    }
+
+    /// Forget the commits of `surface` for `reading`: it is no longer
+    /// predicted (here and in every process, which read the line appended).
+    /// False when there was none.
+    pub fn forget(&mut self, reading: &str, surface: &str) -> std::io::Result<bool> {
+        self.sync();
+        if !self
+            .stats
+            .contains_key(&(reading.to_string(), surface.to_string()))
+        {
+            return Ok(false);
+        }
+        self.append(&Record {
+            r: reading.to_string(),
+            s: surface.to_string(),
+            p: String::new(),
+            d: true,
         })?;
+        Ok(true)
+    }
+
+    fn append(&mut self, record: &Record) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         OpenOptions::new()
             .create(true)
@@ -271,6 +306,30 @@ mod tests {
             q.complete("よろし", "", 1)[0].surface,
             "よろしくお願いします"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_forgotten_prediction_is_offered_no_more() {
+        let path = temp("forget");
+        let mut p = Predictor::at(path.clone());
+        let mut q = Predictor::at(path.clone());
+        p.record("かさのした", "傘の下", "").unwrap();
+        p.record("かさのした", "傘の下", "").unwrap();
+        p.record("かさのしたで", "傘の下で", "").unwrap();
+        assert!(!p.forget("かさのした", "笠の下").unwrap());
+        assert!(p.forget("かさのした", "傘の下").unwrap());
+        let surfaces = |p: &mut Predictor| -> Vec<String> {
+            p.complete("かさの", "", 5)
+                .into_iter()
+                .map(|x| x.surface)
+                .collect()
+        };
+        assert_eq!(surfaces(&mut p), ["傘の下で"]);
+        // another process reads it too; a new commit counts again
+        assert_eq!(surfaces(&mut q), ["傘の下で"]);
+        p.record("かさのした", "傘の下", "").unwrap();
+        assert_eq!(surfaces(&mut q).len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 

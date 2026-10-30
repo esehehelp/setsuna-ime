@@ -586,13 +586,17 @@ fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, no
 /// (the TSF DLL's), searched last for the engine and models. On Windows it
 /// connects to the login's shared server (`setsuna-engine serve`, one model
 /// in memory for every app), starting it when there is none, in the
-/// background: this returns at once; an elevated app or one in an
-/// AppContainer has a child of its own (a server it started would run
-/// elevated and serve the login's other apps across that boundary, or run
-/// in the container where they cannot reach it), as does every app
-/// elsewhere. Returns `None` (→ raw-hiragana passthrough) when no model is
-/// found or the client fails to start. `notify` is called from a client
-/// thread for each result.
+/// background: this returns at once; an elevated app has a child of its own
+/// (a server it started would run elevated and serve the login's other apps
+/// across that boundary), as does every app elsewhere. An app in an
+/// AppContainer (a Store app, the Start menu's search) only connects to the
+/// server another app started: a server it started would run in the
+/// container where the others cannot reach it, and a child would load the
+/// model once per sandbox; the installer lets AppContainers read the
+/// install directory and `config.toml`, so it computes the same pipe name.
+/// Returns `None` (→ raw-hiragana passthrough) when no model is found or
+/// the client fails to start. `notify` is called from a client thread for
+/// each result.
 pub fn spawn_with_config(
     cfg: &crate::config::Config,
     module_dir: Option<&Path>,
@@ -635,8 +639,23 @@ pub fn spawn_with_config(
             crate::diagnostics::log("engine: elevated, a child of this app's own");
             notify
         } else if win::is_app_container().unwrap_or(false) {
-            crate::diagnostics::log("engine: in an AppContainer, a child of this app's own");
-            notify
+            return match pipe::PipeEngineClient::connect_only(
+                &manifest,
+                &engine_exe,
+                notify,
+                &cfg.engine,
+            ) {
+                Ok(c) => {
+                    crate::diagnostics::log("engine: in an AppContainer, the shared engine only");
+                    Some(Box::new(c))
+                }
+                Err((e, _)) => {
+                    crate::diagnostics::log(format!(
+                        "engine disabled: in an AppContainer, the shared engine cannot be named: {e}"
+                    ));
+                    None
+                }
+            };
         } else {
             match pipe::PipeEngineClient::start(&manifest, &engine_exe, notify, &cfg.engine) {
                 Ok(c) => return Some(Box::new(c)),

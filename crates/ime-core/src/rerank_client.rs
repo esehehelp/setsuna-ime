@@ -544,6 +544,11 @@ pub fn spawn_with_config(
         crate::diagnostics::log("rerank: elevated, a child of this app's own");
         ChildRerankClient::spawn(manifest, &exe, notify, c)
             .map(|c| Box::new(c) as Box<dyn RerankClient>)
+    } else if setsuna_pipe::win::is_app_container().unwrap_or(false) {
+        // a Store app's sandbox: the server another app started, if any
+        crate::diagnostics::log("rerank: in an AppContainer, the shared reranker only");
+        PipeRerankClient::connect_only(manifest, &exe, notify, c)
+            .map(|c| Box::new(c) as Box<dyn RerankClient>)
     } else {
         PipeRerankClient::start(manifest, &exe, notify, c)
             .map(|c| Box::new(c) as Box<dyn RerankClient>)

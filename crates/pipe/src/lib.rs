@@ -118,7 +118,7 @@ mod tests {
         // splits servers across versions, so make it on purpose only
         assert_eq!(
             rerank_pipe_name(&key()),
-            r"\\.\pipe\setsuna-rerank-c3a284b618595feb0231c0a308bb3446"
+            r"\\.\pipe\setsuna-rerank-5884c7755e36d80fcb8c2be780a443a2"
         );
     }
 
@@ -178,7 +178,7 @@ mod tests {
         // pinned as the reranker's is: the IME's clients in every app compute it
         assert_eq!(
             base,
-            r"\\.\pipe\setsuna-engine-0d8b5a77b2f80471999a54fdea85d64c"
+            r"\\.\pipe\setsuna-engine-e7ccc184fcb8e3ad9a64d7e4dc49bfc0"
         );
         for other in [
             engine_pipe_name(user, manifest, exe, &flags(&[])),

@@ -8,6 +8,7 @@
 //! along the top and a rounded highlight (`[ui.candidate_window] theme`). A
 //! click on a candidate calls the window's `on_select`.
 
+use crate::placement::Rect;
 use setsuna_core::config::{CandidateWindowCfg, Config};
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -162,6 +163,9 @@ struct Layout {
 
 pub struct CandidateWindow {
     hwnd: HWND,
+    /// The caret's rect on screen the window is placed by (`placement`),
+    /// again at each show as its size changes; `None` until one is known.
+    anchor: Option<Rect>,
 }
 
 impl CandidateWindow {
@@ -202,7 +206,7 @@ impl CandidateWindow {
                 }
             }
         }
-        Self { hwnd }
+        Self { hwnd, anchor: None }
     }
 
     fn data(&mut self) -> Option<&mut RenderData> {
@@ -238,7 +242,7 @@ impl CandidateWindow {
     }
 
     fn render(&mut self, candidates: &[String], selected: usize) {
-        let hwnd = self.hwnd;
+        let (hwnd, anchor) = (self.hwnd, self.anchor);
         let Some(d) = self.data() else {
             return;
         };
@@ -271,15 +275,15 @@ impl CandidateWindow {
                 sc(radius * 2, s),
             );
             SetWindowRgn(hwnd, rgn, false);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                width,
-                height,
-                SWP_NOMOVE | SWP_NOACTIVATE,
-            );
+            // placed by its size before it shows, inside the screen
+            let (x, y, keep) = match anchor {
+                Some(caret) => {
+                    let (x, y) = crate::placement::place_on_screen(caret, width, height, 0);
+                    (x, y, SWP_NOACTIVATE)
+                }
+                None => (0, 0, SWP_NOMOVE | SWP_NOACTIVATE),
+            };
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, keep);
             let _ = InvalidateRect(hwnd, None, false);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
@@ -313,21 +317,10 @@ impl CandidateWindow {
         }
     }
 
-    pub fn move_to(&mut self, x: i32, y: i32) {
-        if self.hwnd.0 as usize == 0 {
-            return;
-        }
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                x,
-                y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
+    /// Place the window by `caret` (screen coordinates) from the next show
+    /// on.
+    pub fn set_anchor(&mut self, caret: Rect) {
+        self.anchor = Some(caret);
     }
 }
 
@@ -514,6 +507,13 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // a panic never unwinds into the host's message loop
+    crate::guard::catch("candidate window", LRESULT(0), || unsafe {
+        handle_message(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
             unsafe { paint(hwnd) };

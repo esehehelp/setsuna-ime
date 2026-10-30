@@ -48,7 +48,13 @@ impl IClassFactory_Impl for SetsunaClassFactory_Impl {
                 );
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
-            let service: IUnknown = SetsunaTextService::new().into();
+            // the service's state is made here (the bridge with its
+            // defaults): a panic in it never reaches the host
+            let Some(service) = crate::guard::run("CreateInstance", || {
+                IUnknown::from(SetsunaTextService::new())
+            }) else {
+                return Err(E_FAIL.into());
+            };
             let result = service.query(&*riid, ppvobject).ok();
             setsuna_core::diagnostics::log(format!(
                 "ClassFactory::CreateInstance result={result:?}"

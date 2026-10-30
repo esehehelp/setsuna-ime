@@ -17,13 +17,10 @@ pub mod gdi_window;
 #[cfg(test)]
 pub mod noop;
 
-/// Screen-coordinate anchor for the popup. `(0, 0)` is treated as "no
-/// move" by impls (`GdiCandidateUi` keeps its previous position).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ScreenPos {
-    pub x: i32,
-    pub y: i32,
-}
+/// What the popup is placed by: the caret's (the composition's) rect on
+/// screen. The window goes below it, or above it near the bottom of the
+/// screen (`crate::placement`); `None` keeps the previous position.
+pub type Anchor = Option<crate::placement::Rect>;
 
 /// Minimal candidate-window contract. The trait is intentionally narrow
 /// so the call sites in `key_event_sink::apply_actions` (`Show...` /
@@ -32,9 +29,9 @@ pub struct ScreenPos {
 pub trait CandidateUi {
     /// Show the candidate list. `selected` is the 0-based index of the
     /// highlighted item; the impl is responsible for capping it to the
-    /// list length. `anchor` repositions the window — pass
-    /// `ScreenPos::default()` to keep the current position.
-    fn show(&mut self, candidates: &[String], selected: usize, anchor: ScreenPos);
+    /// list length. `anchor` repositions the window — pass `None` to keep
+    /// the current position.
+    fn show(&mut self, candidates: &[String], selected: usize, anchor: Anchor);
 
     /// Hide the window without destroying state. A subsequent `show` is
     /// expected to be fast (no resource re-init).
@@ -53,7 +50,7 @@ pub trait CandidateUi {
 
     /// Show suggestions while typing (live conversion off: the conversions
     /// of the kana shown): no candidate highlighted.
-    fn show_suggestions(&mut self, _list: &[String], _anchor: ScreenPos) {}
+    fn show_suggestions(&mut self, _list: &[String], _anchor: Anchor) {}
 
     /// Whether what is shown is suggestions (`show_suggestions`).
     fn is_suggesting(&self) -> bool {

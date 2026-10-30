@@ -142,10 +142,15 @@ struct AltList {
     /// The input is one word the model knows as Latin (`made` read まで):
     /// offer it as typed among the first candidates.
     typed_early: bool,
+    /// The user dictionary's words of the other reading as a whole: they
+    /// come first of its candidates, and all of them (`ALT_MAX` counts the
+    /// others).
+    user_words: Vec<String>,
 }
 
 /// Candidates of the other reading offered (its first `ALT_EARLY` right
-/// after the first `ALT_EARLY` of the mixed one).
+/// after the first `ALT_EARLY` of the mixed one), besides its user
+/// dictionary words.
 const ALT_MAX: usize = 5;
 const ALT_EARLY: usize = 3;
 
@@ -221,6 +226,11 @@ pub struct EngineBridge {
     /// returns.
     cached_prefix_reading: String,
     cached_prefix_kanji: String,
+    /// A shortcut word of the user dictionary (短縮よみ) on top of the
+    /// conversion of `cached_prefix_reading`: shown while the reading is
+    /// that one only, `cached_prefix_kanji` standing for it as the start of
+    /// a longer reading (`cache_conversion`).
+    cached_shortcut: Option<String>,
     live_min_dispatch_chars: usize,
     force_convert_on_space: bool,
     symbol_width: crate::config::SymbolWidth,
@@ -254,6 +264,9 @@ pub struct EngineBridge {
     last_commit: String,
     /// The predictions open as the candidate list (Tab while typing).
     prediction: Option<Vec<crate::predict::Prediction>>,
+    /// The open list stands for all that is typed, pending romaji too: the
+    /// user dictionary's words of a reading of letters (`w`: (笑)).
+    covers_typed: bool,
     /// The engine's top waiting for the reranked one.
     deferred: Option<Deferred>,
     /// `/command` and the like go to the app (`pass_through_commands`).
@@ -272,8 +285,9 @@ pub struct EngineBridge {
     /// them with.
     list_starts: HashMap<String, Vec<usize>>,
     /// Segment conversions in flight: (request id, segment index, its
-    /// `continue_beam`: 0 for the segment's own conversion).
-    seg_requests: Vec<(u64, usize, u32)>,
+    /// `continue_beam`: 0 for the segment's own conversion, whether it is
+    /// the conversion of the segment's letters read as romaji).
+    seg_requests: Vec<(u64, usize, u32, bool)>,
     /// Candidates per page of the frontend's window: what PageUp / PageDown
     /// step by and what the digit keys pick from.
     page_size: usize,
@@ -289,6 +303,11 @@ pub struct EngineBridge {
     live_conversion: bool,
     /// `[frontend] backspace_deletes_shown` (`backspace_shown`).
     backspace_deletes_shown: bool,
+    /// `[frontend] escape_to_kana` (`handle_escape`).
+    escape_to_kana: bool,
+    /// Escape showed the kana typed in place of the conversion: Escape
+    /// again clears, Enter commits the kana; typing on converts again.
+    kana_shown: bool,
     /// What Backspace left of a conversion shown, with its reading and its
     /// chars' reading starts: the list of that reading keeps it first, so
     /// the preview stays as it was (until the reading changes), with those
@@ -296,6 +315,9 @@ pub struct EngineBridge {
     kept: Option<(String, String, Vec<usize>)>,
     /// The last F6–F10 conversion, while its text is what Converting shows.
     form: Option<FormShown>,
+    /// The last F6–F10 conversion of a segment: (segment, form, press
+    /// count, text), while that segment shows it.
+    seg_form: Option<(usize, Form, usize, String)>,
     /// The character n-gram table and its bigram and trigram weights
     /// (`[ngram]`); `None` when off.
     ngram: Option<(Arc<crate::char_ngram::CharNgram>, f32, f32)>,
@@ -375,6 +397,7 @@ impl EngineBridge {
             last_applied_reading: String::new(),
             cached_prefix_reading: String::new(),
             cached_prefix_kanji: String::new(),
+            cached_shortcut: None,
             live_min_dispatch_chars: frontend.live_min_dispatch_chars,
             force_convert_on_space: frontend.force_convert_on_space,
             symbol_width: frontend.symbol_width,
@@ -395,6 +418,7 @@ impl EngineBridge {
             predictor: None,
             last_commit: String::new(),
             prediction: None,
+            covers_typed: false,
             deferred: None,
             pass_commands: frontend.pass_through_commands,
             at_word_start: None,
@@ -408,8 +432,11 @@ impl EngineBridge {
             sentence_case: frontend.sentence_case,
             live_conversion: frontend.live_conversion.unwrap_or(true),
             backspace_deletes_shown: frontend.backspace_deletes_shown,
+            escape_to_kana: frontend.escape_to_kana,
+            kana_shown: false,
             kept: None,
             form: None,
+            seg_form: None,
             ngram: None,
             lexicon: None,
             reranker: None,
@@ -604,13 +631,18 @@ impl EngineBridge {
     /// DeleteSelectedCandidate): what was learned to put it up is forgotten;
     /// when nothing was, it is hidden for this reading from now on
     /// (`hidden.jsonl`). Either way it leaves the list open. The kana of the
-    /// reading and a list's last candidate stay.
+    /// reading and a list's last candidate stay in it (and are not hidden).
+    /// On the predictions open (Tab while typing), the prediction is
+    /// forgotten instead (`forget_prediction`).
     pub fn handle_forget_candidate(&mut self) -> KeyOutcome {
         let Some(reading) = self.shown_reading() else {
             return not_consumed();
         };
         if self.form_shown().is_some() {
             return consumed(Vec::new());
+        }
+        if self.prediction.is_some() {
+            return self.forget_prediction();
         }
         let (cand, count) = match &self.phase {
             Phase::Converting { seg: Some(s), .. } => {
@@ -631,12 +663,12 @@ impl EngineBridge {
             .learning
             .as_mut()
             .is_some_and(|l| l.forget(&reading, &cand).unwrap_or(false));
+        // a list's last candidate and the kana stay, learned or not
+        let stays =
+            count <= 1 || cand == reading || cand == crate::kana_candidates::to_katakana(&reading);
         let message = if forgot {
             "学習を取り消しました"
-        } else if count <= 1
-            || cand == reading
-            || cand == crate::kana_candidates::to_katakana(&reading)
-        {
+        } else if stays {
             return consumed(vec![Action::Status {
                 text: "この候補は消せません".to_string(),
             }]);
@@ -646,6 +678,12 @@ impl EngineBridge {
                 _ => return consumed(Vec::new()),
             }
         };
+        let status = Action::Status {
+            text: message.to_string(),
+        };
+        if stays {
+            return consumed(vec![status]);
+        }
         // out of the list open
         let mut actions = match &mut self.phase {
             Phase::Converting { seg: Some(s), .. } => {
@@ -662,21 +700,99 @@ impl EngineBridge {
                 candidates.retain(|c| c != &cand);
                 *selected = (*selected).min(candidates.len().saturating_sub(1));
                 let (list, sel) = (candidates.clone(), *selected);
-                let text = self.with_pending(list[sel].clone());
-                vec![
-                    Action::UpdatePreedit { text },
-                    Action::ShowCandidates {
-                        list,
-                        selected: sel,
-                    },
-                ]
+                match list.get(sel) {
+                    Some(top) => vec![
+                        Action::UpdatePreedit {
+                            text: self.with_pending(top.clone()),
+                        },
+                        Action::ShowCandidates {
+                            list,
+                            selected: sel,
+                        },
+                    ],
+                    // nothing left to show: back to typing
+                    None => return consumed(self.close_list()),
+                }
             }
             _ => Vec::new(),
         };
-        actions.push(Action::Status {
-            text: message.to_string(),
-        });
+        actions.push(status);
         consumed(actions)
+    }
+
+    /// Ctrl+Delete on a prediction open: its commits are forgotten
+    /// (`Predictor::forget`), so it is predicted no more, and it leaves the
+    /// list; with none left, typing goes on. The learning and the hidden
+    /// candidates stay as they are: a prediction is no conversion of what
+    /// is typed.
+    fn forget_prediction(&mut self) -> KeyOutcome {
+        let Phase::Converting {
+            candidates,
+            selected,
+            seg: None,
+        } = &self.phase
+        else {
+            return consumed(Vec::new());
+        };
+        let Some(surface) = candidates.get(*selected).cloned() else {
+            return consumed(self.close_list());
+        };
+        let reading = self
+            .prediction
+            .iter()
+            .flatten()
+            .find(|p| p.surface == surface)
+            .map(|p| p.reading.clone())
+            .unwrap_or_default();
+        let forgot = self.predictor.as_ref().is_some_and(|p| {
+            p.borrow_mut()
+                .forget(&reading, &surface)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("prediction forget failed: {e}");
+                    false
+                })
+        });
+        if !forgot {
+            return consumed(Vec::new());
+        }
+        if let Some(p) = self.prediction.as_mut() {
+            p.retain(|x| x.surface != surface);
+        }
+        let Phase::Converting {
+            candidates,
+            selected,
+            ..
+        } = &mut self.phase
+        else {
+            return consumed(Vec::new());
+        };
+        candidates.retain(|c| *c != surface);
+        *selected = (*selected).min(candidates.len().saturating_sub(1));
+        let (list, sel) = (candidates.clone(), *selected);
+        let Some(top) = list.get(sel).cloned() else {
+            return consumed(self.close_list());
+        };
+        consumed(vec![
+            Action::UpdatePreedit { text: top },
+            Action::ShowCandidates {
+                list,
+                selected: sel,
+            },
+            Action::Status {
+                text: "この予測を消しました".to_string(),
+            },
+        ])
+    }
+
+    /// Close the candidate window for typing (a list emptied).
+    fn close_list(&mut self) -> Vec<Action> {
+        self.back_to_composing();
+        vec![
+            Action::HideCandidates,
+            Action::UpdatePreedit {
+                text: self.live_preedit(),
+            },
+        ]
     }
 
     pub fn is_active(&self) -> bool {
@@ -831,8 +947,16 @@ impl EngineBridge {
             let best = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
             if best.is_finite() {
                 let worst = best + crate::lexicon::MARGIN;
-                // the engine's top stays whatever it costs
-                let keep = |i: &usize| *i == 0 || costs[*i].is_some_and(|c| c <= worst);
+                // the engine's top stays whatever it costs, and so does a
+                // one-char word of a reading of a kana or two (`char_words`)
+                let chars: Vec<String> = lex.char_words(&r).into_iter().map(|(w, _)| w).collect();
+                let keep = |i: &usize| {
+                    *i == 0
+                        || costs[*i].is_some_and(|c| c <= worst)
+                        || chars
+                            .iter()
+                            .any(|w| result.candidates[*i].nfkc().eq(w.chars()))
+                };
                 order.retain(keep);
                 rest.retain(keep);
                 if order.is_empty() {
@@ -882,6 +1006,10 @@ impl EngineBridge {
         self.cached_prefix_reading.clear();
         self.cached_prefix_kanji.clear();
         self.kept = None;
+        self.kana_shown = false;
+        self.prediction = None;
+        self.covers_typed = false;
+        self.form = None;
         self.stop_rerank();
         self.stop_rewrite();
         self.forget_context();
@@ -1088,8 +1216,7 @@ impl EngineBridge {
                 });
             } else {
                 self.deferred = None;
-                self.cached_prefix_reading = result.reading.clone();
-                self.cached_prefix_kanji = top;
+                self.cache_conversion(&result.reading, &result.candidates);
             }
             self.last_applied_reading = current_hira;
             return vec![Action::UpdatePreedit {
@@ -1128,7 +1255,10 @@ impl EngineBridge {
             } else {
                 0
             });
-        let text = self.with_pending(candidates[sel].clone());
+        let Some(text) = candidates.get(sel).cloned() else {
+            return Vec::new();
+        };
+        let text = self.with_pending(text);
         let list = candidates;
         // the candidate window is open: rerank at once
         self.start_rerank(
@@ -1185,6 +1315,7 @@ impl EngineBridge {
                 ends_english: false,
                 typed: String::new(),
                 typed_early: false,
+                user_words: Vec::new(),
             });
         }
         let reading = self.composing.kana_reading();
@@ -1198,6 +1329,7 @@ impl EngineBridge {
             ends_english: self.composing.ends_in_english(),
             typed: self.composing.romaji(),
             typed_early: self.composing.is_known_word(),
+            user_words: Vec::new(),
         })
     }
 
@@ -1228,7 +1360,17 @@ impl EngineBridge {
             return main;
         };
         alt.main = main.clone();
-        let other = &alt.candidates[..alt.candidates.len().min(ALT_MAX)];
+        // the user's words of the other reading first, all of them (よろ:
+        // ten registered, read yoro after English: all ten offered)
+        let (mine, rest): (Vec<&String>, Vec<&String>) = alt
+            .candidates
+            .iter()
+            .partition(|c| alt.user_words.contains(c));
+        let other: Vec<String> = mine
+            .into_iter()
+            .chain(rest.into_iter().take(ALT_MAX))
+            .cloned()
+            .collect();
         let (other_early, other_late) = other.split_at(other.len().min(ALT_EARLY));
         let mut list: Vec<String> = Vec::new();
         if alt.ends_english {
@@ -1281,8 +1423,13 @@ impl EngineBridge {
         };
         let main = alt.main.clone();
         let candidates = self.finish_list(&reading, result.candidates, false);
+        let user_words = self
+            .user_dict()
+            .map(|d| d.words(&reading))
+            .unwrap_or_default();
         if let Some(alt) = self.alt.as_mut() {
             alt.candidates = candidates;
+            alt.user_words = user_words;
         }
         let shown = match &self.phase {
             Phase::Converting {
@@ -1296,6 +1443,9 @@ impl EngineBridge {
         let sel = shown
             .and_then(|t| list.iter().position(|c| *c == t))
             .unwrap_or(0);
+        let Some(text) = list.get(sel).cloned() else {
+            return Vec::new();
+        };
         self.phase = Phase::Converting {
             candidates: list.clone(),
             selected: sel,
@@ -1303,7 +1453,7 @@ impl EngineBridge {
         };
         vec![
             Action::UpdatePreedit {
-                text: self.with_pending(list[sel].clone()),
+                text: self.with_pending(text),
             },
             Action::ShowCandidates {
                 list,
@@ -1568,6 +1718,7 @@ impl EngineBridge {
         let candidates = self.dispatch_live();
         self.cached_prefix_reading = left;
         self.cached_prefix_kanji = rest;
+        self.cached_shortcut = None;
         self.phase = Phase::Composing { candidates };
         Some(consumed(vec![Action::UpdatePreedit {
             text: self.live_preedit(),
@@ -1580,6 +1731,10 @@ impl EngineBridge {
         if self.form_shown().is_some() {
             // Space after F6–F10 converts the reading as usual.
             self.back_to_composing();
+        }
+        // letters or symbols the user dictionary has as a reading (`w`)
+        if let Some(out) = self.open_typed_words() {
+            return out;
         }
         // Mixed input: Space after an English word, or a lone `i` (`i
         // think`), types a space (`Hello world`); Space again, or after
@@ -1661,11 +1816,15 @@ impl EngineBridge {
                         return self.handle_enter();
                     }
                     // This also works without a model or while it loads.
-                    let list = if dynamic {
+                    let mut list = if dynamic {
                         self.finish_list(&reading, vec![reading.clone()], true)
                     } else {
-                        vec![provisional]
+                        Vec::new()
                     };
+                    // (the user dictionary may suppress them all)
+                    if list.is_empty() {
+                        list.push(provisional);
+                    }
                     self.list_starts = self.list_starts_of(&reading, &[], &[], &list);
                     self.list_reading = if dynamic {
                         reading.clone()
@@ -1674,7 +1833,7 @@ impl EngineBridge {
                     };
                     let source = list[0].clone();
                     let list = self.shown_list(list);
-                    let first = self.with_pending(list[0].clone());
+                    let first = self.with_pending(list.first().cloned().unwrap_or_default());
                     self.phase = Phase::Converting {
                         candidates: list.clone(),
                         selected: 0,
@@ -1688,14 +1847,14 @@ impl EngineBridge {
                     return consumed(actions);
                 }
                 if dynamic && self.cached_prefix_reading == reading {
-                    self.cached_prefix_kanji = candidates.first().cloned().unwrap_or_default();
+                    self.cache_conversion(&reading, &candidates);
                 }
                 // Preserve the model's alignments while adding starts for
                 // fresh local candidates (which each cover the whole reading).
                 for (text, starts) in self.list_starts_of(&reading, &[], &[], &candidates) {
                     self.list_starts.entry(text).or_insert(starts);
                 }
-                let source = candidates[0].clone();
+                let source = candidates.first().cloned().unwrap_or_default();
                 let candidates = self.shown_list(candidates);
                 if ready {
                     self.request_alt();
@@ -1719,6 +1878,50 @@ impl EngineBridge {
                 consumed(actions)
             }
         }
+    }
+
+    /// Space on what was typed when the user dictionary has it as a reading
+    /// of letters or symbols (`w` for (笑), as MS-IME takes one): the list
+    /// of its words and the input as typed, which no conversion makes (`w`
+    /// is no kana; mixed input would type a space after it). `None` when
+    /// the dictionary has no such reading.
+    fn open_typed_words(&mut self) -> Option<KeyOutcome> {
+        if !matches!(self.phase, Phase::Composing { .. }) || !self.composing.cursor_at_end() {
+            return None;
+        }
+        let typed = self.composing.romaji();
+        let key = typed.to_ascii_lowercase();
+        if !crate::user_dict::is_typed_reading(&key) {
+            return None;
+        }
+        let dict = self.user_dict()?;
+        if dict.words(&key).is_empty() {
+            return None;
+        }
+        let mut list = dict.apply(&key, vec![typed]);
+        if let Some(learning) = self.learning.as_mut() {
+            list = learning.rerank(&key, list);
+        }
+        if let Some(hidden) = self.hidden.as_mut() {
+            list = hidden.filter(&key, list);
+        }
+        let first = list.first().cloned()?;
+        self.invalidate_engine_results();
+        self.stop_rerank();
+        self.alt = None;
+        self.kana_shown = false;
+        self.covers_typed = true;
+        self.list_reading = key;
+        self.list_starts.clear();
+        self.phase = Phase::Converting {
+            candidates: list.clone(),
+            selected: 0,
+            seg: None,
+        };
+        Some(consumed(vec![
+            Action::UpdatePreedit { text: first },
+            Action::ShowCandidates { list, selected: 0 },
+        ]))
     }
 
     pub fn handle_enter(&mut self) -> KeyOutcome {
@@ -1760,6 +1963,8 @@ impl EngineBridge {
                 // otherwise than what was typed so far (`ok`: OK, not お
                 // and k)
                 let done_otherwise = self.composing.reads_otherwise_when_done();
+                // after Escape the kana shown is what goes
+                let kana = std::mem::take(&mut self.kana_shown);
                 let reading = self.composing.full_reading();
                 let cand_top = candidates
                     .first()
@@ -1768,10 +1973,11 @@ impl EngineBridge {
                             && self.composing.cursor_at_end()
                             && self.list_reading == self.composing.live_reading()
                             && !done_otherwise
+                            && !kana
                     })
                     .cloned();
                 let text = match cand_top {
-                    _ if done_otherwise => self.composing.commit(),
+                    _ if done_otherwise || kana => self.composing.commit(),
                     Some(t) if !t.is_empty() => format!("{t}{}", self.composing.commit_live_tail()),
                     _ if self.live_conversion && self.composing.cursor_at_end() => {
                         let text = self.provisional_conversion();
@@ -1802,6 +2008,10 @@ impl EngineBridge {
         }
     }
 
+    /// Escape steps back, as MS-IME's does (`escape_to_kana`): the
+    /// candidate window, or a conversion shown live, gives way to the kana
+    /// typed, and Escape on the kana clears the composition. Without it the
+    /// window goes back to the live conversion, and Escape there clears.
     pub fn handle_escape(&mut self) -> KeyOutcome {
         self.passing = false;
         match &self.phase {
@@ -1815,6 +2025,9 @@ impl EngineBridge {
             }
             Phase::Converting { .. } => {
                 self.back_to_composing();
+                if self.escape_to_kana {
+                    self.show_kana();
+                }
                 let preedit = self.live_preedit();
                 KeyOutcome {
                     consumed: true,
@@ -1824,22 +2037,60 @@ impl EngineBridge {
                     ],
                 }
             }
-            Phase::Composing { .. } => {
-                self.invalidate_engine_results();
-                self.composing.reset();
-                self.stop_rerank();
-                self.stop_rewrite();
-                self.phase = Phase::Empty;
-                self.last_applied_reading.clear();
-                self.cached_prefix_reading.clear();
-                self.cached_prefix_kanji.clear();
-                self.kept = None;
-                KeyOutcome {
-                    consumed: true,
-                    actions: vec![Action::EndComposition],
-                }
+            Phase::Composing { .. }
+                if self.escape_to_kana
+                    && !self.kana_shown
+                    && self.live_preedit() != self.composing.preedit() =>
+            {
+                self.show_kana();
+                consumed(vec![Action::UpdatePreedit {
+                    text: self.live_preedit(),
+                }])
             }
+            Phase::Composing { .. } => consumed(self.cancel()),
         }
+    }
+
+    /// Show the kana typed in place of the conversion while typing (the
+    /// first Escape): the conversion shown, a rerank and a result on their
+    /// way are dropped; the candidates stay for Space.
+    fn show_kana(&mut self) {
+        self.invalidate_engine_results();
+        self.stop_rerank();
+        self.deferred = None;
+        self.cached_prefix_reading.clear();
+        self.cached_prefix_kanji.clear();
+        self.kept = None;
+        self.kana_shown = true;
+    }
+
+    /// Drop the composition without committing it (Escape on the kana, or
+    /// the app ended the composition), keeping the context.
+    pub fn cancel(&mut self) -> Vec<Action> {
+        if !self.is_active() {
+            return Vec::new();
+        }
+        let converting = self.is_converting();
+        self.invalidate_engine_results();
+        self.composing.reset();
+        self.stop_rerank();
+        self.stop_rewrite();
+        self.phase = Phase::Empty;
+        self.prediction = None;
+        self.covers_typed = false;
+        self.form = None;
+        self.seg_requests.clear();
+        self.last_applied_reading.clear();
+        self.cached_prefix_reading.clear();
+        self.cached_prefix_kanji.clear();
+        self.kept = None;
+        self.kana_shown = false;
+        let mut actions = Vec::new();
+        if converting {
+            actions.push(Action::HideCandidates);
+        }
+        actions.push(Action::EndComposition);
+        actions
     }
 
     pub fn handle_move_cursor(&mut self, delta: i32) -> KeyOutcome {
@@ -1915,7 +2166,7 @@ impl EngineBridge {
         if seg.is_some() {
             return true;
         }
-        if self.list_reading.is_empty() {
+        if self.list_reading.is_empty() || self.covers_typed {
             return false;
         }
         // a segment's own conversions take over from the whole sentence's rerank
@@ -1944,7 +2195,8 @@ impl EngineBridge {
             for k in 0..s.segs.len() {
                 let reading = s.reading_of(k);
                 let cands = std::mem::take(&mut s.segs[k].cands);
-                let cands = crate::kana_candidates::arrange(&reading, cands);
+                let cands =
+                    with_romaji_kana(&reading, crate::kana_candidates::arrange(&reading, cands));
                 let generated = if date_time_enabled {
                     char_rules.apply(crate::date_time::candidates(&reading, &date_now))
                 } else {
@@ -2015,7 +2267,29 @@ impl EngineBridge {
             } else {
                 client.dispatch_more(req_id, &context, &reading, more);
             }
-            self.seg_requests.push((req_id, k, more));
+            self.seg_requests.push((req_id, k, more, false));
+        }
+    }
+
+    /// Convert segment `k`'s letters read as romaji (`romaji_to_kana`: an
+    /// English segment's other reading, よろ for `yoro`), once, after its
+    /// own conversion; its candidates join the segment's.
+    fn query_segment_kana(&mut self, k: usize) {
+        if !self.seg_requests.is_empty() {
+            return;
+        }
+        let Some(s) = self.segmented() else {
+            return;
+        };
+        let kana = crate::composing_text::romaji_to_kana(&s.reading_of(k));
+        let context = format!("{}{}", self.context, s.text_before(k));
+        if let (Some(kana), Some(client)) = (kana, &self.client) {
+            let req_id = self.req_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            client.dispatch(req_id, &context, &kana);
+            self.seg_requests.push((req_id, k, 0, true));
+        }
+        if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
+            s.segs[k].kana_queried = true;
         }
     }
 
@@ -2048,7 +2322,8 @@ impl EngineBridge {
         true
     }
 
-    /// Convert the focused segment unless that was done or is under way.
+    /// Convert the focused segment unless that was done or is under way,
+    /// then (an English one) its letters read as romaji.
     fn query_focused_segment(&mut self) {
         let Some(s) = self.segmented() else {
             return;
@@ -2060,12 +2335,14 @@ impl EngineBridge {
         }
         if !s.segs[k].queried && self.seg_requests.is_empty() {
             self.query_segment(k, 0);
+        } else if s.segs[k].queried && !s.segs[k].kana_queried && self.seg_requests.is_empty() {
+            self.query_segment_kana(k);
         }
     }
 
     fn query_next_stale(&mut self) {
         if let Some(k) = self.segmented().and_then(|s| s.next_stale()) {
-            if !self.seg_requests.iter().any(|&(_, i, _)| i == k) {
+            if !self.seg_requests.iter().any(|&(_, i, _, _)| i == k) {
                 self.query_segment(k, 0);
             }
         }
@@ -2079,12 +2356,30 @@ impl EngineBridge {
         let Some(at) = self
             .seg_requests
             .iter()
-            .position(|&(id, _, _)| id == result.req_id)
+            .position(|&(id, _, _, _)| id == result.req_id)
         else {
             return Some(Vec::new());
         };
-        let (_, k, more) = self.seg_requests.remove(at);
+        let (_, k, more, kana) = self.seg_requests.remove(at);
         let reading = self.segmented()?.reading_of(k);
+        if kana {
+            // the letters read as romaji: its conversions after the
+            // segment's own, the kana forms with them
+            let Some(kana) =
+                crate::composing_text::romaji_to_kana(&reading).filter(|r| *r == result.reading)
+            else {
+                return Some(Vec::new());
+            };
+            let list = self.finish_list(&kana, result.candidates.clone(), false);
+            if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
+                if !s.segs[k].stale {
+                    s.take(k, with_romaji_kana(&reading, list));
+                }
+            }
+            self.query_next_stale();
+            self.query_focused_segment();
+            return Some(self.segment_actions());
+        }
         if reading != result.reading {
             return Some(Vec::new());
         }
@@ -2104,7 +2399,7 @@ impl EngineBridge {
         let mut again = false;
         if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
             let before = s.segs[k].cands.len();
-            s.take(k, list);
+            s.take(k, with_romaji_kana(&reading, list));
             let seg = &mut s.segs[k];
             let added = seg.cands.len() > before;
             if more > 0 && !added {
@@ -2455,6 +2750,9 @@ impl EngineBridge {
                         .and_then(|t| list.iter().position(|c| *c == t))
                         .unwrap_or(0)
                 };
+                let Some(text) = list.get(sel).cloned() else {
+                    return Vec::new();
+                };
                 if let Phase::Converting {
                     candidates,
                     selected,
@@ -2467,7 +2765,7 @@ impl EngineBridge {
                 self.list_starts = starts;
                 return vec![
                     Action::UpdatePreedit {
-                        text: self.with_pending(list[sel].clone()),
+                        text: self.with_pending(text),
                     },
                     Action::ShowCandidates {
                         list,
@@ -2479,12 +2777,12 @@ impl EngineBridge {
         }
         self.list_starts = starts;
         // the reranked top is what the deferred preedit waited for
-        if self.deferred.as_ref().is_some_and(|d| d.reading == reading) {
+        let waited = self.deferred.as_ref().is_some_and(|d| d.reading == reading);
+        if waited {
             self.deferred = None;
-            self.cached_prefix_reading = reading.to_string();
         }
-        if self.cached_prefix_reading == reading {
-            self.cached_prefix_kanji = list[0].clone();
+        if waited || self.cached_prefix_reading == reading {
+            self.cache_conversion(reading, &list);
         }
         vec![Action::UpdatePreedit {
             text: self.live_preedit(),
@@ -2503,8 +2801,10 @@ impl EngineBridge {
         };
         let processed = crate::postprocess::drop_changed_digits(reading, processed);
         let processed = crate::postprocess::drop_broken_numbers(reading, processed);
+        let processed = crate::postprocess::drop_misread_digits(reading, processed);
         let processed = crate::postprocess::drop_moved_sentence_ends(reading, processed);
         let processed = crate::postprocess::drop_script_flips(processed);
+        let processed = crate::postprocess::drop_lone_katakana(processed);
         // The English words of a mixed reading stay as typed.
         let processed = if self.composing.is_mixed() {
             processed
@@ -2516,8 +2816,13 @@ impl EngineBridge {
         };
         let mut arranged = crate::kana_candidates::arrange(reading, processed);
         // a reading of one word: the lexicon's words for it that the model
-        // left out (検収 for けんしゅう), after its first candidates
-        if let (Some(lex), false) = (&self.lexicon, self.composing.is_mixed()) {
+        // left out (検収 for けんしゅう), after its first candidates; not
+        // for a reading with English in it (`is_mixed` says only that the
+        // mixed-input model is loaded, as it is by default)
+        let english = reading
+            .chars()
+            .any(|c| crate::postprocess::to_half(c).is_ascii_alphabetic());
+        if let (Some(lex), false) = (&self.lexicon, english) {
             use unicode_normalization::UnicodeNormalization;
             let words: Vec<String> = lex
                 .word_candidates(reading)
@@ -2527,6 +2832,16 @@ impl EngineBridge {
                 .collect();
             let at = crate::lexicon::WORDS_AT.min(arranged.len());
             arranged.splice(at..at, words);
+            // a reading of a kana or two: its one-char words however dear
+            // (阿 吾 唖 for あ), after the first page
+            let chars: Vec<String> = lex
+                .char_words(reading)
+                .into_iter()
+                .map(|(w, _)| w)
+                .filter(|w| !arranged.iter().any(|c| c.nfkc().eq(w.nfkc())))
+                .collect();
+            let at = crate::lexicon::CHAR_WORDS_AT.min(arranged.len());
+            arranged.splice(at..at, chars);
         }
         if let Some(dict) = &self.symbol_dict {
             arranged = dict.insert(reading, arranged);
@@ -2748,6 +3063,7 @@ impl EngineBridge {
         let mut actions = Vec::new();
         match &self.phase {
             Phase::Empty => return not_consumed(),
+            Phase::Converting { seg: Some(_), .. } => return self.convert_segment_to(form),
             Phase::Alphabet { buffer } => {
                 // the typed letters become the composition
                 let buffer = buffer.clone();
@@ -2795,6 +3111,50 @@ impl EngineBridge {
         consumed(actions)
     }
 
+    /// F6–F10 while editing segments: the focused segment only, in `form`
+    /// (its letters read as romaji for the kana forms, its kana spelled as
+    /// romaji for the alphanumeric ones), the others as they are. The text
+    /// becomes the segment's choice, so ← / → go on editing; F9 / F10
+    /// again cycle the case. The segments' readings stay as typed.
+    fn convert_segment_to(&mut self, form: Form) -> KeyOutcome {
+        let Some(s) = self.segmented() else {
+            return consumed(Vec::new());
+        };
+        let k = s.focus;
+        let reading = s.reading_of(k);
+        let shown = s.text_of(k);
+        let kana =
+            crate::composing_text::romaji_to_kana(&reading).unwrap_or_else(|| reading.clone());
+        let romaji = char_forms::romaji_of(&reading);
+        let case = match &self.seg_form {
+            Some((at, f, case, text)) if *at == k && *f == form && *text == shown => {
+                if form.cycles_case() {
+                    case + 1
+                } else {
+                    *case
+                }
+            }
+            _ => 0,
+        };
+        let text = char_forms::convert(form, &kana, &romaji, case);
+        if text.is_empty() {
+            return consumed(Vec::new());
+        }
+        if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
+            let f = &mut s.segs[k];
+            f.selected = match f.cands.iter().position(|c| *c == text) {
+                Some(i) => i,
+                None => {
+                    f.cands.push(text.clone());
+                    f.cands.len() - 1
+                }
+            };
+            f.advance = false;
+        }
+        self.seg_form = Some((k, form, case, text));
+        consumed(self.segment_actions())
+    }
+
     /// The candidates of the whole reading the screen holds: the typing
     /// phase's, or the open list's when it is not provisional.
     fn current_list(&self) -> Vec<String> {
@@ -2810,11 +3170,16 @@ impl EngineBridge {
     /// Leave Converting for typing, keeping the reading's candidates (Enter
     /// then commits the conversion the preedit shows).
     fn back_to_composing(&mut self) {
-        // the predictions are no conversion of what is typed
-        let predicted = self.prediction.take().is_some();
+        // the predictions are no conversion of what is typed, nor are the
+        // words of letters typed
+        let predicted = self.prediction.take().is_some() | std::mem::take(&mut self.covers_typed);
+        if predicted {
+            self.list_reading.clear();
+        }
+        self.seg_form = None;
         let mut list = match self.form_shown() {
+            _ if predicted => Vec::new(),
             Some(f) => f.list.clone(),
-            None if predicted => Vec::new(),
             None => self.current_list(),
         };
         // typing shows (and Enter commits) the engine's conversion; the
@@ -3149,6 +3514,8 @@ impl EngineBridge {
     }
 
     fn dispatch_live_inner(&mut self, force: bool) -> Vec<String> {
+        // the input changed or is converted: the kana Escape showed go
+        self.kana_shown = false;
         let hira = if force {
             self.composing.commit_reading()
         } else {
@@ -3232,6 +3599,12 @@ impl EngineBridge {
         }
         let cached_r = &self.cached_prefix_reading;
         let cached_k = &self.cached_prefix_kanji;
+        // a shortcut word stands for its whole reading only
+        if let Some(word) = self.cached_shortcut.as_ref() {
+            if hira == cached_r.as_str() {
+                return format!("{word}{pending}");
+            }
+        }
         if !cached_r.is_empty() && !cached_k.is_empty() {
             let common = cached_r
                 .chars()
@@ -3249,6 +3622,30 @@ impl EngineBridge {
         }
         // nothing converted yet: as typed (けっこn)
         format!("{hira}{pending}")
+    }
+
+    /// Cache the top of `list` as the conversion of `reading` shown while
+    /// typing. A shortcut word of the user dictionary (短縮よみ: an address
+    /// for じゅうしょ) is for the whole reading only: it is shown while the
+    /// reading is that one, and the first other candidate stands for the
+    /// reading as the start of a longer one, so the word does not stay on
+    /// screen before the kana typed after it.
+    fn cache_conversion(&mut self, reading: &str, list: &[String]) {
+        let dict = self.user_dict();
+        let shortcut = |c: &String| dict.as_ref().is_some_and(|d| d.is_shortcut(reading, c));
+        let top = list.first().cloned().unwrap_or_default();
+        self.cached_prefix_reading = reading.to_string();
+        if shortcut(&top) {
+            self.cached_prefix_kanji = list
+                .iter()
+                .find(|c| !shortcut(c))
+                .cloned()
+                .unwrap_or_else(|| reading.to_string());
+            self.cached_shortcut = Some(top);
+        } else {
+            self.cached_prefix_kanji = top;
+            self.cached_shortcut = None;
+        }
     }
 
     fn invalidate_engine_results(&mut self) {
@@ -3284,7 +3681,7 @@ impl EngineBridge {
 
     fn with_pending(&self, mut text: String) -> String {
         // a prediction covers what is still being typed
-        if self.form_shown().is_none() && self.prediction.is_none() {
+        if self.form_shown().is_none() && self.prediction.is_none() && !self.covers_typed {
             text.push_str(self.composing.pending_romaji());
         }
         text
@@ -3350,13 +3747,17 @@ impl EngineBridge {
             self.deferred = Some(d);
             return Vec::new();
         }
-        if !matches!(self.phase, Phase::Composing { .. })
-            || self.composing.live_reading() != d.reading
-        {
-            return Vec::new();
-        }
-        self.cached_prefix_reading = d.reading;
-        self.cached_prefix_kanji = d.top;
+        let list = match &self.phase {
+            Phase::Composing { candidates } if self.composing.live_reading() == d.reading => {
+                if candidates.first() == Some(&d.top) {
+                    candidates.clone()
+                } else {
+                    vec![d.top]
+                }
+            }
+            _ => return Vec::new(),
+        };
+        self.cache_conversion(&d.reading, &list);
         vec![Action::UpdatePreedit {
             text: self.live_preedit(),
         }]
@@ -3442,7 +3843,8 @@ impl EngineBridge {
             None if !self.list_reading.is_empty() && seg.is_none() => self.list_reading.clone(),
             None => self.composing.full_reading(),
         };
-        let tail = if self.form_shown().is_none() && prediction.is_none() {
+        let covers_typed = std::mem::take(&mut self.covers_typed);
+        let tail = if self.form_shown().is_none() && prediction.is_none() && !covers_typed {
             self.composing.commit_tail()
         } else {
             // a prediction covers what was still being typed
@@ -3460,6 +3862,8 @@ impl EngineBridge {
         self.cached_prefix_reading.clear();
         self.cached_prefix_kanji.clear();
         self.kept = None;
+        self.kana_shown = false;
+        self.seg_form = None;
         if !text.is_empty() {
             self.append_context(&text);
             vec![Action::Commit { text }]
@@ -3517,6 +3921,25 @@ fn not_consumed() -> KeyOutcome {
         consumed: false,
         actions: vec![],
     }
+}
+
+/// A segment's candidates `cands` with, for a reading of letters (an
+/// English word of mixed input), the hiragana and katakana of the letters
+/// read as romaji (`yoro`: よろ, ヨロ) after them: a word taken for English
+/// converts by the segment too, as F6 / F7 convert the whole input.
+fn with_romaji_kana(reading: &str, mut cands: Vec<String>) -> Vec<String> {
+    if cands.is_empty() {
+        return cands;
+    }
+    if let Some(kana) = crate::composing_text::romaji_to_kana(reading) {
+        let katakana = crate::kana_candidates::to_katakana(&kana);
+        for form in [kana, katakana] {
+            if !cands.contains(&form) {
+                cands.push(form);
+            }
+        }
+    }
+    cands
 }
 
 /// Split each run of chars `starts` places at one reading char (a kanji
@@ -3923,6 +4346,7 @@ mod tests {
     #[test]
     fn escape_leaves_the_rewrite_out_of_typing() {
         let (mut bridge, _mock, rewriter) = rewriting_bridge();
+        bridge.escape_to_kana = false;
         bridge.handle_space();
         rewriter.answer(Ok("傘をさして"));
         bridge.apply_async_result();
@@ -4128,6 +4552,7 @@ mod tests {
         assert!(bridge.deferred_for().is_none());
         // none by the deadline: the engine's top
         bridge.handle_escape();
+        bridge.handle_escape();
         type_str(&mut bridge, "kasano");
         answer_scored(&mock, &["傘の", "笠の", "嵩の"], &[-1.0, -1.5, -4.0]);
         bridge.apply_async_result();
@@ -4308,6 +4733,7 @@ mod tests {
         );
         // Enter on a pending n commits the conversion with ん
         bridge.handle_escape();
+        bridge.handle_escape();
         type_str(&mut bridge, "kyouhan");
         mock.set_result("きょうはん", &["共犯"]);
         bridge.apply_async_result();
@@ -4454,6 +4880,32 @@ mod tests {
         type_str(&mut bridge, "desu");
         bridge.handle_punctuation("。");
         assert_eq!(commits(&bridge.handle_enter().actions), vec!["です。"]);
+    }
+
+    #[test]
+    fn mixed_input_types_the_symbols_in_the_width_chosen() {
+        let model = std::sync::Arc::new(crate::mixed::tests::model());
+        for (full, paren, question) in [(false, "(", "?"), (true, "（", "？")] {
+            let symbols =
+                crate::config::symbols_in_width(&crate::config::default_symbol_map(), full);
+            let (mut bridge, _mock) = bridge_with_mock();
+            bridge.set_mixed(
+                Some(model.clone()),
+                &symbols,
+                crate::mixed::Casing::default(),
+            );
+            // what the frontends hand over for the keys: the table's symbol
+            let typed = |c: char| crate::config::typed_symbol(c, false, &symbols);
+            type_str(&mut bridge, "desu");
+            bridge.handle_punctuation(&typed('('));
+            type_str(&mut bridge, "ka");
+            bridge.handle_punctuation(&typed('?'));
+            bridge.handle_punctuation(&typed('.'));
+            assert_eq!(
+                commits(&bridge.handle_enter().actions),
+                vec![format!("です{paren}か{question}。")]
+            );
+        }
     }
 
     #[test]
@@ -5126,6 +5578,7 @@ mod tests {
         assert!(job.scores[2] < -1.3);
         // off: the engine's order
         bridge.handle_escape();
+        bridge.handle_escape();
         bridge.set_ngram(&crate::config::NgramCfg::default());
         type_str(&mut bridge, "hakusi");
         bridge.handle_space();
@@ -5157,6 +5610,7 @@ mod tests {
         ));
         let text = "博士が来る。猫が白い。白紙に書く。".repeat(20);
         std::fs::write(&path, crate::char_ngram::tests::table(&text)).unwrap();
+        bridge.handle_escape();
         bridge.handle_escape();
         bridge.set_ngram(&crate::config::NgramCfg {
             table: Some(path.to_string_lossy().into_owned()),
@@ -5802,6 +6256,68 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_words_are_listed_with_the_mixed_input_model_loaded() {
+        // the installer loads the mixed-input model by default: a reading
+        // with no English in it still gets the lexicon's words
+        let table = "研修\tけんしゅう\t9.4\tnoun\n検収\tけんしゅう\t14.6\tnoun\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-words-mixed-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+        let (mut bridge, mock) = mixed_bridge();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "kensyuu");
+        answer_scored(&mock, &["研修"], &[-0.5]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert!(list.contains(&"検収".to_string()), "{list:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reading_of_one_kana_lists_its_one_char_words() {
+        let mut table = String::from("亜\tあ\t12.7\tnoun\n亞\tあ\t16.7\tnoun\n");
+        // dearer than WORD_MARGIN above 亜, and a kanji the engine gave
+        // that costs more than MARGIN above it
+        for (w, cost) in [("阿", 23.0), ("吾", 23.5), ("唖", 24.0), ("我", 30.0)] {
+            table.push_str(&format!("{w}\tあ\t{cost}\tnoun\n"));
+        }
+        table.push_str("娃\tあ\t40.0\tnoun\na\tあ\t26.0\tnoun\n");
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-chars-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(&table, None).unwrap()).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "a");
+        bridge.handle_space();
+        answer_scored(&mock, &["亜", "娃"], &[-0.5, -1.0]);
+        let list = bridge
+            .apply_async_result()
+            .iter()
+            .find_map(|a| match a {
+                Action::ShowCandidates { list, .. } => Some(list.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // 娃 is a word of あ and stays though it costs more than MARGIN over
+        // 亜; 亞 is in WORD_MARGIN (`word_candidates`), the other words come
+        // after it cheapest first, a Latin letter not
+        assert_eq!(
+            list,
+            ["亜", "あ", "ア", "娃", "亞", "阿", "吾", "唖", "我"],
+            "{list:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn a_homophone_of_a_word_in_the_engines_top_is_listed() {
         let table = "研修\tけんしゅう\t9.4\tnoun\n検収\tけんしゅう\t14.6\tnoun\n\
                      担当\tたんとう\t8.0\tnoun\n者\tしゃ\t5.0\tsuff\n";
@@ -5974,11 +6490,12 @@ mod tests {
         })
     }
 
-    /// `kasano` typed and converted, with `n` candidates (傘の, 笠の, …).
+    /// `kasano` typed and converted, with `n` candidates (候補No1, …: a
+    /// digit by a Latin letter, which `drop_misread_digits` leaves).
     fn converting_many(n: usize) -> (EngineBridge, MockClient) {
         let (mut bridge, mock) = bridge_with_mock();
         type_str(&mut bridge, "kasano");
-        let cands: Vec<String> = (0..n).map(|i| format!("候補{}", i + 1)).collect();
+        let cands: Vec<String> = (0..n).map(|i| format!("候補No{}", i + 1)).collect();
         let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
         mock.set_result("かさの", &refs);
         bridge.apply_async_result();
@@ -6024,9 +6541,9 @@ mod tests {
         mock.set_result("かさの", &["傘の", "笠の"]);
         bridge.apply_async_result();
         bridge.handle_convert_to(Form::Katakana);
-        // Escape: back to typing, the conversion still what Enter commits
+        // Escape: back to typing, the kana typed shown
         let out = bridge.handle_escape();
-        assert_eq!(preedit(&out.actions).as_deref(), Some("傘の"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("かさの"));
         bridge.handle_convert_to(Form::Katakana);
         // Space: the usual candidate window
         let out = bridge.handle_space();
@@ -6034,6 +6551,17 @@ mod tests {
             a,
             Action::ShowCandidates { list, .. } if list[0] == "傘の"
         )));
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘の"]);
+        // escape_to_kana off: Escape goes back to the conversion, still what
+        // Enter commits
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.escape_to_kana = false;
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        bridge.handle_convert_to(Form::Katakana);
+        let out = bridge.handle_escape();
+        assert_eq!(preedit(&out.actions).as_deref(), Some("傘の"));
         assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘の"]);
     }
 
@@ -6051,14 +6579,14 @@ mod tests {
         let (mut bridge, _mock) = converting_many(15);
         // off by default: a digit commits and starts typing
         let out = bridge.handle_char('2');
-        assert_eq!(commits(&out.actions), vec!["候補1"]);
+        assert_eq!(commits(&out.actions), vec!["候補No1"]);
         bridge.handle_escape();
 
         let (mut bridge, _mock) = converting_many(15);
         bridge.set_candidate_paging(9, true);
         // the reading and its katakana are 3rd and 4th
         let out = bridge.handle_char('5');
-        assert_eq!(commits(&out.actions), vec!["候補3"]);
+        assert_eq!(commits(&out.actions), vec!["候補No3"]);
         assert!(!bridge.is_active());
 
         // on the second page, 1 is the page's first
@@ -6066,7 +6594,7 @@ mod tests {
         bridge.set_candidate_paging(9, true);
         bridge.handle_page_down();
         let out = bridge.handle_char('1');
-        assert_eq!(commits(&out.actions), vec!["候補8"]);
+        assert_eq!(commits(&out.actions), vec!["候補No8"]);
 
         // past the list: nothing
         let (mut bridge, _mock) = converting_many(3);
@@ -6082,25 +6610,25 @@ mod tests {
 
     #[test]
     fn page_keys_step_by_the_window_page() {
-        // 候補1, 候補2, かさの, カサノ, 候補3, …, 候補12: 14 candidates
+        // 候補No1, 候補No2, かさの, カサノ, 候補No3, …, 候補No12: 14 candidates
         let (mut bridge, _mock) = converting_many(12);
         bridge.set_candidate_paging(5, false);
         bridge.handle_down();
         let out = bridge.handle_page_down();
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補5"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補No5"));
         // the last page is short: its last candidate
         bridge.handle_down();
         bridge.handle_down();
         bridge.handle_down();
         let out = bridge.handle_page_down();
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補12"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補No12"));
         // and it wraps
         let out = bridge.handle_page_down();
         assert_eq!(preedit(&out.actions).as_deref(), Some("カサノ"));
         let out = bridge.handle_home_end(true);
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補12"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補No12"));
         let out = bridge.handle_home_end(false);
-        assert_eq!(preedit(&out.actions).as_deref(), Some("候補1"));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("候補No1"));
     }
 
     #[test]
@@ -6212,6 +6740,349 @@ mod tests {
         let actions = bridge.apply_async_result();
         assert_eq!(preedit(&actions).as_deref(), Some("傘の"));
         assert!(bridge.suggestions().is_empty());
+    }
+
+    /// A fresh directory under the temp dir for a test's files.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("setsuna-bridge-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn ctrl_delete_on_a_prediction_forgets_it_not_the_learning() {
+        // the crash: 傘の下 learned over 笠の下 and predicted, Tab on かさの,
+        // Ctrl+Delete; the learned word 傘 made the learning's forget succeed
+        // and the one-prediction list was emptied, then indexed
+        let dir = temp_dir("forget-prediction");
+        let (mut bridge, mock) = bridge_with_mock();
+        let cfg = crate::config::LearningCfg::default();
+        bridge.set_learning(Some(Learning::at(dir.join("learning.jsonl"), &cfg)));
+        bridge.set_hidden(Some(crate::hidden::Hidden::at(dir.join("hidden.jsonl"))));
+        bridge.set_predictor(Some(crate::predict::Predictor::at(
+            dir.join("prediction.jsonl"),
+        )));
+        let convert = |bridge: &mut EngineBridge| {
+            type_str(bridge, "kasanoshita");
+            mock.set_result("かさのした", &["笠の下", "傘の下"]);
+            bridge.apply_async_result();
+            bridge.handle_space()
+        };
+        for _ in 0..2 {
+            let (list, _) = shown(&convert(&mut bridge).actions).unwrap();
+            for _ in 0..list.iter().position(|c| c == "傘の下").unwrap() {
+                bridge.handle_down();
+            }
+            assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘の下"]);
+        }
+        type_str(&mut bridge, "kasano");
+        let out = bridge.handle_tab(false);
+        assert_eq!(shown(&out.actions).unwrap().0, v(&["傘の下"]));
+        let out = bridge.handle_forget_candidate();
+        assert!(out.consumed);
+        assert!(out.actions.contains(&Action::HideCandidates));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("かさの"));
+        assert!(!bridge.is_converting() && bridge.is_active());
+        // predicted no more, here and in a new predictor of the file
+        assert!(bridge.predictions().is_empty());
+        let mut again = crate::predict::Predictor::at(dir.join("prediction.jsonl"));
+        assert!(again.complete("かさの", "", 3).is_empty());
+        // the learning and the hidden candidates are as they were
+        assert!(!dir.join("hidden.jsonl").exists());
+        bridge.handle_escape();
+        let (list, _) = shown(&convert(&mut bridge).actions).unwrap();
+        assert_eq!(list[0], "傘の下");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_delete_keeps_a_lists_last_candidate_learned_or_not() {
+        let dir = temp_dir("forget-one");
+        let (mut bridge, _mock) = bridge_with_mock();
+        let cfg = crate::config::LearningCfg::default();
+        let mut learning = Learning::at(dir.join("learning.jsonl"), &cfg);
+        learning.record("かさの", "傘の", "笠の").unwrap();
+        bridge.set_learning(Some(learning));
+        bridge.set_hidden(Some(crate::hidden::Hidden::at(dir.join("hidden.jsonl"))));
+        type_str(&mut bridge, "kasano");
+        let one = |bridge: &mut EngineBridge, text: &str| {
+            bridge.list_reading = "かさの".into();
+            bridge.phase = Phase::Converting {
+                candidates: v(&[text]),
+                selected: 0,
+                seg: None,
+            };
+        };
+        // learned: the learning goes, the candidate stays shown
+        one(&mut bridge, "傘の");
+        let out = bridge.handle_forget_candidate();
+        assert_eq!(status(&out.actions), Some("学習を取り消しました"));
+        assert!(bridge.is_converting());
+        assert_eq!(bridge.current_list(), v(&["傘の"]));
+        // not learned: it cannot go
+        one(&mut bridge, "笠の");
+        let out = bridge.handle_forget_candidate();
+        assert_eq!(status(&out.actions), Some("この候補は消せません"));
+        assert_eq!(bridge.current_list(), v(&["笠の"]));
+        assert!(!dir.join("hidden.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escape_shows_the_kana_then_clears() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        // the conversion shown: the kana typed
+        let out = bridge.handle_escape();
+        assert_eq!(
+            out.actions,
+            vec![Action::UpdatePreedit {
+                text: "かさの".into()
+            }]
+        );
+        assert!(bridge.is_active());
+        // a late result does not bring the conversion back
+        mock.set_result("かさの", &["傘の"]);
+        assert!(bridge.apply_async_result().is_empty());
+        // Escape again clears
+        assert_eq!(bridge.handle_escape().actions, vec![Action::EndComposition]);
+        assert!(!bridge.is_active());
+
+        // Enter on the kana commits the kana
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        bridge.handle_escape();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["かさの"]);
+
+        // Space converts again, at once
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        bridge.handle_escape();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "傘の");
+        // from the candidate window: the kana, then cleared
+        let out = bridge.handle_escape();
+        assert!(out.actions.contains(&Action::HideCandidates));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("かさの"));
+        assert_eq!(bridge.handle_escape().actions, vec![Action::EndComposition]);
+
+        // typing on converts again
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        bridge.handle_escape();
+        type_str(&mut bridge, "de");
+        mock.set_result("かさので", &["傘ので"]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("傘ので")
+        );
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘ので"]);
+
+        // the kana shown already: one Escape clears
+        type_str(&mut bridge, "ka");
+        assert_eq!(bridge.handle_escape().actions, vec![Action::EndComposition]);
+    }
+
+    #[test]
+    fn the_app_ending_the_composition_drops_it_whole() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の"]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        let actions = bridge.cancel();
+        assert_eq!(
+            actions,
+            vec![Action::HideCandidates, Action::EndComposition]
+        );
+        assert!(!bridge.is_active());
+        assert!(bridge.cancel().is_empty());
+    }
+
+    #[test]
+    fn space_on_letters_the_user_dictionary_reads_lists_its_words() {
+        let (entries, skipped) =
+            crate::user_dict::parse("w\t(笑)\t名詞\nｗ\t（ｗ）\t名詞\nわ\t輪\t名詞\n");
+        assert!(skipped.is_empty());
+        let dict = || Some(crate::user_dict::UserDict::new(&entries));
+        // romaji input: w is pending romaji, no kana
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_user_dict(dict());
+        bridge.handle_char('w');
+        let out = bridge.handle_space();
+        assert_eq!(shown(&out.actions).unwrap().0, v(&["(笑)", "（ｗ）", "w"]));
+        assert_eq!(preedit(&out.actions).as_deref(), Some("(笑)"));
+        // nothing typed is left after it
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["(笑)"]);
+        assert!(!bridge.is_active());
+        // the input as typed is offered too
+        bridge.handle_char('w');
+        bridge.handle_space();
+        bridge.handle_down();
+        bridge.handle_down();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["w"]);
+        // a reading of one kana still converts as one
+        type_str(&mut bridge, "wa");
+        bridge.handle_space();
+        mock.set_result("わ", &["わ", "和"]);
+        let (list, _) = shown(&bridge.apply_async_result()).unwrap();
+        assert_eq!(list[0], "輪");
+        bridge.handle_escape();
+        bridge.handle_escape();
+        // letters it has no reading for: as before
+        bridge.handle_char('x');
+        assert_eq!(commits(&bridge.handle_space().actions), vec!["x"]);
+
+        // mixed input: no space typed after it
+        let (mut bridge, _mock) = mixed_bridge();
+        bridge.set_user_dict(dict());
+        bridge.handle_char('w');
+        let out = bridge.handle_space();
+        assert!(bridge.is_converting());
+        assert_eq!(shown(&out.actions).unwrap().0[0], "(笑)");
+    }
+
+    #[test]
+    fn every_user_word_of_the_other_reading_is_offered() {
+        // yoro read as English (after an English sentence): the dictionary's
+        // ten words for よろ come with the reading every letter as romaji,
+        // past the five candidates that reading gives otherwise
+        let (mut bridge, mock) = mixed_bridge();
+        let words: Vec<String> = (0..10).map(|i| format!("語{i}")).collect();
+        let text: String = words.iter().map(|w| format!("よろ\t{w}\t名詞\n")).collect();
+        let (entries, _) = crate::user_dict::parse(&text);
+        bridge.set_user_dict(Some(crate::user_dict::UserDict::new(&entries)));
+        bridge.phase = Phase::Converting {
+            candidates: v(&["yoro"]),
+            selected: 0,
+            seg: None,
+        };
+        bridge.alt = Some(AltList {
+            reading: Some("よろ".into()),
+            req_id: Some(7),
+            candidates: Vec::new(),
+            main: v(&["yoro"]),
+            ends_english: false,
+            typed: "yoro".into(),
+            typed_early: false,
+            user_words: Vec::new(),
+        });
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id: 7,
+            reading: "よろ".into(),
+            candidates: v(&["余呂", "世路", "夜路", "四路", "代ろ", "与呂"]),
+            ..Default::default()
+        });
+        let (list, _) = shown(&bridge.apply_async_result()).unwrap();
+        for w in &words {
+            assert!(list.contains(w), "{w} not in {list:?}");
+        }
+        // they come first of the other reading's, right after the main top
+        assert_eq!(list[..4], v(&["yoro", "語0", "語1", "語2"])[..]);
+        // and the others are cut as before
+        let others = list
+            .iter()
+            .filter(|c| !words.contains(c) && *c != "yoro")
+            .count();
+        assert_eq!(others, ALT_MAX);
+    }
+
+    #[test]
+    fn a_shortcut_word_stays_out_of_the_preedit_of_a_longer_reading() {
+        let (mut bridge, mock) = bridge_with_mock();
+        let (entries, _) = crate::user_dict::parse("じゅうしょ\t東京都千代田区1-1\t短縮よみ\n");
+        bridge.set_user_dict(Some(crate::user_dict::UserDict::new(&entries)));
+        type_str(&mut bridge, "juusho");
+        mock.set_result("じゅうしょ", &["住所", "じゅうしょ"]);
+        // the whole reading shows it, and Enter would commit it
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("東京都千代田区1-1")
+        );
+        // typed on, the conversion before the kana is the model's, not it
+        // (while a letter is pending the reading is still its own)
+        bridge.handle_char('w');
+        assert_eq!(
+            preedit(&bridge.handle_char('o').actions).as_deref(),
+            Some("住所を")
+        );
+        // deleted back to it, it shows again
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).as_deref(),
+            Some("東京都千代田区1-1")
+        );
+        assert_eq!(
+            commits(&bridge.handle_enter().actions),
+            vec!["東京都千代田区1-1"]
+        );
+    }
+
+    /// `傘をyoro` converting, `yoro` the English of mixed input, cut at
+    /// the を: two segments, the first focused.
+    fn editing_an_english_segment() -> (EngineBridge, MockClient) {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.list_reading = "かさをyoro".into();
+        bridge
+            .list_starts
+            .insert("傘をyoro".into(), vec![0, 2, 3, 4, 5, 6]);
+        bridge.phase = Phase::Converting {
+            candidates: v(&["傘をyoro"]),
+            selected: 0,
+            seg: None,
+        };
+        let (texts, _) = segments_shown(&bridge.handle_move_cursor(1).actions);
+        assert_eq!(texts, v(&["傘を", "yoro"]));
+        (bridge, mock)
+    }
+
+    #[test]
+    fn an_english_segment_offers_its_letters_read_as_romaji() {
+        let (mut bridge, mock) = editing_an_english_segment();
+        let (list, _, _) = segment_list(&bridge.handle_move_cursor(1).actions);
+        assert_eq!(list, v(&["yoro", "よろ", "ヨロ"]));
+        // the first segment's conversion, then the English one's, then
+        // that of its letters as romaji
+        mock.answer_last(&["傘を", "笠を"]);
+        bridge.apply_async_result();
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "yoro");
+        mock.answer_last(&["yoro"]);
+        bridge.apply_async_result();
+        let (context, reading) = mock.answer_last(&["余呂", "よろ"]);
+        assert_eq!((context.as_str(), reading.as_str()), ("傘を", "よろ"));
+        let (list, selected, _) = segment_list(&bridge.apply_async_result());
+        assert_eq!(list, v(&["yoro", "よろ", "ヨロ", "余呂"]));
+        assert_eq!(selected, 0);
+        bridge.handle_down();
+        bridge.handle_down();
+        bridge.handle_down();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["傘を余呂"]);
+    }
+
+    #[test]
+    fn function_keys_convert_the_focused_segment_only() {
+        let (mut bridge, _mock) = editing_an_english_segment();
+        bridge.handle_move_cursor(1);
+        let out = bridge.handle_convert_to(Form::Katakana);
+        assert_eq!(segments_shown(&out.actions).0, v(&["傘を", "ヨロ"]));
+        assert!(bridge.is_converting());
+        // F10 again and again cycles the case
+        let out = bridge.handle_convert_to(Form::HalfAlnum);
+        assert_eq!(segments_shown(&out.actions).0, v(&["傘を", "yoro"]));
+        let out = bridge.handle_convert_to(Form::HalfAlnum);
+        assert_eq!(segments_shown(&out.actions).0, v(&["傘を", "YORO"]));
+        // the other segment by its kana and romaji
+        bridge.handle_move_cursor(-1);
+        let out = bridge.handle_convert_to(Form::FullAlnum);
+        assert_eq!(segments_shown(&out.actions).0, v(&["ｋａｓａｗｏ", "YORO"]));
+        let out = bridge.handle_convert_to(Form::Hiragana);
+        assert_eq!(segments_shown(&out.actions).0, v(&["かさを", "YORO"]));
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["かさをYORO"]);
     }
 
     #[test]

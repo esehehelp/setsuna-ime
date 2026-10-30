@@ -3,14 +3,14 @@
 //! Records every call into a `Vec<NoopEvent>` so tests can assert
 //! show/hide ordering without touching Win32.
 
-use super::{CandidateUi, ScreenPos};
+use super::{Anchor, CandidateUi};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoopEvent {
     Show {
         candidates: Vec<String>,
         selected: usize,
-        anchor: ScreenPos,
+        anchor: Anchor,
     },
     Hide,
 }
@@ -28,7 +28,7 @@ impl NoopUi {
 }
 
 impl CandidateUi for NoopUi {
-    fn show(&mut self, candidates: &[String], selected: usize, anchor: ScreenPos) {
+    fn show(&mut self, candidates: &[String], selected: usize, anchor: Anchor) {
         self.events.push(NoopEvent::Show {
             candidates: candidates.to_vec(),
             selected,
@@ -50,12 +50,20 @@ impl CandidateUi for NoopUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement::Rect;
+
+    const CARET: Rect = Rect {
+        left: 10,
+        top: 20,
+        right: 12,
+        bottom: 40,
+    };
 
     #[test]
     fn noop_records_show_hide() {
         let mut ui = NoopUi::default();
         assert!(!ui.is_visible());
-        ui.show(&["a".into(), "b".into()], 0, ScreenPos { x: 10, y: 20 });
+        ui.show(&["a".into(), "b".into()], 0, Some(CARET));
         assert!(ui.is_visible());
         ui.hide();
         assert!(!ui.is_visible());
@@ -65,7 +73,7 @@ mod tests {
                 NoopEvent::Show {
                     candidates: vec!["a".into(), "b".into()],
                     selected: 0,
-                    anchor: ScreenPos { x: 10, y: 20 },
+                    anchor: Some(CARET),
                 },
                 NoopEvent::Hide,
             ]

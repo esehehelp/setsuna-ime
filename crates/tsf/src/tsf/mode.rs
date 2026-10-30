@@ -33,6 +33,10 @@ pub(crate) struct ModeState {
     pub on: Cell<bool>,
     /// Rewriting is on (`[rewriter] enabled`), shown while the IME is.
     pub rewrite: Cell<bool>,
+    /// There is a conversion engine: without one (no model, or a Store
+    /// app's sandbox with no shared engine to reach) the tooltip says the
+    /// IME types kana only.
+    pub converts: Cell<bool>,
     sink: RefCell<Option<ITfLangBarItemSink>>,
     /// A click on the item: the service toggles the mode.
     on_click: Box<dyn Fn()>,
@@ -43,6 +47,7 @@ impl ModeState {
         Rc::new(Self {
             on: Cell::new(on),
             rewrite: Cell::new(false),
+            converts: Cell::new(true),
             sink: RefCell::new(None),
             on_click,
         })
@@ -134,8 +139,8 @@ fn show_menu(pt: POINT) {
     }
 }
 
-/// Start the settings GUI. It edits `config.toml`, which the IME reads at
-/// its next activation.
+/// Start the settings GUI. It edits `config.toml`, which the IME reads
+/// again when the next input starts.
 fn open_settings() {
     let Some(exe) = crate::globals::dll_dir().map(|d| d.join(SETTINGS_EXE)) else {
         return;
@@ -177,6 +182,7 @@ impl ITfLangBarItem_Impl for ModeItem_Impl {
     fn GetTooltipString(&self) -> Result<BSTR> {
         Ok(BSTR::from(match self.state.glyph() {
             "A" => "直接入力 (半角/全角 でひらがな)",
+            _ if !self.state.converts.get() => "ひらがな・変換エンジンなし (半角/全角 で直接入力)",
             "直" => "ひらがな・書き直し (半角/全角 で直接入力)",
             _ => "ひらがな (半角/全角 で直接入力)",
         }))
@@ -186,12 +192,14 @@ impl ITfLangBarItem_Impl for ModeItem_Impl {
 impl ITfLangBarItemButton_Impl for ModeItem_Impl {
     fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
         setsuna_core::diagnostics::log(format!("mode item click {}", click.0));
-        if click == TF_LBI_CLK_RIGHT {
-            show_menu(*pt);
-        } else {
-            (self.state.on_click)();
-        }
-        Ok(())
+        crate::guard::catch("mode item click", Err(E_FAIL.into()), || {
+            if click == TF_LBI_CLK_RIGHT {
+                show_menu(*pt);
+            } else {
+                (self.state.on_click)();
+            }
+            Ok(())
+        })
     }
 
     /// The menu for the old floating language bar; the taskbar's input

@@ -97,6 +97,14 @@ pub const WORD_MARGIN: f32 = 12.0;
 /// -> 98.31% (98.10% with the words at the end of the list); AJIMEE's 999:
 /// 98.40% -> 99.30%, first page 98.30% -> 99.00% (98.30%).
 pub const WORDS_AT: usize = 5;
+/// A reading of up to `CHAR_READING` kana lists up to `CHAR_WORDS` of the
+/// lexicon's one-char words for it (`char_words`), however dear, after the
+/// first page of the list (`CHAR_WORDS_AT`, the candidate window's 9): あ
+/// listed 亜 亞 阿 有 在 合 and its kana, where a dictionary IME lists some
+/// forty kanji (user 2026-10-30).
+pub const CHAR_READING: usize = 2;
+pub const CHAR_WORDS: usize = 50;
+pub const CHAR_WORDS_AT: usize = 9;
 
 const MAGIC: &[u8; 8] = b"LEXICON1";
 const VERSION: usize = 3;
@@ -529,6 +537,40 @@ impl Lexicon {
             .filter(|w| w.1 <= floor)
             .map(|(s, c)| (format!("{s}{rest}"), c))
             .collect()
+    }
+
+    /// The one-char words of a reading of one or two kana (`CHAR_READING`),
+    /// as a dictionary IME lists them: up to `CHAR_WORDS` of the lexicon's
+    /// surfaces of one char that is a kanji (whatever its class), read as
+    /// the whole reading, cheapest first, however dear (亜 亞 啞 痾 在 婀 有
+    /// 合 吾 唖 我 阿 for あ, where `word_candidates` keeps those up to
+    /// `WORD_MARGIN` over the cheapest). Empty for a longer reading.
+    pub fn char_words(&self, reading: &str) -> Vec<(String, f32)> {
+        let m = reading.chars().count();
+        if m == 0 || m > CHAR_READING || !reading.chars().all(is_kana) {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, f32)> = Vec::new();
+        self.reading_prefixes(reading, |len, surface, e| {
+            let mut chars = surface.chars();
+            // a kanji, of any class (Mozc's single kanji are symbols: 阿 for
+            // あ), not a symbol, a or 5 (the table has them for あ and い)
+            let one = matches!(
+                (chars.next(), chars.next()),
+                (Some(c), None) if c.is_alphabetic()
+                    && !c.is_ascii()
+                    && !is_kana(c)
+                    && !matches!(c, '\u{FF01}'..='\u{FF5E}')
+            );
+            if len == reading.len()
+                && one
+                && out.len() < CHAR_WORDS
+                && !out.iter().any(|(s, _)| s == surface)
+            {
+                out.push((surface.to_string(), e.cost));
+            }
+        });
+        out
     }
 
     /// Where each char of `text` (a run of kanji the engine placed as one,
@@ -1041,5 +1083,21 @@ mod tests {
         assert!(words("みこみっと").is_empty());
         assert!(words("ぞくがきまった").is_empty());
         assert!(words("ほげ").is_empty());
+    }
+
+    #[test]
+    fn a_reading_of_a_kana_or_two_lists_its_one_char_words() {
+        let table = "亜\tあ\t12.7\tnoun\n阿\tあ\t23.7\tsym\nあ\tあ\t10.9\tintj\n\
+                     a\tあ\t23.7\tnoun\n○\tまる\t9.0\tsym\n丸\tまる\t10.0\tnoun\n\
+                     円\tまる\t15.0\tnoun\n丸い\tまるい\t9.0\tadj\n";
+        let lex = Lexicon::from_table(table);
+        let chars =
+            |r: &str| -> Vec<String> { lex.char_words(r).into_iter().map(|(w, _)| w).collect() };
+        // however dear, kanji only (阿 of the symbols' class, as Mozc has
+        // single kanji): not the kana, a Latin letter or a symbol
+        assert_eq!(chars("あ"), ["亜", "阿"]);
+        assert_eq!(chars("まる"), ["丸", "円"]);
+        // three kana are a word's reading, not a char's
+        assert!(chars("まるい").is_empty());
     }
 }

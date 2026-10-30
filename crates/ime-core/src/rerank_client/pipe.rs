@@ -8,7 +8,9 @@
 //! handle (one request in flight at most). A pipe that broke (the server
 //! killed or gone) is connected again for the next request; failing that,
 //! reranking waits a while before trying again, never falling back to a child
-//! of its own.
+//! of its own. In an AppContainer it never starts the server either
+//! ([`PipeRerankClient::connect_only`]): one started there would run in the
+//! sandbox, out of the other apps' reach.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
@@ -39,6 +41,8 @@ struct Target {
     user: String,
     exe: PathBuf,
     args: Vec<OsString>,
+    /// Start the server when there is none (false: connect only).
+    start: bool,
 }
 
 pub struct PipeRerankClient {
@@ -56,6 +60,26 @@ impl PipeRerankClient {
         exe: &Path,
         notify: Notify,
         cfg: &crate::config::RerankCfg,
+    ) -> io::Result<Self> {
+        Self::open(manifest, exe, notify, cfg, true)
+    }
+
+    /// The client of a server some other app started, never starting one.
+    pub fn connect_only(
+        manifest: &Path,
+        exe: &Path,
+        notify: Notify,
+        cfg: &crate::config::RerankCfg,
+    ) -> io::Result<Self> {
+        Self::open(manifest, exe, notify, cfg, false)
+    }
+
+    fn open(
+        manifest: &Path,
+        exe: &Path,
+        notify: Notify,
+        cfg: &crate::config::RerankCfg,
+        start: bool,
     ) -> io::Result<Self> {
         let user = win::user_sid()?;
         let canonical = std::fs::canonicalize(manifest)?;
@@ -89,6 +113,7 @@ impl PipeRerankClient {
             user,
             exe: exe.to_path_buf(),
             args,
+            start,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -309,6 +334,8 @@ fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Opt
                 }
                 // it left before (exiting idle as we came): again
             }
+            // no server, and this client may not start one
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !target.start => return Err(e),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if !started {
                     let cwd = target.exe.parent();

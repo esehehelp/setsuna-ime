@@ -1,7 +1,7 @@
 //! `CandidateUi` adapter wrapping the in-process GDI `CandidateWindow`
 //! (`tsf/candidate_window.rs`), drawn as `[ui.candidate_window]` says.
 
-use super::{CandidateUi, ScreenPos};
+use super::{Anchor, CandidateUi};
 use crate::tsf::candidate_window::CandidateWindow;
 
 /// In-process GDI candidate popup. Owns a `CandidateWindow` and tracks
@@ -26,11 +26,12 @@ impl GdiCandidateUi {
 }
 
 impl CandidateUi for GdiCandidateUi {
-    fn show(&mut self, candidates: &[String], selected: usize, anchor: ScreenPos) {
-        self.inner.show(candidates, selected);
-        if anchor != ScreenPos::default() {
-            self.inner.move_to(anchor.x, anchor.y);
+    fn show(&mut self, candidates: &[String], selected: usize, anchor: Anchor) {
+        // placed by its new size before it is shown: no flash where it was
+        if let Some(caret) = anchor {
+            self.inner.set_anchor(caret);
         }
+        self.inner.show(candidates, selected);
         self.visible = true;
         self.suggesting = false;
     }
@@ -42,11 +43,11 @@ impl CandidateUi for GdiCandidateUi {
         self.suggesting = false;
     }
 
-    fn show_suggestions(&mut self, list: &[String], anchor: ScreenPos) {
-        self.inner.show_suggestions(list);
-        if anchor != ScreenPos::default() {
-            self.inner.move_to(anchor.x, anchor.y);
+    fn show_suggestions(&mut self, list: &[String], anchor: Anchor) {
+        if let Some(caret) = anchor {
+            self.inner.set_anchor(caret);
         }
+        self.inner.show_suggestions(list);
         self.visible = true;
         self.suggesting = true;
     }

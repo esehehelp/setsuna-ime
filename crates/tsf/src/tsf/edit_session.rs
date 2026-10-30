@@ -5,13 +5,14 @@
 //! EndComposition during DoEditSession propagates back to the service after
 //! the synchronous call returns.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use windows::core::*;
-use windows::Win32::Foundation::FALSE;
+use windows::Win32::Foundation::{E_FAIL, FALSE};
 use windows::Win32::UI::TextServices::*;
 
+use crate::tsf::text_input_processor::SetsunaTextService_Impl;
 use setsuna_core::engine_bridge::Action;
 
 #[implement(ITfEditSession)]
@@ -25,6 +26,9 @@ pub struct ActionEditSession {
     /// Where the caret goes in a typing preedit, as a char offset; `None`
     /// for the end.
     caret: Option<usize>,
+    /// Set when the session panicked (the composition is then ended where
+    /// it stood): the caller drops what the engine was composing too.
+    pub(crate) panicked: Rc<Cell<bool>>,
 }
 
 impl ActionEditSession {
@@ -45,12 +49,24 @@ impl ActionEditSession {
             atom_input,
             atom_converted,
             caret,
+            panicked: Rc::new(Cell::new(false)),
         }
     }
 }
 
 impl ITfEditSession_Impl for ActionEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        crate::guard::run("DoEditSession", || self.apply(ec)).unwrap_or_else(|| {
+            // end the composition as it stands, with the cookie in hand
+            self.panicked.set(true);
+            let _ = crate::guard::run("end composition", || self.end_composition(ec));
+            Err(E_FAIL.into())
+        })
+    }
+}
+
+impl ActionEditSession {
+    fn apply(&self, ec: u32) -> Result<()> {
         for action in &self.actions {
             match action {
                 Action::UpdatePreedit { text } => {
@@ -75,9 +91,7 @@ impl ITfEditSession_Impl for ActionEditSession_Impl {
         }
         Ok(())
     }
-}
 
-impl ActionEditSession {
     fn ensure_composition(&self, ec: u32) -> Result<()> {
         let mut comp = self.composition.borrow_mut();
         if comp.is_some() {
@@ -94,7 +108,9 @@ impl ActionEditSession {
     }
 
     fn end_composition(&self, ec: u32) -> Result<()> {
-        let mut comp = self.composition.borrow_mut();
+        let Ok(mut comp) = self.composition.try_borrow_mut() else {
+            return Ok(());
+        };
         if let Some(composition) = comp.take() {
             unsafe {
                 composition.EndComposition(ec)?;
@@ -256,4 +272,30 @@ impl ActionEditSession {
         }
         self.end_composition(ec)
     }
+}
+
+/// End `composition` where it stands, its text left in the document (the
+/// service dropped what it was composing after a panic).
+pub(crate) fn end_composition(
+    service: &SetsunaTextService_Impl,
+    context: &ITfContext,
+    composition: ITfComposition,
+) {
+    #[implement(ITfEditSession)]
+    struct End(ITfComposition);
+    impl ITfEditSession_Impl for End_Impl {
+        fn DoEditSession(&self, ec: u32) -> Result<()> {
+            crate::guard::catch("end composition", Err(E_FAIL.into()), || unsafe {
+                self.0.EndComposition(ec)
+            })
+        }
+    }
+    let client_id = match service.inner.try_borrow() {
+        Ok(inner) => inner.client_id,
+        Err(_) => return,
+    };
+    let session: ITfEditSession = End(composition).into();
+    let hr =
+        unsafe { context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READWRITE) };
+    setsuna_core::diagnostics::log(format!("composition ended after a panic: {hr:?}"));
 }

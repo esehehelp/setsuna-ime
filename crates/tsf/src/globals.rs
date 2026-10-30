@@ -59,11 +59,22 @@ pub const GUID_TFCAT_TIPCAP_SECUREMODE: GUID =
 pub const GUID_TFCAT_TIPCAP_UIELEMENTENABLED: GUID =
     GUID::from_u128(0x49D2_F9CF_1F5E_11D7_A6D3_0006_5B84_435C);
 
-/// PreservedKey GUID for the Hankaku/Zenkaku (IME on/off) toggle.
+/// PreservedKey GUID of the keys that turn the IME on or off
+/// (`[frontend] toggle_keys`: Hankaku/Zenkaku by default).
 /// `{6B41F5FA-4378-4730-BC12-F0B5C9F885EB}`
 #[cfg(target_os = "windows")]
 pub const GUID_PRESERVED_KEY_ONOFF: GUID =
     GUID::from_u128(0x6b41_f5fa_4378_4730_bc12_f0b5_c9f8_85eb);
+
+/// PreservedKey GUID of the keys that turn it on (`on_keys`).
+/// `{FF3722C7-22B6-403D-B433-BAA71BEDD731}`
+#[cfg(target_os = "windows")]
+pub const GUID_PRESERVED_KEY_ON: GUID = GUID::from_u128(0xff37_22c7_22b6_403d_b433_baa7_1bed_d731);
+
+/// PreservedKey GUID of the keys that turn it off (`off_keys`).
+/// `{AED35535-08E0-4408-A5A6-6AD68539A015}`
+#[cfg(target_os = "windows")]
+pub const GUID_PRESERVED_KEY_OFF: GUID = GUID::from_u128(0xaed3_5535_08e0_4408_a5a6_6ad6_8539_a015);
 
 /// Japanese LANGID (0x0411).
 pub const LANGID_JAPANESE: u16 = 0x0411;
@@ -119,6 +130,13 @@ pub const WM_APP_CANDIDATE_CLICK: u32 = 0x8000 + 2;
 /// the IME on or off.
 #[cfg(target_os = "windows")]
 pub const WM_APP_TOGGLE: u32 = 0x8000 + 3;
+
+/// Posted to the same window when the input scopes of the field that took
+/// the focus were read: `wparam` bit 0 is set for a field that starts with
+/// the IME off (a URL, a number, a password), bit 1 for one the user turned
+/// the IME on or off in before.
+#[cfg(target_os = "windows")]
+pub const WM_APP_FIELD: u32 = 0x8000 + 4;
 
 /// Directory the loaded TSF DLL lives in: where the engine and models are
 /// looked for last.

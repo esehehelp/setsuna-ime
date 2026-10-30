@@ -11,20 +11,31 @@ use windows::Win32::UI::TextServices::*;
 use crate::tsf::text_input_processor::SetsunaTextService_Impl;
 
 impl ITfCompositionSink_Impl for SetsunaTextService_Impl {
+    /// The app ended the composition (a click elsewhere, its own commit):
+    /// what was shown stays in its text. The engine drops what it was
+    /// composing, and the candidate window goes with it.
     fn OnCompositionTerminated(
         &self,
         _ecwrite: u32,
         _pcomposition: Option<&ITfComposition>,
     ) -> Result<()> {
-        let mut inner = match self.inner.try_borrow_mut() {
-            Ok(inner) => inner,
-            Err(_) => {
-                tracing::debug!("OnCompositionTerminated: reentrant borrow, skipping");
-                return Ok(());
+        self.guarded("OnCompositionTerminated", None, Ok(()), || {
+            {
+                let mut inner = match self.inner.try_borrow_mut() {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        tracing::debug!("OnCompositionTerminated: reentrant borrow, skipping");
+                        return Ok(());
+                    }
+                };
+                // its actions (end the composition, hide the window) are
+                // done here: the composition is gone already
+                let _ = inner.engine.discard();
+                inner.composition = None;
+                inner.last_preedit.clear();
             }
-        };
-        inner.engine.handle_escape();
-        inner.composition = None;
-        Ok(())
+            self.hide_window();
+            Ok(())
+        })
     }
 }

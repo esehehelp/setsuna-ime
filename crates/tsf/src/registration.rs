@@ -1,10 +1,13 @@
 //! COM / TSF registration (adapted from karukan-tsf MIT/Apache-2.0).
 //!
 //! Sets up the registry entries TSF needs to discover the IME and grants the
-//! AppContainer ACL on the DLL so UWP hosts can load it. The category list
-//! matches karukan's (IMMERSIVESUPPORT / SYSTRAYSUPPORT / SECUREMODE /
+//! AppContainer ACL on the DLL so UWP hosts can load it (install.ps1 grants
+//! it on the whole install directory and on config.toml). The category list
+//! is karukan's (IMMERSIVESUPPORT / SYSTRAYSUPPORT / SECUREMODE /
 //! UIELEMENTENABLED) — omitting any of these caused key events to never
-//! reach us in modern apps.
+//! reach us in modern apps — and CorvusSKK's COMLESS and
+//! INPUTMODECOMPARTMENT, which the Start menu's search and other immersive
+//! hosts look for.
 
 #[cfg(target_os = "windows")]
 use windows::core::w;
@@ -152,6 +155,8 @@ pub fn register_server() -> windows::core::Result<()> {
             GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
             GUID_TFCAT_TIPCAP_SECUREMODE,
             GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+            GUID_TFCAT_TIPCAP_COMLESS,
+            GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
         ] {
             cat_mgr.RegisterCategory(
                 &CLSID_SETSUNA_TEXT_SERVICE,
@@ -199,6 +204,8 @@ pub fn unregister_server() -> windows::core::Result<()> {
                 GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
                 GUID_TFCAT_TIPCAP_SECUREMODE,
                 GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+                GUID_TFCAT_TIPCAP_COMLESS,
+                GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
             ] {
                 let _ = cat_mgr.UnregisterCategory(
                     &CLSID_SETSUNA_TEXT_SERVICE,
@@ -230,12 +237,16 @@ fn get_dll_path() -> windows::core::Result<String> {
     Ok(String::from_utf16_lossy(&buf[..len]))
 }
 
+/// Let AppContainers (ALL APPLICATION PACKAGES, S-1-15-2-1) and less
+/// privileged ones (ALL RESTRICTED APPLICATION PACKAGES, S-1-15-2-2) load
+/// the DLL.
 #[cfg(target_os = "windows")]
 fn set_appcontainer_acl(dll_path: &str) {
     match std::process::Command::new("icacls")
         .arg(dll_path)
         .arg("/grant")
         .arg("*S-1-15-2-1:(RX)")
+        .arg("*S-1-15-2-2:(RX)")
         .output()
     {
         Ok(output) if output.status.success() => {

@@ -760,6 +760,18 @@ fn convert_raw(raw: &str, flush_final_n: bool) -> Converted {
     out
 }
 
+/// `text` with every letter read as romaji, as `kana_reading` reads them
+/// (a final `n` as ん, the rest kept: 東京yoro → 東京よろ); `None` when a
+/// letter reads as no kana (`google` → ごおgぇ) or there is none.
+pub(crate) fn romaji_to_kana(text: &str) -> Option<String> {
+    if !text.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let converted = convert_raw(text, true);
+    let kana = converted.text + &converted.pending;
+    (!kana.chars().any(|c| c.is_ascii_alphabetic())).then_some(kana)
+}
+
 /// The kana romaji still being typed (`k`, `ky`, `n`) may become: the
 /// first kana of each table entry it starts, ん for `n`, っ for a lone
 /// consonant (doubled next).
@@ -1163,6 +1175,15 @@ mod tests {
     }
 
     // ---- commit must not drop un-converted romaji ----
+
+    #[test]
+    fn letters_read_as_romaji() {
+        assert_eq!(romaji_to_kana("yoro").as_deref(), Some("よろ"));
+        assert_eq!(romaji_to_kana("Yoron").as_deref(), Some("よろん"));
+        assert_eq!(romaji_to_kana("東京yoro").as_deref(), Some("東京よろ"));
+        assert_eq!(romaji_to_kana("google"), None);
+        assert_eq!(romaji_to_kana("かさ"), None);
+    }
 
     #[test]
     fn garbage_does_not_block_embedded_conversion() {

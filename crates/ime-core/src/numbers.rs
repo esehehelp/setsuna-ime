@@ -567,6 +567,266 @@ impl Parser<'_> {
     }
 }
 
+/// How a number is read where a reading ends: as it is said alone (いち,
+/// にじゅう), or in a form only a counter after it takes (いっ of いっかい, よ
+/// of よじ, ひと of ひとつ), with the kana the counter's reading may start
+/// with ("" for any).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Said {
+    Alone,
+    BeforeCounter(&'static str),
+}
+
+/// The kana a geminated number (いっ, はっ, じゅっ) goes before.
+const VOICELESS: &str = "かきくけこさしすせそたちつてとぱぴぷぺぽ";
+const GEMINATED: Said = Said::BeforeCounter(VOICELESS);
+/// よ (よじ, よねん, よにん), and し and く (しがつ, くじ).
+const YO: Said = Said::BeforeCounter("じねに");
+const SHI_KU: Said = Said::BeforeCounter("がじ");
+const NATIVE: Said = Said::BeforeCounter("");
+
+/// The ways a digit 1-9 is read in a number, and before a counter.
+fn ones(d: u64) -> &'static [(&'static str, Said)] {
+    match d {
+        1 => &[("いち", Said::Alone), ("いっ", GEMINATED)],
+        2 => &[("に", Said::Alone)],
+        3 => &[("さん", Said::Alone)],
+        4 => &[
+            ("よん", Said::Alone),
+            ("よっ", GEMINATED),
+            ("よ", YO),
+            ("し", SHI_KU),
+        ],
+        5 => &[("ご", Said::Alone)],
+        6 => &[("ろく", Said::Alone), ("ろっ", GEMINATED)],
+        7 => &[("なな", Said::Alone), ("しち", Said::Alone)],
+        8 => &[("はち", Said::Alone), ("はっ", GEMINATED)],
+        9 => &[("きゅう", Said::Alone), ("く", SHI_KU)],
+        _ => &[],
+    }
+}
+
+fn tens(d: u64) -> &'static [(&'static str, Said)] {
+    match d {
+        1 => &[
+            ("じゅう", Said::Alone),
+            ("じゅっ", GEMINATED),
+            ("じっ", GEMINATED),
+        ],
+        2 => &[
+            ("にじゅう", Said::Alone),
+            ("にじゅっ", GEMINATED),
+            ("にじっ", GEMINATED),
+        ],
+        3 => &[
+            ("さんじゅう", Said::Alone),
+            ("さんじゅっ", GEMINATED),
+            ("さんじっ", GEMINATED),
+        ],
+        4 => &[
+            ("よんじゅう", Said::Alone),
+            ("しじゅう", Said::Alone),
+            ("よんじゅっ", GEMINATED),
+            ("よんじっ", GEMINATED),
+        ],
+        5 => &[
+            ("ごじゅう", Said::Alone),
+            ("ごじゅっ", GEMINATED),
+            ("ごじっ", GEMINATED),
+        ],
+        6 => &[
+            ("ろくじゅう", Said::Alone),
+            ("ろくじゅっ", GEMINATED),
+            ("ろくじっ", GEMINATED),
+        ],
+        7 => &[
+            ("ななじゅう", Said::Alone),
+            ("しちじゅう", Said::Alone),
+            ("ななじゅっ", GEMINATED),
+            ("ななじっ", GEMINATED),
+        ],
+        8 => &[
+            ("はちじゅう", Said::Alone),
+            ("はちじゅっ", GEMINATED),
+            ("はちじっ", GEMINATED),
+        ],
+        9 => &[
+            ("きゅうじゅう", Said::Alone),
+            ("きゅうじゅっ", GEMINATED),
+            ("きゅうじっ", GEMINATED),
+        ],
+        _ => &[],
+    }
+}
+
+fn hundreds(d: u64) -> &'static [(&'static str, Said)] {
+    match d {
+        1 => &[("ひゃく", Said::Alone), ("ひゃっ", GEMINATED)],
+        2 => &[("にひゃく", Said::Alone)],
+        3 => &[("さんびゃく", Said::Alone)],
+        4 => &[("よんひゃく", Said::Alone)],
+        5 => &[("ごひゃく", Said::Alone)],
+        6 => &[("ろっぴゃく", Said::Alone)],
+        7 => &[("ななひゃく", Said::Alone)],
+        8 => &[("はっぴゃく", Said::Alone)],
+        9 => &[("きゅうひゃく", Said::Alone)],
+        _ => &[],
+    }
+}
+
+fn thousands(d: u64) -> &'static [(&'static str, Said)] {
+    match d {
+        1 => &[("せん", Said::Alone), ("いっせん", Said::Alone)],
+        2 => &[("にせん", Said::Alone)],
+        3 => &[("さんぜん", Said::Alone)],
+        4 => &[("よんせん", Said::Alone)],
+        5 => &[("ごせん", Said::Alone)],
+        6 => &[("ろくせん", Said::Alone)],
+        7 => &[("ななせん", Said::Alone)],
+        8 => &[("はっせん", Said::Alone)],
+        9 => &[("きゅうせん", Said::Alone)],
+        _ => &[],
+    }
+}
+
+/// The native readings, only said before a counter (ひとつ, ふたり, みっか,
+/// ついたち, はつか, はたち).
+fn native(n: u64) -> &'static [(&'static str, Said)] {
+    match n {
+        1 => &[("ひと", NATIVE), ("つい", NATIVE)],
+        2 => &[("ふた", NATIVE), ("ふつ", NATIVE)],
+        3 => &[("み", NATIVE), ("みっ", GEMINATED)],
+        5 => &[("いつ", NATIVE)],
+        6 => &[("む", NATIVE), ("むい", NATIVE), ("むっ", GEMINATED)],
+        7 => &[("なの", NATIVE)],
+        8 => &[("や", NATIVE), ("よう", NATIVE), ("やっ", GEMINATED)],
+        9 => &[("ここの", NATIVE)],
+        10 => &[("とお", NATIVE), ("と", NATIVE)],
+        20 => &[("はつ", NATIVE), ("はた", NATIVE)],
+        _ => &[],
+    }
+}
+
+/// A digit read alone, as in a phone number (ぜろいちにぜろ).
+fn digit_alone(d: u32) -> &'static [&'static str] {
+    match d {
+        0 => &["ぜろ", "れい", "まる"],
+        1 => &["いち"],
+        2 => &["に", "にい"],
+        3 => &["さん"],
+        4 => &["よん"],
+        5 => &["ご", "ごお"],
+        6 => &["ろく"],
+        7 => &["なな"],
+        8 => &["はち"],
+        9 => &["きゅう"],
+        _ => &[],
+    }
+}
+
+/// Where a reading of the number `digits` (ASCII digits) that starts at
+/// `reading[at]` can end, and how it is said there: the number as a whole
+/// (にせんご, さんびゃく, いっかい's いっ, ひとつ's ひと), or each digit
+/// alone. Empty when no reading of it starts there.
+pub(crate) fn reading_ends(digits: &str, reading: &[char], at: usize) -> Vec<(usize, Said)> {
+    let starts = |j: usize, text: &str| {
+        let mut k = j;
+        for c in text.chars() {
+            if reading.get(k) != Some(&c) {
+                return None;
+            }
+            k += 1;
+        }
+        Some(k)
+    };
+    let mut out: Vec<(usize, Said)> = Vec::new();
+    let leading_zero = digits.len() > 1 && digits.starts_with('0');
+    if let (false, Ok(n)) = (leading_zero || digits.len() > 16, digits.parse::<u64>()) {
+        if n == 0 {
+            for t in digit_alone(0) {
+                out.extend(starts(at, t).map(|k| (k, Said::Alone)));
+            }
+        }
+        // the parts of the number, the 兆, 億 and 万 groups and then the
+        // ones, each read in turn: only its last read before a counter
+        let mut parts: Vec<Vec<(&'static str, Said)>> = Vec::new();
+        for (unit, name) in [
+            (1_0000_0000_0000u64, "ちょう"),
+            (1_0000_0000, "おく"),
+            (1_0000, "まん"),
+            (1, ""),
+        ] {
+            let g = n / unit % 1_0000;
+            if g == 0 {
+                continue;
+            }
+            for (v, table) in [
+                (
+                    g / 1000,
+                    thousands as fn(u64) -> &'static [(&'static str, Said)],
+                ),
+                (g / 100 % 10, hundreds),
+                (g / 10 % 10, tens),
+                (g % 10, ones),
+            ] {
+                if v > 0 {
+                    parts.push(table(v).to_vec());
+                }
+            }
+            if !name.is_empty() {
+                parts.push(vec![(name, Said::Alone)]);
+            }
+        }
+        let mut at_ends: Vec<(usize, Said)> = vec![(at, Said::Alone)];
+        for (i, options) in parts.iter().enumerate() {
+            let last = i + 1 == parts.len();
+            // いっちょう, はっちょう: a geminated digit before 兆
+            let before_cho = parts.get(i + 1).is_some_and(|p| p[0].0 == "ちょう");
+            let mut next = Vec::new();
+            for &(j, _) in &at_ends {
+                for &(text, said) in options {
+                    if said != Said::Alone && !last && !(before_cho && said == GEMINATED) {
+                        continue;
+                    }
+                    if let Some(k) = starts(j, text) {
+                        if !next.contains(&(k, said)) {
+                            next.push((k, said));
+                        }
+                    }
+                }
+            }
+            at_ends = next;
+            if at_ends.is_empty() {
+                break;
+            }
+        }
+        if !parts.is_empty() {
+            out.extend(at_ends);
+        }
+        for &(text, said) in native(n) {
+            out.extend(starts(at, text).map(|k| (k, said)));
+        }
+    }
+    if digits.len() > 1 {
+        let mut at_ends = vec![at];
+        for d in digits.chars().filter_map(|c| c.to_digit(10)) {
+            let mut next = Vec::new();
+            for &j in &at_ends {
+                for t in digit_alone(d) {
+                    if let Some(k) = starts(j, t) {
+                        if !next.contains(&k) {
+                            next.push(k);
+                        }
+                    }
+                }
+            }
+            at_ends = next;
+        }
+        out.extend(at_ends.into_iter().map(|k| (k, Said::Alone)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
