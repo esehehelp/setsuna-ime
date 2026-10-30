@@ -1,16 +1,21 @@
 # Fetch a public conversion artifact pinned by models.json. No login required.
 # Writes only to the download cache; returns the local manifest path on stdout.
 # Verified cache files work offline. Downloads are staged before replacement.
+# With -Component, one of the catalog's components (the reading lexicon, the
+# analyzer) instead: every file it pins, and its entry's path on stdout.
 #
 # Usage:
 #   pwsh -File crates/tsf/fetch-model.ps1
 #   pwsh -File crates/tsf/fetch-model.ps1 -Precision fp32 -CacheDir local/models/downloads
+#   pwsh -File crates/tsf/fetch-model.ps1 -Component lexicon
 
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
     [ValidateSet('int8', 'fp32')]
     [string]$Precision = 'int8',
+    [ValidateSet('lexicon', 'analyzer')]
+    [string]$Component,
     [string]$CacheDir = (Join-Path $env:LOCALAPPDATA 'setsuna-ime\cache\models'),
     # Default: models.json next to this script.
     [string]$CatalogPath
@@ -43,17 +48,30 @@ function Test-VerifiedFile {
 }
 
 $catalog = Get-Content -LiteralPath $CatalogPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($catalog.schema -ne 'setsuna-model-download-v1' -or
-    $catalog.repository -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$' -or
-    $catalog.revision -notmatch '^[a-f0-9]{40}$') {
+if ($catalog.schema -ne 'setsuna-model-download-v1') { throw 'invalid model catalog (unknown schema)' }
+# what is fetched: the conversion model, or a component with a repository
+# and revision of its own
+$source = $catalog
+if ($Component) {
+    $source = $catalog.components.$Component
+    if (-not $source) { throw "model catalog has no $Component component" }
+}
+if ($source.repository -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$' -or
+    $source.revision -notmatch '^[a-f0-9]{40}$') {
     throw 'invalid model catalog (expected a repository and pinned commit)'
 }
-Assert-ArtifactPath $catalog.repository
-$variant = $catalog.variants.$Precision
-if (-not $variant) { throw "model catalog has no $Precision variant" }
-Assert-ArtifactPath $variant.manifest
+Assert-ArtifactPath $source.repository
+if ($Component) {
+    Assert-ArtifactPath $source.entry
+    $files = $source.files
+} else {
+    $variant = $catalog.variants.$Precision
+    if (-not $variant) { throw "model catalog has no $Precision variant" }
+    Assert-ArtifactPath $variant.manifest
+    $files = $variant.files
+}
 $specs = @{}
-foreach ($file in $variant.files) {
+foreach ($file in $files) {
     Assert-ArtifactPath $file.path
     if ($file.sha256 -notmatch '^[a-f0-9]{64}$' -or $null -eq $file.size -or
         $file.size -le 0 -or $specs.ContainsKey($file.path)) {
@@ -61,12 +79,13 @@ foreach ($file in $variant.files) {
     }
     $specs[$file.path] = $file
 }
-if (-not $specs.ContainsKey($variant.manifest)) { throw 'manifest is not pinned in the catalog' }
+$entry = if ($Component) { $source.entry } else { $variant.manifest }
+if (-not $specs.ContainsKey($entry)) { throw "$entry is not pinned in the catalog" }
 
-$destination = Join-Path $CacheDir "$($catalog.repository)/$($catalog.revision)"
+$destination = Join-Path $CacheDir "$($source.repository)/$($source.revision)"
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 $destination = (Resolve-Path -LiteralPath $destination).Path
-$baseUrl = "https://huggingface.co/$($catalog.repository)/resolve/$($catalog.revision)"
+$baseUrl = "https://huggingface.co/$($source.repository)/resolve/$($source.revision)"
 # Windows PowerShell 5.1 may otherwise negotiate an obsolete TLS version.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 # Its progress bar slows a download many times over.
@@ -111,6 +130,16 @@ function Get-ArtifactFile {
     return $path
 }
 
+if ($Component) {
+    # every pinned file, the entry first
+    $entryPath = Get-ArtifactFile $entry
+    foreach ($pinned in @($specs.Keys | Sort-Object)) {
+        if ($pinned -ne $entry) { Get-ArtifactFile $pinned | Out-Null }
+    }
+    Write-Host "$Component ready: $($source.repository) @ $($source.revision)"
+    return $entryPath
+}
+
 $manifestPath = Get-ArtifactFile $variant.manifest
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.schema -ne 'neo-ime-ctc-nat-export-v1' -or $manifest.proposal.precision -ne $Precision) {
@@ -137,5 +166,5 @@ foreach ($relative in $relativeFiles) {
     if (-not $specs.ContainsKey($relative)) { throw "manifest references an unpinned file: $relative" }
 }
 foreach ($relative in $relativeFiles) { Get-ArtifactFile $relative | Out-Null }
-Write-Host "model ready: $($catalog.repository) @ $($catalog.revision) ($Precision)"
+Write-Host "model ready: $($source.repository) @ $($source.revision) ($Precision)"
 return $manifestPath

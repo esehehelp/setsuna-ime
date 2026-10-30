@@ -9,7 +9,7 @@
 #   powershell -ExecutionPolicy Bypass -File setup.ps1 -Archive setsuna-ime-<version>-windows-x64.zip
 #
 # Options are install.ps1's (-ModelPrecision, -RerankManifest,
-# -NameDictionary, -Force, -NoElevate), and -Archive <zip> installs a local
+# -NameDictionary, -NoDictionaries, -Force, -NoElevate), and -Archive <zip> installs a local
 # release zip instead of the download. Under iex this runs in the caller's
 # session: it throws on failure instead of exiting. ASCII only, as iex reads
 # a download without knowing its encoding.
@@ -20,6 +20,7 @@ param(
     [string]$RerankManifest,
     [string]$NameDictionary,
     [string]$Archive,
+    [switch]$NoDictionaries,
     [switch]$Force,
     [switch]$NoElevate
 )
@@ -30,6 +31,7 @@ function Install-SetsunaIme {
         [string]$RerankManifest,
         [string]$NameDictionary,
         [string]$Archive,
+        [switch]$NoDictionaries,
         [switch]$Force,
         [switch]$NoElevate
     )
@@ -73,6 +75,7 @@ function Install-SetsunaIme {
         $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer[0], '-ModelPrecision', $ModelPrecision)
         if ($RerankManifest) { $argv += @('-RerankManifest', (Resolve-Path -LiteralPath $RerankManifest).Path) }
         if ($NameDictionary) { $argv += @('-NameDictionary', (Resolve-Path -LiteralPath $NameDictionary).Path) }
+        if ($NoDictionaries) { $argv += '-NoDictionaries' }
         if ($Force) { $argv += '-Force' }
         if ($NoElevate) { $argv += '-NoElevate' }
         & (Get-Process -Id $PID).Path @argv
@@ -85,4 +88,4 @@ function Install-SetsunaIme {
 }
 
 Install-SetsunaIme -ModelPrecision $ModelPrecision -RerankManifest $RerankManifest -NameDictionary $NameDictionary `
-    -Archive $Archive -Force:$Force -NoElevate:$NoElevate
+    -Archive $Archive -NoDictionaries:$NoDictionaries -Force:$Force -NoElevate:$NoElevate

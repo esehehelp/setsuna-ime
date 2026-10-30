@@ -1,7 +1,8 @@
 # Setsuna TSF IME installer.
 #
 # Usage:
-#   pwsh -File crates\tsf\install.ps1                           # download pinned int8 model + install
+#   pwsh -File crates\tsf\install.ps1                           # download pinned model, lexicon, analyzer + install
+#   pwsh -File crates\tsf\install.ps1 -NoDictionaries           # the model only
 #   pwsh -File crates\tsf\install.ps1 -ModelPrecision fp32      # download pinned fp32 model instead
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m>             # local model, no download (UAC for regsvr32)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NoElevate  # files-only (CI)
@@ -12,7 +13,10 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Analyzer <a>  # also the analyzer (segment editing)
 #
 # Without -Manifest, fetch-model.ps1 downloads the public artifact pinned in
-# models.json, verifies its size/SHA-256, and reuses verified cache files offline.
+# models.json, verifies its size/SHA-256, and reuses verified cache files offline;
+# the reading lexicon and the analyzer pinned there come too (unless -Lexicon /
+# -Analyzer name local ones, or -NoDictionaries), and when they cannot be had
+# the IME is installed without them.
 # <m> is the model's `*.manifest.json` written by export. The manifest and
 # every file it lists are copied, keeping their relative paths.
 #
@@ -50,8 +54,8 @@
 #   %LOCALAPPDATA%\setsuna-ime\models\mixed\kana.tsv, latin.tsv, params.txt  (crates\ime-core\data\mixed,
 #                                  or -MixedModel <dir>)
 #   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
-#   %LOCALAPPDATA%\setsuna-ime\models\lexicon\<lexicon>  (with -Lexicon)
-#   %LOCALAPPDATA%\setsuna-ime\models\analyzer\<its directory's name>\<manifest> + its files  (with -Analyzer)
+#   %LOCALAPPDATA%\setsuna-ime\models\lexicon\<lexicon>  (downloaded, or -Lexicon)
+#   %LOCALAPPDATA%\setsuna-ime\models\analyzer\<its directory's name>\<manifest> + its files  (downloaded, or -Analyzer)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
@@ -93,6 +97,9 @@ param(
     # analyzer_manifest): the engine analyzes a conversion segment editing
     # cuts, which then cuts it by its words.
     [string]$Analyzer,
+    # Without -Manifest: do not download the lexicon and the analyzer.
+    [Parameter(ParameterSetName = 'Download')]
+    [switch]$NoDictionaries,
     [switch]$Force,
     [switch]$NoElevate
 )
@@ -443,6 +450,22 @@ if ($PSCmdlet.ParameterSetName -eq 'Download') {
         $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision
     } catch {
         Write-Log ERROR "model download failed: $_ (retry, or use -Manifest for a local artifact)"; exit 30
+    }
+    # the lexicon and the analyzer pinned with it: the IME converts without
+    # them, so a failed download is a warning
+    if (-not $NoDictionaries -and -not $Lexicon) {
+        try {
+            $Lexicon = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component lexicon
+        } catch {
+            Write-Log WARN "lexicon download failed, installing without it: $_ (run again to retry)"
+        }
+    }
+    if (-not $NoDictionaries -and -not $Analyzer) {
+        try {
+            $Analyzer = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component analyzer
+        } catch {
+            Write-Log WARN "analyzer download failed, installing without it: $_ (run again to retry)"
+        }
     }
 }
 $Manifest = Resolve-Path-Safe $Manifest

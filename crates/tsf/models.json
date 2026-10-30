@@ -39,5 +39,43 @@
         }
       ]
     }
+  },
+  "components": {
+    "lexicon": {
+      "repository": "esehe/setsuna-ime-dict",
+      "revision": "cc86612d5a0e19553e0799f3e7c7056c9f10cf5b",
+      "license": "CC-BY-SA-4.0",
+      "entry": "lexicon-v1.lexicon",
+      "files": [
+        {
+          "path": "lexicon-v1.lexicon",
+          "size": 232575200,
+          "sha256": "acda328ff4b3fb875eece329ff9be4a8a8827ac055e60d6e4d1f0cc41cb0f658"
+        }
+      ]
+    },
+    "analyzer": {
+      "repository": "esehe/setsuna-ime-dict",
+      "revision": "cc86612d5a0e19553e0799f3e7c7056c9f10cf5b",
+      "license": "CC-BY-SA-4.0",
+      "entry": "nid-ma-v2-600k-tb/analyzer.manifest.json",
+      "files": [
+        {
+          "path": "nid-ma-v2-600k-tb/analyzer.manifest.json",
+          "size": 346,
+          "sha256": "cb7c33af99b069a3541e44e93bfbbf9d148a4fdc12e35b9ca8546d850ccec0b1"
+        },
+        {
+          "path": "nid-ma-v2-600k-tb/system.dic.zst",
+          "size": 130216048,
+          "sha256": "059d2e54e2ffe59383a1e128025330785ef765f69e0ae11a4f862ca5fbab7ece"
+        },
+        {
+          "path": "nid-ma-v2-600k-tb/alternates.bin",
+          "size": 158143584,
+          "sha256": "e51c44c0e0070aab0e6f5b41935bd53b0a812187448fa050abf84a324ac52514"
+        }
+      ]
+    }
   }
 }

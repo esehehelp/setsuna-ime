@@ -86,7 +86,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'models.json') -Destination $Out
 # pwsh's modules (no Get-FileHash).
 $cmd = @(
     '@echo off',
-    'rem Setsuna IME installer: double-click, or install.cmd -ModelPrecision fp32 and the other options of install.ps1.',
+    'rem Setsuna IME installer: double-click, or install.cmd -NoDictionaries and the other options of install.ps1.',
     'setlocal',
     'set "PSModulePath="',
     'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" %*',
