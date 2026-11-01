@@ -2,15 +2,15 @@
 
 Setsuna (刹那) is a Japanese input method built around a non-autoregressive
 neural kana-kanji converter (CTC-NAT). This repository holds the inference engine, the IME
-frontends for Windows (TSF), Linux (fcitx5) and Android (in development), an optional LM reranker, a
-settings GUI and a browser demo. **Research stage**: a public conversion model
+frontends for Windows (TSF), Linux (fcitx5) and Android (in development), an optional LM reranker and a
+settings GUI. **Research stage**: a public conversion model
 is available, and the Windows installer downloads it automatically (see
 [Status](#状態)).
 
 Setsuna（刹那）は、非自己回帰のニューラルかな漢字変換（CTC-NAT）を中心にした
 日本語入力メソッド。推論エンジン、
-Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言語モデルによるリランカ、設定 GUI、
-ブラウザで動くデモを含む。
+Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言語モデルによるリランカ、設定 GUI
+を含む。
 
 ## 状態
 
@@ -172,7 +172,6 @@ Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言�
 | `crates/android` | platform | Android の入力メソッド（Rust 部分 + `app/` の Kotlin のサービスとキーボード。開発中） |
 | `crates/rewrite` | platform | 書き直し（`setsuna-rewrite`、Sign in with ChatGPT、OpenAI / 互換 API の client） |
 | `crates/settings` | platform | 設定 GUI `setsuna-settings`（システムの WebView に出す HTML 画面。Windows / macOS / Linux） |
-| `crates/demo` | platform | ブラウザで IME を動かすローカルデモ |
 
 frontend はエンジンをリンクせず、`setsuna-engine daemon` / `setsuna-rerank
 daemon` / `setsuna-rewrite daemon` を子プロセスとして起動し stdio で話す。
@@ -396,16 +395,11 @@ pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモ
 Setsuna を有効にし、キーボードの あ/A キーの長押し（入力方法の選択）で切り替える。
 `config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。
 
-### デモ / 設定 GUI
+### 設定 GUI
 
 ```sh
-cargo run --release -p setsuna-demo -- --port 8765   # http://127.0.0.1:8765/
 cargo run --release -p setsuna-settings
 ```
-
-デモは fcitx5 frontend と同じ session をブラウザのキー入力で動かし、エンジンの
-所要時間・スコア・アラインメントを表示する。エンジンとモデルは IME と同じ
-`config.toml` から読む。
 
 ## モデルと manifest
 
