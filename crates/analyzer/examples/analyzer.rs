@@ -1,8 +1,9 @@
 //! Analyzer tools.
 //!
-//! `alternates <lex.csv> <matrix.def> <reading column> <out>`: compile the
-//! other readings' table (`setsuna_analyzer::alternates`) from a trained
-//! analyzer's lexicon and connection costs.
+//! `alternates <lex.csv> <matrix.def | bigram dir> <reading column> <out>`:
+//! compile the other readings' table (`setsuna_analyzer::alternates`) from a
+//! trained analyzer's lexicon and connection costs (the matrix, or the
+//! model's bigram.right / .left / .cost the dictionary was built from).
 //! `analyze <manifest>`: JSON lines {"id", "text"} on stdin -> {"id",
 //! "tokens"} on stdout.
 
@@ -15,11 +16,11 @@ use anyhow::{bail, Context, Result};
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["alternates", lex, matrix, col, out] => {
+        ["alternates", lex, connection, col, out] => {
             let t = Instant::now();
             let (keys, entries) = setsuna_analyzer::alternates::build(
                 Path::new(lex),
-                Path::new(matrix),
+                Path::new(connection),
                 col.parse().context("reading column")?,
                 Path::new(out),
             )?;
@@ -46,7 +47,7 @@ fn main() -> Result<()> {
                 out.write_all(b"\n")?;
             }
         }
-        _ => bail!("usage: analyzer alternates <lex.csv> <matrix.def> <reading column> <out> | analyze <manifest>"),
+        _ => bail!("usage: analyzer alternates <lex.csv> <matrix.def | bigram dir> <reading column> <out> | analyze <manifest>"),
     }
     Ok(())
 }
