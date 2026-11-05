@@ -4,10 +4,13 @@
 //! copy of the model).
 //!
 //! A pipe's name is a hash of everything the clients must agree on to share
-//! a server: the user, the manifest, the binary and the options that change
-//! its answers. The reranker's both ends compute it with
-//! [`rerank_pipe_name`]; the engine's client computes it with
-//! [`engine_pipe_name`] and passes it to the server it starts.
+//! a server: the wire protocol ([`PROTOCOL`]), the user, the manifest, the
+//! binary and the options that change its answers. The reranker's both ends
+//! compute it with [`rerank_pipe_name`]; the engine's client computes it with
+//! [`engine_pipe_name`] and passes it to the server it starts. Not the
+//! release: the IMEs of two builds that start the same binary (config.toml's,
+//! read again when it changes), in an app opened before an update and one
+//! opened after it, share its server.
 //!
 //!   - win: the Win32 calls of both ends (Windows only)
 //!   - server: the server's loop, a worker thread owning the model (Windows only)
@@ -18,6 +21,14 @@ use std::path::Path;
 pub mod server;
 #[cfg(windows)]
 pub mod win;
+
+/// The shared servers' wire protocol: the pipe's framing (`server`) and the
+/// request and response lines of `setsuna-engine` and `setsuna-rerank`.
+/// Raise it when a client of one build and a server of another would
+/// misread each other (a field renamed, dropped or changed in meaning, a
+/// request an older server would answer wrongly); an optional field added is
+/// read by both. Every pipe is named again by it.
+pub const PROTOCOL: u32 = 1;
 
 /// What a reranker server is shared over: clients with the same key use one
 /// server.
@@ -58,7 +69,7 @@ pub fn engine_pipe_name(user: &str, manifest: &Path, exe: &str, flags: &[String]
 fn name_of(service: &str, user: &str, manifest: &Path, exe: &str, options: &[String]) -> String {
     let mut text = vec![
         format!("{service}-pipe"),
-        env!("CARGO_PKG_VERSION").to_string(),
+        format!("protocol {PROTOCOL}"),
         user.to_string(),
         manifest.to_string_lossy().to_lowercase(),
         exe.to_string(),
@@ -114,11 +125,12 @@ mod tests {
 
     #[test]
     fn name_is_pinned() {
-        // the server and every client build compute this: a change here
-        // splits servers across versions, so make it on purpose only
+        // the server and every client build compute this, across releases:
+        // a change here splits servers between builds, so with PROTOCOL
+        // raised only
         assert_eq!(
             rerank_pipe_name(&key()),
-            r"\\.\pipe\setsuna-rerank-dc9c7cb018498278b03d708d917e9941"
+            r"\\.\pipe\setsuna-rerank-339463879cc2a0d00a2e9556df28e30f"
         );
     }
 
@@ -178,7 +190,7 @@ mod tests {
         // pinned as the reranker's is: the IME's clients in every app compute it
         assert_eq!(
             base,
-            r"\\.\pipe\setsuna-engine-15c3265fee79dbe6a4daefe7d254a907"
+            r"\\.\pipe\setsuna-engine-eb7da22bd07a86800ab33d3b2ad3a113"
         );
         for other in [
             engine_pipe_name(user, manifest, exe, &flags(&[])),
