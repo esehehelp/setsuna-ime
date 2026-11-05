@@ -27,7 +27,7 @@ pub mod tsf;
 mod dll_exports {
     use windows::core::*;
     use windows::Win32::Foundation::{
-        BOOL, CLASS_E_CLASSNOTAVAILABLE, E_POINTER, HMODULE, S_FALSE, S_OK, TRUE,
+        BOOL, CLASS_E_CLASSNOTAVAILABLE, E_FAIL, E_POINTER, HMODULE, S_FALSE, S_OK, TRUE,
     };
 
     use crate::globals::*;
@@ -154,5 +154,71 @@ mod dll_exports {
                 .try_borrow()
                 .map_or(true, |inner| inner.composition.is_some()),
         )
+    }
+
+    /// The text service `tip` (`SetsunaCoreCreate`'s, active) as the next
+    /// one in a swap takes it (`SwapState`, JSON) in `buf`, when it fits in
+    /// `cap` bytes: its length (0: `tip` is busy, nothing to hand over).
+    #[unsafe(no_mangle)]
+    extern "system" fn SetsunaCoreState(
+        tip: *mut core::ffi::c_void,
+        buf: *mut u8,
+        cap: usize,
+    ) -> usize {
+        use crate::tsf::text_input_processor::{SetsunaTextService, SwapState};
+        use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
+        let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
+            return 0;
+        };
+        let service: &SetsunaTextService = unsafe { tip.as_impl() };
+        let Ok(inner) = service.inner.try_borrow() else {
+            return 0;
+        };
+        let json = SwapState {
+            enabled: inner.enabled,
+            auto_off: inner.auto_off,
+            focused: inner.focused,
+            switched_in: inner.switched_in,
+        }
+        .to_json();
+        if !buf.is_null() && json.len() <= cap {
+            unsafe { core::ptr::copy_nonoverlapping(json.as_ptr(), buf, json.len()) };
+        }
+        json.len()
+    }
+
+    /// `tip`'s next activation is a swap: it takes `state` (`len` bytes,
+    /// `SetsunaCoreState`'s of the text service it replaces; none: as it
+    /// was) instead of starting as a new text service does (no `[[apps]]
+    /// start`, the fields' start states as they were).
+    #[unsafe(no_mangle)]
+    extern "system" fn SetsunaCoreSwapIn(
+        tip: *mut core::ffi::c_void,
+        state: *const u8,
+        len: usize,
+    ) -> HRESULT {
+        use crate::tsf::text_input_processor::{SetsunaTextService, SwapState};
+        use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
+        let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
+            return E_POINTER;
+        };
+        let service: &SetsunaTextService = unsafe { tip.as_impl() };
+        let json = if state.is_null() {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(state, len) }
+        };
+        let swap = SwapState::from_json(json);
+        setsuna_core::diagnostics::log(format!(
+            "SetsunaCoreSwapIn enabled={} auto_off={}",
+            swap.enabled, swap.auto_off
+        ));
+        match service.inner.try_borrow_mut() {
+            Ok(mut inner) => {
+                inner.swap_in = Some(swap);
+                S_OK
+            }
+            Err(_) => E_FAIL,
+        }
     }
 }

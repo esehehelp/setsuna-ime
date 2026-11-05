@@ -241,7 +241,7 @@ Assert (@($local.Parameters | Where-Object { $_.Name -eq 'NoDictionaries' }).Cou
 # publishing models, writing config or reaching COM/registry operations.
 $source = Join-Path $root 'installer-source'
 New-Item -ItemType Directory -Path $source | Out-Null
-foreach ($name in @('setsuna_tsf.dll', 'setsuna-engine.exe', 'onnxruntime.dll')) {
+foreach ($name in @('setsuna_tsf.dll', 'setsuna_tsf_shim.dll', 'setsuna-tsf-check.exe', 'setsuna-engine.exe', 'onnxruntime.dll')) {
     [IO.File]::WriteAllText((Join-Path $source $name), 'stub')
 }
 $wrapper = Join-Path $root 'installer-failure.ps1'

@@ -10,17 +10,31 @@ description = "The TSF text service registered in the IME DLL's place: it forwar
 name = "setsuna_tsf_shim"
 path = "src/lib.rs"
 # Links nothing of the IME: the core is loaded by its path and reached by
-# its exports (SetsunaCoreCreate, SetsunaCoreComposing).
+# its exports (SetsunaCoreCreate, and the optional SetsunaCoreComposing,
+# SetsunaCoreState, SetsunaCoreSwapIn).
 crate-type = ["cdylib"]
 
+# Run by install.ps1 before a core is named in core.txt: it activates the
+# registered shim with that core in a process of its own.
+[[bin]]
+name = "setsuna-tsf-check"
+path = "src/bin/check.rs"
+
 [target.'cfg(windows)'.dependencies]
+# the CLSID and profile it takes the IME's place under, and registration
+setsuna-tsf-reg = { path = "../tsf-reg" }
+# a core's name carries its SHA-256: checked before it is loaded
+sha2 = "0.10"
 windows = { version = "0.58", features = [
     "implement",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",

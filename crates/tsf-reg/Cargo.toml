@@ -1,0 +1,16 @@
+[package]
+name = "setsuna-tsf-reg"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "The IME's identity in TSF (its CLSID, profile and categories) and its registration, shared by the IME DLL and the shim registered in its place."
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_TextServices",
+] }

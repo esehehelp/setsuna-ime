@@ -2921,8 +2921,10 @@ name = "setsuna-tsf"
 version = "0.2.1"
 dependencies = [
  "once_cell",
+ "serde_json",
  "setsuna-core",
  "setsuna-pipe",
+ "setsuna-tsf-reg",
  "tracing",
  "tracing-subscriber",
  "windows 0.58.0",
@@ -2930,9 +2932,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "setsuna-tsf-reg"
+version = "0.2.1"
+dependencies = [
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "setsuna-tsf-shim"
 version = "0.2.1"
 dependencies = [
+ "setsuna-tsf-reg",
+ "sha2",
  "windows 0.58.0",
  "windows-core 0.58.0",
 ]

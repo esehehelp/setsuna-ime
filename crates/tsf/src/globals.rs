@@ -2,8 +2,7 @@
 //!
 //! Structure and helpers adapted from karukan-tsf (MIT/Apache-2.0).
 //! The CLSID / profile / display-attribute / preserved-key GUIDs are minted
-//! for Setsuna. The `GUID_TFCAT_TIPCAP_*` values are OS-defined capability
-//! categories and must stay verbatim.
+//! for Setsuna; the categories it is registered in are `setsuna_tsf_reg`'s.
 
 #[cfg(target_os = "windows")]
 use once_cell::sync::OnceCell;
@@ -12,16 +11,12 @@ use windows::core::GUID;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HMODULE;
 
-/// Stable CLSID for the Setsuna TSF service.
-/// `{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}`
+/// The CLSID and profile of the Setsuna TSF service (shared with the shim
+/// registered in this DLL's place: `setsuna_tsf_reg::IME`).
 #[cfg(target_os = "windows")]
-pub const CLSID_SETSUNA_TEXT_SERVICE: GUID =
-    GUID::from_u128(0xc3f4_dfa2_6e28_4aa0_9daa_407b_575e_f52d);
-
-/// Stable language profile GUID for the Setsuna TSF service.
-/// `{ACEB29C0-964E-4FF1-8BDC-B507AAB78873}`
+pub const CLSID_SETSUNA_TEXT_SERVICE: GUID = setsuna_tsf_reg::IME.clsid;
 #[cfg(target_os = "windows")]
-pub const GUID_SETSUNA_PROFILE: GUID = GUID::from_u128(0xaceb_29c0_964e_4ff1_8bdc_b507_aab7_8873);
+pub const GUID_SETSUNA_PROFILE: GUID = setsuna_tsf_reg::IME.profile;
 
 /// Preedit input display attribute (dotted underline).
 /// `{849A1339-948F-4836-96EB-7E87FFBE2051}`
@@ -34,30 +29,6 @@ pub const GUID_DISPLAY_ATTRIBUTE_INPUT: GUID =
 #[cfg(target_os = "windows")]
 pub const GUID_DISPLAY_ATTRIBUTE_CONVERTED: GUID =
     GUID::from_u128(0x21cc_c3c2_35de_4f7f_984d_e1ca_1b29_2d46);
-
-/// Immersive (modern/UWP) support — required so UWP hosts load us.
-/// `{13A016DF-560B-46CD-947A-4C3AF1E0E35D}` (OS-defined).
-#[cfg(target_os = "windows")]
-pub const GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT: GUID =
-    GUID::from_u128(0x13A0_16DF_560B_46CD_947A_4C3A_F1E0_E35D);
-
-/// System tray support — required for proper system tray integration.
-/// `{25504FB4-7BAB-4BC1-9C69-CF81890F0EF5}` (OS-defined).
-#[cfg(target_os = "windows")]
-pub const GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT: GUID =
-    GUID::from_u128(0x2550_4FB4_7BAB_4BC1_9C69_CF81_890F_0EF5);
-
-/// Secure-mode capability — required for key delivery in UWP apps.
-/// `{49D2F9CE-1F5E-11D7-A6D3-00065B84435C}` (OS-defined).
-#[cfg(target_os = "windows")]
-pub const GUID_TFCAT_TIPCAP_SECUREMODE: GUID =
-    GUID::from_u128(0x49D2_F9CE_1F5E_11D7_A6D3_0006_5B84_435C);
-
-/// UI element support.
-/// `{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}` (OS-defined).
-#[cfg(target_os = "windows")]
-pub const GUID_TFCAT_TIPCAP_UIELEMENTENABLED: GUID =
-    GUID::from_u128(0x49D2_F9CF_1F5E_11D7_A6D3_0006_5B84_435C);
 
 /// PreservedKey GUID of the keys that turn the IME on or off
 /// (`[frontend] toggle_keys`: Hankaku/Zenkaku by default).

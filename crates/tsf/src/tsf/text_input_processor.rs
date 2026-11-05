@@ -134,6 +134,47 @@ pub(crate) struct Inner {
     pub(crate) window_made: Option<String>,
     /// No engine client: when to try starting one again.
     pub(crate) engine_retry_at: Option<Instant>,
+    /// The next activation is a swap (the shim's, `SetsunaCoreSwapIn`):
+    /// the state of the text service this one replaces.
+    pub(crate) swap_in: Option<SwapState>,
+}
+
+/// What a text service hands the one that replaces it in a swap (the shim
+/// swaps a newer DLL's in while the app runs): the mode as the user left it
+/// in this thread, so that nothing the user sees changes. JSON between the
+/// two, which may be of different builds: a field one does not know is
+/// left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SwapState {
+    pub enabled: bool,
+    pub auto_off: bool,
+    pub focused: usize,
+    pub switched_in: usize,
+}
+
+impl SwapState {
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "enabled": self.enabled,
+            "auto_off": self.auto_off,
+            "focused": self.focused,
+            "switched_in": self.switched_in,
+        })
+        .to_string()
+    }
+
+    /// The state in `json`; what it lacks, as a new text service has it.
+    pub fn from_json(json: &[u8]) -> SwapState {
+        let v: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
+        let flag = |k: &str, d: bool| v[k].as_bool().unwrap_or(d);
+        let ptr = |k: &str| v[k].as_u64().unwrap_or(0) as usize;
+        SwapState {
+            enabled: flag("enabled", true),
+            auto_off: flag("auto_off", false),
+            focused: ptr("focused"),
+            switched_in: ptr("switched_in"),
+        }
+    }
 }
 
 /// How often the key path looks at `config.toml`'s modification time.
@@ -181,6 +222,7 @@ impl SetsunaTextService {
                 reranker_started: None,
                 window_made: None,
                 engine_retry_at: None,
+                swap_in: None,
             }),
         }
     }
@@ -869,6 +911,8 @@ impl SetsunaTextService_Impl {
         if self.inner.borrow().keystroke_advised {
             let _ = self.deactivate();
         }
+        // this activation's only, whether it gets to the mode or not
+        let swap = self.inner.borrow_mut().swap_in.take();
 
         // Resolve display attribute atoms once per activation.
         let (atom_input, atom_converted) = resolve_display_atoms();
@@ -941,11 +985,19 @@ impl SetsunaTextService_Impl {
 
         // The mode: the thread's on / off compartment (unset: on, as
         // Microsoft asks of IMEs), the taskbar item showing it, the notice.
+        // A swap keeps the thread's mode as it was: no start state applied.
         let compartment = mode::open_close(thread_mgr);
         let start = app
             .as_ref()
             .map_or(setsuna_core::config::AppStart::Keep, |a| a.start);
         let on = match (compartment.as_ref(), start) {
+            _ if swap.is_some() => {
+                let before = swap.map_or(true, |s| s.enabled);
+                compartment
+                    .as_ref()
+                    .and_then(mode::read_open)
+                    .unwrap_or(before)
+            }
             // the application's start state, `[[apps]] start`
             (Some(c), setsuna_core::config::AppStart::On | setsuna_core::config::AppStart::Off) => {
                 let on = start == setsuna_core::config::AppStart::On;
@@ -1000,6 +1052,13 @@ impl SetsunaTextService_Impl {
             inner.enabled = on;
             inner.auto_off = false;
             inner.quiet_mode_change = false;
+            if let Some(s) = swap {
+                // the field start states as they were: a field the user
+                // switched in keeps the user's choice
+                inner.auto_off = s.auto_off;
+                inner.focused = s.focused;
+                inner.switched_in = s.switched_in;
+            }
             inner.open_close = open_close;
             inner.mode = added.is_ok().then_some((state, item));
         }
@@ -1207,5 +1266,34 @@ impl ITfTextInputProcessorEx_Impl for SetsunaTextService_Impl {
         self.guarded("ActivateEx", None, Err(E_FAIL.into()), || {
             self.activate(thread_mgr, tid, dwflags)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SwapState;
+
+    #[test]
+    fn a_swap_state_goes_over_as_json_and_a_missing_field_is_a_new_services() {
+        let s = SwapState {
+            enabled: false,
+            auto_off: true,
+            focused: 0x1234,
+            switched_in: 0x5678,
+        };
+        assert_eq!(SwapState::from_json(s.to_json().as_bytes()), s);
+        // an older or newer build's: what it lacks as a new text service has
+        // it, what it adds left out
+        let other = SwapState::from_json(br#"{"auto_off":true,"later":1}"#);
+        assert_eq!(
+            other,
+            SwapState {
+                enabled: true,
+                auto_off: true,
+                focused: 0,
+                switched_in: 0
+            }
+        );
+        assert_eq!(SwapState::from_json(b"not json").enabled, true);
     }
 }

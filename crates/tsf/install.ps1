@@ -33,10 +33,18 @@
 #   40 source DLL, engine.exe or onnxruntime.dll not found
 #   50 file copy failed
 #   60 Visual C++ runtime missing and could not be installed
+#   70 the new IME DLL did not come up (setsuna-tsf-check): core.txt still
+#      names the one before, which the apps keep
 #
 # Layout produced:
-#   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf.dll
-#   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf_<sha256>.dll  (fallback when the stable DLL is locked)
+#   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf_shim.dll  (the DLL registered as the IME: it loads the
+#                                  IME DLL core.txt names and swaps it for a newer one in the
+#                                  apps that are running; setsuna_tsf_shim_<sha256>.dll when locked)
+#   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf_<sha256>.dll  (the IME DLL, named by its content; one an
+#                                  app still holds stays until a later install)
+#   %LOCALAPPDATA%\setsuna-ime\core.txt  (the IME DLL's name, written once setsuna-tsf-check saw it
+#                                  come up through the registered shim)
+#   %LOCALAPPDATA%\setsuna-ime\setsuna-tsf-check.exe
 #   %LOCALAPPDATA%\setsuna-ime\setsuna-engine.exe
 #   %LOCALAPPDATA%\setsuna-ime\setsuna-engine_<sha256>.exe  (fallback when running daemons lock it;
 #                                                     config engine_exe points at it)
@@ -129,6 +137,8 @@ $InstallDir = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
 $ConfigDir  = Join-Path $env:APPDATA      'setsuna-ime'
 $LogFile    = Join-Path $InstallDir 'install.log'
 $DllName    = 'setsuna_tsf.dll'
+$ShimName   = 'setsuna_tsf_shim.dll'
+$CheckExe   = 'setsuna-tsf-check.exe'
 $EngineExe  = 'setsuna-engine.exe'
 $OrtDll     = 'onnxruntime.dll'
 $SettingsExe = 'setsuna-settings.exe'
@@ -303,6 +313,60 @@ function Copy-InstallFile {
     }
 }
 
+# setsuna-tsf-check: the registered shim activated in a process of its own
+# with the IME DLL $Name (in the shim's directory), as an app would have it.
+# Whether its text service came up; what it printed goes to the log. A check
+# that hangs is ended after a minute.
+function Test-CoreComesUp {
+    param([string]$Check, [string]$Name)
+    $out = Join-Path ([IO.Path]::GetTempPath()) "setsuna-tsf-check-$PID.txt"
+    $p = Start-Process -FilePath $Check -ArgumentList $Name -NoNewWindow -PassThru -RedirectStandardOutput $out
+    # Windows PowerShell gives no exit code for a handle not taken before the exit
+    $null = $p.Handle
+    if (-not $p.WaitForExit(60000)) {
+        try { $p.Kill() } catch { }
+        Write-Log ERROR "$Check $Name did not finish in a minute"
+        $code = -1
+    } else {
+        $code = $p.ExitCode
+    }
+    if (Test-Path -LiteralPath $out) {
+        Get-Content -LiteralPath $out | ForEach-Object { Write-Log INFO "  check: $_" }
+        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+    }
+    $code -eq 0
+}
+
+# core.txt beside the shim names $Name: written to a file of its own and moved
+# over core.txt, so that a shim never reads it half written. The shims in the
+# running apps see the directory change and swap to it.
+function Set-CoreName {
+    param([string]$Name)
+    $coreTxt = Join-Path $InstallDir 'core.txt'
+    if ((Test-Path -LiteralPath $coreTxt) -and
+        ((Get-Content -LiteralPath $coreTxt -Raw -ErrorAction SilentlyContinue) -eq $Name)) {
+        Write-Log INFO "core.txt names $Name already"
+        return
+    }
+    $tmp = Join-Path $InstallDir 'core.txt.new'
+    [IO.File]::WriteAllText($tmp, $Name, (New-Object Text.UTF8Encoding($false)))
+    for ($i = 0; ; $i++) {
+        try {
+            if (Test-Path -LiteralPath $coreTxt) {
+                [IO.File]::Replace($tmp, $coreTxt, [NullString]::Value)
+            } else {
+                [IO.File]::Move($tmp, $coreTxt)
+            }
+            break
+        } catch {
+            # a shim reading it that instant
+            if ($i -ge 20) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Write-Log INFO "core.txt names $Name"
+}
+
 # fetch-model.ps1's download cache: what is installed from it is a hard link
 # to the cached file, and the cache goes once the install is done (the next
 # install's fetch-model.ps1 takes the installed files back into it).
@@ -421,7 +485,10 @@ function Remove-StaleFiles {
     }
 
     $stale = @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object {
-        $_.Name -match '^(setsuna_tsf|setsuna-engine|setsuna-rewrite|onnxruntime)_[0-9a-f]{12}\.(dll|exe)$' -or
+        $_.Name -match '^(setsuna_tsf|setsuna_tsf_shim|setsuna-tsf-check|setsuna-engine|setsuna-rewrite|onnxruntime)_[0-9a-f]{12}\.(dll|exe)$' -or
+        # the IME DLL registered itself before the shim (registered no more
+        # once this install registered the shim)
+        (-not $NoElevate -and $_.Name -eq $DllName) -or
         $_.Extension -eq '.lexicon' })
     $stale += @(Get-ChildItem -LiteralPath $InstallDir -Directory | Where-Object { $_.Name -match '^rerank(_[0-9a-f]{12})?$' })
     foreach ($sub in 'models\onnx', 'models\lexicon', 'models\rerank') {
@@ -592,9 +659,13 @@ if ([Environment]::Is64BitOperatingSystem -ne $true) {
 
 $SourceDir = Resolve-Path-Safe $SourceDir
 $DllSrc    = Join-Path $SourceDir $DllName
+$ShimSrc   = Join-Path $SourceDir $ShimName
+$CheckSrc  = Join-Path $SourceDir $CheckExe
 $EngineSrc = Join-Path $SourceDir $EngineExe
 
 if (-not (Test-Path -LiteralPath $DllSrc))    { Write-Log ERROR "source DLL not found: $DllSrc";    exit 40 }
+if (-not (Test-Path -LiteralPath $ShimSrc))   { Write-Log ERROR "shim DLL not found: $ShimSrc";     exit 40 }
+if (-not (Test-Path -LiteralPath $CheckSrc))  { Write-Log ERROR "$CheckExe not found: $CheckSrc";  exit 40 }
 if (-not (Test-Path -LiteralPath $EngineSrc)) { Write-Log ERROR "engine.exe not found: $EngineSrc"; exit 40 }
 $OrtSrc = Join-Path $SourceDir $OrtDll
 if (-not (Test-Path -LiteralPath $OrtSrc)) {
@@ -782,11 +853,29 @@ foreach ($rel in $ArtifactFiles) {
     $copies += @{ src = (Join-Path $ManifestItem.Directory.FullName $rel); dst = $dst }
 }
 
-$DllInstalled = Join-Path $InstallDir $DllName
+# The IME DLL under its content's name, beside the ones apps still hold;
+# core.txt names it once it came up (below). The shim, registered as the
+# IME, loads it: in the apps that are running too, which swap to it.
+$CoreInstalled = Join-Path $InstallDir (Get-ContentAddressedName -Source $DllSrc -Destination (Join-Path $InstallDir $DllName))
 try {
-    $DllInstalled = Copy-InstallFile -Source $DllSrc -Destination $DllInstalled -AllowLockedFallback
+    # its name is its content: there already (an app may hold it), it is this one
+    if (Test-SameContent -Source $DllSrc -Destination $CoreInstalled) {
+        Write-Log INFO "skip (unchanged) $CoreInstalled"
+    } else {
+        $CoreInstalled = Copy-InstallFile -Source $DllSrc -Destination $CoreInstalled
+    }
 } catch {
-    Write-Log ERROR "copy failed $DllSrc -> $DllInstalled`: $_"; exit 50
+    Write-Log ERROR "copy failed $DllSrc -> $CoreInstalled`: $_"; exit 50
+}
+# The shim rarely changes: a running app holds it, and a new one goes next to
+# it under a content-addressed name, registered for the apps started after.
+$ShimInstalled = Join-Path $InstallDir $ShimName
+$CheckInstalled = Join-Path $InstallDir $CheckExe
+try {
+    $ShimInstalled = Copy-InstallFile -Source $ShimSrc -Destination $ShimInstalled -AllowLockedFallback
+    $CheckInstalled = Copy-InstallFile -Source $CheckSrc -Destination $CheckInstalled -AllowLockedFallback
+} catch {
+    Write-Log ERROR "copy failed: $_"; exit 50
 }
 
 # Engine daemons started by running input hosts lock the exe; the new one goes
@@ -995,16 +1084,11 @@ shift_9 = "）"
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
-    $StableDll = Join-Path $InstallDir $DllName
-    if ($NoElevate -and ($DllInstalled -ne $StableDll)) {
-        Write-Log WARN "NoElevate with fallback DLL: config preserved because registered DLL was not updated"
-    } else {
-        try {
-            Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
-            Write-Log INFO "updated engine config: $ConfigPath"
-        } catch {
-            Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"
-        }
+    try {
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
+        Write-Log INFO "updated engine config: $ConfigPath"
+    } catch {
+        Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"
     }
 }
 
@@ -1014,16 +1098,35 @@ if (Test-Path -LiteralPath $ConfigPath) {
     Grant-AppContainerRead -Path $ConfigPath
 }
 
-# ---- regsvr32 ----
+# ---- regsvr32 (the shim, as the IME) ----
 if (-not $NoElevate) {
-    Write-Log INFO "regsvr32 /s $DllInstalled"
-    $p = Start-Process regsvr32.exe -ArgumentList '/s', "`"$DllInstalled`"" -Wait -PassThru -NoNewWindow
+    Write-Log INFO "regsvr32 /s $ShimInstalled"
+    $p = Start-Process regsvr32.exe -ArgumentList '/s', "`"$ShimInstalled`"" -Wait -PassThru -NoNewWindow
     if ($p.ExitCode -ne 0) {
         Write-Log ERROR "regsvr32 failed with exit code $($p.ExitCode)"; exit 20
     }
     Write-Log INFO 'regsvr32 OK'
 } else {
     Write-Log WARN 'NoElevate: skipped regsvr32 (DLL not activated)'
+}
+
+# ---- the IME DLL: tried, then named ----
+# A DLL that does not come up never reaches the apps: core.txt keeps naming
+# the one before. Without regsvr32 nothing can try it.
+$CoreName = Split-Path -Leaf $CoreInstalled
+if (-not $NoElevate) {
+    Write-Log INFO "$CheckExe $CoreName"
+    if (-not (Test-CoreComesUp -Check $CheckInstalled -Name $CoreName)) {
+        Write-Log ERROR "$CoreName did not come up: core.txt still names the IME DLL before (install.log has the check's output)"
+        exit 70
+    }
+} else {
+    Write-Log WARN "NoElevate: $CoreName named without a check"
+}
+try {
+    Set-CoreName -Name $CoreName
+} catch {
+    Write-Log ERROR "core.txt not written: $_"; exit 50
 }
 
 # ---- Apps & Features entry (HKCU) ----
@@ -1041,7 +1144,7 @@ Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
 Write-Log INFO "registered HKCU Uninstall entry: $UninstReg"
 
 # ---- what earlier installs left ----
-$InstalledFiles = @($DllInstalled, $EngineInstalled, $OrtInstalled, $RewriteInstalled, $RerankInstalled,
+$InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInstalled, $OrtInstalled, $RewriteInstalled, $RerankInstalled,
                     $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled)
 $InstalledFiles += @($ArtifactFiles | ForEach-Object { Join-Path $ModelDstDir $_ })
 try {

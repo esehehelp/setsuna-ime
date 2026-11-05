@@ -53,8 +53,8 @@ foreach ($p in @($Out, $Zip, $Setup, (Join-Path $Dist 'SHA256SUMS'))) {
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 # binaries
-$binaries = @('setsuna_tsf.dll', 'setsuna-engine.exe', 'onnxruntime.dll', 'setsuna-settings.exe',
-              'setsuna-rewrite.exe')
+$binaries = @('setsuna_tsf.dll', 'setsuna_tsf_shim.dll', 'setsuna-tsf-check.exe', 'setsuna-engine.exe',
+              'onnxruntime.dll', 'setsuna-settings.exe', 'setsuna-rewrite.exe')
 if ($WithRerank) {
     $binaries += @('setsuna-rerank.exe') +
                  @(Get-ChildItem -LiteralPath $Release -File -Filter '*.dll' |
