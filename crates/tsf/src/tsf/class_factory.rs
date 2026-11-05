@@ -13,6 +13,22 @@ use crate::tsf::text_input_processor::SetsunaTextService;
 #[implement(IClassFactory)]
 pub struct SetsunaClassFactory;
 
+/// A new text service, its `riid` in `ppv` (the class factory's, and the
+/// shim's `SetsunaCoreCreate`).
+///
+/// # Safety
+/// `riid` and `ppv` are valid, as COM passes them.
+pub unsafe fn create_service(riid: *const GUID, ppv: *mut *mut core::ffi::c_void) -> Result<()> {
+    // the service's state is made here (the bridge with its defaults): a
+    // panic in it never reaches the host
+    let Some(service) = crate::guard::run("CreateInstance", || {
+        IUnknown::from(SetsunaTextService::new())
+    }) else {
+        return Err(E_FAIL.into());
+    };
+    service.query(&*riid, ppv).ok()
+}
+
 #[allow(clippy::new_without_default)]
 impl SetsunaClassFactory {
     pub fn new() -> Self {
@@ -48,14 +64,7 @@ impl IClassFactory_Impl for SetsunaClassFactory_Impl {
                 );
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
-            // the service's state is made here (the bridge with its
-            // defaults): a panic in it never reaches the host
-            let Some(service) = crate::guard::run("CreateInstance", || {
-                IUnknown::from(SetsunaTextService::new())
-            }) else {
-                return Err(E_FAIL.into());
-            };
-            let result = service.query(&*riid, ppvobject).ok();
+            let result = create_service(riid, ppvobject);
             setsuna_core::diagnostics::log(format!(
                 "ClassFactory::CreateInstance result={result:?}"
             ));

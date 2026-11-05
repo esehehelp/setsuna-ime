@@ -109,4 +109,50 @@ mod dll_exports {
             Err(e) => e.code(),
         }
     }
+
+    /// The version of the calls below, the shim's way in (`crates/tsf-shim`,
+    /// registered in this DLL's place, forwards TSF's calls to a text
+    /// service of this DLL and swaps it for a newer DLL's while the app
+    /// runs). A shim of another version is refused and keeps the core it has.
+    const CORE_ABI: u32 = 1;
+
+    /// A new text service, `riid` of it in `ppv`, as the class factory makes
+    /// one.
+    #[unsafe(no_mangle)]
+    extern "system" fn SetsunaCoreCreate(
+        abi: u32,
+        riid: *const GUID,
+        ppv: *mut *mut core::ffi::c_void,
+    ) -> HRESULT {
+        setsuna_core::diagnostics::log(format!("SetsunaCoreCreate abi={abi}"));
+        if ppv.is_null() || riid.is_null() {
+            return E_POINTER;
+        }
+        unsafe { *ppv = core::ptr::null_mut() };
+        if abi != CORE_ABI {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        }
+        match unsafe { crate::tsf::class_factory::create_service(riid, ppv) } {
+            Ok(()) => S_OK,
+            Err(e) => e.code(),
+        }
+    }
+
+    /// Whether `tip`, an `ITfTextInputProcessorEx` `SetsunaCoreCreate` made,
+    /// holds a composition (or is busy): the shim swaps it only when not.
+    #[unsafe(no_mangle)]
+    extern "system" fn SetsunaCoreComposing(tip: *mut core::ffi::c_void) -> BOOL {
+        use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
+        let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
+            return TRUE;
+        };
+        let service: &crate::tsf::text_input_processor::SetsunaTextService =
+            unsafe { tip.as_impl() };
+        BOOL::from(
+            service
+                .inner
+                .try_borrow()
+                .map_or(true, |inner| inner.composition.is_some()),
+        )
+    }
 }
