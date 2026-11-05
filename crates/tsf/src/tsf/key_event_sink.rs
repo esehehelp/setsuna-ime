@@ -28,7 +28,7 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
         _lparam: LPARAM,
     ) -> Result<BOOL> {
         let vk = wparam.0 as u32;
-        setsuna_core::diagnostics::log(format!("OnTestKeyDown vk={vk:#x}"));
+        setsuna_core::diagnostics::log(format!("OnTestKeyDown vk={}", key_for_log(vk)));
         self.guarded("OnTestKeyDown", pic, Ok(FALSE), || {
             let eaten = self.test_key_down(pic, vk);
             if !eaten {
@@ -40,7 +40,11 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         let vk = wparam.0 as u32;
-        setsuna_core::diagnostics::log(format!("OnKeyDown vk={vk:#x} pic={}", pic.is_some()));
+        setsuna_core::diagnostics::log(format!(
+            "OnKeyDown vk={} pic={}",
+            key_for_log(vk),
+            pic.is_some()
+        ));
         self.guarded("OnKeyDown", pic, Ok(FALSE), || self.key_down(pic, vk))
     }
 
@@ -74,6 +78,22 @@ impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
         self.guarded("OnPreservedKey", pic, Ok(FALSE), || {
             self.switch_by_key(role, pic)
         })
+    }
+}
+
+/// A key for the log: its code when it types no character (Enter, Space,
+/// an arrow, F7, a modifier), `char` when it does (a letter, a digit, a
+/// symbol, the numeric keypad's), so that what is typed, a password too,
+/// stays out of the log.
+fn key_for_log(vk: u32) -> String {
+    let types_a_char = matches!(
+        vk,
+        0x30..=0x39 | 0x41..=0x5A | 0x60..=0x6F | 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2
+    );
+    if types_a_char {
+        "char".into()
+    } else {
+        format!("{vk:#x}")
     }
 }
 
@@ -999,6 +1019,18 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_keys_are_logged_without_their_code() {
+        // A, Z, 0, 9, numpad 5, ";", "[", "\\" (JIS)
+        for vk in [0x41, 0x5A, 0x30, 0x39, 0x65, 0xBA, 0xDB, 0xE2] {
+            assert_eq!(key_for_log(vk), "char", "{vk:#x}");
+        }
+        // Enter, Space, Backspace, an arrow, F7, Shift, ImeOn
+        for vk in [0x0D, 0x20, 0x08, 0x25, 0x76, 0x10, 0x16] {
+            assert_eq!(key_for_log(vk), format!("{vk:#x}"));
+        }
+    }
 
     #[test]
     fn keys_that_edit_or_move_break_the_context() {

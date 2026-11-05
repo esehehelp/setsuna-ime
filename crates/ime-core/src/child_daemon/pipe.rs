@@ -233,8 +233,9 @@ impl EngineClient for PipeEngineClient {
             return child.dispatch_more(req_id, context, reading, continue_beam);
         }
         crate::diagnostics::log(format!(
-            "dispatch req_id={req_id} context_len={} reading={reading} continue_beam={continue_beam}",
-            context.chars().count()
+            "dispatch req_id={req_id} context_len={} reading_len={} continue_beam={continue_beam}",
+            context.chars().count(),
+            reading.chars().count()
         ));
         self.shared.state.lock().unwrap().pending = Some(Pending {
             req_id,
@@ -510,7 +511,10 @@ fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<Str
         match serde_json::from_str::<serde_json::Value>(text) {
             Ok(v) if v["id"] == id || v["id"] == 0 => return Ok(buf),
             Ok(v) => crate::diagnostics::log(format!("engine stale response id={}", v["id"])),
-            Err(e) => crate::diagnostics::log(format!("engine parse failed: {e}; line={text}")),
+            Err(e) => crate::diagnostics::log(format!(
+                "engine parse failed: {e}; line of {} bytes",
+                text.len()
+            )),
         }
     }
 }

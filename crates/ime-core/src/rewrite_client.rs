@@ -141,16 +141,7 @@ impl ChildRewriteClient {
         ));
         cmd.args(args);
         let stderr = crate::diagnostics::log_path("rewrite-stderr.log")
-            .and_then(|path| {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-            })
+            .and_then(|path| crate::diagnostics::open_log(&path))
             .map(Stdio::from)
             .unwrap_or_else(Stdio::null);
         cmd.stdin(Stdio::piped())

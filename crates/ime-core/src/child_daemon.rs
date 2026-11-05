@@ -241,16 +241,7 @@ impl ChildDaemonClient {
         cmd.args(args);
 
         let stderr = crate::diagnostics::log_path("engine-stderr.log")
-            .and_then(|path| {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-            })
+            .and_then(|path| crate::diagnostics::open_log(&path))
             .map(Stdio::from)
             .unwrap_or_else(Stdio::null);
 
@@ -327,13 +318,11 @@ impl EngineClient for ChildDaemonClient {
         if reading.is_empty() {
             return;
         }
-        let context_len = context.chars().count();
-        let context_tail: String = context
-            .chars()
-            .skip(context_len.saturating_sub(8))
-            .collect();
+        // lengths only: what the user types stays out of the log
         crate::diagnostics::log(format!(
-            "dispatch req_id={req_id} context_len={context_len} context_tail={context_tail:?} reading={reading} continue_beam={continue_beam}"
+            "dispatch req_id={req_id} context_len={} reading_len={} continue_beam={continue_beam}",
+            context.chars().count(),
+            reading.chars().count()
         ));
         {
             let mut st = self.shared.state.lock().unwrap();
@@ -425,8 +414,9 @@ fn request_line(shared: &Shared, pending: &Pending) -> Option<String> {
         analyze: (!pending.analyze.is_empty()).then_some(&pending.analyze[..]),
     };
     crate::diagnostics::log(format!(
-        "writer send req_id={} reading={}",
-        pending.req_id, pending.reading
+        "writer send req_id={} reading_len={}",
+        pending.req_id,
+        pending.reading.chars().count()
     ));
     match serde_json::to_string(&req) {
         Ok(l) => Some(l),
@@ -524,7 +514,10 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
     let resp: DaemonResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
         Err(e) => {
-            crate::diagnostics::log(format!("reader parse failed: {e}; line={trimmed}"));
+            crate::diagnostics::log(format!(
+                "reader parse failed: {e}; line of {} bytes",
+                trimmed.len()
+            ));
             return None;
         }
     };

@@ -72,11 +72,37 @@ pub fn say(message: impl std::fmt::Display) {
     };
     let line = format!("{label} pid={}: {message}", std::process::id());
     match file {
+        // whole, in one write: the IME's helpers share the file
         Some(file) => {
-            let _ = writeln!(lock(file), "{line}");
+            let _ = lock(file).write_all(
+                format!(
+                    "{line}
+"
+                )
+                .as_bytes(),
+            );
         }
         None => eprintln!("{line}"),
     }
+}
+
+/// The size past which a log moves to `<name>.1` when a server opens it
+/// (the IME's logs' limit).
+const LOG_LIMIT: u64 = 4 << 20;
+
+/// `path` opened to append, moved to `<path>.1` first (the one there before
+/// goes) when past [`LOG_LIMIT`]; one that cannot be moved is appended to.
+fn open_log(path: &std::path::Path) -> Option<std::fs::File> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > LOG_LIMIT) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, &old);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 /// Claim the pipe, make the service with `load` (it returns the service and
@@ -92,13 +118,7 @@ pub fn serve<S: Service + 'static>(
         Err(e) if win::is_taken(&e) => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("create {}", opts.pipe_name)),
     };
-    let log = opts.log.as_ref().and_then(|path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    });
+    let log = opts.log.as_deref().and_then(open_log);
     let _ = LOG.set((opts.label, log.map(Mutex::new)));
     let clients = Arc::new(Mutex::new(Clients {
         connected: 0,

@@ -389,13 +389,7 @@ fn start(
     let mut cmd = Command::new(&launch.exe);
     cmd.args(&launch.args);
     let stderr = stderr_log_path()
-        .and_then(|path| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok()
-        })
+        .and_then(|path| crate::diagnostics::open_log(&path))
         .map(Stdio::from)
         .unwrap_or_else(Stdio::null);
     cmd.stdin(Stdio::piped())
@@ -480,7 +474,10 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
         let resp: Response = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                crate::diagnostics::log(format!("rerank parse failed: {e}; line={trimmed}"));
+                crate::diagnostics::log(format!(
+                    "rerank parse failed: {e}; line of {} bytes",
+                    trimmed.len()
+                ));
                 continue;
             }
         };

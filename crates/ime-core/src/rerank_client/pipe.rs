@@ -387,7 +387,10 @@ fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<Res
                 crate::diagnostics::log(format!("rerank stale response id={}", resp.id));
             }
             Err(e) => {
-                crate::diagnostics::log(format!("rerank parse failed: {e}; line={text}"));
+                crate::diagnostics::log(format!(
+                    "rerank parse failed: {e}; line of {} bytes",
+                    text.len()
+                ));
             }
         }
     }

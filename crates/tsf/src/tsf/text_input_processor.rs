@@ -382,7 +382,10 @@ fn on_async_done(svc: &SetsunaTextService_Impl) {
         setsuna_core::diagnostics::log("on_async_done no actions");
         return;
     }
-    setsuna_core::diagnostics::log(format!("on_async_done actions={actions:?}"));
+    setsuna_core::diagnostics::log(format!(
+        "on_async_done actions={}",
+        setsuna_core::engine_bridge::Action::shapes(&actions)
+    ));
 
     let Some(context) = focused_context(svc) else {
         setsuna_core::diagnostics::log("on_async_done no focused context");

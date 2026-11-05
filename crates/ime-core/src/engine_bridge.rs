@@ -81,6 +81,38 @@ pub enum Action {
     },
 }
 
+impl Action {
+    /// The action for a log: its kind and the length of its text or list,
+    /// never the text.
+    pub fn shape(&self) -> String {
+        let n = |s: &str| s.chars().count();
+        match self {
+            Action::UpdatePreedit { text } => format!("UpdatePreedit({})", n(text)),
+            Action::Commit { text } => format!("Commit({})", n(text)),
+            Action::EndComposition => "EndComposition".into(),
+            Action::ShowCandidates { list, selected } => {
+                format!("ShowCandidates({}, selected {selected})", list.len())
+            }
+            Action::HideCandidates => "HideCandidates".into(),
+            Action::UpdateSegments { segments, focus } => {
+                format!("UpdateSegments({}, focus {focus})", segments.len())
+            }
+            Action::ShowSegmentCandidates { list, selected, at } => format!(
+                "ShowSegmentCandidates({}, selected {selected}, at {at})",
+                list.len()
+            ),
+            Action::Status { text } => format!("Status({})", n(text)),
+            Action::ShowSuggestions { list } => format!("ShowSuggestions({})", list.len()),
+        }
+    }
+
+    /// [`Action::shape`] of each, for a log.
+    pub fn shapes(actions: &[Action]) -> String {
+        let shapes: Vec<String> = actions.iter().map(Action::shape).collect();
+        format!("[{}]", shapes.join(", "))
+    }
+}
+
 pub struct KeyOutcome {
     pub consumed: bool,
     pub actions: Vec<Action>,
@@ -2703,8 +2735,9 @@ impl EngineBridge {
         let reading = job.reading.clone();
         let (k, n) = (job.k, job.raw.len());
         crate::diagnostics::log(format!(
-            "rerank applied k={k} ms={:.1} top={:?} (was {:?})",
-            result.score_ms, raw[0], job.raw[0]
+            "rerank applied k={k} ms={:.1} top changed={}",
+            result.score_ms,
+            raw[0] != job.raw[0]
         ));
         let list = self.finish_list(&reading, raw.clone(), true);
         let starts = self.list_starts_of(&reading, &raw, &reading_pos, &list);
