@@ -56,6 +56,8 @@
 #   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
 #   %LOCALAPPDATA%\setsuna-ime\models\lexicon\<lexicon>  (downloaded, or -Lexicon)
 #   %LOCALAPPDATA%\setsuna-ime\models\analyzer\<its directory's name>\<manifest> + its files  (downloaded, or -Analyzer)
+#   %LOCALAPPDATA%\setsuna-ime\cache\models\<repository>\<revision>\  (fetch-model.ps1's downloads while
+#                                  installing: the files are installed as hard links, the cache removed)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
@@ -65,6 +67,12 @@
 # %APPDATA%\setsuna-ime (the learning, the history and credentials.bin stay
 # closed to them). The IME in such an app then reaches the login's shared
 # engine; it never starts an engine of its own there.
+#
+# What earlier installs left and nothing uses goes: the content-addressed
+# binaries, the models and dictionaries in models\ that neither this install
+# nor config.toml names, and the download cache (a file a running app holds
+# goes at a later install). The next install takes the installed model and
+# dictionaries back when models.json pins them still, instead of downloading.
 #
 # Idempotent: re-running converges to the desired state. Per-user file layout
 # under %LOCALAPPDATA%; regsvr32 still requires admin because registration.rs
@@ -295,6 +303,156 @@ function Copy-InstallFile {
     }
 }
 
+# fetch-model.ps1's download cache: what is installed from it is a hard link
+# to the cached file, and the cache goes once the install is done (the next
+# install's fetch-model.ps1 takes the installed files back into it).
+$CacheDir = Join-Path $InstallDir 'cache'
+
+function Test-InCache {
+    param([string]$Path)
+    ([IO.Path]::GetFullPath($Path)).StartsWith($CacheDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+# Whether $Destination is a name of the file $Source is (fsutil lists every
+# name of a file, without its drive).
+function Test-HardLinked {
+    param([string]$Source, [string]$Destination)
+    if (-not (Test-Path -LiteralPath $Destination)) { return $false }
+    $names = @(& fsutil hardlink list $Destination 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $tail = ([IO.Path]::GetFullPath($Source)).Substring(2)
+    @($names | Where-Object { $_ -ieq $tail }).Count -gt 0
+}
+
+# A model or dictionary file: one from the cache is linked (copied when the
+# file system will not link), any other copied by Copy-InstallFile. A locked
+# destination (a lexicon apps map) is kept when it has the content, else the
+# file goes beside it under a content-addressed name.
+function Install-ArtifactFile {
+    param([string]$Source, [string]$Destination, [switch]$AllowLockedFallback)
+    if (-not (Test-InCache $Source)) {
+        return Copy-InstallFile -Source $Source -Destination $Destination -AllowLockedFallback:$AllowLockedFallback
+    }
+    if (Test-HardLinked -Source $Source -Destination $Destination) {
+        Write-Log INFO "skip (linked) $Destination"
+        return $Destination
+    }
+    $target = $Destination
+    if (Test-Path -LiteralPath $Destination) {
+        try {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+        } catch {
+            if (Test-SameContent -Source $Source -Destination $Destination) {
+                Write-Log INFO "skip (unchanged, in use) $Destination"
+                return $Destination
+            }
+            if (-not $AllowLockedFallback) { throw }
+            $target = Join-Path (Split-Path -Parent $Destination) (Get-ContentAddressedName -Source $Source -Destination $Destination)
+            if (Test-HardLinked -Source $Source -Destination $target) {
+                Write-Log WARN "$Destination was locked; using linked $target"
+                return $target
+            }
+            Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            Write-Log WARN "$Destination was locked; installing $target"
+        }
+    }
+    try {
+        New-Item -ItemType HardLink -Path $target -Value $Source -ErrorAction Stop | Out-Null
+        Write-Log INFO "linked $Source -> $target"
+    } catch {
+        Copy-Item -LiteralPath $Source -Destination $target -Force
+        Write-Log INFO "copied $Source -> $target (no hard link: $_)"
+    }
+    return $target
+}
+
+# The files a model, reranker or analyzer manifest names, relative to it.
+function Get-ManifestFiles {
+    param([string]$Path)
+    try {
+        $j = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return @()
+    }
+    @($j.proposal.path, $j.proposal.external_data, $j.vocab, $j.input_vocab, $j.crf.path,
+      $j.rescore.pairs, $j.rescore.words, $j.weights.path, $j.tokenizer.path,
+      $j.dictionary.path, $j.alternates) |
+        ForEach-Object { $_ } | Where-Object { $_ -is [string] -and $_ }
+}
+
+# Whether some file under $Path is open without delete sharing (a running
+# daemon's exe or DLLs, a mapped dictionary).
+function Test-InUse {
+    param([string]$Path)
+    foreach ($f in @(Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+        try {
+            $s = [IO.File]::Open($f.FullName, 'Open', 'Read', 'None')
+            $s.Close()
+        } catch {
+            return $true
+        }
+    }
+    $false
+}
+
+# What earlier installs left that nothing uses now: the content-addressed
+# binaries and directories a locked file got, the models and dictionaries
+# models\ holds besides this install's and those config.toml names, and the
+# download cache (installed from, or of revisions no longer pinned). Whatever
+# a running app still holds stays until a later install.
+function Remove-StaleFiles {
+    param([string[]]$Keep, [string]$ConfigPath)
+    $keepSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $paths = @($Keep | Where-Object { $_ })
+    if (Test-Path -LiteralPath $ConfigPath) {
+        $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+        foreach ($m in [regex]::Matches($text, '"([A-Za-z]:[/\\][^"]+)"')) {
+            $paths += $m.Groups[1].Value.Replace('/', '\')
+        }
+    }
+    foreach ($p in $paths) {
+        $full = [IO.Path]::GetFullPath($p)
+        [void]$keepSet.Add($full)
+        if ($full -like '*.json' -and (Test-Path -LiteralPath $full)) {
+            foreach ($rel in Get-ManifestFiles $full) {
+                [void]$keepSet.Add([IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $full) $rel)))
+            }
+        }
+    }
+
+    $stale = @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object {
+        $_.Name -match '^(setsuna_tsf|setsuna-engine|setsuna-rewrite|onnxruntime)_[0-9a-f]{12}\.(dll|exe)$' -or
+        $_.Extension -eq '.lexicon' })
+    $stale += @(Get-ChildItem -LiteralPath $InstallDir -Directory | Where-Object { $_.Name -match '^rerank(_[0-9a-f]{12})?$' })
+    foreach ($sub in 'models\onnx', 'models\lexicon', 'models\rerank') {
+        $dir = Join-Path $InstallDir $sub
+        if (Test-Path -LiteralPath $dir) { $stale += @(Get-ChildItem -LiteralPath $dir -File -Recurse) }
+    }
+    $dir = Join-Path $InstallDir 'models\analyzer'
+    if (Test-Path -LiteralPath $dir) { $stale += @(Get-ChildItem -LiteralPath $dir -Directory) }
+    $cache = Join-Path $CacheDir 'models'
+    if (Test-Path -LiteralPath $cache) { $stale += @(Get-ChildItem -LiteralPath $cache -Directory) }
+
+    foreach ($item in $stale) {
+        $full = $item.FullName
+        $prefix = $full.TrimEnd('\') + '\'
+        if ($keepSet.Contains($full) -or
+            ($item.PSIsContainer -and @($keepSet | Where-Object { $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)) {
+            continue
+        }
+        if ($item.PSIsContainer -and (Test-InUse $full)) {
+            Write-Log INFO "kept $full (in use)"
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+            Write-Log INFO "removed unused $full"
+        } catch {
+            Write-Log INFO "kept $full (in use)"
+        }
+    }
+}
+
 function Set-OrAppendConfigValue {
     param(
         [string[]]$Lines,
@@ -446,8 +604,10 @@ if (-not (Test-Path -LiteralPath $OrtSrc)) {
 # Resolve the public artifact before elevation. The elevated invocation receives
 # this local manifest, so it neither downloads again nor changes cache ownership.
 if ($PSCmdlet.ParameterSetName -eq 'Download') {
+    # what an earlier install put in place is not downloaded again
+    $Seeds = @('onnx', 'lexicon', 'analyzer') | ForEach-Object { Join-Path $InstallDir "models\$_" }
     try {
-        $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision
+        $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision -SeedDir $Seeds
     } catch {
         Write-Log ERROR "model download failed: $_ (retry, or use -Manifest for a local artifact)"; exit 30
     }
@@ -455,14 +615,14 @@ if ($PSCmdlet.ParameterSetName -eq 'Download') {
     # them, so a failed download is a warning
     if (-not $NoDictionaries -and -not $Lexicon) {
         try {
-            $Lexicon = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component lexicon
+            $Lexicon = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component lexicon -SeedDir $Seeds
         } catch {
             Write-Log WARN "lexicon download failed, installing without it: $_ (run again to retry)"
         }
     }
     if (-not $NoDictionaries -and -not $Analyzer) {
         try {
-            $Analyzer = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component analyzer
+            $Analyzer = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component analyzer -SeedDir $Seeds
         } catch {
             Write-Log WARN "analyzer download failed, installing without it: $_ (run again to retry)"
         }
@@ -677,7 +837,7 @@ if (Test-Path -LiteralPath $RewriteSrc) {
 
 foreach ($c in $copies) {
     try {
-        Copy-InstallFile -Source $c.src -Destination $c.dst | Out-Null
+        Install-ArtifactFile -Source $c.src -Destination $c.dst | Out-Null
     } catch {
         Write-Log ERROR "copy failed $($c.src) -> $($c.dst): $_"; exit 50
     }
@@ -749,7 +909,7 @@ try {
         $LexiconDir = Join-Path $InstallDir 'models\lexicon'
         New-Item -ItemType Directory -Force -Path $LexiconDir | Out-Null
         # mapped by every app the IME runs in: a new one beside it when locked
-        $LexiconInstalled = Copy-InstallFile -Source $Lexicon -Destination (Join-Path $LexiconDir (Split-Path -Leaf $Lexicon)) -AllowLockedFallback
+        $LexiconInstalled = Install-ArtifactFile -Source $Lexicon -Destination (Join-Path $LexiconDir (Split-Path -Leaf $Lexicon)) -AllowLockedFallback
     }
     if ($Analyzer) {
         # its directory named as the source's: a running engine maps the
@@ -758,9 +918,9 @@ try {
         $AnalyzerDir = Join-Path $InstallDir ('models\analyzer\' + (Split-Path -Leaf $AnalyzerSrcDir))
         New-Item -ItemType Directory -Force -Path $AnalyzerDir | Out-Null
         foreach ($f in $AnalyzerFiles) {
-            Copy-InstallFile -Source (Join-Path $AnalyzerSrcDir $f) -Destination (Join-Path $AnalyzerDir $f) | Out-Null
+            Install-ArtifactFile -Source (Join-Path $AnalyzerSrcDir $f) -Destination (Join-Path $AnalyzerDir $f) | Out-Null
         }
-        $AnalyzerInstalled = Copy-InstallFile -Source $Analyzer -Destination (Join-Path $AnalyzerDir (Split-Path -Leaf $Analyzer))
+        $AnalyzerInstalled = Install-ArtifactFile -Source $Analyzer -Destination (Join-Path $AnalyzerDir (Split-Path -Leaf $Analyzer))
     }
 } catch {
     Write-Log ERROR "copy failed (mixed input): $_"; exit 50
@@ -879,6 +1039,16 @@ Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPol
 Set-ItemProperty $UninstReg NoModify        1 -Type DWord
 Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
 Write-Log INFO "registered HKCU Uninstall entry: $UninstReg"
+
+# ---- what earlier installs left ----
+$InstalledFiles = @($DllInstalled, $EngineInstalled, $OrtInstalled, $RewriteInstalled, $RerankInstalled,
+                    $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled)
+$InstalledFiles += @($ArtifactFiles | ForEach-Object { Join-Path $ModelDstDir $_ })
+try {
+    Remove-StaleFiles -Keep $InstalledFiles -ConfigPath $ConfigPath
+} catch {
+    Write-Log WARN "could not remove what earlier installs left: $_"
+}
 
 Write-Log INFO "install complete at $InstallDir"
 Write-Host ""

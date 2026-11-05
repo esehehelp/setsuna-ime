@@ -3,6 +3,9 @@
 # Verified cache files work offline. Downloads are staged before replacement.
 # With -Component, one of the catalog's components (the reading lexicon, the
 # analyzer) instead: every file it pins, and its entry's path on stdout.
+# -SeedDir names where installed files are, which come into the cache by a
+# hard link when they are the pinned ones (install.ps1 removes the cache
+# once it has installed from it).
 #
 # Usage:
 #   pwsh -File crates/tsf/fetch-model.ps1
@@ -17,6 +20,9 @@ param(
     [ValidateSet('lexicon', 'analyzer')]
     [string]$Component,
     [string]$CacheDir = (Join-Path $env:LOCALAPPDATA 'setsuna-ime\cache\models'),
+    # Directories of installed files (a pinned file's path, or its name,
+    # under one): a verified one is put in the cache instead of downloading.
+    [string[]]$SeedDir = @(),
     # Default: models.json next to this script.
     [string]$CatalogPath
 )
@@ -114,6 +120,22 @@ function Get-ArtifactFile {
         return $path
     }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    # the same file installed already: linked into the cache (copied when the
+    # file system will not link), not downloaded again
+    foreach ($seed in $SeedDir) {
+        foreach ($candidate in @((Join-Path $seed $RelativePath), (Join-Path $seed (Split-Path -Leaf $RelativePath)))) {
+            if (Test-VerifiedFile $candidate $spec) {
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+                try {
+                    New-Item -ItemType HardLink -Path $path -Value $candidate -ErrorAction Stop | Out-Null
+                } catch {
+                    Copy-Item -LiteralPath $candidate -Destination $path -Force
+                }
+                Write-Host "model reused: $RelativePath"
+                return $path
+            }
+        }
+    }
     $temporary = "$path.$([Guid]::NewGuid().ToString('N')).part"
     $escaped = ($RelativePath.Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
     Write-Host "downloading model: $RelativePath"

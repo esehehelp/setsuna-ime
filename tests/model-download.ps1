@@ -198,7 +198,23 @@ $state.offline = $true
 $state.requests = @()
 $again = & $fetch -Component analyzer -CacheDir $cache -CatalogPath $catalogPath
 Assert ($again -eq $analyzer[0] -and $state.requests.Count -eq 0) 'verified component cache works offline'
+# installed files seed an empty cache: by path or by name, verified, no HTTP
+$seed = Join-Path $root 'seed'
+New-Item -ItemType Directory -Force -Path (Join-Path $seed 'ma') | Out-Null
+foreach ($relative in $state.dict.Keys) { [IO.File]::WriteAllBytes((Join-Path $seed $relative), $state.dict[$relative]) }
+$lexSeed = Join-Path $root 'lexseed'
+New-Item -ItemType Directory -Force -Path $lexSeed | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $lexSeed 'words.lexicon'), $state.dict['words.lexicon'])
+$seeded = Join-Path $root 'seeded-cache'
+$fromSeed = & $fetch -Component analyzer -CacheDir $seeded -CatalogPath $catalogPath -SeedDir @($lexSeed, $seed)
+Assert ($fromSeed -eq (Join-Path $seeded "example/dict/$dictRevision/ma/analyzer.manifest.json") -and $state.requests.Count -eq 0) 'installed files seed the cache offline'
+$fromSeed = & $fetch -Component lexicon -CacheDir $seeded -CatalogPath $catalogPath -SeedDir @($lexSeed)
+Assert ($state.requests.Count -eq 0 -and (Test-Path -LiteralPath $fromSeed)) 'a seed found by its name'
 $state.offline = $false
+[IO.File]::WriteAllBytes((Join-Path $seed 'ma/system.dic.zst'), [Text.Encoding]::UTF8.GetBytes('changed'))
+Remove-Item -LiteralPath (Join-Path $seeded "example/dict/$dictRevision/ma/system.dic.zst")
+& $fetch -Component analyzer -CacheDir $seeded -CatalogPath $catalogPath -SeedDir @($seed) | Out-Null
+Assert ($state.requests.Count -eq 1 -and $state.requests[0].EndsWith('ma/system.dic.zst')) 'a seed of other content is downloaded instead'
 $catalog.components.lexicon.entry = 'other.lexicon'
 Save-Catalog
 Assert-Throws { & $fetch -Component lexicon -CacheDir $cache -CatalogPath $catalogPath } 'is not pinned in the catalog'

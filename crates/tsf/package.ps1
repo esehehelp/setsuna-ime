@@ -7,19 +7,22 @@
 #   pwsh -File target\dist\setup.ps1 -Archive target\dist\setsuna-ime-<version>-windows-x64.zip   # try it
 #   gh release create v<version> target\dist\*                                                    # publish
 #
-# The zip holds the TSF DLL, the engine, reranker (with llama.cpp's DLLs) and
-# rewriter daemons, ONNX Runtime (crates\engine\fetch-onnxruntime.ps1), the
-# settings GUI, the mixed input model (mixed\), the licenses and install.ps1,
-# uninstall.ps1, fetch-model.ps1 and models.json: install.ps1 downloads the
-# model pinned there. Its scripts get a UTF-8 BOM, which Windows PowerShell
-# 5.1 needs to read non-ASCII text, and install.cmd runs install.ps1 on a
-# double-click.
+# The zip holds the TSF DLL, the engine and rewriter daemons, ONNX Runtime
+# (crates\engine\fetch-onnxruntime.ps1), the settings GUI, the mixed input
+# model (mixed\), the licenses and install.ps1, uninstall.ps1, fetch-model.ps1
+# and models.json: install.ps1 downloads the model pinned there. Its scripts
+# get a UTF-8 BOM, which Windows PowerShell 5.1 needs to read non-ASCII text,
+# and install.cmd runs install.ps1 on a double-click. The reranker (with
+# llama.cpp's DLLs, 21 MB) only with -WithRerank: no LM it scores with is
+# published, so a release's install has none to use.
 
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
     # Package the binaries already in target\release.
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Also the reranker and llama.cpp's DLLs (install.ps1 -RerankManifest).
+    [switch]$WithRerank
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,15 +54,18 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 # binaries
 $binaries = @('setsuna_tsf.dll', 'setsuna-engine.exe', 'onnxruntime.dll', 'setsuna-settings.exe',
-              'setsuna-rewrite.exe', 'setsuna-rerank.exe') +
-            @(Get-ChildItem -LiteralPath $Release -File -Filter '*.dll' |
-              Where-Object { $_.Name -match '^(llama|ggml)' } | ForEach-Object { $_.Name })
+              'setsuna-rewrite.exe')
+if ($WithRerank) {
+    $binaries += @('setsuna-rerank.exe') +
+                 @(Get-ChildItem -LiteralPath $Release -File -Filter '*.dll' |
+                   Where-Object { $_.Name -match '^(llama|ggml)' } | ForEach-Object { $_.Name })
+    if (-not ($binaries -match '^ggml-cpu-')) { throw "no ggml CPU backends in $Release" }
+}
 foreach ($b in $binaries) {
     $src = Join-Path $Release $b
     if (-not (Test-Path -LiteralPath $src)) { throw "missing build output: $src" }
     Copy-Item -LiteralPath $src -Destination $Out
 }
-if (-not ($binaries -match '^ggml-cpu-')) { throw "no ggml CPU backends in $Release" }
 
 # install.ps1 installs the Visual C++ runtime when older than its floor,
 # which must not be below the toolset (linker version) of any binary.
@@ -107,7 +113,7 @@ foreach ($f in @('kana.tsv', 'latin.tsv', 'params.txt', 'README.md')) {
 
 # licenses
 $licenses = Join-Path $Out 'licenses'
-New-Item -ItemType Directory -Force -Path (Join-Path $licenses 'onnxruntime'), (Join-Path $licenses 'llama.cpp') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $licenses 'onnxruntime') | Out-Null
 Copy-Item -LiteralPath (Join-Path $Repo 'LICENSE'), (Join-Path $Repo 'THIRD_PARTY_NOTICES.md') -Destination $licenses
 # ONNX Runtime's, from the zip fetch-onnxruntime.ps1 checked
 $ortDll = (Get-Item -LiteralPath (Join-Path $Release 'onnxruntime.dll')).VersionInfo.ProductVersion
@@ -128,13 +134,16 @@ try {
     $archive.Dispose()
 }
 # llama.cpp (MIT), built into the reranker from the llama-cpp-sys-2 crate
-$lock = Get-Content -LiteralPath (Join-Path $Repo 'Cargo.lock') -Raw
-if ($lock -notmatch '(?m)^name = "llama-cpp-sys-2"\r?\nversion = "([^"]+)"') { throw 'no llama-cpp-sys-2 in Cargo.lock' }
-$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-$llamaLicense = Get-ChildItem -Path (Join-Path $cargoHome "registry\src\*\llama-cpp-sys-2-$($Matches[1])\llama.cpp\LICENSE") |
-    Select-Object -First 1
-if (-not $llamaLicense) { throw "no llama.cpp LICENSE of llama-cpp-sys-2 $($Matches[1]) under $cargoHome" }
-Copy-Item -LiteralPath $llamaLicense.FullName -Destination (Join-Path $licenses 'llama.cpp\LICENSE')
+if ($WithRerank) {
+    $lock = Get-Content -LiteralPath (Join-Path $Repo 'Cargo.lock') -Raw
+    if ($lock -notmatch '(?m)^name = "llama-cpp-sys-2"\r?\nversion = "([^"]+)"') { throw 'no llama-cpp-sys-2 in Cargo.lock' }
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+    $llamaLicense = Get-ChildItem -Path (Join-Path $cargoHome "registry\src\*\llama-cpp-sys-2-$($Matches[1])\llama.cpp\LICENSE") |
+        Select-Object -First 1
+    if (-not $llamaLicense) { throw "no llama.cpp LICENSE of llama-cpp-sys-2 $($Matches[1]) under $cargoHome" }
+    New-Item -ItemType Directory -Force -Path (Join-Path $licenses 'llama.cpp') | Out-Null
+    Copy-Item -LiteralPath $llamaLicense.FullName -Destination (Join-Path $licenses 'llama.cpp\LICENSE')
+}
 
 [IO.Compression.ZipFile]::CreateFromDirectory($Out, $Zip, [IO.Compression.CompressionLevel]::Optimal, $true)
 Remove-Item -LiteralPath $Out -Recurse -Force
