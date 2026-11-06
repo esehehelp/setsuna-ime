@@ -1,27 +1,28 @@
-//! One IME session: the `EngineBridge` plus what the addon should show.
+//! One IME session: the `EngineBridge` plus what the frontend should show.
 //!
 //! The bridge answers each key with `Action`s meant to be applied in order
-//! (TSF edit sessions). fcitx5 instead renders a state: text to commit, a
-//! preedit and a candidate list. `Session` folds the actions into a [`View`]
-//! the addon reads after every call and renders whole.
+//! (TSF edit sessions). The fcitx5 addon and the Android keyboard instead
+//! render a state: text to commit, a preedit and a candidate list. `Session`
+//! folds the actions into a [`View`] the frontend reads after every call and
+//! renders whole. Keys come in as X keysyms ([`crate::keysym`]).
 //!
-//! The addon keeps one session for all input contexts: only the focused one
-//! composes, and the composition is committed when it loses focus
+//! A frontend keeps one session for all input contexts: only the focused
+//! one composes, and the composition is committed when it loses focus
 //! ([`Session::flush`]), so a context never inherits another's.
 
 use std::collections::BTreeMap;
 
-use setsuna_core::char_forms::annotation;
-use setsuna_core::config::Config;
-use setsuna_core::engine_bridge::{Action, EngineBridge, KeyKind, KeyOutcome};
-use setsuna_core::engine_client::EngineClient;
-use setsuna_core::learning::Learning;
-use setsuna_core::rerank_client::RerankClient;
-use setsuna_core::rewrite_client::RewriteClient;
+use crate::char_forms::annotation;
+use crate::config::Config;
+use crate::engine_bridge::{Action, EngineBridge, KeyKind, KeyOutcome};
+use crate::engine_client::EngineClient;
+use crate::learning::Learning;
+use crate::rerank_client::RerankClient;
+use crate::rewrite_client::RewriteClient;
 
-use crate::keys::{self, Key};
+use crate::keysym::{self as keys, Key};
 
-/// What the addon shows after a call.
+/// What the frontend shows after a call.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct View {
     /// Text to commit, in order, before the preedit is shown. Only the
@@ -58,8 +59,8 @@ pub struct View {
     pub status: String,
 }
 
-/// What the focused field is, from fcitx5's capability flags (the input
-/// scopes on Windows).
+/// What the focused field is, from fcitx5's capability flags or Android's
+/// input type (the input scopes on Windows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Normal,
@@ -159,7 +160,7 @@ impl Session {
         bridge.set_learning(Learning::open(&cfg.learning));
         bridge.set_ngram(&cfg.ngram);
         bridge.set_lexicon(&cfg.lexicon);
-        bridge.set_hidden(setsuna_core::hidden::Hidden::open());
+        bridge.set_hidden(crate::hidden::Hidden::open());
         bridge.use_user_dictionary_file();
         bridge.open_predictor(&cfg.frontend);
         bridge.set_candidate_paging(page_size(cfg), true);
@@ -193,7 +194,7 @@ impl Session {
         self.bridge.set_learning(Learning::open(&cfg.learning));
         self.bridge.set_ngram(&cfg.ngram);
         self.bridge.set_lexicon(&cfg.lexicon);
-        self.bridge.set_hidden(setsuna_core::hidden::Hidden::open());
+        self.bridge.set_hidden(crate::hidden::Hidden::open());
         self.bridge.use_user_dictionary_file();
         self.bridge.open_predictor(&cfg.frontend);
         self.page_size = page_size(cfg);
@@ -396,7 +397,7 @@ impl Session {
     pub fn toggle(&mut self) {
         self.flush();
         self.enabled = !self.enabled;
-        setsuna_core::diagnostics::log(format!("fcitx5 toggle: enabled={}", self.enabled));
+        crate::diagnostics::log(format!("toggle: enabled={}", self.enabled));
     }
 
     /// Drop the composition (the app reset the input context).
@@ -434,11 +435,11 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setsuna_core::engine_client::EngineResult;
+    use crate::engine_client::EngineResult;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::keys::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+    use crate::keysym::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 
     /// Answers every dispatch with `candidates[reading]` on the next
     /// `take_latest`.

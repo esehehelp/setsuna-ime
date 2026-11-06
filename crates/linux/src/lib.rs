@@ -6,9 +6,10 @@
 //! fcitx5 key events into `keys::Key`s and renders the `session::View`
 //! (commit text, preedit, candidate list) with fcitx5's own panel.
 //!
-//! The IME logic is `setsuna-core`, shared with the TSF DLL; conversion runs
-//! in a `setsuna-engine daemon` child process.
+//! The IME logic is `setsuna-core`, shared with the TSF DLL and the Android
+//! keyboard (its `session` and `keysym` with the latter); conversion runs in
+//! a `setsuna-engine daemon` child process.
 
 pub mod ffi;
-pub mod keys;
-pub mod session;
+pub use setsuna_core::keysym as keys;
+pub use setsuna_core::session;

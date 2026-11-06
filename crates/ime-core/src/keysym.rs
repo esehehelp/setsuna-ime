@@ -1,24 +1,28 @@
-//! X keysym → engine key classification: the fcitx5 counterpart of the TSF
-//! crate's `keymap.rs`.
+//! X keysym → engine key classification, for the frontends that hand over
+//! keys as X keysyms: the fcitx5 addon (`crates/linux`) and the Android
+//! keyboard (`crates/android`, whose keys and a hardware keyboard's are
+//! sent as the keysyms they type). The counterpart of the TSF crate's
+//! `keymap.rs`.
 //!
-//! fcitx5 hands the addon keysyms resolved by the keyboard layout, so the
-//! symbol keys are looked up by the character they type rather than by
-//! position (`setsuna_core::config::symbol_name`): `;` is `semicolon`, `(`
-//! is `shift_8`, `"` is `double_quote`, whatever key made it. `\` is
-//! `oem102_backslash` on the JIS ろ key and `yen` elsewhere, as on Windows.
+//! A keysym is resolved by the keyboard layout already, so the symbol keys
+//! are looked up by the character they type rather than by position
+//! (`crate::config::symbol_name`): `;` is `semicolon`, `(` is `shift_8`, `"`
+//! is `double_quote`, whatever key made it. `\` is `oem102_backslash` on the
+//! JIS ろ key and `yen` elsewhere, as on Windows.
 
 use std::collections::BTreeMap;
 
-use setsuna_core::char_forms::Form;
-use setsuna_core::engine_bridge::KeyKind;
+use crate::char_forms::Form;
+use crate::engine_bridge::KeyKind;
 
-/// Modifier bits of [`Key::mods`] (`SETSUNA_MOD_*` in `include/setsuna.h`).
+/// Modifier bits of [`Key::mods`] (`SETSUNA_MOD_*` in
+/// `crates/linux/include/setsuna.h`).
 pub const MOD_SHIFT: u32 = 1;
 pub const MOD_CTRL: u32 = 1 << 1;
 pub const MOD_ALT: u32 = 1 << 2;
 pub const MOD_SUPER: u32 = 1 << 3;
 
-/// A key press as fcitx5 reports it.
+/// A key press as the frontend reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     /// X keysym (`fcitx::KeySym`).
@@ -143,7 +147,7 @@ pub fn classify(key: &Key, symbols: &BTreeMap<String, String>) -> Option<KeyKind
                 c
             }))
         }
-        0x21..=0x7e => Some(KeyKind::Punctuation(setsuna_core::config::typed_symbol(
+        0x21..=0x7e => Some(KeyKind::Punctuation(crate::config::typed_symbol(
             key.sym as u8 as char,
             key.code == KEYCODE_RO,
             symbols,
@@ -176,7 +180,7 @@ pub fn breaks_context(key: &Key) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setsuna_core::config::default_symbol_map;
+    use crate::config::default_symbol_map;
 
     fn key(sym: u32, mods: u32) -> Key {
         Key { sym, code: 0, mods }

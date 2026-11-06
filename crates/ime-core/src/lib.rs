@@ -4,8 +4,11 @@
 //! candidate post-processing and learning, the config and the clients of the
 //! `setsuna-engine daemon`, `setsuna-rerank daemon` and `setsuna-rewrite
 //! daemon` child processes. A frontend (the Windows TSF DLL in
-//! `crates/tsf`, the fcitx5 addon in `crates/linux`) turns its key events
-//! into `engine_bridge::KeyKind`s and renders the `Action`s that come back.
+//! `crates/tsf`) turns its key events into `engine_bridge::KeyKind`s and
+//! renders the `Action`s that come back; one that renders a state instead
+//! (the fcitx5 addon in `crates/linux`, the Android keyboard in
+//! `crates/android`) hands `session` X keysyms (`keysym`) and renders its
+//! `View`.
 
 pub mod bunsetsu;
 pub mod char_forms;
@@ -20,6 +23,7 @@ pub mod engine_bridge;
 pub mod engine_client;
 pub mod hidden;
 pub mod kana_candidates;
+pub mod keysym;
 pub mod learning;
 pub mod lexicon;
 pub mod mixed;
@@ -33,6 +37,7 @@ pub mod rewrite_client;
 pub mod romaji_table;
 mod segmented;
 pub mod segments;
+pub mod session;
 pub mod symbol_dict;
 pub mod typo;
 pub mod user_dict;
