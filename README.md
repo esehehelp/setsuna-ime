@@ -320,8 +320,12 @@ curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/ins
 `install.sh`（`crates/linux/install.sh`）は root で動く前提で、中で権限昇格はしない。
 自分と組になった release アーカイブ（SHA-256 固定）と、そのアーカイブが固定する
 変換モデル・読みの辞書（lexicon-v1、222 MB）・解析器（nid-ma v2-600k-tb、288 MB）
-（`crates/tsf/models.json` の `variants` と `components` と同じ。`/var/cache/setsuna-ime/models`
-に取得・検証し、検証済みならオフラインで再利用）を取ってきて入れる。読みの辞書と解析器は
+（`crates/tsf/models.json` の `variants` と `components` と同じ）を取ってきて入れる。
+どのファイルも 1 部だけ持つ: `/var/cache/setsuna-ime/models` に取得・検証したものを
+入れる場所へハードリンクで置き（リンクできないファイルシステムならコピー）、入れ終わったら
+キャッシュを消す。次のインストールでは、入っているファイルが固定したものと一致すればそのまま
+使うので、固定が同じなら何も取得しない（オフラインでも入れ直せる）。前のインストールが
+キャッシュに残したもの（0.2.1 までは取得したものを `/var/cache` にも持っていた）も消える。読みの辞書と解析器は
 取得できなければ警告を出してそれなしで入れる（前に入れたものがあれば残る。もう一度
 実行すれば取り直す）。addon は fcitx5 の addon
 ディレクトリに、エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・ONNX Runtime

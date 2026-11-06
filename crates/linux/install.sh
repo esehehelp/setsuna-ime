@@ -43,8 +43,10 @@
 #   /usr/lib/setsuna-ime/analyzer/<manifest> + its dictionary and alternates  (downloaded, or --analyzer)
 # These are the addon's defaults where config.toml sets nothing.
 #   /usr/bin/setsuna-settings  (when WebKitGTK 4.1 is there)
-#   /var/cache/setsuna-ime/models  (verified model, lexicon and analyzer
-#                                   downloads, reused offline)
+#   /var/cache/setsuna-ime/models  (downloads while installing: hard-linked into
+#                                   place, then removed)
+# The pinned files are kept once, where they are installed: an installed one
+# that is the pinned file stays and is not downloaded again (offline too).
 # /usr/lib/setsuna-ime is compiled into the addon, so no config.toml is needed.
 # Uninstall: sudo /usr/lib/setsuna-ime/uninstall.sh
 #
@@ -223,36 +225,79 @@ src=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'setsuna-ime-*' | head 
 [[ -n $src && -f $src/models.tsv && -f $src/addon/setsuna.so ]] || fail 30 "not a Setsuna release archive: $archive"
 [[ $VERSION != @* ]] || VERSION=$(basename "$src" | sed 's/^setsuna-ime-//; s/-linux-.*//')
 
-# ---- the model (pinned by the archive's models.tsv) ----
+# ---- the pinned files: the model, the reading lexicon and the analyzer ----
+# Each is installed once: a file installed before that is the pinned one stays
+# as it is, the others are downloaded into the cache, checked, hard-linked into
+# place (copied where the cache is on another file system) and the cache goes
+# after the install. A later install with the same pins downloads nothing.
+module=/usr/lib/setsuna-ime
+installed=()
+cache_root=$root/var/cache/setsuna-ime/models
+pinned_src=() # the file to install ("": the installed one is it)
+pinned_dst=() # where, absolute
+verified() {
+    [[ -f $1 && $(file_size "$1") == "$2" && $(file_sha256 "$1") == "$3" ]]
+}
+# obtain <what> <repository> <revision> <path> <size> <sha256> <destination>:
+# queue a pinned file; 1 when it cannot be had
+obtain() {
+    local what=$1 repo=$2 rev=$3 path=$4 size=$5 sha=$6 dst=$7 c
+    c=$cache_root/$repo/$rev/$path
+    if verified "$root$dst" "$size" "$sha"; then
+        log "$what installed already: $path"
+        c=
+    elif verified "$c" "$size" "$sha"; then
+        log "$what cache verified: $path"
+    else
+        log "downloading $what: $path"
+        try_fetch "https://huggingface.co/$repo/resolve/$rev/$path" "$c" "$size" "$sha" || return 1
+    fi
+    pinned_src+=("$c")
+    pinned_dst+=("$dst")
+}
+
+# the model (models.tsv's repository, revision and <precision> lines)
 repository=$(awk -F'\t' '$1 == "repository" { print $2 }' "$src/models.tsv")
 revision=$(awk -F'\t' '$1 == "revision" { print $2 }' "$src/models.tsv")
 [[ $repository =~ $repository_re && $revision =~ ^[a-f0-9]{40}$ ]] ||
     fail 30 "invalid model pins in the archive"
-cache=$root/var/cache/setsuna-ime/models/$repository/$revision
-model_files=()
 manifest=
 while IFS=$'\t' read -r p path size sha; do
     [[ $p == "$precision" ]] || continue
     [[ $path =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $size =~ ^[1-9][0-9]*$ && $sha =~ ^[a-f0-9]{64}$ ]] ||
         fail 30 "invalid model pin: $path"
-    if [[ ! -f $cache/$path || $(file_size "$cache/$path") != "$size" || $(file_sha256 "$cache/$path") != "$sha" ]]; then
-        log "downloading model: $path"
-        fetch_to "https://huggingface.co/$repository/resolve/$revision/$path" "$cache/$path" "$size" "$sha"
-    else
-        log "model cache verified: $path"
-    fi
-    model_files+=("$path")
+    obtain model "$repository" "$revision" "$path" "$size" "$sha" "$module/models/onnx/$path" ||
+        fail 30 "could not get the model"
     [[ $path == *manifest.json ]] && manifest=$path
 done <"$src/models.tsv"
 [[ -n $manifest ]] || fail 30 "the archive pins no $precision model"
 
-# ---- the reading lexicon and the analyzer (models.tsv's components) ----
-# fetch_component <name>: the files models.tsv pins for it, verified in the
-# cache or downloaded. Sets comp_dir (where they are), comp_entry (its entry
-# file) and comp_files (all its files), paths under comp_dir; 1 when it cannot
-# be had.
+# component_dst <name> <entry> <path>: where a component's file goes. The
+# lexicon is words.lexicon; the analyzer's files keep their paths relative to
+# its manifest, as the manifest names them.
+component_dst() {
+    local entry_dir
+    case $1 in
+        lexicon)
+            [[ $3 == "$2" ]] || return 1
+            echo "$module/lexicon/words.lexicon"
+            ;;
+        analyzer)
+            entry_dir=$(dirname "$2")
+            if [[ $entry_dir == . ]]; then
+                echo "$module/analyzer/$3"
+            else
+                [[ $3 == "$entry_dir"/* ]] || return 1
+                echo "$module/analyzer/${3#"$entry_dir"/}"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+# fetch_component <name>: queue the files models.tsv pins for it (component
+# lines); 1, with nothing queued, when it cannot be had. Sets comp_entry.
 fetch_component() {
-    local name=$1 repo= rev= entry= p path size sha
+    local name=$1 repo= rev= entry= p path size sha dst found=0 n=${#pinned_src[@]}
     IFS=$'\t' read -r repo rev entry < <(awk -F'\t' -v OFS='\t' -v n="$name" \
         '$1 == "component" && $2 == n { print $3, $4, $5; exit }' "$src/models.tsv") || true
     if [[ -z $entry ]]; then
@@ -263,57 +308,53 @@ fetch_component() {
         log "invalid $name pins in the archive"
         return 1
     fi
-    comp_dir=$root/var/cache/setsuna-ime/models/$repo/$rev
     comp_entry=$entry
-    comp_files=()
     while IFS=$'\t' read -r p path size sha; do
         [[ $p == "$name" ]] || continue
-        if ! [[ $path =~ $pin_path_re && $size =~ ^[1-9][0-9]*$ && $sha =~ ^[a-f0-9]{64}$ ]]; then
+        if ! [[ $path =~ $pin_path_re && $size =~ ^[1-9][0-9]*$ && $sha =~ ^[a-f0-9]{64}$ ]] ||
+            ! dst=$(component_dst "$name" "$entry" "$path"); then
             log "invalid $name pin: $path"
+            pinned_src=("${pinned_src[@]:0:n}")
+            pinned_dst=("${pinned_dst[@]:0:n}")
             return 1
         fi
-        if [[ -f $comp_dir/$path && $(file_size "$comp_dir/$path") == "$size" &&
-            $(file_sha256 "$comp_dir/$path") == "$sha" ]]; then
-            log "$name cache verified: $path"
-        else
-            log "downloading $name: $path"
-            try_fetch "https://huggingface.co/$repo/resolve/$rev/$path" "$comp_dir/$path" "$size" "$sha" || return 1
+        if ! obtain "$name" "$repo" "$rev" "$path" "$size" "$sha" "$dst"; then
+            pinned_src=("${pinned_src[@]:0:n}")
+            pinned_dst=("${pinned_dst[@]:0:n}")
+            return 1
         fi
-        comp_files+=("$path")
+        [[ $path == "$entry" ]] && found=1
     done <"$src/models.tsv"
-    if ! printf '%s\n' "${comp_files[@]}" | grep -qxF -- "$entry"; then
+    if ((!found)); then
         log "the archive pins no file $entry for $name"
+        pinned_src=("${pinned_src[@]:0:n}")
+        pinned_dst=("${pinned_dst[@]:0:n}")
         return 1
     fi
 }
-if ((dictionaries)) && [[ -z $lexicon ]]; then
+# What this install brings (else what was installed before stays)
+have_lexicon=0
+have_analyzer=0
+analyzer_name=
+[[ -n $lexicon ]] && have_lexicon=1
+[[ -n $analyzer ]] && have_analyzer=1 && analyzer_name=$(basename "$analyzer")
+if ((dictionaries && !have_lexicon)); then
     if fetch_component lexicon; then
-        lexicon=$comp_dir/$comp_entry
+        have_lexicon=1
     else
         log "warning: no reading lexicon: installing without it (run again to retry)"
     fi
 fi
-if ((dictionaries)) && [[ -z $analyzer ]]; then
+if ((dictionaries && !have_analyzer)); then
     if fetch_component analyzer; then
-        # its files relative to the manifest, as the manifest names them
-        entry_dir=$(dirname "$comp_entry")
-        for f in "${comp_files[@]}"; do
-            [[ $f == "$comp_entry" ]] && continue
-            if [[ $entry_dir != . ]]; then
-                [[ $f == "$entry_dir"/* ]] || fail 30 "analyzer file outside its manifest's directory: $f"
-                f=${f#"$entry_dir"/}
-            fi
-            analyzer_files+=("$f")
-        done
-        analyzer=$comp_dir/$comp_entry
+        have_analyzer=1
+        analyzer_name=$(basename "$comp_entry")
     else
         log "warning: no analyzer: installing without it (run again to retry)"
     fi
 fi
 
 # ---- install ----
-module=/usr/lib/setsuna-ime
-installed=()
 # put <source> <absolute destination> <mode>: copied beside the destination
 # and renamed over it, so running daemons keep the files they have open
 put() {
@@ -336,6 +377,23 @@ put_tree() {
         put "$f" "$2/$rel" "$mode"
     done < <(find "$1" -type f -print0 | sort -z)
 }
+# place <source or ""> <absolute destination>: a pinned file, hard-linked from
+# the cache beside the destination (copied where it cannot be linked) and
+# renamed over it; "" keeps the installed one, which is the pinned file
+place() {
+    local dst=$root$2 tmp
+    if [[ -n $1 ]]; then
+        mkdir -p "$(dirname "$dst")"
+        tmp=$dst.setsuna-new.$$
+        rm -f -- "$tmp"
+        if ! { { ln -- "$1" "$tmp" 2>/dev/null || cp -- "$1" "$tmp"; } &&
+            chmod 644 "$tmp" && mv -f "$tmp" "$dst"; }; then
+            rm -f -- "$tmp"
+            fail 50 "could not install $2"
+        fi
+    fi
+    installed+=("$2")
+}
 
 put "$src/addon/setsuna.so" "$addon_dir/setsuna.so" 755
 put_tree "$src/share" /usr/share
@@ -347,8 +405,18 @@ for m in "$root$module"/models/onnx/*manifest.json; do
         rm -f -- "$m"
     fi
 done
-for path in "${model_files[@]}"; do
-    put "$cache/$path" "$module/models/onnx/$path" 644
+# One analyzer: the addon gives the engine the only manifest there.
+if ((have_analyzer)); then
+    for m in "$root$module"/analyzer/*manifest.json; do
+        if [[ -e $m && $(basename "$m") != "$analyzer_name" ]]; then
+            rm -f -- "$m"
+        fi
+    done
+fi
+# the model, lexicon and analyzer from the pins (a lexicon renamed over the
+# old one, which a running fcitx5 keeps mapped)
+for i in "${!pinned_dst[@]}"; do
+    place "${pinned_src[i]}" "${pinned_dst[i]}"
 done
 if [[ -f $src/bin/setsuna-settings ]]; then
     if ldd "$src/bin/setsuna-settings" 2>/dev/null | grep -q 'not found'; then
@@ -372,12 +440,11 @@ if [[ -n $name_dictionary ]]; then
     put "$name_dictionary" "$module/names/latin-names.tsv" 644
 fi
 if [[ -n $lexicon ]]; then
-    # renamed over the old one, which a running fcitx5 keeps mapped
+    # a local one (--lexicon), renamed over the old one
     put "$lexicon" "$module/lexicon/words.lexicon" 644
 fi
 if [[ -n $analyzer ]]; then
-    # one analyzer: the addon gives the engine the only manifest there
-    rm -f -- "$root$module"/analyzer/*manifest.json
+    # a local one (--analyzer)
     put "$analyzer" "$module/analyzer/$(basename "$analyzer")" 644
     for f in "${analyzer_files[@]}"; do
         put "$(dirname "$analyzer")/$f" "$module/analyzer/$f" 644
@@ -392,8 +459,8 @@ if [[ -f $root$module/installed-files ]]; then
         printf '%s\n' "${installed[@]}" | grep -qxF -- "$f" && continue
         if [[ ($f == "$module"/models/rerank/* && -z $rerank_manifest) ||
             ($f == "$module"/names/* && -z $name_dictionary) ||
-            ($f == "$module"/lexicon/* && -z $lexicon) ||
-            ($f == "$module"/analyzer/* && -z $analyzer) ]] && [[ -f $root$f ]]; then
+            ($f == "$module"/lexicon/* && $have_lexicon == 0) ||
+            ($f == "$module"/analyzer/* && $have_analyzer == 0) ]] && [[ -f $root$f ]]; then
             installed+=("$f")
             continue
         fi
@@ -401,6 +468,11 @@ if [[ -f $root$module/installed-files ]]; then
     done <"$root$module/installed-files"
 fi
 printf '%s\n' "${installed[@]}" "$module/installed-files" >"$root$module/installed-files"
+# The download cache: what this install needed is installed (one copy each),
+# and what earlier installs left there (other revisions, other models) no
+# install uses.
+rm -rf -- "$cache_root"
+rmdir -- "$root/var/cache/setsuna-ime" 2>/dev/null || true
 if [[ -z $root ]] && command -v gtk-update-icon-cache >/dev/null && [[ -f /usr/share/icons/hicolor/index.theme ]]; then
     gtk-update-icon-cache -q -t /usr/share/icons/hicolor || true
 fi
