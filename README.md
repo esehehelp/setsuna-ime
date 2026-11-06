@@ -2,14 +2,14 @@
 
 Setsuna (刹那) is a Japanese input method built around a non-autoregressive
 neural kana-kanji converter (CTC-NAT). This repository holds the inference engine, the IME
-frontends for Windows (TSF) and Linux (fcitx5), an optional LM reranker, a
+frontends for Windows (TSF), Linux (fcitx5) and Android (in development), an optional LM reranker, a
 settings GUI and a browser demo. **Research stage**: a public conversion model
 is available, and the Windows installer downloads it automatically (see
 [Status](#状態)).
 
 Setsuna（刹那）は、非自己回帰のニューラルかな漢字変換（CTC-NAT）を中心にした
 日本語入力メソッド。推論エンジン、
-Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリランカ、設定 GUI、
+Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言語モデルによるリランカ、設定 GUI、
 ブラウザで動くデモを含む。
 
 ## 状態
@@ -169,6 +169,7 @@ Windows（TSF）と Linux（fcitx5）の IME、言語モデルによるリラン
 | `crates/ime-core` | platform | 各 frontend 共通の IME ロジック（ローマ字合成、状態遷移、後処理、学習、設定、daemon client） |
 | `crates/tsf` | platform | Windows TSF IME（DLL） |
 | `crates/linux` | platform | fcitx5 addon（Rust 部分 + `fcitx5/` の C++ shim） |
+| `crates/android` | platform | Android の入力メソッド（Rust 部分 + `app/` の Kotlin のサービスとキーボード。開発中） |
 | `crates/rewrite` | platform | 書き直し（`setsuna-rewrite`、Sign in with ChatGPT、OpenAI / 互換 API の client） |
 | `crates/settings` | platform | 設定 GUI `setsuna-settings`（システムの WebView に出す HTML 画面。Windows / macOS / Linux） |
 | `crates/demo` | platform | ブラウザで IME を動かすローカルデモ |
@@ -365,6 +366,35 @@ bash tests/model-download.sh
 `SETSUNA_MODULE_DIR`（既定 `<libdir>/setsuna-ime`）の順に探す。開発中は
 `-DSETSUNA_MODULE_DIR=<repo>/target/release` とすると `target/release` の
 エンジンと `<repo>/local/models/onnx` のモデルを使う。
+
+### Android（開発中）
+
+arm64 の Android 8 以降が対象。キーボードは Gboard の日本語 QWERTY（数字行つき）と
+同じ配列（見た目は Setsuna のもの: アイコンのグラデーションの Enter キーと上端の線、
+スペースキーの「Setsuna」）で、あa1 キーで あ（ローマ字かな変換）／ a（英字そのまま）／ 1（数字パッド。
+フリックで記号）を切り替え、a の ?123 から電卓配列と記号 2 ページに行く。ライブ変換・
+候補バー・確定のほか、ツールバーからテキスト編集（カーソル移動、選択、すべて選択、
+切り取り・コピー・貼り付け）とクリップボード（コピーした文字の一覧。1 時間、メモリだけに
+置き、パスワードなど機密の印のついたものは残さない）が使える。モデルのダウンロードと
+配布用の署名はまだ。IME の
+ロジックは fcitx5 版と同じ `session`（ime-core）で、キーは X の keysym として渡す。
+エンジンは APK に `libsetsuna_engine.so` として入れた実行ファイルを子プロセスで動かし、
+ONNX Runtime は Microsoft の onnxruntime-android（1.28.0）のものを使う。
+
+build に要るもの: Android SDK（platform 35 と NDK。`ANDROID_HOME`、既定は
+`%LOCALAPPDATA%\Android\Sdk`）、JDK 17 以降（`JAVA_HOME`）、
+`rustup target add aarch64-linux-android`、`cargo install cargo-ndk`。
+
+```powershell
+pwsh crates/android/build.ps1 -Install   # Rust 部分とエンジンを arm64 で build、APK を作って adb で入れる
+pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモデル・読みの辞書・解析器をアプリへ
+```
+
+モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`）から読む。
+`push-models.ps1` は `/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build
+（`-Release` なし）のときだけ使える。入れたあと、アプリの画面の「入力方法の設定を開く」で
+Setsuna を有効にし、キーボードの あ/A キーの長押し（入力方法の選択）で切り替える。
+`config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。
 
 ### デモ / 設定 GUI
 

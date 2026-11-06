@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Setsuna</string>
+    <string name="ime_name">Setsuna</string>
+    <string name="subtype_ja">日本語（ローマ字）</string>
+    <string name="no_engine">変換モデルがありません（ひらがなのみ）</string>
+    <string name="open_settings">入力方法の設定を開く</string>
+    <string name="pick_ime">入力方法を切り替える</string>
+    <string name="try_here">ここで試す</string>
+</resources>

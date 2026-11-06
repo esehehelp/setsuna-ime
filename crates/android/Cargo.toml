@@ -1,0 +1,22 @@
+[package]
+name = "setsuna-android"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+description = "Android IME frontend for Setsuna: the Rust half of the input method service (app/), loaded into it as a JNI library."
+
+[lib]
+name = "setsuna_android"
+path = "src/lib.rs"
+# cdylib: libsetsuna_android.so, which app/ loads (System.loadLibrary).
+# rlib: for the unit tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The shared IME logic. The engine is never linked: setsuna-core talks to a
+# `setsuna-engine daemon` child process over its stdio protocol (the engine
+# binary is packaged as libsetsuna_engine.so; see build.ps1).
+setsuna-core = { path = "../ime-core" }
+serde_json.workspace = true
+jni = "0.21"
