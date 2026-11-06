@@ -254,6 +254,21 @@ impl EngineClient for PipeEngineClient {
         ours.or_else(|| self.fallback.child.lock().ok()?.as_ref()?.take_latest())
     }
 
+    fn wait_latest(&self, timeout: Duration) -> bool {
+        // not under the fallback's lock, which the I/O thread takes
+        let child = self
+            .fallback
+            .child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.shared.clone());
+        child
+            .as_deref()
+            .unwrap_or(&self.shared)
+            .wait_latest(timeout)
+    }
+
     fn analyze(&self, texts: &[String], timeout: Duration) -> Option<Vec<Vec<Word>>> {
         if let Some(child) = self.fallback.child.lock().unwrap().as_ref() {
             return child.analyze(texts, timeout);

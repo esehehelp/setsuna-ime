@@ -129,6 +129,8 @@ struct Shared {
     state: Mutex<State>,
     cv: Condvar,
     latest: Mutex<Option<EngineResult>>,
+    /// Signalled when `latest` is set.
+    latest_cv: Condvar,
     ready: AtomicBool,
     alive: AtomicBool,
     /// The engine was started with an analyzer.
@@ -145,6 +147,7 @@ impl Shared {
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
             latest: Mutex::new(None),
+            latest_cv: Condvar::new(),
             ready: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             has_analyzer: analyzer_of(cfg).is_some(),
@@ -152,6 +155,20 @@ impl Shared {
             analyzed_cv: Condvar::new(),
             next_analysis: AtomicU64::new(ANALYZE_IDS),
         }
+    }
+
+    /// Wait until a result is in `latest`, at most `timeout`.
+    fn wait_latest(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self.latest.lock().unwrap();
+        while slot.is_none() {
+            let now = Instant::now();
+            if now >= deadline || !self.alive.load(Ordering::SeqCst) {
+                return false;
+            }
+            slot = self.latest_cv.wait_timeout(slot, deadline - now).unwrap().0;
+        }
+        true
     }
 
     /// Queue an analysis of `texts` before any conversion and wait for it,
@@ -340,6 +357,10 @@ impl EngineClient for ChildDaemonClient {
 
     fn take_latest(&self) -> Option<EngineResult> {
         self.shared.latest.lock().ok()?.take()
+    }
+
+    fn wait_latest(&self, timeout: Duration) -> bool {
+        self.shared.wait_latest(timeout)
     }
 
     fn analyze(&self, texts: &[String], timeout: Duration) -> Option<Vec<Vec<Word>>> {
@@ -566,6 +587,7 @@ fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, no
             round_trip_ms: dispatched_at.elapsed().as_secs_f64() * 1000.0,
         });
     }
+    shared.latest_cv.notify_all();
     if shared.alive.load(Ordering::SeqCst) {
         crate::diagnostics::log(format!("notify req_id={}", resp.id));
         notify(resp.id);
@@ -947,6 +969,11 @@ mod tests {
         let engine = {
             let shared = shared.clone();
             thread::spawn(move || {
+                // once it is queued: a writer free before then sends what
+                // is pending (the test raced it under load)
+                while shared.state.lock().unwrap().analysis.is_none() {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 let first = next_request(&shared).unwrap();
                 let line = request_line(&shared, &first).unwrap();
                 let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -984,6 +1011,37 @@ mod tests {
             .analyze(&["今日".to_string()], Duration::from_millis(20))
             .is_none());
         assert!(shared.state.lock().unwrap().analysis.is_none());
+    }
+
+    /// A result delivered wakes who waits for one (Enter, for the
+    /// conversion of what is typed); none in time is false.
+    #[test]
+    fn waiting_for_a_result() {
+        let shared = Arc::new(Shared::new(&EngineCfg::default()));
+        assert!(!shared.wait_latest(Duration::from_millis(20)));
+        let engine = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                shared.state.lock().unwrap().in_flight = Some(InFlight {
+                    reading: "きょう".into(),
+                    context: String::new(),
+                    dispatched_at: Instant::now(),
+                    analyze: false,
+                });
+                let line = r#"{"id":3,"candidates":["今日"],"engine_ms":0.1}"#;
+                let (resp, inflight) = take_response(&shared, line).unwrap();
+                let notify: Notify = Box::new(|_| {});
+                deliver(&shared, resp, inflight, &notify);
+            })
+        };
+        assert!(shared.wait_latest(Duration::from_secs(5)));
+        engine.join().unwrap();
+        let result = shared.latest.lock().unwrap().take().unwrap();
+        assert_eq!(
+            (result.req_id, result.candidates),
+            (3, vec!["今日".to_string()])
+        );
     }
 
     struct TempDir(PathBuf);

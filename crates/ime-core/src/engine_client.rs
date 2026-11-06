@@ -90,6 +90,13 @@ pub trait EngineClient {
     /// results are overwritten before they are taken.
     fn take_latest(&self) -> Option<EngineResult>;
 
+    /// Wait until a result is in for `take_latest`, at most `timeout`; false
+    /// when none came. A backend that cannot wait says false at once.
+    fn wait_latest(&self, timeout: std::time::Duration) -> bool {
+        let _ = timeout;
+        false
+    }
+
     /// Whether the backend has finished loading and is serving requests.
     /// Dispatches before this is true are still accepted (buffered).
     fn is_ready(&self) -> bool;

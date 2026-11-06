@@ -400,6 +400,12 @@ impl Session {
         crate::diagnostics::log(format!("toggle: enabled={}", self.enabled));
     }
 
+    /// Forget the view's commits, which the frontend has written into the
+    /// app (a frontend that may read the view again before the next key).
+    pub fn clear_commits(&mut self) {
+        self.view.commits.clear();
+    }
+
     /// Drop the composition (the app reset the input context).
     pub fn reset(&mut self) {
         self.view.commits.clear();
@@ -447,6 +453,8 @@ mod tests {
     struct Echo {
         answers: Rc<RefCell<BTreeMap<String, Vec<String>>>>,
         last: Rc<RefCell<Option<(u64, String, String)>>>,
+        /// `wait_latest` sees an answer in (else it cannot wait).
+        waits: Rc<std::cell::Cell<bool>>,
     }
 
     impl Echo {
@@ -476,6 +484,13 @@ mod tests {
                 ..Default::default()
             })
         }
+        fn wait_latest(&self, _timeout: std::time::Duration) -> bool {
+            let last = self.last.borrow();
+            self.waits.get()
+                && last
+                    .as_ref()
+                    .is_some_and(|l| self.answers.borrow().contains_key(&l.2))
+        }
         fn is_ready(&self) -> bool {
             true
         }
@@ -483,6 +498,47 @@ mod tests {
 
     fn session() -> (Session, Echo) {
         session_with(|_| {})
+    }
+
+    /// Enter while the conversion of what is typed is still coming waits for
+    /// it (a slow engine may take 100 ms and more), rather than commit the
+    /// conversion before with the kana typed since (京 + は).
+    #[test]
+    fn enter_waits_for_the_conversion_of_what_is_typed() {
+        let (mut s, echo) = session();
+        echo.waits.set(true);
+        type_str(&mut s, "kyou");
+        echo.answer("きょう", &["京"]);
+        assert!(s.apply_async_result());
+        type_str(&mut s, "ha");
+        // in when Enter comes, not taken yet
+        echo.answer("きょうは", &["今日は"]);
+        press(&mut s, RETURN, 0);
+        assert_eq!(s.view().commits, vec!["今日は"]);
+        // an engine that cannot wait: as before, what was in
+        let (mut s, echo) = session();
+        type_str(&mut s, "kyou");
+        echo.answer("きょう", &["京"]);
+        assert!(s.apply_async_result());
+        type_str(&mut s, "ha");
+        echo.answer("きょうは", &["今日は"]);
+        press(&mut s, RETURN, 0);
+        assert_eq!(s.view().commits, vec!["京は"]);
+    }
+
+    /// With the mixed input model the frontends ship, `gboard` typed key by
+    /// key reads `g` and English `board`: shown and converted in the order
+    /// typed (its `g` was left pending and shown after, `boardg`, and the
+    /// engine asked for `board`).
+    #[test]
+    fn a_letter_before_an_english_word_stays_before_it() {
+        let (mut s, echo) = session_with(|c| {
+            c.frontend.mixed_model =
+                Some(concat!(env!("CARGO_MANIFEST_DIR"), "/data/mixed").into());
+        });
+        type_str(&mut s, "gboard");
+        assert_eq!(s.view().preedit.concat(), "gboard");
+        assert_eq!(echo.last.borrow().as_ref().unwrap().2, "gboard");
     }
 
     /// The caret where it is (`preedit_cursor_at_start` off) unless `f`

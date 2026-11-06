@@ -193,6 +193,11 @@ const PREDICTIONS: usize = 3;
 /// conversion it cuts (`bunsetsu`) before cutting it by the char alignment.
 const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// How long Enter waits for the conversion of what is typed when it is not
+/// in yet (`await_live_conversion`): a phone without SDOT takes 100-300 ms
+/// a conversion, and one may be in flight before it.
+const ENTER_WAIT: Duration = Duration::from_millis(1000);
+
 /// The engine's top of what is typed, waiting for the reranked one
 /// (`[rerank] defer_ms`).
 struct Deferred {
@@ -885,6 +890,7 @@ impl EngineBridge {
             .as_deref()
             .filter(|p| !p.is_empty())
             .and_then(crate::lexicon::shared);
+        self.composing.set_lexicon(self.lexicon.clone());
     }
 
     /// The engine's candidates that spell the reading out first, by their
@@ -1730,13 +1736,13 @@ impl EngineBridge {
         if rest.chars().count() + 1 < starts.len() {
             return None;
         }
-        let rest_starts = starts[..rest.chars().count()].to_vec();
+        let mut rest_starts = starts[..rest.chars().count()].to_vec();
         for _ in last..n {
             self.composing.delete_left();
         }
         self.invalidate_engine_results();
         self.stop_rerank();
-        if self.composing.is_empty() || rest.is_empty() {
+        if self.composing.is_empty() {
             self.composing.reset();
             self.phase = Phase::Empty;
             self.last_applied_reading.clear();
@@ -1746,6 +1752,36 @@ impl EngineBridge {
             return Some(consumed(vec![Action::EndComposition]));
         }
         let left = self.composing.hiragana().to_string();
+        // A letter typed before the kana deleted went back to the romaji
+        // pending (ふくめkなお less なお holds ふくめ, k pending): what is
+        // kept is the chars read wholly within the kana left, then the kana
+        // after them; the letter shows once, as pending (含めk, not 含めkk).
+        let mut rest = rest;
+        if !left.chars().eq(reading.chars().take(last)) {
+            let common = left
+                .chars()
+                .zip(reading.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let (within, read) = self
+                .converted_within(&reading, &shown, common)
+                .unwrap_or_default();
+            rest_starts.truncate(within.chars().count());
+            rest_starts.extend(read..left.chars().count());
+            rest = within + &left.chars().skip(read).collect::<String>();
+        }
+        if rest.is_empty() {
+            // a letter alone is left
+            self.kept = None;
+            self.cached_prefix_reading.clear();
+            self.cached_prefix_kanji.clear();
+            self.cached_shortcut = None;
+            let candidates = self.dispatch_live();
+            self.phase = Phase::Composing { candidates };
+            return Some(consumed(vec![Action::UpdatePreedit {
+                text: self.live_preedit(),
+            }]));
+        }
         self.kept = Some((left.clone(), rest.clone(), rest_starts));
         let candidates = self.dispatch_live();
         self.cached_prefix_reading = left;
@@ -1958,6 +1994,7 @@ impl EngineBridge {
 
     pub fn handle_enter(&mut self) -> KeyOutcome {
         self.passing = false;
+        self.await_live_conversion();
         self.invalidate_engine_results();
         match &self.phase {
             Phase::Empty => not_consumed(),
@@ -3644,17 +3681,65 @@ impl EngineBridge {
                 .zip(hira.chars())
                 .take_while(|(a, b)| a == b)
                 .count();
-            if common > 0 {
-                let shrink_chars = cached_r.chars().count() - common;
-                let kanji_chars: Vec<char> = cached_k.chars().collect();
-                let keep = kanji_chars.len().saturating_sub(shrink_chars);
-                let trimmed: String = kanji_chars[..keep].iter().collect();
+            if common == cached_r.chars().count() {
                 let tail: String = hira.chars().skip(common).collect();
-                return format!("{trimmed}{tail}{pending}");
+                return format!("{cached_k}{tail}{pending}");
+            }
+            if common > 0 {
+                if let Some((kept, read)) = self.converted_within(cached_r, cached_k, common) {
+                    let tail: String = hira.chars().skip(read).collect();
+                    return format!("{kept}{tail}{pending}");
+                }
             }
         }
         // nothing converted yet: as typed (けっこn)
         format!("{hira}{pending}")
+    }
+
+    /// The chars of `text` (the conversion of `reading`) read wholly within
+    /// the first `common` kana of the reading, and how many kana they read:
+    /// what a shrunk or changed reading still shows of it, the kana after
+    /// them shown as typed (会社 for かいしゃ, one kana deleted: 会 and し).
+    /// The chars' reading starts are those Backspace kept, the list's
+    /// (the engine's), else the char alignment, a kanji run split by the
+    /// lexicon; `None` when they cannot be had, and the kana are shown: a
+    /// char kept by counting kana hid the kana left of its reading
+    /// (会 shown, かいし held: `a` gave 開始ア; HTC温度 and HTCondor gave
+    /// HTondor).
+    fn converted_within(
+        &self,
+        reading: &str,
+        text: &str,
+        common: usize,
+    ) -> Option<(String, usize)> {
+        let mut starts = self
+            .kept
+            .as_ref()
+            .filter(|(r, t, _)| r == reading && t == text)
+            .map(|(_, _, s)| s.clone())
+            .or_else(|| self.list_starts.get(text).cloned())
+            .or_else(|| crate::segments::char_starts(reading, text, None))?;
+        if starts.len() != text.chars().count() {
+            return None;
+        }
+        if let Some(lex) = &self.lexicon {
+            split_runs(lex, reading, text, &mut starts);
+        }
+        let n = reading.chars().count();
+        // char i reads starts[i] .. starts[i + 1] (the last, up to n); chars
+        // sharing a start are one unit (今日, きょう), cut after its last
+        let ends: Vec<usize> = starts.iter().skip(1).copied().chain([n]).collect();
+        let mut k = 0;
+        for c in 1..=ends.len() {
+            if ends[c - 1] > common {
+                break;
+            }
+            if c == ends.len() || starts[c] > starts[c - 1] {
+                k = c;
+            }
+        }
+        let read = if k == 0 { 0 } else { ends[k - 1] };
+        Some((text.chars().take(k).collect(), read))
     }
 
     /// Cache the top of `list` as the conversion of `reading` shown while
@@ -3678,6 +3763,45 @@ impl EngineBridge {
         } else {
             self.cached_prefix_kanji = top;
             self.cached_shortcut = None;
+        }
+    }
+
+    /// Enter on a live conversion whose reading is still being converted
+    /// (typed after the last result came in): wait for its conversion, at
+    /// most `ENTER_WAIT`, so that Enter commits it rather than the
+    /// conversion before with the kana typed since (the whole in kana when
+    /// none was in). Results for a shorter reading are taken on the way.
+    /// Not when Enter commits the kana anyway (the caret moved, Escape, a
+    /// reading too short to convert, mixed input reading the whole
+    /// otherwise) or the engine is not serving.
+    fn await_live_conversion(&mut self) {
+        if !self.live_conversion
+            || !matches!(self.phase, Phase::Composing { .. })
+            || !self.composing.cursor_at_end()
+            || self.kana_shown
+            || self.composing.reads_otherwise_when_done()
+        {
+            return;
+        }
+        let reading = self.composing.live_reading();
+        if reading.chars().count() < self.live_min_dispatch_chars {
+            return;
+        }
+        let deadline = Instant::now() + ENTER_WAIT;
+        while self.list_reading != reading {
+            let Some(client) = self.client.as_ref() else {
+                return;
+            };
+            if !client.is_ready() || !client.is_alive() {
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !client.wait_latest(left) {
+                crate::diagnostics::log("enter: the conversion did not come in time");
+                return;
+            }
+            // what it shows is committed next: its actions go
+            let _ = self.apply_engine_result();
         }
     }
 
@@ -3976,30 +4100,45 @@ fn with_romaji_kana(reading: &str, mut cands: Vec<String>) -> Vec<String> {
 }
 
 /// Split each run of chars `starts` places at one reading char (a kanji
-/// run without the engine's positions: 東京 both at the と of とう) by the
-/// lexicon's readings of its chars (`Lexicon::split_reading`), where they
-/// split it.
+/// run without the engine's positions: 東京 both at the と of とう), and
+/// each run of kanji, by the lexicon's readings of its chars
+/// (`Lexicon::split_reading`). The engine's positions inside a kanji run are
+/// the frames its tokens came out at, not where their readings start (会社
+/// of かいしゃ: 会 at か, 社 at ゃ, which left し with 会 and hid it when
+/// Backspace took 社). A kanji run the lexicon does not split goes as one
+/// (今日, きょう).
 fn split_runs(lex: &crate::lexicon::Lexicon, reading: &str, text: &str, starts: &mut [usize]) {
     let r: Vec<char> = reading.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < t.len() {
         let mut j = i + 1;
-        while j < t.len() && starts[j] == starts[i] {
+        while j < t.len() && (starts[j] == starts[i] || is_kanji(t[j - 1]) && is_kanji(t[j])) {
             j += 1;
         }
         let end = if j < t.len() { starts[j] } else { r.len() };
         if j - i > 1 && starts[i] < end {
             let run: String = t[i..j].iter().collect();
             let read: String = r[starts[i]..end].iter().collect();
-            if let Some(split) = lex.split_reading(&run, &read) {
-                for (k, s) in split.into_iter().enumerate() {
-                    starts[i + k] = starts[i] + s;
+            match lex.split_reading(&run, &read) {
+                Some(split) => {
+                    for (k, s) in split.into_iter().enumerate() {
+                        starts[i + k] = starts[i] + s;
+                    }
+                }
+                None => {
+                    let s = starts[i];
+                    starts[i..j].iter_mut().for_each(|x| *x = s);
                 }
             }
         }
         i = j;
     }
+}
+
+/// A kanji, or an iteration or abbreviation mark read as one (々, 〆, ヶ).
+fn is_kanji(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '々' | '〆' | 'ヶ')
 }
 
 #[cfg(test)]
@@ -5314,6 +5453,105 @@ mod tests {
         assert_eq!(bridge.composing.hiragana(), "きょ");
         assert!(bridge.is_active());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The engine's positions inside a kanji run are where its tokens came
+    /// out, not where their readings start (社 of 会社 at the ゃ of かいしゃ):
+    /// the lexicon's readings of the chars place them, so Backspace takes
+    /// 社 with しゃ and what is shown is what is held (会 shown with かいし
+    /// held gave 開始ア for an `a` typed after, on the phone).
+    #[test]
+    fn backspace_takes_a_kanji_s_whole_reading_where_the_engine_put_it_late() {
+        let table = "会\tかい\t10.0\tnoun\n社\tしゃ\t10.0\tnoun\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-late-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "kaisha");
+        let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id,
+            reading,
+            candidates: vec!["会社".into()],
+            reading_pos: vec![vec![0, 3]],
+            ..Default::default()
+        });
+        bridge.apply_async_result();
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "会");
+        assert_eq!(bridge.composing.hiragana(), "かい");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A conversion shown while its reading shrinks keeps the chars read
+    /// within what is left and shows the kana after them as typed: a char
+    /// kept by counting kana hid the kana left of its reading (会 for かいし).
+    #[test]
+    fn a_shrunk_reading_shows_its_kana_not_a_char_cut_by_count() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        // a kana deleted, not the char shown
+        bridge.backspace_deletes_shown = false;
+        type_str(&mut bridge, "kaisha");
+        let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id,
+            reading,
+            candidates: vec!["会社".into()],
+            reading_pos: vec![vec![0, 2]],
+            ..Default::default()
+        });
+        bridge.apply_async_result();
+        assert_eq!(preedit(&bridge.handle_backspace().actions).unwrap(), "会し");
+        // where the chars' readings are not known: the kana
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        bridge.backspace_deletes_shown = false;
+        type_str(&mut bridge, "kaisha");
+        mock.set_result("かいしゃ", &["会社"]);
+        bridge.apply_async_result();
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "かいし"
+        );
+    }
+
+    /// A letter typed before a kana stays in the reading as it is (`kna` is
+    /// kな) and goes back to romaji pending when the kana after it goes:
+    /// what Backspace keeps shown leaves it to the pending romaji (含め and
+    /// k showed 含めkk, and Enter committed it, on this PC: "含めk直せる",
+    /// "含めkk").
+    #[test]
+    fn backspace_leaves_a_letter_gone_back_to_romaji_to_it() {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.live_conversion = true;
+        type_str(&mut bridge, "fukumeknao");
+        assert_eq!(bridge.composing.hiragana(), "ふくめkなお");
+        let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id,
+            reading,
+            candidates: vec!["含めk治".into()],
+            reading_pos: vec![vec![0, 2, 3, 4]],
+            ..Default::default()
+        });
+        bridge.apply_async_result();
+        assert_eq!(bridge.live_preedit(), "含めk治");
+        assert_eq!(
+            preedit(&bridge.handle_backspace().actions).unwrap(),
+            "含めk"
+        );
+        assert_eq!(bridge.composing.hiragana(), "ふくめ");
+        assert_eq!(bridge.composing.pending_romaji(), "k");
+        mock.set_result("ふくめ", &["含め", "服め"]);
+        bridge.apply_async_result();
+        assert_eq!(bridge.live_preedit(), "含めk");
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["含めk"]);
     }
 
     #[test]
