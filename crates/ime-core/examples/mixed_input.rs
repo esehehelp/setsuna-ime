@@ -11,6 +11,10 @@
 //!                  [--typos <typo cases.jsonl> --typo-weight 1] [--write]
 //! mixed_input live --cases <cases.jsonl> --model <dir> [--names <tsv>] [--show 20]
 //! mixed_input trace <typed> [--before <text>] [--no-mixed | --model <dir>]
+//! mixed_input timing --model <dir> [--lexicon <file>] [--text <typed>]
+//! mixed_input gap --cases <cases.jsonl> --model <dir> [--names <tsv>] [--show 30]
+//! mixed_input flips --cases <cases.jsonl> --model <dir> [--names <tsv>] --out <flips.jsonl>
+//!                   [--lexicon <file>]
 //! mixed_input score --cases <cases.jsonl> --predictions <predictions.jsonl> [--show 20]
 //! mixed_input typos --cases <cases.jsonl> --out <typo cases.jsonl> [--seed 1]
 //! ```
@@ -49,10 +53,20 @@
 //! new names.
 //! With both, `multi-*` cases type two sentences in one composition: two
 //! Japanese ones, and a Japanese one and a mixed one either way round.
+//! `gap` lists the cases the model reads otherwise than expected (case
+//! aside) with what the expected reading costs over the model's (the
+//! letters of the expected text's Latin runs held English, the rest
+//! Japanese), by how far. `flips` writes, for every Latin word the model
+//! knows inside a Japanese span of its reading, its cost read English and
+//! whether either reading is the expected one: a rule to be weighed offline.
 //! `typos` types each Japanese case (`corpus-ja`, `multi-ja`) again with one
 //! slip of the fingers among its letters (a neighbouring key instead, one
 //! more, a letter left out, two swapped) as a `typo-ja` case, which should
 //! still read as Japanese, the slip left in the kana.
+//! `--lexicon` gives the model (and the bridge) the reading lexicon, by
+//! which a known Latin word romaji reads wholly as kana may be English
+//! (`MixedModel::segment_with`); with it `flips` writes those words only,
+//! with the lexicon's costs of the span's kana and of the kana each side.
 //! `score` compares any system's `{"id", "actual"}` lines with the cases,
 //! per category: with the case (a lowercase case's `cased`, its English as
 //! written, as a names dictionary would give it) and ignoring it (where the
@@ -98,9 +112,29 @@ fn casing() -> mixed::Casing {
     CASING.get().copied().unwrap_or_default()
 }
 
+/// The reading lexicon the model and the bridge read with (`--lexicon`).
+static LEXICON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn lexicon() -> Option<std::sync::Arc<setsuna_core::lexicon::Lexicon>> {
+    LEXICON
+        .get()
+        .and_then(|p| p.as_deref())
+        .and_then(setsuna_core::lexicon::shared)
+}
+
+/// A bridge as `frontend` sets it up, with the reading lexicon.
+fn new_bridge(frontend: &setsuna_core::config::FrontendCfg) -> EngineBridge {
+    let mut bridge = EngineBridge::with_frontend(None, frontend);
+    if let Some(file) = LEXICON.get().cloned().flatten() {
+        bridge.set_lexicon(&setsuna_core::config::LexiconCfg { file: Some(file) });
+    }
+    bridge
+}
+
 /// What `model` shows for `typed` once typing is done, cased.
 fn shown(model: &MixedModel, typed: &str, before: Option<&str>) -> String {
-    let (chars, spans) = model.cased(typed, before, true, casing());
+    let lexicon = lexicon();
+    let (chars, spans) = model.cased_with(typed, before, true, casing(), lexicon.as_deref());
     let (text, pending) = mixed::render_parts(&chars, &spans, true, &HashMap::new());
     text + &pending
 }
@@ -129,6 +163,7 @@ fn main() -> Result<()> {
         names,
         sentences: !args.iter().any(|a| a == "--no-sentence-case"),
     });
+    let _ = LEXICON.set(flag("--lexicon"));
     match args.first().map(String::as_str) {
         Some("prepare") => {
             let mut cases = hand_made()?;
@@ -222,25 +257,49 @@ fn main() -> Result<()> {
             let model = load_model(&dir, &args)?;
             let mut frontend = setsuna_core::config::FrontendCfg::default();
             frontend.mixed_model = Some(dir);
-            let text = "kyouhagoogledekensakushitekaraashitanomeetingnisankashimasu.";
+            let text = flag("--text").unwrap_or_else(|| {
+                "kyouhagoogledekensakushitekaraashitanomeetingnisankashimasu.".into()
+            });
+            let lexicon = lexicon();
             for len in [10, 20, 40, 60, 90, 120] {
                 let typed: String = text.chars().cycle().take(len).collect();
+                // the first time (the lexicon's costs not kept yet), then again
+                let t = std::time::Instant::now();
+                std::hint::black_box(model.segment_with(&typed, None, false, lexicon.as_deref()));
+                let first = t.elapsed().as_secs_f64() * 1000.0;
                 let runs = 200;
                 let t = std::time::Instant::now();
                 for _ in 0..runs {
-                    std::hint::black_box(model.segment(&typed, None, false));
+                    std::hint::black_box(model.segment_with(
+                        &typed,
+                        None,
+                        false,
+                        lexicon.as_deref(),
+                    ));
                 }
                 let seg = t.elapsed().as_secs_f64() * 1000.0 / runs as f64;
                 // the key that makes it `len` long, through the bridge
-                let mut bridge = EngineBridge::with_frontend(None, &frontend);
+                let mut bridge = new_bridge(&frontend);
                 for c in typed.chars().take(len - 1) {
                     bridge.handle_char(c);
                 }
                 let t = std::time::Instant::now();
                 bridge.handle_char(typed.chars().last().unwrap());
                 let key = t.elapsed().as_secs_f64() * 1000.0;
-                println!("{len:>4} chars: segment {seg:.2} ms, key {key:.2} ms");
+                println!("{len:>4} chars: segment {seg:.2} ms (first {first:.2}), key {key:.2} ms");
             }
+        }
+        Some("flips") => {
+            let cases: Vec<Case> = read_jsonl(&need("--cases")?)?;
+            let model = load_model(&need("--model")?, &args)?;
+            let lexicon = lexicon();
+            flips(&model, lexicon.as_deref(), &cases, &need("--out")?)?;
+        }
+        Some("gap") => {
+            let cases: Vec<Case> = read_jsonl(&need("--cases")?)?;
+            let model = load_model(&need("--model")?, &args)?;
+            let show = flag("--show").map_or(Ok(30), |s| s.parse())?;
+            gap(&model, &cases, show);
         }
         Some("trace") => {
             let typed = args.get(1).context("trace <typed>")?;
@@ -766,7 +825,7 @@ fn type_line(
     frontend: &setsuna_core::config::FrontendCfg,
 ) -> String {
     let symbols = &frontend.symbols;
-    let mut bridge = EngineBridge::with_frontend(None, frontend);
+    let mut bridge = new_bridge(frontend);
     if let Some(before) = before {
         bridge.set_app_context(Some(before));
     }
@@ -873,7 +932,7 @@ fn live(cases: &[Case], frontend: &setsuna_core::config::FrontendCfg, show: usiz
         if case.expected.chars().any(|c| c.is_ascii_alphabetic()) || case.typed.contains(' ') {
             continue;
         }
-        let mut bridge = EngineBridge::with_frontend(None, frontend);
+        let mut bridge = new_bridge(frontend);
         bridge.set_app_context(case.before.as_deref());
         let mut bad = None;
         for (k, c) in case.typed.chars().enumerate() {
@@ -915,6 +974,189 @@ fn live(cases: &[Case], frontend: &setsuna_core::config::FrontendCfg, show: usiz
         println!(
             "{cat:<22} {p:>5}/{t:<5} {:>6.1}% shown as Japanese all along",
             100.0 * *p as f64 / *t as f64
+        );
+    }
+}
+
+/// The language of each typed char as `expected` reads it: the letters of
+/// each of its Latin runs, found in order, English; other letters Japanese;
+/// the rest free.
+fn mask_of(typed: &str, expected: &str) -> Vec<Option<mixed::Lang>> {
+    let low: Vec<char> = typed.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut mask: Vec<Option<mixed::Lang>> = low
+        .iter()
+        .map(|c| c.is_ascii_alphabetic().then_some(mixed::Lang::Ja))
+        .collect();
+    let e: Vec<char> = expected.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut at, mut i) = (0, 0);
+    while i < e.len() {
+        if !e[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let j = (i..e.len())
+            .find(|&j| !e[j].is_ascii_alphabetic())
+            .unwrap_or(e.len());
+        let run = &e[i..j];
+        if let Some(k) =
+            (at..=low.len().saturating_sub(run.len())).find(|&k| low[k..k + run.len()] == *run)
+        {
+            mask[k..k + run.len()].fill(Some(mixed::Lang::En));
+            at = k + run.len();
+        }
+        i = j;
+    }
+    mask
+}
+
+/// Every known Latin word (3 letters or more) inside a Japanese span of the
+/// model's reading, read as English instead: its cost over the best, and
+/// whether each reading is the expected one (case aside), as JSON lines, for
+/// a rule that turns such words English to be weighed offline.
+fn flips(
+    model: &MixedModel,
+    lexicon: Option<&setsuna_core::lexicon::Lexicon>,
+    cases: &[Case],
+    out: &str,
+) -> Result<()> {
+    let ja = |text: &str| {
+        let n = text.chars().count();
+        mixed::render(
+            text,
+            &[mixed::Span {
+                lang: mixed::Lang::Ja,
+                start: 0,
+                end: n,
+            }],
+            true,
+        )
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = cases.len().div_ceil(threads).max(1);
+    let lines: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    let mut cache: HashMap<String, f64> = HashMap::new();
+                    let mut lex = |kana: &str| -> f64 {
+                        match lexicon {
+                            Some(l) if !kana.is_empty() => {
+                                *cache.entry(kana.to_string()).or_insert_with(|| {
+                                    l.convert(kana, 1).first().map_or(f64::NAN, |c| c.1 as f64)
+                                })
+                            }
+                            _ => 0.0,
+                        }
+                    };
+                    let mut lines = Vec::new();
+                    for c in part {
+                        let before = c.before.as_deref();
+                        let chars: Vec<char> = c.typed.chars().collect();
+                        let (free, cost) = model.segment_masked(&c.typed, before, true, None);
+                        let want = c.expected.to_lowercase();
+                        let ok = mixed::render(&c.typed, &free, true).to_lowercase() == want;
+                        for span in free.iter().filter(|s| s.lang == mixed::Lang::Ja) {
+                            for a in span.start..span.end {
+                                for b in a + 3..=(a + 15).min(span.end) {
+                                    let word: String = chars[a..b].iter().collect();
+                                    if !word.chars().all(|c| c.is_ascii_alphabetic())
+                                        || !model.knows(&word)
+                                    {
+                                        continue;
+                                    }
+                                    let kana = ja(&word);
+                                    // with a lexicon: the words romaji reads wholly as kana only
+                                    let span_text: String =
+                                        chars[span.start..span.end].iter().collect();
+                                    let left: String = chars[span.start..a].iter().collect();
+                                    let right: String = chars[b..span.end].iter().collect();
+                                    let (k_all, k_left, k_right) =
+                                        (ja(&span_text), ja(&left), ja(&right));
+                                    let all_kana = !kana.chars().any(|c| c.is_ascii_alphabetic())
+                                        && k_all == format!("{k_left}{kana}{k_right}");
+                                    if lexicon.is_some() && !all_kana {
+                                        continue;
+                                    }
+                                    let mut mask = vec![None; chars.len()];
+                                    mask[span.start..span.end].fill(Some(mixed::Lang::Ja));
+                                    mask[a..b].fill(Some(mixed::Lang::En));
+                                    let (flipped, fcost) =
+                                        model.segment_masked(&c.typed, before, true, Some(&mask));
+                                    let ok2 = mixed::render(&c.typed, &flipped, true)
+                                        .to_lowercase()
+                                        == want;
+                                    let mut line = serde_json::json!({
+                                        "id": c.id, "cat": c.cat, "word": word, "kana": kana,
+                                        "gap": fcost - cost, "ok": ok, "ok2": ok2,
+                                        "freq": model.frequency(&word),
+                                    });
+                                    if lexicon.is_some() {
+                                        let extra = serde_json::json!({
+                                            "k_all": k_all, "k_left": k_left, "k_right": k_right,
+                                            "lex_all": lex(&k_all), "lex_left": lex(&k_left),
+                                            "lex_right": lex(&k_right), "lex_word": lex(&kana),
+                                        });
+                                        for (k, v) in extra.as_object().unwrap() {
+                                            line[k] = v.clone();
+                                        }
+                                    }
+                                    lines.push(line.to_string());
+                                }
+                            }
+                        }
+                    }
+                    lines
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let mut w = BufWriter::new(File::create(out)?);
+    for line in lines {
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
+}
+
+/// The cases the model reads otherwise than expected (case aside), each with
+/// the cost of its expected reading over the model's best (the gap), as
+/// `segment` scores them: how far each is from being read right.
+fn gap(model: &MixedModel, cases: &[Case], show: usize) {
+    let mut gaps = Vec::new();
+    for c in cases {
+        let before = c.before.as_deref();
+        let (free, cost) = model.segment_masked(&c.typed, before, true, None);
+        let got = mixed::render(&c.typed, &free, true);
+        if got.to_lowercase() == c.expected.to_lowercase() {
+            continue;
+        }
+        let mask = mask_of(&c.typed, &c.expected);
+        let (forced, fcost) = model.segment_masked(&c.typed, before, true, Some(&mask));
+        let want = mixed::render(&c.typed, &forced, true);
+        gaps.push((fcost - cost, c, got, want));
+    }
+    gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let bins = [1.0, 2.0, 5.0, 10.0, 20.0, f64::INFINITY];
+    println!(
+        "{} read otherwise; gap of the expected reading:",
+        gaps.len()
+    );
+    let mut lo = f64::NEG_INFINITY;
+    for hi in bins {
+        let n = gaps.iter().filter(|g| g.0 > lo && g.0 <= hi).count();
+        println!("  ({lo:>5}, {hi:>5}]  {n}");
+        lo = hi;
+    }
+    for (g, c, got, want) in gaps.iter().take(show) {
+        println!(
+            "{g:7.2} [{}] {}
+        got  {got}
+        want {want}",
+            c.cat, c.typed
         );
     }
 }

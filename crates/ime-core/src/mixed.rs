@@ -42,6 +42,7 @@ use anyhow::{Context, Result};
 
 use crate::composing_text::{pending_kana, romaji_units, UnitKind};
 use crate::config::NameCase;
+use crate::lexicon::Lexicon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -66,6 +67,9 @@ pub struct MixedParams {
     /// English as the first span with no text before the caret.
     pub start_en: f64,
     pub leftover: f64,
+    /// Each letter left over after the first in one Japanese span (ぱyぱy
+    /// for paypay): as often several slips as an English word.
+    pub leftover_more: f64,
     pub upper: f64,
     /// Weight of the word frequencies against the letter model.
     pub known: f64,
@@ -86,6 +90,24 @@ pub struct MixedParams {
     /// knows (nor the start of one, while it is typed): as often a slip of
     /// romaji (`kagriare` for かげりあれ) as a new word.
     pub oov: f64,
+    /// A Latin word the model knows that romaji reads with a letter left
+    /// (`bug` ぶg, `zip` じp, `kpi` kぴ) is English inside Japanese when that
+    /// costs at most this over the best reading (0: never).
+    pub letter_word: f64,
+    /// The frequency among Latin words such a word needs: a rarer one
+    /// (`furq`, `chk`) is likelier a slip of the romaji around it.
+    pub letter_word_floor: f64,
+    /// With the reading lexicon: a Latin word the model knows that romaji
+    /// reads wholly as kana (`issue` いっすえ) is English inside Japanese
+    /// when its kana cost as Japanese (the lexicon's cheapest words over
+    /// them and `kana_word_window` kana each side, less those of the sides
+    /// alone) more than this over the word's cost among Latin words.
+    pub kana_word: f64,
+    /// The frequency among Latin words such a word needs.
+    pub kana_word_floor: f64,
+    /// The kana each side of the word the lexicon reads it with (0: the
+    /// whole Japanese span).
+    pub kana_word_window: f64,
 }
 
 impl Default for MixedParams {
@@ -96,6 +118,7 @@ impl Default for MixedParams {
             en_en: 6.0,
             start_en: 3.0,
             leftover: 8.0,
+            leftover_more: 0.0,
             upper: 8.0,
             known: 0.9,
             ja_text: 0.7,
@@ -105,17 +128,23 @@ impl Default for MixedParams {
             name: 1e-4,
             sentence: 1.0,
             oov: 0.0,
+            letter_word: 4.0,
+            letter_word_floor: 4e-5,
+            kana_word: 8.0,
+            kana_word_floor: 4e-5,
+            kana_word_window: 4.0,
         }
     }
 }
 
 impl MixedParams {
-    pub const NAMES: [&'static str; 14] = [
+    pub const NAMES: [&'static str; 20] = [
         "switch_in",
         "switch_out",
         "en_en",
         "start_en",
         "leftover",
+        "leftover_more",
         "upper",
         "known",
         "ja_text",
@@ -125,6 +154,11 @@ impl MixedParams {
         "name",
         "sentence",
         "oov",
+        "letter_word",
+        "letter_word_floor",
+        "kana_word",
+        "kana_word_floor",
+        "kana_word_window",
     ];
 
     pub fn field(&mut self, name: &str) -> Option<&mut f64> {
@@ -134,6 +168,7 @@ impl MixedParams {
             "en_en" => &mut self.en_en,
             "start_en" => &mut self.start_en,
             "leftover" => &mut self.leftover,
+            "leftover_more" => &mut self.leftover_more,
             "upper" => &mut self.upper,
             "known" => &mut self.known,
             "ja_text" => &mut self.ja_text,
@@ -143,6 +178,11 @@ impl MixedParams {
             "name" => &mut self.name,
             "sentence" => &mut self.sentence,
             "oov" => &mut self.oov,
+            "letter_word" => &mut self.letter_word,
+            "letter_word_floor" => &mut self.letter_word_floor,
+            "kana_word" => &mut self.kana_word,
+            "kana_word_floor" => &mut self.kana_word_floor,
+            "kana_word_window" => &mut self.kana_word_window,
             _ => return None,
         })
     }
@@ -188,7 +228,14 @@ pub struct MixedModel {
     /// word too: OK, Word).
     names: FastMap<String, (String, f64, bool)>,
     pub params: MixedParams,
+    /// The reading lexicon's cost of kana `kana_words` asked for, by the
+    /// lexicon (its address) and the kana: typing asks again for the same
+    /// at each key.
+    lexicon_costs: Mutex<HashMap<(usize, String), f64>>,
 }
+
+/// Kana costs `MixedModel::lexicon_costs` keeps before it starts over.
+const LEXICON_COSTS: usize = 4096;
 
 impl std::fmt::Debug for MixedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -323,6 +370,7 @@ impl MixedModel {
             en_total: en_total.max(1.0),
             names: FastMap::default(),
             params,
+            lexicon_costs: Mutex::default(),
         })
     }
 
@@ -369,6 +417,279 @@ impl MixedModel {
     /// kana after one are read on from `@` (`google` + を is common,
     /// `melty` + ぺ is not).
     pub fn segment(&self, typed: &str, before: Option<&str>, fin: bool) -> Vec<Span> {
+        self.segment_with(typed, before, fin, None)
+    }
+
+    /// `segment` with the reading lexicon, which reads the words romaji
+    /// reads wholly as kana (`kana_words`).
+    pub fn segment_with(
+        &self,
+        typed: &str,
+        before: Option<&str>,
+        fin: bool,
+        lexicon: Option<&Lexicon>,
+    ) -> Vec<Span> {
+        let (spans, cost) = self.segment_masked(typed, before, fin, None);
+        let spans = self.letter_words(typed, before, fin, spans, cost);
+        match lexicon {
+            Some(lexicon) => self.kana_words(lexicon, typed, fin, spans),
+            None => spans,
+        }
+    }
+
+    /// A Latin word the model knows (as often as `kana_word_floor`) that
+    /// romaji reads wholly as kana inside a Japanese span of `spans`
+    /// (`issue` いっすえ, `made` まで) is English where its kana cost as
+    /// Japanese more than `kana_word` over its cost among Latin words: the
+    /// reading lexicon's cheapest words over the kana with
+    /// `kana_word_window` kana each side, less those over the sides alone
+    /// (まで is a particle, cheap; いっすえ is 一 + 据え, dear). The kana
+    /// model reads kana by threes and finds いっすえ about as likely as
+    /// Japanese goes; a word over it is what tells. Of words that overlap,
+    /// the one by the most.
+    fn kana_words(&self, lexicon: &Lexicon, typed: &str, fin: bool, spans: Vec<Span>) -> Vec<Span> {
+        let p = &self.params;
+        let chars: Vec<char> = typed.chars().collect();
+        let mut out = Vec::with_capacity(spans.len());
+        for span in spans {
+            if span.lang != Lang::Ja || span.end - span.start < 3 {
+                out.push(span);
+                continue;
+            }
+            let done = fin || span.end < chars.len();
+            let units = romaji_units(&chars[span.start..span.end], done);
+            // the kana before each unit, and whether the unit is a kana
+            let mut kana: Vec<char> = Vec::new();
+            let mut at: Vec<usize> = Vec::with_capacity(units.len() + 1);
+            for u in &units {
+                at.push(kana.len());
+                match u.kind {
+                    UnitKind::Kana(k) => kana.extend(k.chars()),
+                    UnitKind::Char(c) => kana.push(c),
+                    UnitKind::Pending => {}
+                }
+            }
+            at.push(kana.len());
+            let window = p.kana_word_window as usize;
+            let mut flips: Vec<(f64, usize, usize)> = Vec::new();
+            for i in 0..units.len() {
+                let a = span.start + units[i].start;
+                for j in i + 1..=units.len() {
+                    let u = &units[j - 1];
+                    if !matches!(u.kind, UnitKind::Kana(_)) {
+                        break;
+                    }
+                    let b = span.start + u.end;
+                    if b - a > 15 {
+                        break;
+                    }
+                    if b - a < 3 || !chars[a..b].iter().all(|c| c.is_ascii_alphabetic()) {
+                        continue;
+                    }
+                    let word: String = chars[a..b].iter().map(|c| c.to_ascii_lowercase()).collect();
+                    let Some(freq) = self.known(&word).filter(|&f| f >= p.kana_word_floor) else {
+                        continue;
+                    };
+                    let (ka, kb) = (at[i], at[j]);
+                    // its kana as the word alone spells them: not a doubled
+                    // consonant's first letter after it (`bit` of `bitto`)
+                    let alone = romaji_units(&chars[a..b], true);
+                    let mut spelled = String::new();
+                    for u in &alone {
+                        match u.kind {
+                            UnitKind::Kana(k) => spelled.push_str(k),
+                            _ => spelled.push('#'),
+                        }
+                    }
+                    // nor a word whose kana start inside a Japanese one
+                    // (`npo` of でんぽう, んぽ: ん and small kana end the
+                    // kana before them)
+                    if !spelled.chars().eq(kana[ka..kb].iter().copied())
+                        || "んゃゅょぁぃぅぇぉっゎ".contains(kana[ka])
+                    {
+                        continue;
+                    }
+                    // nor one beside a letter the Japanese leaves: a slip of
+                    // the romaji is there, which the word is likelier part
+                    // of (げたをぬいdせお: not SEO)
+                    let leftover = |u: Option<&crate::composing_text::RomajiUnit>| {
+                        u.is_some_and(|u| match u.kind {
+                            UnitKind::Char(c) => c.is_ascii_alphabetic(),
+                            UnitKind::Pending => done,
+                            UnitKind::Kana(_) => false,
+                        })
+                    };
+                    if leftover(i.checked_sub(1).and_then(|k| units.get(k)))
+                        || leftover(units.get(j))
+                    {
+                        continue;
+                    }
+                    let from = if window == 0 {
+                        0
+                    } else {
+                        ka.saturating_sub(window)
+                    };
+                    let to = if window == 0 {
+                        kana.len()
+                    } else {
+                        (kb + window).min(kana.len())
+                    };
+                    let all: String = kana[from..to].iter().collect();
+                    let left: String = kana[from..ka].iter().collect();
+                    let right: String = kana[kb..to].iter().collect();
+                    let as_ja = self.lexicon_cost(lexicon, &all)
+                        - self.lexicon_cost(lexicon, &left)
+                        - self.lexicon_cost(lexicon, &right);
+                    let by = as_ja + freq.ln() - p.kana_word;
+                    if by > 0.0 {
+                        flips.push((by, a, b));
+                    }
+                }
+            }
+            // the words by the most first, none over another
+            flips.sort_by(|x, y| y.0.total_cmp(&x.0));
+            let mut taken: Vec<(usize, usize)> = Vec::new();
+            for &(_, a, b) in &flips {
+                if taken.iter().all(|&(x, y)| b <= x || y <= a) {
+                    taken.push((a, b));
+                }
+            }
+            taken.sort_unstable();
+            let mut pos = span.start;
+            for (a, b) in taken {
+                if pos < a {
+                    out.push(Span {
+                        lang: Lang::Ja,
+                        start: pos,
+                        end: a,
+                    });
+                }
+                out.push(Span {
+                    lang: Lang::En,
+                    start: a,
+                    end: b,
+                });
+                pos = b;
+            }
+            if pos < span.end {
+                out.push(Span {
+                    lang: Lang::Ja,
+                    start: pos,
+                    end: span.end,
+                });
+            }
+        }
+        out
+    }
+
+    /// The reading lexicon's cheapest conversion of `kana` (0 for none).
+    fn lexicon_cost(&self, lexicon: &Lexicon, kana: &str) -> f64 {
+        if kana.is_empty() {
+            return 0.0;
+        }
+        let key = (lexicon as *const Lexicon as usize, kana.to_string());
+        if let Some(&c) = self
+            .lexicon_costs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return c;
+        }
+        let cost = lexicon.convert(kana, 1).first().map_or(
+            f64::from(crate::lexicon::KANA_COST) * kana.chars().count() as f64,
+            |c| f64::from(c.1),
+        );
+        let mut costs = self.lexicon_costs.lock().unwrap_or_else(|e| e.into_inner());
+        if costs.len() >= LEXICON_COSTS {
+            costs.clear();
+        }
+        costs.insert(key, cost);
+        cost
+    }
+
+    /// A letter the Japanese of `spans` (whose cost is `cost`) leaves (ぶg
+    /// for `bug`, kぴ for `kpi`) read with the letters around it as a Latin
+    /// word the model knows, English, where that costs at most
+    /// `letter_word` over the best, the cheapest first, up to three: the
+    /// letter model finds such a word about as likely as a slip of romaji,
+    /// which leaves a letter too, but a slip rarely makes a word.
+    fn letter_words(
+        &self,
+        typed: &str,
+        before: Option<&str>,
+        fin: bool,
+        mut spans: Vec<Span>,
+        mut cost: f64,
+    ) -> Vec<Span> {
+        let limit = self.params.letter_word;
+        if limit <= 0.0 {
+            return spans;
+        }
+        let chars: Vec<char> = typed.chars().collect();
+        for _ in 0..3 {
+            let mut best: Option<(f64, Vec<Span>, f64)> = None;
+            for span in spans.iter().filter(|s| s.lang == Lang::Ja) {
+                // the letters the Japanese shown leaves: only a word over one
+                // is read again (most spans have none, and cost nothing)
+                let done = fin || span.end < chars.len();
+                let left: Vec<usize> = romaji_units(&chars[span.start..span.end], done)
+                    .iter()
+                    .filter(|u| match u.kind {
+                        UnitKind::Char(c) => c.is_ascii_alphabetic(),
+                        UnitKind::Pending => done,
+                        UnitKind::Kana(_) => false,
+                    })
+                    .map(|u| span.start + u.start)
+                    .collect();
+                for &l in &left {
+                    for a in l.saturating_sub(14).max(span.start)..=l {
+                        for b in (a + 3).max(l + 1)..=(a + 15).min(span.end) {
+                            if !chars[a..b].iter().all(|c| c.is_ascii_alphabetic()) {
+                                break;
+                            }
+                            let word: String =
+                                chars[a..b].iter().map(|c| c.to_ascii_lowercase()).collect();
+                            if !self
+                                .known(&word)
+                                .is_some_and(|f| f >= self.params.letter_word_floor)
+                            {
+                                continue;
+                            }
+                            let mut mask = vec![None; chars.len()];
+                            mask[span.start..span.end].fill(Some(Lang::Ja));
+                            mask[a..b].fill(Some(Lang::En));
+                            let (flipped, fcost) =
+                                self.segment_masked(typed, before, fin, Some(&mask));
+                            let gap = fcost - cost;
+                            if gap <= limit && best.as_ref().is_none_or(|(g, _, _)| gap < *g) {
+                                best = Some((gap, flipped, fcost));
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((_, flipped, fcost)) = best else {
+                break;
+            };
+            spans = flipped;
+            cost = fcost;
+        }
+        spans
+    }
+
+    /// `segment` with the language of some chars fixed (`mask`, a language
+    /// or `None` for each char), and the cost of the best segmentation so,
+    /// before its spans are read again (particles split, words protected):
+    /// what the bench's `gap` compares a case's expected reading with.
+    #[doc(hidden)]
+    pub fn segment_masked(
+        &self,
+        typed: &str,
+        before: Option<&str>,
+        fin: bool,
+        mask: Option<&[Option<Lang>]>,
+    ) -> (Vec<Span>, f64) {
         // The state after a span: Japanese, English, or Japanese that an
         // English span follows right away (its cost has the odds of `@`).
         const JA: usize = 0;
@@ -378,6 +699,10 @@ impl MixedModel {
         let chars: Vec<char> = typed.chars().collect();
         let n = chars.len();
         let p = &self.params;
+        // whether chars[a..b] may be read as `lang`
+        let allowed = |lang: Lang, a: usize, b: usize| {
+            mask.is_none_or(|m| m[a..b].iter().all(|l| l.is_none_or(|l| l == lang)))
+        };
         let context = before.and_then(context_lang).map(|l| match l {
             Lang::Ja => JA,
             Lang::En => EN,
@@ -443,7 +768,12 @@ impl MixedModel {
             // switch. After a sentence's end Japanese may start as freely.
             // Whether it shows as `.` or 。 is the sentence's
             // (`english_punctuation`).
-            if !spaced && !first && is_sentence_punct(chars[start]) && best[start][EN].is_finite() {
+            if !spaced
+                && !first
+                && is_sentence_punct(chars[start])
+                && best[start][EN].is_finite()
+                && allowed(Lang::En, start, start + 1)
+            {
                 let end = (start..n)
                     .find(|&k| !is_sentence_punct(chars[k]))
                     .unwrap_or(n);
@@ -506,6 +836,9 @@ impl MixedModel {
                 };
                 for &(len, cost, to_latin) in costs {
                     let end = start + len;
+                    if !allowed(Lang::Ja, start, end) {
+                        continue;
+                    }
                     let cost = c0
                         + enter
                         + cost
@@ -537,7 +870,9 @@ impl MixedModel {
                     self.en_costs(&chars[start..to], !fin && to == n)
                 });
                 for &(len, cost) in costs.iter() {
-                    update(start + len, EN, c0 + enter + cost, prev);
+                    if allowed(Lang::En, start, start + len) {
+                        update(start + len, EN, c0 + enter + cost, prev);
+                    }
                 }
             }
         }
@@ -551,15 +886,17 @@ impl MixedModel {
         } else {
             JA
         };
+        let total = best[end][state];
         let mut spans = Vec::new();
         while end > 0 {
             if !best[end][state].is_finite() {
                 // Unreachable (only spaces): give up on segmenting.
-                return vec![Span {
+                let all = Span {
                     lang: Lang::Ja,
                     start: 0,
                     end: n,
-                }];
+                };
+                return (vec![all], total);
             }
             let (start, prev) = back[end][state];
             let lang = if state == EN { Lang::En } else { Lang::Ja };
@@ -585,7 +922,7 @@ impl MixedModel {
                 s.lang = Lang::Ja;
             }
         }
-        spans
+        (spans, total)
     }
 
     /// An English span the model does not know as a word that ends in a
@@ -800,6 +1137,7 @@ impl MixedModel {
         let mut ctx = ctx;
         let mut cost = 0.0;
         let mut pos = 0;
+        let mut left_over = 0usize;
         for unit in units {
             let to_latin = self.kana.cost(ctx[0], ctx[1], '@');
             // An end inside this unit leaves its letters unread.
@@ -813,7 +1151,10 @@ impl MixedModel {
             };
             cost += match unit.kind {
                 UnitKind::Kana(kana) => kana.chars().map(&mut add).sum(),
-                UnitKind::Char(c) if c.is_ascii_alphabetic() => p.leftover,
+                UnitKind::Char(c) if c.is_ascii_alphabetic() => {
+                    left_over += 1;
+                    p.leftover + p.leftover_more * (left_over - 1) as f64
+                }
                 // Digits are the same in either language; the kana after
                 // them starts over (3じ).
                 UnitKind::Char(c) if c.is_ascii_digit() || is_decimal_point(chars, unit.start) => {
@@ -971,6 +1312,12 @@ impl MixedModel {
         self.words.contains_key(&lower) || self.name_weight(&lower).is_some()
     }
 
+    /// `known` of `word` in any case (for the bench).
+    #[doc(hidden)]
+    pub fn frequency(&self, word: &str) -> Option<f64> {
+        self.known(&word.to_ascii_lowercase())
+    }
+
     /// The frequency of a lowercase word among Latin words, if seen; else
     /// a name's (`name_weight`).
     fn known(&self, word: &str) -> Option<f64> {
@@ -1034,8 +1381,20 @@ impl MixedModel {
         fin: bool,
         casing: Casing,
     ) -> (Vec<char>, Vec<Span>) {
+        self.cased_with(typed, before, fin, casing, None)
+    }
+
+    /// `cased` segmenting with the reading lexicon (`segment_with`).
+    pub fn cased_with(
+        &self,
+        typed: &str,
+        before: Option<&str>,
+        fin: bool,
+        casing: Casing,
+        lexicon: Option<&Lexicon>,
+    ) -> (Vec<char>, Vec<Span>) {
         let mut chars: Vec<char> = typed.chars().collect();
-        let mut spans = self.segment(typed, before, fin);
+        let mut spans = self.segment_with(typed, before, fin, lexicon);
         let sentence = if casing.sentences {
             english_sentence(&chars, &spans, before)
         } else {
@@ -1225,7 +1584,8 @@ struct Piece {
     digits: bool,
     /// The last two chars, for case breaks: two capitals then lowercase
     /// (`SCmo`, an acronym then romaji), but for a plural `s` at the end
-    /// (`PCs`), counted once the piece goes on.
+    /// (`PCs`), counted once the piece goes on; lowercase then two capitals
+    /// (`gaDJ`, romaji then an acronym).
     last: [char; 2],
     breaks: usize,
     s_break: bool,
@@ -1255,6 +1615,14 @@ impl Piece {
             } else {
                 self.breaks += 1;
             }
+        }
+        // lowercase, then capitals (`gaDJ`, `sateLEC`: romaji, then an
+        // acronym)
+        if self.last[0].is_ascii_lowercase()
+            && self.last[1].is_ascii_uppercase()
+            && c.is_ascii_uppercase()
+        {
+            self.breaks += 1;
         }
         self.last = [self.last[1], c];
         self.digits &= c.is_ascii_digit();
@@ -1744,7 +2112,10 @@ impl CharLm {
 /// (shown after it, not yet part of the reading): Japanese as kana with its
 /// ASCII symbols as `symbols` maps them (else `,` `.` as 、。 and the others
 /// full width), English as typed, chars between spans as they are. With
-/// `fin`, a final `n` is ん and other pending romaji is text.
+/// `fin`, a final `n` is ん and other pending romaji is text. Romaji is
+/// pending at the end of `chars` only: a Japanese span with more after it
+/// is done, its `n` ん and a letter no kana took text where it was
+/// (`gboard`, `g` and English `board`: not `board` with `g` pending after).
 pub fn render_parts(
     chars: &[char],
     spans: &[Span],
@@ -1754,17 +2125,44 @@ pub fn render_parts(
     let mut text = String::new();
     let mut pending = String::new();
     let mut pos = 0;
+    // the text ends in Latin: an English span's letter or digit, or a digit
+    // (a letter romaji left over is a slip, not Latin: つよしh。)
+    let mut latin_end = false;
     for span in spans {
-        text.extend(&chars[pos..span.start]);
+        if pos < span.start {
+            text.extend(&chars[pos..span.start]);
+            latin_end = false;
+        }
         let part = &chars[span.start..span.end];
         match span.lang {
-            Lang::En => text.extend(part),
+            Lang::En => {
+                text.extend(part);
+                latin_end = part.last().is_some_and(|c| c.is_ascii_alphanumeric());
+            }
             Lang::Ja => {
-                for unit in romaji_units(part, fin && span.end == chars.len()) {
+                let done = fin || span.end < chars.len();
+                let laughs = laughter(part);
+                for unit in romaji_units(part, done) {
+                    let after_latin = std::mem::replace(&mut latin_end, false);
+                    if laughs[unit.start] {
+                        text.extend(&part[unit.start..unit.end]);
+                        continue;
+                    }
                     match unit.kind {
+                        // a hyphen after a digit or a Latin letter is one
+                        // (3-5-2, NEWS-), not ー (らーめん)
+                        UnitKind::Kana("ー") if after_latin => text.push('-'),
                         UnitKind::Kana(kana) => text.push_str(kana),
-                        UnitKind::Char(c) if !c.is_ascii_punctuation() => text.push(c),
+                        UnitKind::Char(c) if !c.is_ascii_punctuation() => {
+                            text.push(c);
+                            latin_end = c.is_ascii_digit();
+                        }
                         UnitKind::Char(c) if is_decimal_point(part, unit.start) => text.push(c),
+                        UnitKind::Char('.')
+                            if period_as_typed(part, unit.start, &text, after_latin) =>
+                        {
+                            text.push('.')
+                        }
                         UnitKind::Char(c) => match symbols.get(&c) {
                             Some(s) => text.push_str(s),
                             None => text.push(match c {
@@ -1773,7 +2171,7 @@ pub fn render_parts(
                                 _ => char::from_u32(c as u32 - 0x21 + 0xff01).unwrap_or(c),
                             }),
                         },
-                        UnitKind::Pending if fin => text.extend(&part[unit.start..unit.end]),
+                        UnitKind::Pending if done => text.extend(&part[unit.start..unit.end]),
                         UnitKind::Pending => pending.extend(&part[unit.start..unit.end]),
                     }
                 }
@@ -1783,6 +2181,42 @@ pub fn render_parts(
     }
     text.extend(&chars[pos..]);
     (text, pending)
+}
+
+/// The chars of `part` in a laugh: two `w` or more that no romaji goes on
+/// from (the end, a space, a symbol after them), as typed (`ww`, not っw);
+/// a vowel typed after makes them romaji again (`wwa`, っわ).
+fn laughter(part: &[char]) -> Vec<bool> {
+    let mut out = vec![false; part.len()];
+    let mut i = 0;
+    while i < part.len() {
+        if !part[i].eq_ignore_ascii_case(&'w') {
+            i += 1;
+            continue;
+        }
+        let j = (i..part.len())
+            .find(|&j| !part[j].eq_ignore_ascii_case(&'w'))
+            .unwrap_or(part.len());
+        let ends = part.get(j).is_none_or(|c| !c.is_ascii_alphabetic());
+        if j - i >= 2 && ends {
+            out[i..j].fill(true);
+        }
+        i = j;
+    }
+    out
+}
+
+/// A period of Japanese text that stays one: in a run of periods (`...`,
+/// not 。。。) or after an initial (`J.`, `A.R.C.`: a Latin letter
+/// `after_latin`, with none before it). After a word it is the sentence's
+/// end (Google。).
+fn period_as_typed(part: &[char], at: usize, shown: &str, after_latin: bool) -> bool {
+    let run = at > 0 && part[at - 1] == '.' || part.get(at + 1) == Some(&'.');
+    let mut back = shown.chars().rev();
+    let initial = after_latin
+        && back.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && !back.next().is_some_and(|c| c.is_ascii_alphabetic());
+    run || initial
 }
 
 /// What the spans of `typed` show (`render_parts`, default symbols, the
@@ -1944,6 +2378,70 @@ pub(crate) mod tests {
         assert_eq!(
             render_parts(&chars, &spans, false, &HashMap::new()),
             ("きょう".to_string(), "k".to_string())
+        );
+    }
+
+    /// Romaji is pending at the end of the input only: before an English
+    /// word, a letter no kana took stays where it was typed and an n is ん.
+    #[test]
+    fn romaji_before_english_is_done() {
+        let span = |lang, start, end| Span { lang, start, end };
+        let parts = |typed: &str, spans: &[Span]| {
+            let chars: Vec<char> = typed.chars().collect();
+            render_parts(&chars, spans, false, &HashMap::new())
+        };
+        let shown = |text: &str, pending: &str| (text.to_string(), pending.to_string());
+        assert_eq!(
+            parts("gboard", &[span(Lang::Ja, 0, 1), span(Lang::En, 1, 6)]),
+            shown("gboard", "")
+        );
+        assert_eq!(
+            parts("honBook", &[span(Lang::Ja, 0, 3), span(Lang::En, 3, 7)]),
+            shown("ほんBook", "")
+        );
+        // at the end it is still being typed
+        assert_eq!(
+            parts("Bookk", &[span(Lang::En, 0, 4), span(Lang::Ja, 4, 5)]),
+            shown("Book", "k")
+        );
+    }
+
+    /// Japanese text's ASCII punctuation as text writes it beside Latin:
+    /// a hyphen after a digit or a letter, a run of periods, an initial's
+    /// period; ー and 。 elsewhere.
+    #[test]
+    fn punctuation_beside_latin_stays_ascii() {
+        let span = |lang, start, end| Span { lang, start, end };
+        let shown = |typed: &str, spans: &[Span]| render(typed, spans, true);
+        let ja = |typed: &str| shown(typed, &[span(Lang::Ja, 0, typed.chars().count())]);
+        assert_eq!(ja("3-5-2no"), "3-5-2の");
+        assert_eq!(ja("ra-men"), "らーめん");
+        assert_eq!(ja("chotto..."), "ちょっと...");
+        assert_eq!(ja("chotto."), "ちょっと。");
+        // after a letter romaji left over (a slip): 。 and ー
+        assert_eq!(ja("tsuyosih."), "つよしh。");
+        assert_eq!(ja("as-bisu"), "あsーびす");
+        // a laugh as typed, a double consonant as っ
+        assert_eq!(ja("shinjimasennww"), "しんじませんww");
+        assert_eq!(ja("kusawww,hai"), "くさwww、はい");
+        assert_eq!(ja("wwwa"), "っっわ");
+        assert_eq!(
+            shown(
+                "NEWS-hyakunen",
+                &[span(Lang::En, 0, 4), span(Lang::Ja, 4, 13)]
+            ),
+            "NEWS-ひゃくねん"
+        );
+        assert_eq!(
+            shown("J.seruko", &[span(Lang::En, 0, 1), span(Lang::Ja, 1, 8)]),
+            "J.せるこ"
+        );
+        assert_eq!(
+            shown(
+                "Google.kyou",
+                &[span(Lang::En, 0, 6), span(Lang::Ja, 6, 11)]
+            ),
+            "Google。きょう"
         );
     }
 
@@ -2127,6 +2625,53 @@ pub(crate) mod tests {
             cased(&m, "kyouhaiitenkidesune", None),
             "きょうはいいてんきですね"
         );
+    }
+
+    /// A letter the Japanese reading leaves, with the letters around it a
+    /// Latin word the model knows, is that word (ぶg was `bug`); a slip that
+    /// makes no word it knows well stays a slip; and romaji, then capitals,
+    /// is Japanese, then an acronym (gaDJ).
+    #[test]
+    fn the_shipped_model_reads_a_left_letter_as_its_word() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        assert_eq!(cased(&m, "sorehabugdesu", None), "それはbugです");
+        assert_eq!(cased(&m, "kpinomokuhyou", None), "KPIのもくひょう");
+        assert_eq!(cased(&m, "furqnoekusupuresu", None), "ふrqのえくすぷれす");
+        assert_eq!(cased(&m, "gaDJnanode", None), "がDJなので");
+        assert_eq!(cased(&m, "sateLECtakken", None), "さてLECたっけん");
+        // off: the slip's letter as typed
+        let mut off = MixedModel::load(&dir).unwrap();
+        off.params.letter_word = 0.0;
+        assert_eq!(cased(&off, "sorehabugdesu", None), "それはぶgです");
+    }
+
+    /// A word romaji reads wholly as kana is English where the lexicon
+    /// finds its kana dear as Japanese (一 + 据え for いっすえ: "issue立てと
+    /// いて" was 一据え立てといて), not where they are a word (まで).
+    #[test]
+    fn the_lexicon_reads_a_word_spelled_in_kana_as_english_where_no_word_is() {
+        let table = "立て\tたて\t5.0\tverb\nと\tと\t3.0\tpart\nいて\tいて\t5.0\tverb\n\
+                     ここ\tここ\t4.0\tnoun\nまで\tまで\t3.0\tpart\n来た\tきた\t4.0\tverb\n\
+                     一\tいっ\t9.0\tnoun\n据え\tすえ\t11.0\tverb\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-mixed-kana-words-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, Lexicon::build(table, None).unwrap()).unwrap();
+        let lexicon = Lexicon::open(&path).unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        let with = |typed: &str| {
+            let (chars, spans) = m.cased_with(typed, None, true, Casing::default(), Some(&lexicon));
+            let (text, pending) = render_parts(&chars, &spans, true, &HashMap::new());
+            text + &pending
+        };
+        assert_eq!(cased(&m, "issuetatetoite", None), "いっすえたてといて");
+        assert_eq!(with("issuetatetoite"), "issueたてといて");
+        assert_eq!(with("kokomadekita"), "ここまできた");
+        drop(lexicon);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -184,6 +184,14 @@ pub struct Lexicon {
     at: [usize; 8],
 }
 
+impl std::fmt::Debug for Lexicon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lexicon")
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The coarse parts of speech of the table's class column, by index.
 pub const CLASSES: [&str; 15] = [
     "other", "noun", "propn", "verb", "adj", "adjn", "adv", "adnom", "conj", "intj", "part", "aux",

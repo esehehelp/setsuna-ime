@@ -303,6 +303,9 @@ pub struct ComposingText {
     /// Cursor measured in UTF-8 code points (chars) into `raw`.
     cursor: usize,
     mixed: Option<MixedInput>,
+    /// The reading lexicon the mixed model reads words spelled wholly in
+    /// kana by (`MixedModel::segment_with`).
+    lexicon: Option<Arc<crate::lexicon::Lexicon>>,
 }
 
 /// Mixed Japanese / English input: the model splitting the typed text, what
@@ -396,6 +399,14 @@ impl ComposingText {
         self.recompute(false);
     }
 
+    /// The reading lexicon for the mixed model (`None`: none).
+    pub fn set_lexicon(&mut self, lexicon: Option<Arc<crate::lexicon::Lexicon>>) {
+        self.lexicon = lexicon;
+        if self.mixed.is_some() {
+            self.recompute(false);
+        }
+    }
+
     /// The mixed-input model, if mixed input is on (its kana model judges
     /// typo corrections).
     pub fn mixed_model(&self) -> Option<Arc<MixedModel>> {
@@ -455,7 +466,13 @@ impl ComposingText {
         };
         mixed
             .model
-            .cased(&self.raw, Some(&mixed.before), true, mixed.casing)
+            .cased_with(
+                &self.raw,
+                Some(&mixed.before),
+                true,
+                mixed.casing,
+                self.lexicon.as_deref(),
+            )
             .1
             .last()
             .is_some_and(|span| span.lang == Lang::En && span.end == self.raw.chars().count())
@@ -714,9 +731,13 @@ impl ComposingText {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };
-        let (_, spans) = mixed
-            .model
-            .cased(raw, Some(&mixed.before), flush_final_n, mixed.casing);
+        let (_, spans) = mixed.model.cased_with(
+            raw,
+            Some(&mixed.before),
+            flush_final_n,
+            mixed.casing,
+            self.lexicon.as_deref(),
+        );
         let chars: Vec<char> = raw.chars().collect();
         let (text, pending) =
             crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
@@ -728,10 +749,13 @@ impl ComposingText {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };
-        let (chars, spans) =
-            mixed
-                .model
-                .cased(raw, Some(&mixed.before), flush_final_n, mixed.casing);
+        let (chars, spans) = mixed.model.cased_with(
+            raw,
+            Some(&mixed.before),
+            flush_final_n,
+            mixed.casing,
+            self.lexicon.as_deref(),
+        );
         let (text, pending) =
             crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
         Converted { text, pending }
