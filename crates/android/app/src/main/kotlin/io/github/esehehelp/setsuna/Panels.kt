@@ -56,6 +56,9 @@ class EditPanel(context: Context, private val onOp: (Op) -> Unit) : LinearLayout
     private val main = Handler(Looper.getMainLooper())
     private lateinit var selectKey: TextView
 
+    /** A vibration on a press ([KeyboardPrefs.vibrate]). */
+    var vibrate = true
+
     /** 選択 is on: the arrows extend the selection. */
     var selecting = false
         set(value) {
@@ -91,7 +94,7 @@ class EditPanel(context: Context, private val onOp: (Op) -> Unit) : LinearLayout
         val v = keyText(context, palette, label, special, if (label.length == 1) 22f else 15f)
         if (!repeat) {
             v.setOnClickListener {
-                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                if (vibrate) it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                 onOp(op)
             }
             return v
@@ -106,7 +109,7 @@ class EditPanel(context: Context, private val onOp: (Op) -> Unit) : LinearLayout
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     view.isPressed = true
-                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                    if (vibrate) view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                     onOp(op)
                     main.postDelayed(again, 400)
                 }

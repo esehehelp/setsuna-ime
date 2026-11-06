@@ -3,13 +3,15 @@
 #   onnx/<manifest> and the files it lists
 #   lexicon/<lexicon>
 #   analyzer/<its directory's name>/analyzer.manifest.json and its files
+#   names/latin-names.tsv (mixed input's names: HTCondor, GitHub kept as
+#     typed, not read as romaji)
 #
 # Usage:
 #   pwsh -File crates\android\push-models.ps1                  # those this PC's Windows install uses
-#   pwsh -File crates\android\push-models.ps1 -Manifest <m> [-Lexicon <f>] [-Analyzer <a>]
+#   pwsh -File crates\android\push-models.ps1 -Manifest <m> [-Lexicon <f>] [-Analyzer <a>] [-NameDictionary <tsv>]
 #   pwsh -File crates\android\push-models.ps1 -NoDictionaries  # the model only
 #
-# Without -Manifest, the model, the lexicon and the analyzer are those
+# Without -Manifest, the model, the lexicon, the analyzer and the names are those
 # %APPDATA%\setsuna-ime\config.toml names. Each file goes to /data/local/tmp
 # and from there into the app's directory by `run-as`, which only a
 # debuggable build (build.ps1 without -Release) lets in; a file already there
@@ -23,6 +25,8 @@ param(
     [string]$Manifest,
     [string]$Lexicon,
     [string]$Analyzer,
+    # not $Names: PowerShell's names are case-blind, and $names below lists the model's files
+    [string]$NameDictionary,
     [switch]$NoDictionaries
 )
 
@@ -50,6 +54,7 @@ if (-not $Manifest) {
     if (-not $NoDictionaries) {
         if (-not $Lexicon) { $Lexicon = Get-ConfigValue 'lexicon' 'file' }
         if (-not $Analyzer) { $Analyzer = Get-ConfigValue 'engine' 'analyzer_manifest' }
+        if (-not $NameDictionary) { $NameDictionary = Get-ConfigValue 'frontend' 'name_dictionary_file' }
     }
 }
 if (-not $Manifest -or -not (Test-Path -LiteralPath $Manifest)) { throw "model manifest not found: '$Manifest' (pass -Manifest)" }
@@ -85,6 +90,12 @@ if ($Analyzer) {
     $names = @($a.Name, $aj.dictionary.path)
     if ($aj.alternates) { $names += @($aj.alternates) }
     Add-Relative $a.Directory.FullName $names "analyzer/$($a.Directory.Name)"
+}
+
+if ($NameDictionary) {
+    # under the name the app looks for (crates/android/src/host.rs)
+    if (-not (Test-Path -LiteralPath $NameDictionary)) { throw "not found: $NameDictionary" }
+    $Files.Add(@((Get-Item -LiteralPath $NameDictionary).FullName, 'names/latin-names.tsv'))
 }
 
 $state = (& $Adb get-state 2>&1) -join ''

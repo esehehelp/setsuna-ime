@@ -23,6 +23,8 @@ import kotlin.math.abs
  * the あa1 key cycles あ (romaji into setsuna-core), a (letters as they
  * are) and 1 (Gboard's number pad, whose keys flick to symbols); in a, ?123
  * opens the calculator pad, and from there !?# the two pages of symbols.
+ * Shift puts a JIS keyboard's symbols on the number row; the globe key is ?
+ * while something is composed.
  * The space key's drag moves the caret (the segment while converting).
  */
 @SuppressLint("ViewConstructor")
@@ -71,6 +73,8 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         val special: Boolean = false,
         val pill: Boolean = false,
         val icon: Int = 0,
+        /** CHAR: what it types with Shift (the number row's symbols). */
+        val shifted: String = "",
     ) {
         val rect = RectF()
     }
@@ -84,6 +88,17 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     // ---- the layouts ----
 
     private fun chars(s: String) = s.map { Key(it.toString(), Type.CHAR, it.code) }
+
+    /**
+     * The number row, whose Shift types a JIS keyboard's symbols (the user's
+     * PC has one); 0, which has none there, the ~ the number pad's 0 flicks to.
+     */
+    private fun numberRow() = "1234567890".zip("!\"#\$%&'()~").map { (d, s) ->
+        Key(d.toString(), Type.CHAR, d.code, shifted = s.toString())
+    }
+
+    /** While something is composed, the globe key types ? (as Gboard's does). */
+    private val question = Key("?", Type.CHAR, '?'.code)
 
     /** A symbol key: by its keysym when it has one (` is the IME's on / off key), else as text. */
     private fun sym(s: String, w: Float = 1f): Key = when {
@@ -113,7 +128,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     private val ja = Layout(
         listOf(
-            chars("1234567890"),
+            numberRow(),
             chars("qwertyuiop"),
             chars("asdfghjkl") + Key("ー", Type.CHAR, '-'.code),
             listOf(shiftKey()) + chars("zxcvbnm") + backspaceKey(1.5f),
@@ -133,7 +148,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     private val en = Layout(
         listOf(
-            chars("1234567890"),
+            numberRow(),
             chars("qwertyuiop"),
             chars("asdfghjkl"),
             listOf(shiftKey()) + chars("zxcvbnm") + backspaceKey(1.5f),
@@ -287,9 +302,21 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         if (!enabled && mode == Mode.JA) choose(Mode.EN)
     }
 
+    /** The settings page's キーボード: vibration, the bubble, the height. */
+    var prefs = KeyboardPrefs()
+        set(value) {
+            val taller = value.height != field.height
+            field = value
+            if (taller) requestLayout()
+        }
+
+    private fun haptic(feedback: Int) {
+        if (prefs.vibrate) performHapticFeedback(feedback)
+    }
+
     // ---- geometry ----
 
-    private val keysHeight = 266 * density
+    private val keysHeight get() = 266 * density * prefs.height / 100f
     private val padTop = 3 * density
     private val padBottom = 3 * density
     private val hGap = 2.7f * density
@@ -322,15 +349,19 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     private fun keyAt(x: Float, y: Float): Key? {
         val keys = layout().rows.flatten().filter { it.type != Type.SPACER }
-        keys.firstOrNull {
+        val k = keys.firstOrNull {
             x >= it.rect.left - hGap && x <= it.rect.right + hGap && y >= it.rect.top - vGap && y <= it.rect.bottom + vGap
-        }?.let { return it }
-        return keys.minByOrNull { k ->
+        } ?: keys.minByOrNull { k ->
             val dx = maxOf(k.rect.left - x, 0f, x - k.rect.right)
             val dy = maxOf(k.rect.top - y, 0f, y - k.rect.bottom)
             dx * dx + dy * dy
         }
+        return k?.let { shown(it) }
     }
+
+    /** A key as it is now: the globe is ? while something is composed. */
+    private fun shown(k: Key): Key =
+        if (k.type == Type.GLOBE && composing) question.also { it.rect.set(k.rect) } else k
 
     // ---- drawing ----
 
@@ -342,9 +373,16 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private fun letter(k: Key) =
         k.type == Type.CHAR && k.label.length == 1 && k.label[0] in 'a'..'z'
 
+    /** A number row key with Shift on (caps lock, as on a PC, is for the letters only). */
+    private fun symbolNow(k: Key) = k.shifted.isNotEmpty() && shift && !capsLock
+
     /** What a key shows, when it shows text. */
     private fun label(k: Key): String = when (k.type) {
-        Type.CHAR -> if (letter(k) && (shift || capsLock)) k.label.uppercase() else k.label
+        Type.CHAR -> when {
+            letter(k) && (shift || capsLock) -> k.label.uppercase()
+            symbolNow(k) -> k.shifted
+            else -> k.label
+        }
         Type.SPACE -> k.label.ifEmpty { if (composing && mode == Mode.JA && page == Page.KEYS) "変換" else "Setsuna" }
         Type.ENTER -> if (composing) "確定" else ""
         else -> k.label
@@ -355,8 +393,9 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         val held = HashSet<Key>()
         for (i in 0 until presses.size()) held.add(presses.valueAt(i).key)
         for (row in layout().rows) {
-            for (k in row) {
-                if (k.type == Type.SPACER) continue
+            for (key in row) {
+                if (key.type == Type.SPACER) continue
+                val k = shown(key)
                 val r = if (k.pill) k.rect.height() / 2 else radius
                 if (k.type == Type.ENTER) {
                     // the icon's gradient, darkened while held
@@ -495,7 +534,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         val p = holding ?: return@Runnable
         p.fired = true
         holding = null
-        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        haptic(HapticFeedbackConstants.LONG_PRESS)
         listener.onPickInputMethod()
     }
 
@@ -513,7 +552,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         if (dir < 0) k.text else k.more.getOrNull(dir)?.ifEmpty { null } ?: k.text
 
     private fun preview(k: Key, text: String?) {
-        val shows = k.type == Type.CHAR || k.type == Type.TEXT || k.type == Type.FLICK
+        val shows = prefs.preview && (k.type == Type.CHAR || k.type == Type.TEXT || k.type == Type.FLICK)
         listener.onPreview(if (shows) text else null, if (shows) k.rect else null)
     }
 
@@ -541,7 +580,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 }
                 val p = Press(k, x, y, index)
                 presses.put(e.getPointerId(i), p)
-                performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                haptic(HapticFeedbackConstants.KEYBOARD_TAP)
                 preview(k, if (k.type == Type.FLICK) k.text else label(k))
                 when (k.type) {
                     Type.BACKSPACE -> {
@@ -619,9 +658,12 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private fun fire(k: Key, p: Press?) {
         when (k.type) {
             Type.CHAR -> {
-                val upper = letter(k) && (shift || capsLock)
-                if (upper) listener.onKey(k.sym - 0x20, Native.MOD_SHIFT) else listener.onKey(k.sym, 0)
-                if (letter(k) && shift && !capsLock) shift = false
+                when {
+                    letter(k) && (shift || capsLock) -> listener.onKey(k.sym - 0x20, Native.MOD_SHIFT)
+                    symbolNow(k) -> listener.onKey(k.shifted[0].code, Native.MOD_SHIFT)
+                    else -> listener.onKey(k.sym, 0)
+                }
+                if ((letter(k) || k.shifted.isNotEmpty()) && shift && !capsLock) shift = false
             }
             Type.TEXT -> listener.onText(k.text)
             Type.FLICK -> listener.onText(k.text)

@@ -1,6 +1,7 @@
 //! The JNI calls of `io.github.esehehelp.setsuna.Native` (app/).
 //!
-//! Every call runs on the service's main thread, but the wake-up, which the
+//! Every call runs on the service's main thread, but the settings page's
+//! (`settings`, the WebView's bridge thread) and the wake-up, which the
 //! engine client's reader thread makes: it calls the listener's
 //! `onEngineNotify()`, which posts to the main thread. A session is a
 //! `Box<Host>` handed to Java as a `long`. Panics never cross the boundary:
@@ -232,7 +233,9 @@ pub unsafe extern "system" fn Java_io_github_esehehelp_setsuna_Native_toggle(
     with(h, (), |host| host.session.toggle())
 }
 
-/// The view as JSON (`host::view_json`); null for no session.
+/// The view as JSON (`host::view_json`); null for no session. Its commits
+/// are taken: the service writes them into the app once, and a view read
+/// again before the next key (the keyboard shown again, a tick) has none.
 ///
 /// # Safety
 /// `h` is a live session.
@@ -242,10 +245,32 @@ pub unsafe extern "system" fn Java_io_github_esehehelp_setsuna_Native_view<'l>(
     _class: JClass<'l>,
     h: jlong,
 ) -> jstring {
-    let json = with(h, None, |host| Some(host.view_json()));
+    let json = with(h, None, |host| Some(host.take_view_json()));
     match json {
         Some(json) => env
             .new_string(json)
+            .map_or(std::ptr::null_mut(), |s| s.into_raw()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// A message of the settings page (JSON) for the config under the app's
+/// files directory: the reply as JSON, null for none (`settings::handle`).
+/// Called on the WebView's bridge thread, not the service's.
+#[no_mangle]
+pub extern "system" fn Java_io_github_esehehelp_setsuna_Native_settings<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    files: JString<'l>,
+    message: JString<'l>,
+) -> jstring {
+    let files = PathBuf::from(string(&mut env, &files).unwrap_or_default());
+    let Some(message) = string(&mut env, &message) else {
+        return std::ptr::null_mut();
+    };
+    match guard(None, || crate::settings::handle(&files, &message)) {
+        Some(reply) => env
+            .new_string(reply)
             .map_or(std::ptr::null_mut(), |s| s.into_raw()),
         None => std::ptr::null_mut(),
     }

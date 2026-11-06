@@ -18,5 +18,7 @@ crate-type = ["cdylib", "rlib"]
 # `setsuna-engine daemon` child process over its stdio protocol (the engine
 # binary is packaged as libsetsuna_engine.so; see build.ps1).
 setsuna-core = { path = "../ime-core" }
+# The settings page's config and dictionary messages (no window, no rewriter).
+setsuna-settings = { path = "../settings", default-features = false }
 serde_json.workspace = true
 jni = "0.21"

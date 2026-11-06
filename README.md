@@ -376,14 +376,20 @@ bash tests/model-download.sh
 arm64 の Android 8 以降が対象。キーボードは Gboard の日本語 QWERTY（数字行つき）と
 同じ配列（見た目は Setsuna のもの: アイコンのグラデーションの Enter キーと上端の線、
 スペースキーの「Setsuna」）で、あa1 キーで あ（ローマ字かな変換）／ a（英字そのまま）／ 1（数字パッド。
-フリックで記号）を切り替え、a の ?123 から電卓配列と記号 2 ページに行く。ライブ変換・
+フリックで記号）を切り替え、a の ?123 から電卓配列と記号 2 ページに行く。Shift で数字の行は
+JIS 配列の記号（! " # $ % & ' ( ) と、0 は ~）になり、変換中は地球儀キーが ? になる。ライブ変換・
 候補バー・確定のほか、ツールバーからテキスト編集（カーソル移動、選択、すべて選択、
 切り取り・コピー・貼り付け）とクリップボード（コピーした文字の一覧。1 時間、メモリだけに
-置き、パスワードなど機密の印のついたものは残さない）が使える。モデルのダウンロードと
-配布用の署名はまだ。IME の
+置き、パスワードなど機密の印のついたものは残さない）が使える。設定はツールバーの歯車
+（アプリの「Setsuna の設定」、Android の入力方法の設定からも）で、PC 版の設定 GUI と同じ
+ページ（`crates/settings/web/index.html`）を WebView で開く。キーボードの振動・キーの吹き出し・
+高さはここで、書き直し・候補の窓・PC のキーボードのキーなど Android にないものは出さない。
+モデルのダウンロードと配布用の署名はまだ。IME の
 ロジックは fcitx5 版と同じ `session`（ime-core）で、キーは X の keysym として渡す。
 エンジンは APK に `libsetsuna_engine.so` として入れた実行ファイルを子プロセスで動かし、
-ONNX Runtime は Microsoft の onnxruntime-android（1.28.0）のものを使う。
+ONNX Runtime は Microsoft の onnxruntime-android（1.28.0）のものを使う。エンジンの MoE
+（`neo_ime` の op）は ARMv8.2 の SDOT で計算する（Snapdragon SM8850 で 1 文 3〜12 ms。
+SDOT のない CPU は素の Rust で、その 20 倍ほどかかる）。
 
 build に要るもの: Android SDK（platform 35 と NDK。`ANDROID_HOME`、既定は
 `%LOCALAPPDATA%\Android\Sdk`）、JDK 17 以降（`JAVA_HOME`）、
@@ -391,13 +397,13 @@ build に要るもの: Android SDK（platform 35 と NDK。`ANDROID_HOME`、既�
 
 ```powershell
 pwsh crates/android/build.ps1 -Install   # Rust 部分とエンジンを arm64 で build、APK を作って adb で入れる
-pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモデル・読みの辞書・解析器をアプリへ
+pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモデル・読みの辞書・解析器・名前の辞書をアプリへ
 ```
 
-モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`）から読む。
+モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`、`names/latin-names.tsv`）から読む。
 `push-models.ps1` は `/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build
 （`-Release` なし）のときだけ使える。入れたあと、アプリの画面の「入力方法の設定を開く」で
-Setsuna を有効にし、キーボードの あ/A キーの長押し（入力方法の選択）で切り替える。
+Setsuna を有効にし、キーボードの地球儀キーの長押し（入力方法の選択）で切り替える。
 `config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。
 
 ### 設定 GUI

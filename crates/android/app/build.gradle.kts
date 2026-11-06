@@ -43,6 +43,8 @@ android {
         // the mixed input model (assets/mixed), unpacked into the files
         // directory on the first start
         assets.srcDir("../../ime-core/data")
+        // the settings page (index.html), the desktop app's (SettingsActivity)
+        assets.srcDir("../../settings/web")
     }
 
     packaging {

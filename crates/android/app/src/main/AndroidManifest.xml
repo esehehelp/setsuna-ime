@@ -17,6 +17,13 @@
             </intent-filter>
         </activity>
 
+        <!-- also the settings the system opens from its list of keyboards
+             (method.xml): exported for it -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="@string/settings" />
+
         <service
             android:name=".SetsunaIme"
             android:exported="true"

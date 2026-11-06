@@ -18,8 +18,9 @@ import android.widget.TextView
 import java.io.File
 
 /**
- * The app's one screen: whether Setsuna is on as an input method and has a
- * model, the way to turn it on, and a field to try it in.
+ * The app's first screen: whether Setsuna is on as an input method and has
+ * a model, its settings ([SettingsActivity]), the way to turn it on, and a
+ * field to try it in.
  */
 class MainActivity : Activity() {
     private lateinit var status: TextView
@@ -40,6 +41,10 @@ class MainActivity : Activity() {
             setPadding(0, pad, 0, pad)
         }
         column.addView(status)
+        column.addView(Button(this).apply {
+            text = getString(R.string.settings)
+            setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
+        })
         column.addView(Button(this).apply {
             text = getString(R.string.open_settings)
             setOnClickListener { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) }

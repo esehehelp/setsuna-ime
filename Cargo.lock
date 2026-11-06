@@ -2799,6 +2799,7 @@ dependencies = [
  "jni",
  "serde_json",
  "setsuna-core",
+ "setsuna-settings",
 ]
 
 [[package]]

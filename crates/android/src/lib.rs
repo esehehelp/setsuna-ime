@@ -10,6 +10,10 @@
 //! addon; conversion runs in a `setsuna-engine daemon` child process, the
 //! engine binary the APK carries as `libsetsuna_engine.so` (the system
 //! extracts a library executable, a file of another name it does not).
+//!
+//! The app's settings screen is the desktop settings page in a WebView,
+//! whose messages `settings` answers with crates/settings' library.
 
 pub mod host;
 mod jni_api;
+pub mod settings;

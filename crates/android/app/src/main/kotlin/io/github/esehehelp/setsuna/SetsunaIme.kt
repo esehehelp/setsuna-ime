@@ -166,6 +166,10 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
                 cls == InputType.TYPE_CLASS_DATETIME,
         )
         keyboard?.actionIcon = actionIcon(info)
+        // the settings page's キーボード, as last saved
+        val prefs = KeyboardPrefs.load(this)
+        keyboard?.prefs = prefs
+        editPanel?.vibrate = prefs.vibrate
         showPanel(null)
         render()
     }
@@ -180,7 +184,7 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
             CandidateBar.Tool.SETTINGS -> {
                 showPanel(null)
                 startActivity(
-                    android.content.Intent(this, MainActivity::class.java)
+                    android.content.Intent(this, SettingsActivity::class.java)
                         .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
                 )
             }
@@ -272,11 +276,16 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
 
     override fun onFinishInput() {
         // the field loses focus: what is composed is committed
-        if (composing && h != 0L) {
-            Native.flush(h)
-            render()
-        }
+        commitComposition()
         super.onFinishInput()
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        // the keyboard goes away (Back, the field's own hide): so does the
+        // composition, which the app ends too, keeping its text; left in
+        // the session, it was written again when the keyboard came back
+        commitComposition()
+        super.onFinishInputView(finishingInput)
     }
 
     override fun onUpdateSelection(

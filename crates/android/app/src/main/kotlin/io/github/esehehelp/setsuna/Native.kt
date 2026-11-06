@@ -3,7 +3,7 @@ package io.github.esehehelp.setsuna
 /**
  * The Rust half of the input method (crates/android/src/jni_api.rs): a
  * session of setsuna-core and the engine it converts with. Every call but
- * [Listener.onEngineNotify] is made on the main thread.
+ * [Listener.onEngineNotify] and [settings] is made on the main thread.
  */
 object Native {
     init {
@@ -64,4 +64,12 @@ object Native {
 
     @JvmStatic
     external fun view(h: Long): String?
+
+    /**
+     * A message of the settings page (JSON) for the config under [files]
+     * (the app's files directory): the reply as JSON, null for none. Any
+     * thread; no session needed.
+     */
+    @JvmStatic
+    external fun settings(files: String, message: String): String?
 }

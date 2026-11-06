@@ -36,11 +36,24 @@ impl Dirs {
     /// and macOS, `config_dir` and `log_path` follow XDG_CONFIG_HOME and
     /// XDG_STATE_HOME. The engine, a child, inherits them.
     pub fn export(&self) {
-        std::env::set_var("XDG_CONFIG_HOME", self.files.join("config"));
-        std::env::set_var("XDG_STATE_HOME", self.files.join("state"));
-        if std::env::var_os("HOME").is_none_or(|h| h.is_empty()) {
-            std::env::set_var("HOME", &self.files);
+        export_files(&self.files);
+    }
+}
+
+/// [`Dirs::export`] from the files directory alone, as the settings page
+/// has it (its activity may start before the service). A variable already
+/// so is left alone: setting one while another thread reads the
+/// environment is not safe.
+pub fn export_files(files: &Path) {
+    let set = |key: &str, value: PathBuf| {
+        if std::env::var_os(key).as_deref() != Some(value.as_os_str()) {
+            std::env::set_var(key, value);
         }
+    };
+    set("XDG_CONFIG_HOME", files.join("config"));
+    set("XDG_STATE_HOME", files.join("state"));
+    if std::env::var_os("HOME").is_none_or(|h| h.is_empty()) {
+        std::env::set_var("HOME", files);
     }
 }
 
@@ -166,6 +179,13 @@ impl Host {
     pub fn view_json(&self) -> String {
         view_json(&self.session)
     }
+
+    /// [`Host::view_json`], its commits taken: they go into the app once.
+    pub fn take_view_json(&mut self) -> String {
+        let json = self.view_json();
+        self.session.clear_commits();
+        json
+    }
 }
 
 /// `s`'s view as JSON. The caret (`cursor`) is in UTF-16 units into the
@@ -283,6 +303,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&view_json(&s)).unwrap();
         assert_eq!(v["commits"], serde_json::json!(["かな"]));
         assert_eq!(v["preedit"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_service_takes_the_commits_once() {
+        let mut host = Host {
+            session: Session::new(&Config::default(), None),
+            dirs: Dirs {
+                files: PathBuf::new(),
+                native_lib: PathBuf::new(),
+                data: PathBuf::new(),
+            },
+            wake: Arc::new(|| {}),
+        };
+        assert!(host.key('a' as u32, 0, FIELD_NORMAL, None));
+        host.session.flush();
+        let commits = |json: &str| -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(json).unwrap()["commits"].clone()
+        };
+        assert_eq!(commits(&host.take_view_json()), serde_json::json!(["あ"]));
+        // read again before a key (the keyboard shown again): nothing to write
+        assert_eq!(commits(&host.take_view_json()), serde_json::json!([]));
     }
 
     #[test]
