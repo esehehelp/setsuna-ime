@@ -5,23 +5,31 @@
 #   curl -fsSL .../install.sh | sudo bash -s -- --precision fp32
 #
 # Downloads the release archive this script was made for (crates/linux/package.sh
-# fills in its SHA-256 below) and the conversion model pinned in it, checks
-# both, installs them, then adds Setsuna to the input methods of the user who
-# ran sudo (or pkexec) and restarts their fcitx5 so it loads the addon.
+# fills in its SHA-256 below) and the conversion model, the reading lexicon and
+# the analyzer pinned in it, checks them, installs them, then adds Setsuna to
+# the input methods of the user who ran sudo (or pkexec) and restarts their
+# fcitx5 so it loads the addon. A lexicon or analyzer that cannot be had is
+# left out with a warning (the IME converts without it; run again to retry).
 #
 # Options:
 #   --precision int8|fp32   the model (default int8)
 #   --archive <file>        a local release archive instead of the download
+#   --lexicon <file>        a local reading lexicon (a compiled .lexicon) instead
+#                           of the download: the dictionary's words come into
+#                           the candidates
+#   --analyzer <manifest>   a local analyzer (its manifest, the dictionary and
+#                           alternates it names) instead of the download:
+#                           segment editing cuts a conversion by its words
+#   --no-dictionaries       download neither the lexicon nor the analyzer
 #   --rerank-manifest <m>   also the reranker's LM (an LM scorer manifest, the
 #                           weights and tokenizer it names): candidates are reranked
 #   --name-dictionary <tsv> also mixed input's Latin names dictionary
-#   --lexicon <file>        also the reading lexicon (a compiled .lexicon):
-#                           candidates are scored by the words text uses
 #   --no-register           install only; leave fcitx5 as it is
 #   --root <dir>            install under <dir> (staging, tests): no root
 #                           needed, implies --no-register
-# A reranker model, names dictionary or lexicon installed before stays when
-# the option is not given again.
+# A reranker model, names dictionary, lexicon or analyzer installed before
+# stays when this install does not bring one (--no-dictionaries, a failed
+# download, the option not given again).
 #
 # Layout:
 #   <fcitx5 addon dir>/setsuna.so
@@ -31,10 +39,12 @@
 #                          uninstall.sh, installed-files
 #   /usr/lib/setsuna-ime/models/rerank/<manifest> + its weights (and tokenizer)  (with --rerank-manifest)
 #   /usr/lib/setsuna-ime/names/latin-names.tsv  (with --name-dictionary)
-#   /usr/lib/setsuna-ime/lexicon/words.lexicon  (with --lexicon)
+#   /usr/lib/setsuna-ime/lexicon/words.lexicon  (downloaded, or --lexicon)
+#   /usr/lib/setsuna-ime/analyzer/<manifest> + its dictionary and alternates  (downloaded, or --analyzer)
 # These are the addon's defaults where config.toml sets nothing.
 #   /usr/bin/setsuna-settings  (when WebKitGTK 4.1 is there)
-#   /var/cache/setsuna-ime/models  (verified model downloads, reused offline)
+#   /var/cache/setsuna-ime/models  (verified model, lexicon and analyzer
+#                                   downloads, reused offline)
 # /usr/lib/setsuna-ime is compiled into the addon, so no config.toml is needed.
 # Uninstall: sudo /usr/lib/setsuna-ime/uninstall.sh
 #
@@ -58,6 +68,8 @@ root=
 rerank_manifest=
 name_dictionary=
 lexicon=
+analyzer=
+dictionaries=1
 
 log() { echo "setsuna-install: $*" >&2; }
 fail() {
@@ -74,6 +86,8 @@ while (($#)); do
         --rerank-manifest) rerank_manifest=${2:?}; shift 2 ;;
         --name-dictionary) name_dictionary=${2:?}; shift 2 ;;
         --lexicon) lexicon=${2:?}; shift 2 ;;
+        --analyzer) analyzer=${2:?}; shift 2 ;;
+        --no-dictionaries) dictionaries=0; shift ;;
         --no-register) register=0; shift ;;
         --root) root=${2:?}; register=0; shift 2 ;;
         -h | --help) sed -n '1d; /^#/!q; s/^# \{0,1\}//p' "$0"; exit 0 ;;
@@ -140,27 +154,59 @@ if [[ -n $lexicon ]]; then
     [[ -f $lexicon ]] || fail 30 "lexicon not found: $lexicon"
     [[ $(head -c 8 -- "$lexicon") == LEXICON1 ]] || fail 30 "not a compiled lexicon: $lexicon"
 fi
+# The analyzer: its manifest and the dictionary and alternates it names,
+# relative to it (copied to the same relative paths, so the manifest resolves).
+analyzer_files=()
+if [[ -n $analyzer ]]; then
+    [[ -f $analyzer ]] || fail 30 "analyzer manifest not found: $analyzer"
+    if command -v jq >/dev/null; then
+        files=$(jq -r '.dictionary.path // empty, .alternates // empty' "$analyzer") ||
+            fail 30 "analyzer manifest is not JSON: $analyzer"
+    else
+        files=$(tr -d '\n' <"$analyzer" |
+            sed -n 's/.*"dictionary"[[:space:]]*:[[:space:]]*{[^}]*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        files+=$'\n'$(tr -d '\n' <"$analyzer" |
+            sed -n 's/.*"alternates"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    fi
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        if [[ $f == /* || $f =~ (^|/)\.\.(/|$) ]]; then
+            fail 30 "analyzer manifest path leaves its directory: $f"
+        fi
+        [[ -f $(dirname "$analyzer")/$f ]] || fail 30 "analyzer file not found: $(dirname "$analyzer")/$f"
+        analyzer_files+=("$f")
+    done <<<"$files"
+    ((${#analyzer_files[@]})) || fail 30 "the analyzer manifest names no dictionary: $analyzer"
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 file_size() { wc -c <"$1" | tr -d ' '; }
 file_sha256() { sha256sum -- "$1" | cut -d' ' -f1; }
-# fetch_to <url> <path> <size or empty> <sha256>: download, check and move into place
-fetch_to() {
+# try_fetch <url> <path> <size or empty> <sha256>: download, check and move
+# into place; 1 (and nothing in place) when that fails
+try_fetch() {
     local tmp
-    mkdir -p "$(dirname "$2")"
-    tmp=$(mktemp "$2.XXXXXXXX.part")
-    if ! curl -fsSL --retry 2 --connect-timeout 30 --max-time 900 -o "$tmp" "$1"; then
+    mkdir -p "$(dirname "$2")" && tmp=$(mktemp "$2.XXXXXXXX.part") || return 1
+    if ! curl -fsSL --retry 2 --connect-timeout 30 --max-time 3600 -o "$tmp" "$1"; then
         rm -f "$tmp"
-        fail 30 "download failed: $1"
+        log "download failed: $1"
+        return 1
     fi
     if [[ -n $3 && $(file_size "$tmp") != "$3" ]] || [[ $(file_sha256 "$tmp") != "$4" ]]; then
         rm -f "$tmp"
-        fail 30 "size or SHA-256 mismatch: $1"
+        log "size or SHA-256 mismatch: $1"
+        return 1
     fi
     mv -f "$tmp" "$2"
 }
+# fetch_to: try_fetch or stop
+fetch_to() {
+    try_fetch "$@" || fail 30 "could not get $1"
+}
+pin_path_re='^([A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$'
+repository_re='^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 # ---- the release archive ----
 if [[ -z $archive ]]; then
@@ -180,7 +226,7 @@ src=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'setsuna-ime-*' | head 
 # ---- the model (pinned by the archive's models.tsv) ----
 repository=$(awk -F'\t' '$1 == "repository" { print $2 }' "$src/models.tsv")
 revision=$(awk -F'\t' '$1 == "revision" { print $2 }' "$src/models.tsv")
-[[ $repository =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ && $revision =~ ^[a-f0-9]{40}$ ]] ||
+[[ $repository =~ $repository_re && $revision =~ ^[a-f0-9]{40}$ ]] ||
     fail 30 "invalid model pins in the archive"
 cache=$root/var/cache/setsuna-ime/models/$repository/$revision
 model_files=()
@@ -199,6 +245,71 @@ while IFS=$'\t' read -r p path size sha; do
     [[ $path == *manifest.json ]] && manifest=$path
 done <"$src/models.tsv"
 [[ -n $manifest ]] || fail 30 "the archive pins no $precision model"
+
+# ---- the reading lexicon and the analyzer (models.tsv's components) ----
+# fetch_component <name>: the files models.tsv pins for it, verified in the
+# cache or downloaded. Sets comp_dir (where they are), comp_entry (its entry
+# file) and comp_files (all its files), paths under comp_dir; 1 when it cannot
+# be had.
+fetch_component() {
+    local name=$1 repo= rev= entry= p path size sha
+    IFS=$'\t' read -r repo rev entry < <(awk -F'\t' -v OFS='\t' -v n="$name" \
+        '$1 == "component" && $2 == n { print $3, $4, $5; exit }' "$src/models.tsv") || true
+    if [[ -z $entry ]]; then
+        log "the archive pins no $name"
+        return 1
+    fi
+    if ! [[ $repo =~ $repository_re && $rev =~ ^[a-f0-9]{40}$ && $entry =~ $pin_path_re ]]; then
+        log "invalid $name pins in the archive"
+        return 1
+    fi
+    comp_dir=$root/var/cache/setsuna-ime/models/$repo/$rev
+    comp_entry=$entry
+    comp_files=()
+    while IFS=$'\t' read -r p path size sha; do
+        [[ $p == "$name" ]] || continue
+        if ! [[ $path =~ $pin_path_re && $size =~ ^[1-9][0-9]*$ && $sha =~ ^[a-f0-9]{64}$ ]]; then
+            log "invalid $name pin: $path"
+            return 1
+        fi
+        if [[ -f $comp_dir/$path && $(file_size "$comp_dir/$path") == "$size" &&
+            $(file_sha256 "$comp_dir/$path") == "$sha" ]]; then
+            log "$name cache verified: $path"
+        else
+            log "downloading $name: $path"
+            try_fetch "https://huggingface.co/$repo/resolve/$rev/$path" "$comp_dir/$path" "$size" "$sha" || return 1
+        fi
+        comp_files+=("$path")
+    done <"$src/models.tsv"
+    if ! printf '%s\n' "${comp_files[@]}" | grep -qxF -- "$entry"; then
+        log "the archive pins no file $entry for $name"
+        return 1
+    fi
+}
+if ((dictionaries)) && [[ -z $lexicon ]]; then
+    if fetch_component lexicon; then
+        lexicon=$comp_dir/$comp_entry
+    else
+        log "warning: no reading lexicon: installing without it (run again to retry)"
+    fi
+fi
+if ((dictionaries)) && [[ -z $analyzer ]]; then
+    if fetch_component analyzer; then
+        # its files relative to the manifest, as the manifest names them
+        entry_dir=$(dirname "$comp_entry")
+        for f in "${comp_files[@]}"; do
+            [[ $f == "$comp_entry" ]] && continue
+            if [[ $entry_dir != . ]]; then
+                [[ $f == "$entry_dir"/* ]] || fail 30 "analyzer file outside its manifest's directory: $f"
+                f=${f#"$entry_dir"/}
+            fi
+            analyzer_files+=("$f")
+        done
+        analyzer=$comp_dir/$comp_entry
+    else
+        log "warning: no analyzer: installing without it (run again to retry)"
+    fi
+fi
 
 # ---- install ----
 module=/usr/lib/setsuna-ime
@@ -264,15 +375,25 @@ if [[ -n $lexicon ]]; then
     # renamed over the old one, which a running fcitx5 keeps mapped
     put "$lexicon" "$module/lexicon/words.lexicon" 644
 fi
+if [[ -n $analyzer ]]; then
+    # one analyzer: the addon gives the engine the only manifest there
+    rm -f -- "$root$module"/analyzer/*manifest.json
+    put "$analyzer" "$module/analyzer/$(basename "$analyzer")" 644
+    for f in "${analyzer_files[@]}"; do
+        put "$(dirname "$analyzer")/$f" "$module/analyzer/$f" 644
+    done
+fi
 # Files of the previous install that this one no longer has (another model);
-# its reranker model, names dictionary and lexicon stay unless replaced.
+# its reranker model, names dictionary, lexicon and analyzer stay unless
+# replaced.
 if [[ -f $root$module/installed-files ]]; then
     while IFS= read -r f; do
         [[ $f == /* && ! -d $root$f ]] || continue
         printf '%s\n' "${installed[@]}" | grep -qxF -- "$f" && continue
         if [[ ($f == "$module"/models/rerank/* && -z $rerank_manifest) ||
             ($f == "$module"/names/* && -z $name_dictionary) ||
-            ($f == "$module"/lexicon/* && -z $lexicon) ]] && [[ -f $root$f ]]; then
+            ($f == "$module"/lexicon/* && -z $lexicon) ||
+            ($f == "$module"/analyzer/* && -z $analyzer) ]] && [[ -f $root$f ]]; then
             installed+=("$f")
             continue
         fi

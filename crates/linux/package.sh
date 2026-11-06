@@ -11,8 +11,8 @@
 # The archive holds the fcitx5 addon (its module dir compiled in as
 # /usr/lib/setsuna-ime), the engine, reranker (with llama.cpp) and rewriter
 # daemons, ONNX Runtime, the mixed input model, the settings GUI and
-# models.tsv, the conversion model pins of crates/tsf/models.json (install.sh
-# downloads the model). Needs what the build needs (cargo, cmake, fcitx5 and
+# models.tsv, the conversion model, reading lexicon and analyzer pins of
+# crates/tsf/models.json (install.sh downloads them). Needs what the build needs (cargo, cmake, fcitx5 and
 # WebKitGTK 4.1 development files, and for llama.cpp a C/C++ compiler with
 # OpenMP), curl and jq.
 set -euo pipefail
@@ -67,12 +67,20 @@ sys=$(sed -n '/^name = "llama-cpp-sys-2"$/{n;s/^version = "\(.*\)"$/\1/p}' "$rep
 install -m644 "$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/llama-cpp-sys-2-"$sys"/llama.cpp/LICENSE | head -1)" \
     "$out/module/licenses/llama.cpp/LICENSE"
 
-# models.tsv: "repository" / "revision" lines, then <precision> <path> <size> <sha256>
+# models.tsv: "repository" / "revision" lines, then <precision> <path> <size> <sha256>;
+# then per component (lexicon, analyzer) "component <name> <repository> <revision>
+# <entry>" and its files as <name> <path> <size> <sha256>
 catalog=$repo/crates/tsf/models.json
 {
     jq -r '"repository\t\(.repository)", "revision\t\(.revision)"' "$catalog"
     jq -r '.variants | to_entries[] | .key as $p | .value.files[] | [$p, .path, .size, .sha256] | @tsv' "$catalog"
+    jq -r '.components // {} | to_entries[] | .key as $n | .value |
+        (["component", $n, .repository, .revision, .entry] | @tsv),
+        (.files[] | [$n, .path, .size, .sha256] | @tsv)' "$catalog"
 } >"$out/models.tsv"
+for c in lexicon analyzer; do
+    awk -F"\t" -v c="$c" '$1 == "component" && $2 == c { f = 1 } END { exit !f }' "$out/models.tsv" || die "crates/tsf/models.json pins no $c"
+done
 
 tar -C "$dist" --owner=0 --group=0 --numeric-owner --sort=name -czf "$dist/$name.tar.gz" "$name"
 rm -rf "$out"

@@ -297,8 +297,9 @@ unsafe fn with_outer(s: *mut SetsunaSession, f: impl FnOnce(&mut SetsunaSession)
 /// config.toml sets nothing (the Windows installer writes them into it): the
 /// mixed input model (`<module_dir>/mixed`), the Latin names dictionary
 /// (`<module_dir>/names/latin-names.tsv`), the reading lexicon
-/// (`<module_dir>/lexicon/words.lexicon`) and the reranker's model (the one
-/// `*manifest.json` of `<module_dir>/models/rerank`). Every (re)load goes
+/// (`<module_dir>/lexicon/words.lexicon`), the engine's analyzer (the one
+/// `*manifest.json` of `<module_dir>/analyzer`) and the reranker's model (the
+/// one `*manifest.json` of `<module_dir>/models/rerank`). Every (re)load goes
 /// through here, so a reload on activation or focus keeps them.
 fn load_config(module_dir: Option<&Path>) -> Config {
     with_module_defaults(Config::load_default(), module_dir)
@@ -320,6 +321,9 @@ fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
     if cfg.lexicon.file.is_none() {
         let lexicon = dir.join("lexicon").join("words.lexicon");
         cfg.lexicon.file = lexicon.is_file().then(|| path(lexicon));
+    }
+    if cfg.engine.analyzer_manifest.is_none() {
+        cfg.engine.analyzer_manifest = the_manifest_in(&dir.join("analyzer"));
     }
     if cfg.rerank.manifest.is_none() {
         cfg.rerank.manifest = the_manifest_in(&dir.join("models").join("rerank"));
@@ -570,10 +574,14 @@ mod tests {
     }
 
     #[test]
-    fn an_installed_names_dictionary_lexicon_and_rerank_model_are_defaults() {
+    fn an_installed_names_dictionary_lexicon_analyzer_and_rerank_model_are_defaults() {
         let dir = std::env::temp_dir().join(format!("setsuna-ffi-rr-{}", std::process::id()));
         let rerank = dir.join("models/rerank");
+        let analyzer = dir.join("analyzer");
         std::fs::create_dir_all(&rerank).unwrap();
+        std::fs::create_dir_all(&analyzer).unwrap();
+        std::fs::write(analyzer.join("analyzer.manifest.json"), "{}").unwrap();
+        std::fs::write(analyzer.join("system.dic.zst"), "").unwrap();
         std::fs::create_dir_all(dir.join("names")).unwrap();
         std::fs::create_dir_all(dir.join("lexicon")).unwrap();
         std::fs::write(dir.join("names/latin-names.tsv"), "GitHub\t1\n").unwrap();
@@ -592,11 +600,17 @@ mod tests {
             Some(lexicon.to_string_lossy().into_owned())
         );
         assert_eq!(cfg.rerank.manifest, Some(rerank.join("lm.manifest.json")));
-        // config.toml's own wins
+        assert_eq!(
+            cfg.engine.analyzer_manifest,
+            Some(analyzer.join("analyzer.manifest.json"))
+        );
+        // config.toml's own wins (analyzer_manifest = "" turns it off)
         let mut own = Config::default();
         own.rerank.manifest = Some(PathBuf::from("/m.json"));
+        own.engine.analyzer_manifest = Some(PathBuf::new());
         let cfg = with_module_defaults(own, Some(&dir));
         assert_eq!(cfg.rerank.manifest, Some(PathBuf::from("/m.json")));
+        assert_eq!(cfg.engine.analyzer_manifest, Some(PathBuf::new()));
         // two models: which one is not guessed
         std::fs::write(rerank.join("other.manifest.json"), "{}").unwrap();
         let cfg = with_module_defaults(Config::default(), Some(&dir));

@@ -312,23 +312,28 @@ fcitx5（5.1 以上）が入った x86_64 の環境（glibc 2.39 以上: Arch、
 curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
 # リランカの LM も入れる場合: ... | sudo bash -s -- --rerank-manifest <LM scorer manifest>
 # 英日混在入力の名前の辞書も入れる場合: ... | sudo bash -s -- --name-dictionary <names tsv>
-# 読みの辞書も入れる場合: ... | sudo bash -s -- --lexicon <file.lexicon>
+# 手元の読みの辞書・解析器を使う場合: ... | sudo bash -s -- --lexicon <file.lexicon> --analyzer <analyzer manifest>
+# 読みの辞書と解析器を取得しない場合: ... | sudo bash -s -- --no-dictionaries
 # アンインストール: sudo /usr/lib/setsuna-ime/uninstall.sh
 ```
 
 `install.sh`（`crates/linux/install.sh`）は root で動く前提で、中で権限昇格はしない。
 自分と組になった release アーカイブ（SHA-256 固定）と、そのアーカイブが固定する
-変換モデル（`crates/tsf/models.json` と同じ。`/var/cache/setsuna-ime/models` に取得・検証し、
-検証済みならオフラインで再利用）を取ってきて入れる。addon は fcitx5 の addon
+変換モデル・読みの辞書（lexicon-v1、222 MB）・解析器（nid-ma v2-600k-tb、288 MB）
+（`crates/tsf/models.json` の `variants` と `components` と同じ。`/var/cache/setsuna-ime/models`
+に取得・検証し、検証済みならオフラインで再利用）を取ってきて入れる。読みの辞書と解析器は
+取得できなければ警告を出してそれなしで入れる（前に入れたものがあれば残る。もう一度
+実行すれば取り直す）。addon は fcitx5 の addon
 ディレクトリに、エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・ONNX Runtime
 1.28.0・モデル・英日混在のモデルは `/usr/lib/setsuna-ime`（addon に埋め込んだ場所なので
 `config.toml` は要らない）に、設定 GUI は WebKitGTK 4.1 があれば
 `/usr/bin/setsuna-settings` に入る。`--rerank-manifest` の LM は
 `/usr/lib/setsuna-ime/models/rerank`、`--name-dictionary` の辞書は
-`/usr/lib/setsuna-ime/names/latin-names.tsv`、`--lexicon` の読みの辞書は
-`/usr/lib/setsuna-ime/lexicon/words.lexicon` に入り、`config.toml` が `[rerank] manifest` /
-`name_dictionary_file` / `[lexicon] file` を決めていなければそれを使う（次の更新でオプションを
-付けなくても残る）。
+`/usr/lib/setsuna-ime/names/latin-names.tsv`、読みの辞書は
+`/usr/lib/setsuna-ime/lexicon/words.lexicon`、解析器（manifest と、それが指す辞書と別の読みの表）は
+`/usr/lib/setsuna-ime/analyzer` に入り、`config.toml` が `[rerank] manifest` /
+`name_dictionary_file` / `[lexicon] file` / `[engine] analyzer_manifest` を決めていなければ
+それを使う（次の更新でオプションを付けなくても残る。`analyzer_manifest = ""` なら解析器を使わない）。
 最後に sudo（または pkexec）した利用者の fcitx5 の入力メソッドに Setsuna を足し、fcitx5 を
 再起動して読み込ませる（KDE Plasma の Wayland では `fcitx5-wayland-launcher` も
 起動し直させる）。`--no-register` ならファイルを置くだけ。
@@ -429,7 +434,8 @@ cargo run --release -p setsuna-settings
   で読み込み（ready の後に裏で読む）、`{"id":1,"analyze":["今日は晴れ"]}` に
   各文の語（表層、文字の範囲、読み、品詞、別の読みとそれで経路が何コスト高くなるか）
   を返す。辞書はメモリに展開するので、ログインで 1 つのエンジンのプロセスが持つ。
-  IME は `[engine] analyzer_manifest`（`install.ps1 -Analyzer <manifest>`）で
+  IME は `[engine] analyzer_manifest`（`install.ps1 -Analyzer <manifest>`。Linux は
+  `/usr/lib/setsuna-ime/analyzer` に入れたもの）で
   使い、文節編集（← / →）で変換をその語で区切る（`crates/ime-core/src/bunsetsu.rs`。
   KWDLC の文節境界の F1 は test で 83.4 → 94.4）。
 
