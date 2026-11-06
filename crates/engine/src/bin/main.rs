@@ -714,6 +714,14 @@ fn run_daemon(args: EngineArgs) -> Result<()> {
         writeln!(out, "{}", daemon.respond(&line))?;
         out.flush()?;
     }
+    // stdin closed: the client is gone. Leave without running exit's
+    // handlers: ONNX Runtime's static destructors then race its pool's
+    // threads (on Android, bionic aborts on the mutex they destroyed).
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(0)
+    }
+    #[cfg(not(unix))]
     Ok(())
 }
 

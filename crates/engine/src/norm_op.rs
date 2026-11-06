@@ -111,6 +111,8 @@ impl Kernel for NormKernel {
     }
 }
 
+// only x86_64 has kernels of its own; elsewhere the norm is plain
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Isa {
     Avx512,
@@ -138,6 +140,7 @@ impl Isa {
 /// Each row of h = gamma.len() values: y = (s - mean) / sqrt(var + eps) * gamma + beta for s = x + skip (x alone
 /// without a skip), s also written to `sum` when given; mean and (biased) variance over the row, as torch's LayerNorm.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 fn add_layer_norm(
     isa: Isa,
     x: &[f32],

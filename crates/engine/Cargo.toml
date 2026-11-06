@@ -38,6 +38,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-# `cpu`: the process's affinity
-[target.'cfg(target_os = "linux")'.dependencies]
+# `cpu`: the process's affinity (Linux); the daemon's exit (`_exit`)
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

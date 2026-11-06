@@ -352,6 +352,8 @@ impl Packed {
     }
 }
 
+// only x86_64 has kernels of its own; elsewhere every GEMM is plain
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Isa {
     Vnni512,
@@ -403,6 +405,7 @@ fn one_block() -> bool {
 }
 
 #[cfg(not(test))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline(always)]
 fn one_block() -> bool {
     false
