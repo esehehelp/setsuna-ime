@@ -202,6 +202,22 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 }
 .modal h3 { margin: 0 0 8px; font-size: 18px; }
 .modal .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+
+/* ---- a phone's width (the Android app) -------------------------------------- */
+@media (max-width: 640px) {
+  body { padding: 16px 12px 88px; }
+  h1 { font-size: 24px; }
+  .row { flex-wrap: wrap; gap: 8px 16px; padding: 12px 14px; }
+  .row .text { flex: 1 1 200px; }
+  .row .control { flex-wrap: wrap; max-width: 100%; }
+  .row .control input[type=text] { flex: 1 1 140px; min-width: 0; }
+  .reps { padding: 6px 14px 12px; }
+  .rep { flex-wrap: wrap; }
+  .rep input[type=text] { flex: 1 1 40%; }
+  .segmented button { padding: 4px 10px; }
+  .symgrid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  .bar .inner { padding: 10px 12px; }
+}
 </style>
 </head>
 <body>
@@ -209,6 +225,31 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="path" id="path"></div>
 <div class="banner" id="error" hidden></div>
 
+<section data-android hidden>
+<h2>キーボード</h2>
+<div class="card">
+  <div class="row">
+    <div class="text"><div class="title">キーを押したときの振動</div></div>
+    <div class="control" id="kb_vibrate"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">キーの吹き出し</div>
+      <div class="desc">押しているキーの文字を、キーの上に大きく出します</div>
+    </div>
+    <div class="control" id="kb_preview"></div>
+  </div>
+  <div class="row">
+    <div class="text"><div class="title">キーボードの高さ</div></div>
+    <div class="control">
+      <input type="range" id="kb_height" min="80" max="130" step="5">
+      <span class="value" id="kb_height_value"></span>
+    </div>
+  </div>
+</div>
+</section>
+
+<section data-desktop>
 <h2>候補の窓</h2>
 <div class="card">
   <div class="row">
@@ -241,6 +282,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     <div class="control" id="defer_switch"></div>
   </div>
 </div>
+</section>
 
 <h2>入力方式</h2>
 <div class="card">
@@ -251,7 +293,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control"><div class="segmented" id="romaji_table"></div></div>
   </div>
-  <div class="row">
+  <div class="row" data-desktop>
     <div class="text">
       <div class="title">表のファイル</div>
       <div class="desc">ファイルの表を使うときのパス</div>
@@ -272,21 +314,21 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control" data-switch="frontend.pass_through_commands"></div>
   </div>
-  <div class="row">
+  <div class="row" data-desktop>
     <div class="text">
       <div class="title">オン・オフを切り替えるキー</div>
       <div class="desc">カンマ区切り。Zenkaku（半角/全角）、Henkan、Muhenkan、Eisu、Kana、Space、英字、F1〜F24 などに Ctrl+ / Shift+ / Alt+ を付けて書きます。Ctrl+Space は多くのアプリのショートカットなので、使うときだけ足してください</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="toggle_keys" placeholder="Zenkaku, Alt+Zenkaku, Alt+`"></div>
   </div>
-  <div class="row">
+  <div class="row" data-desktop>
     <div class="text">
       <div class="title">オンにするキー</div>
       <div class="desc">ImeOn はオンにする専用のキー（VK_IME_ON）を送るキーボードのためのものです（例: Henkan）</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="on_keys" placeholder="ImeOn"></div>
   </div>
-  <div class="row">
+  <div class="row" data-desktop>
     <div class="text">
       <div class="title">オフにするキー</div>
       <div class="desc">ImeOff はオフにする専用のキー（VK_IME_OFF）です（例: Muhenkan）</div>
@@ -405,7 +447,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row">
     <div class="text">
       <div class="title">アプリごとに変える</div>
-      <div class="desc">実行ファイル名（code.exe など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります</div>
+      <div class="desc" data-android-text="パッケージ名（com.android.chrome など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります">実行ファイル名（code.exe など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります</div>
     </div>
     <div class="control"><button id="add_app">追加</button></div>
   </div>
@@ -472,7 +514,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control" data-switch="learning.words"></div>
   </div>
-  <div class="row">
+  <div class="row" data-desktop>
     <div class="text">
       <div class="title">入力の予測</div>
       <div class="desc">確定した変換を覚えて、読みの始めを打って Tab を押すと候補の窓に出します</div>
@@ -486,7 +528,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
     </div>
     <div class="control" id="clear_controls"></div>
   </div>
-  <div class="row">
+  <div class="row" data-desktop>
     <div class="text">
       <div class="title">表示しない候補</div>
       <div class="desc">変換中に Ctrl+Delete で消した候補です（学習で上がっていた候補は、学習の取り消しになります）</div>
@@ -495,6 +537,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
 </div>
 
+<section data-desktop>
 <h2>書き直し</h2>
 <div class="card">
   <div class="row">
@@ -576,6 +619,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="note">書き直しモードで変換すると、読み・変換結果（と、オンならカーソルの前の文章）が選んだ接続先に送られます。</div>
 </div>
+</section>
 
 <div class="modal" id="plan_notice" hidden>
   <div class="box">
@@ -650,7 +694,19 @@ let hidden = [];
 let confirmClear = false;
 
 const $ = (id) => document.getElementById(id);
-const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
+// In the Android app's WebView the page posts to its bridge (crates/android
+// answers the config's and dictionary's messages as the desktop app does, the
+// app the keyboard's); it has no rewriter, no candidate window and no keys of
+// a PC keyboard, and names apps by their packages.
+const ANDROID = !!window.SetsunaAndroid;
+const send = (msg) => ANDROID
+  ? window.SetsunaAndroid.post(JSON.stringify(msg))
+  : window.ipc.postMessage(JSON.stringify(msg));
+for (const e of document.querySelectorAll("[data-desktop]")) if (ANDROID) e.hidden = true;
+for (const e of document.querySelectorAll("[data-android]")) e.hidden = !ANDROID;
+for (const e of document.querySelectorAll("[data-android-text]")) {
+  if (ANDROID) e.textContent = e.dataset.androidText;
+}
 const at = (path) => path.split(".").reduce((o, k) => o[k], cfg);
 const setAt = (path, v) => {
   const keys = path.split(".");
@@ -791,6 +847,7 @@ function render() {
   $("similarity_threshold").value = cfg.learning.similarity_threshold;
   renderReplacements();
   renderRewriter();
+  renderKeyboard();
   changed();
 }
 
@@ -820,7 +877,7 @@ const APP_FIELDS = [
   ["rewrite", "書き直し"],
   ["mixed_input", "英日混在"],
   ["prediction", "予測"],
-];
+].filter(([key]) => !(ANDROID && (key === "rewrite" || key === "prediction")));
 
 function triState(value, onChange) {
   const s = el("select", {},
@@ -835,7 +892,7 @@ function triState(value, onChange) {
 function renderApps() {
   cfg.apps = cfg.apps ?? [];
   $("apps").replaceChildren(...cfg.apps.map((a, i) => {
-    const name = el("input", { type: "text", value: a.process, placeholder: "code.exe" });
+    const name = el("input", { type: "text", value: a.process, placeholder: ANDROID ? "com.android.chrome" : "code.exe" });
     name.addEventListener("input", () => { a.process = name.value; changed(); });
     const start = el("select", {},
       el("option", { value: "keep", textContent: "開始: 既定" }),
@@ -938,14 +995,37 @@ function renderLearned() {
   }
 }
 
+// The Android keyboard's settings ({vibrate, preview, height}), which the
+// app keeps; null elsewhere.
+let kb = null;
+let kbSaved = "";
+
+function renderKeyboard() {
+  if (!kb) return;
+  $("kb_vibrate").replaceChildren(toggle(kb.vibrate, (v) => { kb.vibrate = v; changed(); }));
+  $("kb_preview").replaceChildren(toggle(kb.preview, (v) => { kb.preview = v; changed(); }));
+  $("kb_height").value = kb.height;
+  $("kb_height_value").textContent = `${kb.height}%`;
+}
+
+$("kb_height").addEventListener("input", (e) => {
+  kb.height = Number(e.target.value);
+  $("kb_height_value").textContent = `${kb.height}%`;
+  changed();
+});
+
+const configDirty = () => JSON.stringify(cfg) !== saved;
+const keyboardDirty = () => kb !== null && JSON.stringify(kb) !== kbSaved;
+
 // After any edit: the derived labels and the buttons.
 function changed() {
+  if (!cfg) return;
   $("strength_value").textContent = Number(cfg.learning.strength).toFixed(1);
   $("similarity_threshold_value").textContent = Number(cfg.learning.similarity_threshold).toFixed(2);
   for (const row of document.querySelectorAll("[data-learning]")) {
     row.classList.toggle("disabled", !cfg.learning.enabled);
   }
-  const dirty = JSON.stringify(cfg) !== saved;
+  const dirty = configDirty() || keyboardDirty();
   $("save").disabled = !(dirty && canSave);
   $("revert").disabled = !dirty;
 }
@@ -1118,8 +1198,16 @@ $("plan_ok").addEventListener("click", () => {
   send({ type: "ack_plan_notice" });
 });
 
-$("save").addEventListener("click", () => send({ type: "save", config: cfg }));
-$("revert").addEventListener("click", () => { cfg = JSON.parse(saved); render(); $("status").textContent = ""; });
+$("save").addEventListener("click", () => {
+  if (configDirty()) send({ type: "save", config: cfg });
+  if (keyboardDirty()) send({ type: "keyboard_save", keyboard: kb });
+});
+$("revert").addEventListener("click", () => {
+  cfg = JSON.parse(saved);
+  if (kb) kb = JSON.parse(kbSaved);
+  render();
+  $("status").textContent = "";
+});
 document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "s") {
     e.preventDefault();
@@ -1142,6 +1230,13 @@ window.setsuna = {
         el("option", { value: m.id, textContent: m.label === m.id ? "" : m.label })));
       $("models_desc").textContent = msg.error
         ?? (models.length ? `${models.length} 件のモデルから選べます` : "モデルがありません");
+      return;
+    }
+    if (msg.type === "keyboard") {
+      kb = msg.keyboard;
+      kbSaved = JSON.stringify(kb);
+      renderKeyboard();
+      changed();
       return;
     }
     if (msg.type === "dict") {
@@ -1173,8 +1268,9 @@ window.setsuna = {
       $("instructions").placeholder = msg.default_instructions ?? "";
       render();
       if (msg.action === "init") {
-        send(endpoint("rewriter_state"));
+        if (!ANDROID) send(endpoint("rewriter_state"));
         send({ type: "dict_load" });
+        if (ANDROID) send({ type: "keyboard_load" });
       }
     } else {
       changed();
