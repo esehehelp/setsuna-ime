@@ -229,8 +229,15 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <h2>キーボード</h2>
 <div class="card">
   <div class="row">
-    <div class="text"><div class="title">キーを押したときの振動</div></div>
+    <div class="text"><div class="title">キーをタップしたときの振動</div></div>
     <div class="control" id="kb_vibrate"></div>
+  </div>
+  <div class="row">
+    <div class="text">
+      <div class="title">長押ししたときの振動</div>
+      <div class="desc">地球儀キーを長押しして入力方法を選ぶとき</div>
+    </div>
+    <div class="control" id="kb_vibrate_hold"></div>
   </div>
   <div class="row">
     <div class="text">
@@ -995,7 +1002,7 @@ function renderLearned() {
   }
 }
 
-// The Android keyboard's settings ({vibrate, preview, height}), which the
+// The Android keyboard's settings ({vibrate, vibrate_hold, preview, height}), which the
 // app keeps; null elsewhere.
 let kb = null;
 let kbSaved = "";
@@ -1003,6 +1010,8 @@ let kbSaved = "";
 function renderKeyboard() {
   if (!kb) return;
   $("kb_vibrate").replaceChildren(toggle(kb.vibrate, (v) => { kb.vibrate = v; changed(); }));
+  $("kb_vibrate_hold").replaceChildren(
+    toggle(kb.vibrate_hold !== false, (v) => { kb.vibrate_hold = v; changed(); }));
   $("kb_preview").replaceChildren(toggle(kb.preview, (v) => { kb.preview = v; changed(); }));
   $("kb_height").value = kb.height;
   $("kb_height_value").textContent = `${kb.height}%`;

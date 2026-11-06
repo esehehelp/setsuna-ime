@@ -302,7 +302,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         if (!enabled && mode == Mode.JA) choose(Mode.EN)
     }
 
-    /** The settings page's キーボード: vibration, the bubble, the height. */
+    /** The settings page's キーボード: vibrations, the bubble, the height. */
     var prefs = KeyboardPrefs()
         set(value) {
             val taller = value.height != field.height
@@ -310,8 +310,10 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             if (taller) requestLayout()
         }
 
+    /** A vibration as the settings page says: a tap's and a long press's apart. */
     private fun haptic(feedback: Int) {
-        if (prefs.vibrate) performHapticFeedback(feedback)
+        val on = if (feedback == HapticFeedbackConstants.LONG_PRESS) prefs.vibrateHold else prefs.vibrate
+        if (on) performHapticFeedback(feedback)
     }
 
     // ---- geometry ----

@@ -9,8 +9,10 @@ import org.json.JSONObject
  * service takes them up when the keyboard comes up for a field.
  */
 data class KeyboardPrefs(
-    /** A vibration on a key press. */
+    /** A vibration on a key tapped (the keys and the edit panel's). */
     val vibrate: Boolean = true,
+    /** A vibration on a key held long (the globe key's input method picker). */
+    val vibrateHold: Boolean = true,
     /** The bubble over a pressed key. */
     val preview: Boolean = true,
     /** The keys' height, in percent of the usual. */
@@ -18,6 +20,7 @@ data class KeyboardPrefs(
 ) {
     fun json(): JSONObject = JSONObject()
         .put("vibrate", vibrate)
+        .put("vibrate_hold", vibrateHold)
         .put("preview", preview)
         .put("height", height)
 
@@ -30,15 +33,17 @@ data class KeyboardPrefs(
             val p = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             return KeyboardPrefs(
                 p.getBoolean("vibrate", true),
+                p.getBoolean("vibrate_hold", true),
                 p.getBoolean("preview", true),
                 p.getInt("height", 100).coerceIn(MIN_HEIGHT, MAX_HEIGHT),
             )
         }
 
-        /** The page's `{vibrate, preview, height}`. */
+        /** The page's `{vibrate, vibrate_hold, preview, height}`. */
         fun save(context: Context, j: JSONObject) {
             context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
                 .putBoolean("vibrate", j.optBoolean("vibrate", true))
+                .putBoolean("vibrate_hold", j.optBoolean("vibrate_hold", true))
                 .putBoolean("preview", j.optBoolean("preview", true))
                 .putInt("height", j.optInt("height", 100).coerceIn(MIN_HEIGHT, MAX_HEIGHT))
                 .apply()
