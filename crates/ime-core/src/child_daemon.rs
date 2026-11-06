@@ -335,11 +335,10 @@ impl EngineClient for ChildDaemonClient {
         if reading.is_empty() {
             return;
         }
-        // lengths only: what the user types stays out of the log
         crate::diagnostics::log(format!(
-            "dispatch req_id={req_id} context_len={} reading_len={} continue_beam={continue_beam}",
-            context.chars().count(),
-            reading.chars().count()
+            "dispatch req_id={req_id} {} {} continue_beam={continue_beam}",
+            context_field(context),
+            crate::diagnostics::text_field("reading", reading)
         ));
         {
             let mut st = self.shared.state.lock().unwrap();
@@ -397,6 +396,18 @@ impl Drop for ChildDaemonClient {
     }
 }
 
+/// The context for the log: its length, and its last 16 chars when what is
+/// typed is logged.
+fn context_field(context: &str) -> String {
+    let n = context.chars().count();
+    if crate::diagnostics::log_typed_text() {
+        let tail: String = context.chars().skip(n.saturating_sub(16)).collect();
+        format!("context_len={n} context_tail={tail:?}")
+    } else {
+        format!("context_len={n}")
+    }
+}
+
 /// Wait for a request to send (one queued, none in flight) and put it in
 /// flight; `None` once the client is gone.
 fn next_request(shared: &Shared) -> Option<Pending> {
@@ -435,9 +446,9 @@ fn request_line(shared: &Shared, pending: &Pending) -> Option<String> {
         analyze: (!pending.analyze.is_empty()).then_some(&pending.analyze[..]),
     };
     crate::diagnostics::log(format!(
-        "writer send req_id={} reading_len={}",
+        "writer send req_id={} {}",
         pending.req_id,
-        pending.reading.chars().count()
+        crate::diagnostics::text_field("reading", &pending.reading)
     ));
     match serde_json::to_string(&req) {
         Ok(l) => Some(l),
@@ -536,8 +547,8 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
         Ok(r) => r,
         Err(e) => {
             crate::diagnostics::log(format!(
-                "reader parse failed: {e}; line of {} bytes",
-                trimmed.len()
+                "reader parse failed: {e}; {}",
+                crate::diagnostics::text_field("line", trimmed)
             ));
             return None;
         }

@@ -10,15 +10,46 @@
 //! [`LOG_LIMIT`] a log moves to `<name>.1` (the one there before goes) and
 //! starts again, so a log takes at most twice that.
 //!
-//! What the user types never goes in: readings, preedits, candidates and
+//! What the user types does not go in: readings, preedits, candidates and
 //! contexts are logged by their length, character keys without their code.
+//! `[diagnostics] log_typed_text` (off unless a config.toml sets it, for
+//! troubleshooting on one's own machine) logs them as they are
+//! ([`set_log_typed_text`], [`text_field`]); character keys stay without
+//! their code even so, and a password field composes nothing, so what is
+//! typed there stays out still.
 
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static LOG_NAME: OnceLock<&'static str> = OnceLock::new();
+static LOG_TYPED_TEXT: AtomicBool = AtomicBool::new(false);
+
+/// Log what the user types as it is (`[diagnostics] log_typed_text`).
+pub fn set_log_typed_text(on: bool) {
+    LOG_TYPED_TEXT.store(on, Ordering::Relaxed);
+}
+
+/// Whether what the user types is logged as it is.
+pub fn log_typed_text() -> bool {
+    LOG_TYPED_TEXT.load(Ordering::Relaxed)
+}
+
+/// `name=<text>` (quoted) when what the user types is logged, else
+/// `name_len=<chars>`.
+pub fn text_field(name: &str, text: &str) -> String {
+    field_of(name, text, log_typed_text())
+}
+
+fn field_of(name: &str, text: &str, typed: bool) -> String {
+    if typed {
+        format!("{name}={text:?}")
+    } else {
+        format!("{name}_len={}", text.chars().count())
+    }
+}
 
 /// The size past which a log moves to `<name>.1`.
 pub const LOG_LIMIT: u64 = 4 << 20;
@@ -115,5 +146,11 @@ mod tests {
         write("b\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn typed_text_goes_in_only_when_asked() {
+        assert_eq!(field_of("reading", "きょう", false), "reading_len=3");
+        assert_eq!(field_of("reading", "きょう", true), "reading=\"きょう\"");
     }
 }

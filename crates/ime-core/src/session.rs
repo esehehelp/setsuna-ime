@@ -156,6 +156,7 @@ fn live_conversion(cfg: &Config) -> bool {
 impl Session {
     /// A session converting through `client` (`None`: raw hiragana only).
     pub fn new(cfg: &Config, client: Option<Box<dyn EngineClient>>) -> Self {
+        crate::diagnostics::set_log_typed_text(cfg.diagnostics.log_typed_text);
         let mut bridge = EngineBridge::with_frontend(client, &cfg.frontend);
         bridge.set_learning(Learning::open(&cfg.learning));
         bridge.set_ngram(&cfg.ngram);
@@ -187,6 +188,7 @@ impl Session {
     /// last one's daemon exited): a new bridge, without the reranker and
     /// rewriter of the old one, as on Windows.
     pub fn configure_with(&mut self, cfg: &Config, client: Option<Box<dyn EngineClient>>) {
+        crate::diagnostics::set_log_typed_text(cfg.diagnostics.log_typed_text);
         match client {
             Some(client) => self.bridge = EngineBridge::with_frontend(Some(client), &cfg.frontend),
             None => self.bridge.reset_preserving_client(&cfg.frontend),

@@ -289,6 +289,13 @@ pwsh crates/tsf/install.ps1                  # 公開モデルと辞書を自動
 IME の処理で想定外のエラー（panic）が起きても、アプリを巻き込んで落とさず、
 入力中の文字をそのまま確定して次のキーからやり直す（`tsf.log` に場所を残す）。
 
+ログ（`%APPDATA%\setsuna-ime\tsf.log` など。4 MB で `.1` に回す）には、打った内容を
+残さない（読み・変換中の文字列・候補・文脈は長さだけ、文字キーはコードなし）。
+自分の PC で不具合を追うときは、`config.toml` に `[diagnostics]` と
+`log_typed_text = true` を書くと、エンジンに渡した読み、カーソル前の文脈の末尾、
+変換中の表示と確定した文字列、リランカーの 1 位をそのまま残す。文字キーのコードは
+それでも残さず、パスワードの欄では変換しないので、そこで打ったものは残らない。
+
 モデルはログイン不要で Hugging Face から取得する。取得元・commit・各ファイルの
 サイズと SHA-256 は `crates/tsf/models.json` に固定し、manifest と参照先の ONNX・語彙・
 並べ直しの表を検証してから配置する。キャッシュは `%LOCALAPPDATA%\setsuna-ime\cache\models`。

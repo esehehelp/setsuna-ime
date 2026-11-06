@@ -424,10 +424,14 @@ fn on_async_done(svc: &SetsunaTextService_Impl) {
         setsuna_core::diagnostics::log("on_async_done no actions");
         return;
     }
-    setsuna_core::diagnostics::log(format!(
-        "on_async_done actions={}",
-        setsuna_core::engine_bridge::Action::shapes(&actions)
-    ));
+    setsuna_core::diagnostics::log(if setsuna_core::diagnostics::log_typed_text() {
+        format!("on_async_done actions={actions:?}")
+    } else {
+        format!(
+            "on_async_done actions={}",
+            setsuna_core::engine_bridge::Action::shapes(&actions)
+        )
+    });
 
     let Some(context) = focused_context(svc) else {
         setsuna_core::diagnostics::log("on_async_done no focused context");
@@ -690,6 +694,7 @@ impl SetsunaTextService_Impl {
     /// frontend settings, learning, lexicon and predictor, the rewriter,
     /// the mode notice and the on / off keys. Never while composing.
     fn apply_config(&self, cfg: Config) {
+        setsuna_core::diagnostics::set_log_typed_text(cfg.diagnostics.log_typed_text);
         let notify_hwnd = self.inner.borrow().notify_hwnd;
 
         // The candidate window, made (hidden) through `ui::default_ui` so a

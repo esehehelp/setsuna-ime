@@ -475,8 +475,8 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
             Ok(r) => r,
             Err(e) => {
                 crate::diagnostics::log(format!(
-                    "rerank parse failed: {e}; line of {} bytes",
-                    trimmed.len()
+                    "rerank parse failed: {e}; {}",
+                    crate::diagnostics::text_field("line", trimmed)
                 ));
                 continue;
             }

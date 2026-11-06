@@ -388,8 +388,8 @@ fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<Res
             }
             Err(e) => {
                 crate::diagnostics::log(format!(
-                    "rerank parse failed: {e}; line of {} bytes",
-                    text.len()
+                    "rerank parse failed: {e}; {}",
+                    crate::diagnostics::text_field("line", text)
                 ));
             }
         }

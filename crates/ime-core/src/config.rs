@@ -47,6 +47,9 @@ pub struct Config {
     pub ngram: NgramCfg,
     pub lexicon: LexiconCfg,
     pub rewriter: RewriterCfg,
+    /// `[diagnostics]`, written only when something in it is on.
+    #[serde(skip_serializing_if = "DiagnosticsCfg::is_off")]
+    pub diagnostics: DiagnosticsCfg,
     /// Settings for one application each (`[[apps]]`), over the others.
     pub apps: Vec<AppCfg>,
 }
@@ -62,6 +65,7 @@ impl Default for Config {
             ngram: NgramCfg::default(),
             lexicon: LexiconCfg::default(),
             rewriter: RewriterCfg::default(),
+            diagnostics: DiagnosticsCfg::default(),
             apps: Vec::new(),
         }
     }
@@ -739,6 +743,24 @@ pub struct NgramCfg {
     pub trigram_weight: f32,
 }
 
+/// `[diagnostics]`: what the IME's logs hold (`diagnostics`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiagnosticsCfg {
+    /// Log what the user types as it is: the readings sent to the engine,
+    /// the end of the text before the caret, the preedits and commits, the
+    /// reranker's top candidate (otherwise their lengths only). For
+    /// troubleshooting on one's own machine; character keys stay without
+    /// their code, and a password field composes nothing.
+    pub log_typed_text: bool,
+}
+
+impl DiagnosticsCfg {
+    fn is_off(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// `[lexicon]`: the reading lexicon (`lexicon`), which scores the engine's
 /// candidates by the words text uses and drops the near-misses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1229,6 +1251,18 @@ fn merge_table(doc: &mut toml_edit::Table, new: &toml_edit::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[diagnostics]` is read, and written only when something in it is
+    /// on: a config saved with it off stays readable by the builds before it.
+    #[test]
+    fn diagnostics_are_written_only_when_on() {
+        let cfg = Config::load_from_str("[diagnostics]\nlog_typed_text = true\n").unwrap();
+        assert!(cfg.diagnostics.log_typed_text);
+        assert!(toml::to_string(&cfg).unwrap().contains("[diagnostics]"));
+        assert!(!toml::to_string(&Config::default())
+            .unwrap()
+            .contains("diagnostics"));
+    }
 
     #[test]
     fn an_application_takes_its_settings_over_the_rest() {

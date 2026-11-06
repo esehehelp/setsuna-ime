@@ -2771,11 +2771,18 @@ impl EngineBridge {
         };
         let reading = job.reading.clone();
         let (k, n) = (job.k, job.raw.len());
-        crate::diagnostics::log(format!(
-            "rerank applied k={k} ms={:.1} top changed={}",
-            result.score_ms,
-            raw[0] != job.raw[0]
-        ));
+        crate::diagnostics::log(if crate::diagnostics::log_typed_text() {
+            format!(
+                "rerank applied k={k} ms={:.1} top={:?} (was {:?})",
+                result.score_ms, raw[0], job.raw[0]
+            )
+        } else {
+            format!(
+                "rerank applied k={k} ms={:.1} top changed={}",
+                result.score_ms,
+                raw[0] != job.raw[0]
+            )
+        });
         let list = self.finish_list(&reading, raw.clone(), true);
         let starts = self.list_starts_of(&reading, &raw, &reading_pos, &list);
         let actions = self.show_reranked(&reading, list, starts);
