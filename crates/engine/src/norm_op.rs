@@ -259,6 +259,8 @@ mod tests {
     /// 16 lanes too.
     #[test]
     fn add_layer_norm_matches_f64() {
+        // the x86 paths are pushed on x86 only
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut isas = vec![Isa::Plain];
         #[cfg(target_arch = "x86_64")]
         {

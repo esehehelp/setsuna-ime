@@ -352,12 +352,14 @@ impl Packed {
     }
 }
 
-// only x86_64 has kernels of its own; elsewhere every GEMM is plain
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+// x86_64 (VNNI) and aarch64 (dotprod) have kernels of their own; elsewhere every GEMM is plain
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Isa {
     Vnni512,
     Vnni256,
+    /// ARMv8.2 SDOT (phones since about 2018): `arm`.
+    Dot,
     Plain,
 }
 
@@ -372,6 +374,10 @@ fn detect_isa() -> Isa {
         if std::arch::is_x86_feature_detected!("avxvnni") {
             return Isa::Vnni256;
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Isa::Dot;
     }
     Isa::Plain
 }
@@ -391,7 +397,160 @@ fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
         (Isa::Vnni512, true) => unsafe { x86::gemm4_vnni512(q, rows, w, acc) },
         #[cfg(target_arch = "x86_64")]
         (Isa::Vnni256, true) => unsafe { x86::gemm4_vnni256(q, rows, w, acc) },
+        #[cfg(target_arch = "aarch64")]
+        (Isa::Dot, _) => unsafe { arm::gemm_dot(q, rows, w, acc) },
         _ => gemm_plain(q, rows, w, acc),
+    }
+}
+
+/// The blocked GEMMs with ARM's SDOT (signed i8 x i8 dot products of four into each i32 lane), the int8 and the int4
+/// weights alike: a block's 64 bytes are four vectors, outputs 0-3, 4-7, 8-11 and 12-15, each lane an output's four
+/// inputs, so the layout of the VNNI paths serves as it is. The u8 codes go in as i8 with their top bit flipped (code -
+/// 128), and the 128 * row sum of the weights this takes off is put back after, so the sums are the plain path's.
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::Packed;
+    use std::arch::aarch64::*;
+
+    /// SDOT: each lane of `acc` plus the dot product of its four i8 of `w` and of `x` (the intrinsic is not stable).
+    #[inline(always)]
+    unsafe fn sdot(acc: int32x4_t, w: int8x16_t, x: int8x16_t) -> int32x4_t {
+        let mut r = acc;
+        std::arch::asm!(
+            "sdot {r:v}.4s, {w:v}.16b, {x:v}.16b",
+            r = inout(vreg) r,
+            w = in(vreg) w,
+            x = in(vreg) x,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        r
+    }
+
+    /// Row r's four codes at input 4 kg, top bits flipped, in every lane.
+    #[inline(always)]
+    unsafe fn codes(q: *const u8, at: usize) -> int8x16_t {
+        let v = vreinterpretq_u8_u32(vdupq_n_u32((q.add(at) as *const u32).read_unaligned()));
+        vreinterpretq_s8_u8(veorq_u8(v, vdupq_n_u8(0x80)))
+    }
+
+    /// RT rows x C output blocks (block c `bstride` bytes after block 0) of int8 weights, or (`NIB`) of int4 ones,
+    /// 32 bytes a block: low nibbles of bytes 0-15 outputs 0-3, of 16-31 outputs 4-7, high nibbles 8-11 and 12-15,
+    /// as value + 8.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn tile<const RT: usize, const C: usize, const NIB: bool>(
+        q: *const u8,
+        k: usize,
+        wb: *const i8,
+        bstride: usize,
+        acc: *mut i32,
+        n: usize,
+    ) {
+        let mut a = [[[vdupq_n_s32(0); 4]; C]; RT];
+        let low = vdupq_n_u8(0x0f);
+        for kg in 0..k / 4 {
+            let mut x = [vdupq_n_s8(0); RT];
+            for (r, xr) in x.iter_mut().enumerate() {
+                *xr = codes(q, r * k + kg * 4);
+            }
+            for c in 0..C {
+                let w = if NIB {
+                    let p = wb.add(c * bstride + kg * 32) as *const u8;
+                    let (b0, b1) = (vld1q_u8(p), vld1q_u8(p.add(16)));
+                    [
+                        vreinterpretq_s8_u8(vandq_u8(b0, low)),
+                        vreinterpretq_s8_u8(vandq_u8(b1, low)),
+                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(b0)),
+                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(b1)),
+                    ]
+                } else {
+                    let p = wb.add(c * bstride + kg * 64);
+                    [
+                        vld1q_s8(p),
+                        vld1q_s8(p.add(16)),
+                        vld1q_s8(p.add(32)),
+                        vld1q_s8(p.add(48)),
+                    ]
+                };
+                for (ar, xr) in a.iter_mut().zip(&x) {
+                    for (av, wv) in ar[c].iter_mut().zip(&w) {
+                        *av = sdot(*av, *wv, *xr);
+                    }
+                }
+            }
+        }
+        for (r, ar) in a.iter().enumerate() {
+            for (c, ac) in ar.iter().enumerate() {
+                for (v, av) in ac.iter().enumerate() {
+                    vst1q_s32(acc.add(r * n + c * 16 + v * 4), *av);
+                }
+            }
+        }
+    }
+
+    /// `tile::<rt, c, NIB>` for a row count known at run time: 1 row on 4 blocks, 2 on 2 (16 sums each), else up
+    /// to 4 rows on one block.
+    macro_rules! by_rows {
+        ($rt:expr, $c:expr, $nib:expr, $($arg:expr),*) => {
+            match ($rt, $c) {
+                (1, 4) => tile::<1, 4, $nib>($($arg),*),
+                (2, 2) => tile::<2, 2, $nib>($($arg),*),
+                (1, _) => tile::<1, 1, $nib>($($arg),*),
+                (2, _) => tile::<2, 1, $nib>($($arg),*),
+                (3, _) => tile::<3, 1, $nib>($($arg),*),
+                _ => tile::<4, 1, $nib>($($arg),*),
+            }
+        };
+    }
+
+    /// The integer sums of `super::gemm_u8i8` on a blocked matrix, int8 or int4 (`Packed::nibbles`).
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn gemm_dot(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+        let (n, k) = (w.out, w.inp);
+        let bstride = if w.nibbles { k * 8 } else { k * 16 };
+        let (qp, ap, wp) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr());
+        // few rows (an expert's frames): more blocks at once, so the sums do not wait on each other
+        let c = match rows {
+            1 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        let blocks = n / 16;
+        let mut ob = 0;
+        while ob < blocks {
+            let cb = if ob + c <= blocks { c } else { 1 };
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                let args = (
+                    qp.add(r0 * k),
+                    k,
+                    wp.add(ob * bstride),
+                    bstride,
+                    ap.add(r0 * n + ob * 16),
+                    n,
+                );
+                if w.nibbles {
+                    by_rows!(rt, cb, true, args.0, args.1, args.2, args.3, args.4, args.5)
+                } else {
+                    by_rows!(rt, cb, false, args.0, args.1, args.2, args.3, args.4, args.5)
+                }
+                r0 += rt;
+            }
+            ob += cb;
+        }
+        // the codes went in as code - 128 (and int4 values as value + 8): put back what that took off
+        for r in 0..rows {
+            let fix = if w.nibbles {
+                let flipped =
+                    q[r * k..(r + 1) * k].iter().map(|&v| v as i32).sum::<i32>() - 128 * k as i32;
+                -8 * flipped
+            } else {
+                0
+            };
+            for (a, &cs) in acc[r * n..(r + 1) * n].iter_mut().zip(&w.colsum) {
+                *a += 128 * cs + fix;
+            }
+        }
     }
 }
 
@@ -400,6 +559,7 @@ fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
 static ONE_BLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn one_block() -> bool {
     ONE_BLOCK.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1077,7 +1237,7 @@ impl MoeWeights {
             Isa::Vnni512 => return unsafe { self.forward_avx512(x, y, s, pool) },
             // every AVX-VNNI CPU has AVX2 and FMA: 8 wide
             Isa::Vnni256 => return unsafe { self.forward_avx2(x, y, s, pool) },
-            Isa::Plain => {}
+            Isa::Dot | Isa::Plain => {}
         }
         self.forward_body(x, y, s, pool)
     }
@@ -1202,7 +1362,7 @@ impl MoeWeights {
         match self.isa {
             Isa::Vnni512 => return unsafe { self.expert_avx512(ex, routed, xq, xs, out, s) },
             Isa::Vnni256 => return unsafe { self.expert_avx2(ex, routed, xq, xs, out, s) },
-            Isa::Plain => {}
+            Isa::Dot | Isa::Plain => {}
         }
         self.expert_body(ex, routed, xq, xs, out, s)
     }
@@ -1379,9 +1539,10 @@ mod tests {
             let mut got = vec![0i32; rows * out];
             gemm_plain(&q, rows, &p, &mut got);
             assert_eq!(got, want, "plain on blocked, rows {rows}");
-            for isa in [Isa::Vnni512, Isa::Vnni256] {
+            for isa in [Isa::Vnni512, Isa::Vnni256, Isa::Dot] {
                 if detect_isa() == Isa::Plain
                     || (isa == Isa::Vnni512 && detect_isa() != Isa::Vnni512)
+                    || (isa == Isa::Dot && detect_isa() != Isa::Dot)
                 {
                     continue;
                 }
@@ -1481,8 +1642,8 @@ mod tests {
                 .collect();
             let mut want = vec![0i32; rows * out];
             gemm_plain(&q, rows, &raw, &mut want);
-            for isa in [Isa::Plain, Isa::Vnni512, Isa::Vnni256] {
-                if isa == Isa::Vnni512 && detect_isa() != Isa::Vnni512 {
+            for isa in [Isa::Plain, Isa::Vnni512, Isa::Vnni256, Isa::Dot] {
+                if (isa == Isa::Vnni512 || isa == Isa::Dot) && detect_isa() != isa {
                     continue;
                 }
                 #[cfg(target_arch = "x86_64")]
