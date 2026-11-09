@@ -12,11 +12,14 @@
 //!   - cpu: the process pinned to one L3 domain on a Zen CPU with several
 //!   - moe_op: the `neo_ime.TokenMoE` fused kernel registered with every session
 //!   - norm_op: `neo_ime.AddLayerNorm`, a residual add and the LayerNorm after it in one kernel
+//!   - group_q: `neo_ime.LinearQ4G` and `neo_ime.TokenMoEQ4G`, Linears and experts on low-bit codes with a scale
+//!     and a zero point per group of inputs
 //!   - runtime: loading the official ONNX Runtime from an explicit path
 //!   - session: EngineSession (manifest load, decode settings, `convert`)
 
 pub mod candidate;
 pub mod cpu;
+pub mod group_q;
 pub mod moe_op;
 pub mod norm_op;
 pub mod normalize;

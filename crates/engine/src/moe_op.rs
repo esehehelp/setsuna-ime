@@ -35,7 +35,9 @@ pub fn domain() -> ort::Result<OperatorDomain> {
         .add(TokenMoE)?
         .add(TokenMoEBlocked)?
         .add(TokenMoEBlocked4)?
-        .add(crate::norm_op::AddLayerNorm)
+        .add(crate::norm_op::AddLayerNorm)?
+        .add(crate::group_q::LinearQ4G)?
+        .add(crate::group_q::TokenMoEQ4G)
 }
 
 const MOE_INPUTS: [TensorElementType; 8] = {
@@ -930,7 +932,7 @@ mod x86 {
 
 /// Per row: u8 codes of `v` (asymmetric, the range widened to hold 0 exactly), its scale and zero point.
 #[inline(always)]
-fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
+pub(crate) fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
     // the range in 16 lanes by compares (one vector min / max each; f32::min / max and one running pair did not
     // vectorize: 1.4 ns a value), NaN skipped as f32::min skips it
     let (mut lo16, mut hi16) = ([0.0f32; 16], [0.0f32; 16]);
@@ -987,7 +989,7 @@ fn erf(x: f32) -> f32 {
 }
 
 #[inline(always)]
-fn gelu(x: f32) -> f32 {
+pub(crate) fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
@@ -1277,33 +1279,7 @@ impl MoeWeights {
         let (e, d, k) = (self.e, self.d, self.k);
         let n = x.len() / d;
         y.fill(0.0);
-        // route: top-k of the router logits, softmax over the k
-        s.rows.resize_with(e, Vec::new);
-        s.rows.iter_mut().for_each(Vec::clear);
-        let mut logits = vec![0.0f32; e];
-        let mut top: Vec<usize> = Vec::with_capacity(k);
-        for r in 0..n {
-            let xr = &x[r * d..(r + 1) * d];
-            for (j, l) in logits.iter_mut().enumerate() {
-                *l = dot(xr, &self.router[j * d..(j + 1) * d]);
-            }
-            top.clear();
-            for _ in 0..k {
-                let best = (0..e)
-                    .filter(|j| !top.contains(j))
-                    .fold(None, |b: Option<usize>, j| match b {
-                        Some(i) if logits[i] >= logits[j] => Some(i),
-                        _ => Some(j),
-                    })
-                    .unwrap();
-                top.push(best);
-            }
-            let m = logits[top[0]];
-            let z: f32 = top.iter().map(|&j| (logits[j] - m).exp()).sum();
-            for &j in &top {
-                s.rows[j].push((r, (logits[j] - m).exp() / z));
-            }
-        }
+        route(x, &self.router, e, d, k, &mut s.rows);
         // the frames' u8 codes, once for every expert they go to
         s.xq.resize(n * d, 0);
         s.xs.clear();
@@ -1450,9 +1426,49 @@ impl MoeWeights {
     }
 }
 
+/// Each frame of `x` (n, d) routed to the top-`k` of its router logits (`router` (e, d)), with the softmax over the k
+/// as its weights: `rows[j]` the (frame, weight) pairs of expert j, in frame order (cleared first).
+#[inline(always)]
+pub(crate) fn route(
+    x: &[f32],
+    router: &[f32],
+    e: usize,
+    d: usize,
+    k: usize,
+    rows: &mut Vec<Vec<(usize, f32)>>,
+) {
+    let n = x.len() / d;
+    rows.resize_with(e, Vec::new);
+    rows.iter_mut().for_each(Vec::clear);
+    let mut logits = vec![0.0f32; e];
+    let mut top: Vec<usize> = Vec::with_capacity(k);
+    for r in 0..n {
+        let xr = &x[r * d..(r + 1) * d];
+        for (j, l) in logits.iter_mut().enumerate() {
+            *l = dot(xr, &router[j * d..(j + 1) * d]);
+        }
+        top.clear();
+        for _ in 0..k {
+            let best = (0..e)
+                .filter(|j| !top.contains(j))
+                .fold(None, |b: Option<usize>, j| match b {
+                    Some(i) if logits[i] >= logits[j] => Some(i),
+                    _ => Some(j),
+                })
+                .unwrap();
+            top.push(best);
+        }
+        let m = logits[top[0]];
+        let z: f32 = top.iter().map(|&j| (logits[j] - m).exp()).sum();
+        for &j in &top {
+            rows[j].push((r, (logits[j] - m).exp() / z));
+        }
+    }
+}
+
 /// y[r] += w * out[i] for the i-th routed frame (r, w) of an expert.
 #[inline(always)]
-fn add_routed(y: &mut [f32], routed: &[(usize, f32)], out: &[f32], d: usize) {
+pub(crate) fn add_routed(y: &mut [f32], routed: &[(usize, f32)], out: &[f32], d: usize) {
     for (i, &(r, wt)) in routed.iter().enumerate() {
         for (yv, &v) in y[r * d..(r + 1) * d]
             .iter_mut()
