@@ -2,10 +2,12 @@
 //! calculator rewriters and azooKey's special conversions make them (the
 //! rules are facts: era start years, numeral characters; no code taken):
 //!
-//! - digits: 1,234 / １２３４ / 千二百三十四 / 一二三四 / 壱阡弐百参拾四 /
-//!   1万2345, circled and Roman numerals for small ones, and for three or
-//!   four digits the times and dates they may be (1:23, 1時23分, 1/23,
-//!   1月23日);
+//! - digits: the dates they may be first (three or four digits: 1001 ->
+//!   10月1日, 10/1, 10/01; eight: 20261001 -> 2026/10/01, 2026年10月1日;
+//!   user 2026-11-10) and their times (10:01, 10時1分), then 1,234 /
+//!   １２３４ / 千二百三十四 / 一二三四 / 壱阡弐百参拾四 / 1万2345, circled
+//!   and Roman numerals for small ones (and the times of digits that are
+//!   no date: 2025, 20:25);
 //! - a number read in kana (じゅうに, さんぜんまん): 12 and 十二;
 //! - a year: 2025ねん -> 令和7年 (both eras in a year of a change),
 //!   れいわ7ねん -> 2025年;
@@ -45,6 +47,12 @@ pub fn candidates(reading: &str) -> Vec<String> {
     out
 }
 
+/// Whether `reading` is digits only or a calculation: what its candidates
+/// are needs no model.
+pub fn stands_alone(reading: &str) -> bool {
+    !reading.is_empty() && reading.chars().all(|c| c.is_ascii_digit()) || is_calculation(reading)
+}
+
 /// Whether the result of `reading` is a calculation (its result goes first).
 pub fn is_calculation(reading: &str) -> bool {
     calculation(reading).is_some()
@@ -68,9 +76,15 @@ pub fn insert(reading: &str, candidates: Vec<String>, generated: Vec<String>) ->
     crate::date_time::insert(reading, candidates, generated)
 }
 
-/// The forms of a number typed in digits.
+/// The forms of a number typed in digits: its dates and its times, then
+/// the number's own; digits that are no date (2025, 1200) have their times
+/// after those, as before dates came first.
 fn digit_forms(digits: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = dates(digits);
+    let date = !out.is_empty();
+    if date {
+        out.extend(times(digits));
+    }
     let trimmed = digits.trim_start_matches('0');
     let n: Option<u64> = digits.parse().ok().filter(|_| digits.len() <= 16);
     if let Some(n) = n {
@@ -97,7 +111,9 @@ fn digit_forms(digits: &str) -> Vec<String> {
     } else {
         out.push(digits.chars().map(kanji_digit).collect());
     }
-    out.extend(times_and_dates(digits));
+    if !date {
+        out.extend(times(digits));
+    }
     out
 }
 
@@ -240,25 +256,77 @@ fn roman(n: u64) -> Option<String> {
     }
 }
 
-/// 3 digits: 1:23 1時23分 1/23 1月23日; 4 digits: 12:34 12時34分 12/31
-/// 12月31日 (each when the parts are a time or a date).
-fn times_and_dates(d: &str) -> Vec<String> {
-    let mut out = Vec::new();
+/// 3 digits: 1:23 1時23分; 4 digits: 12:34 12時34分 (when the parts are a
+/// time).
+fn times(d: &str) -> Vec<String> {
     let (a, b) = match d.len() {
         3 => d.split_at(1),
         4 => d.split_at(2),
-        _ => return out,
+        _ => return Vec::new(),
     };
     let (Ok(h), Ok(m)) = (a.parse::<u32>(), b.parse::<u32>()) else {
-        return out;
+        return Vec::new();
     };
     if h <= 24 && m < 60 {
-        out.push(format!("{h}:{b}"));
-        out.push(format!("{h}時{m}分"));
+        vec![format!("{h}:{b}"), format!("{h}時{m}分")]
+    } else {
+        Vec::new()
     }
-    if (1..=12).contains(&h) && (1..=31).contains(&m) {
-        out.push(format!("{h}/{m}"));
-        out.push(format!("{h}月{m}日"));
+}
+
+/// Whether month `m` has a day `d` (in a leap year: 0229 is a date).
+fn month_day(m: u32, d: u32) -> bool {
+    chrono::NaiveDate::from_ymd_opt(2024, m, d).is_some()
+}
+
+/// The dates digits may be: 4 digits MMDD (1001: 10月1日 10/1 10/01), 3
+/// digits M/DD or MM/D (123: 1月23日 and 12月3日; 101: 10月1日 first, a
+/// day typed with a leading zero being unlikely in three digits), 8
+/// digits YYYYMMDD (20261001: 2026/10/01 2026年10月1日 2026-10-01).
+fn dates(d: &str) -> Vec<String> {
+    let month_day_forms = |(a, b): (&str, &str)| -> Option<Vec<String>> {
+        let (m, day) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+        if !month_day(m, day) {
+            return None;
+        }
+        let mut out = vec![format!("{m}月{day}日"), format!("{m}/{day}")];
+        // as typed, its zeros kept (10/01, 09/30)
+        let typed = format!("{a}/{b}");
+        if !out.contains(&typed) {
+            out.push(typed);
+        }
+        Some(out)
+    };
+    let mut out = Vec::new();
+    match d.len() {
+        3 => {
+            let short_month = month_day_forms(d.split_at(1));
+            let long_month = month_day_forms(d.split_at(2));
+            let first_short = !d[1..].starts_with('0');
+            let (first, second) = if first_short {
+                (short_month, long_month)
+            } else {
+                (long_month, short_month)
+            };
+            out.extend(first.into_iter().flatten());
+            out.extend(second.into_iter().flatten());
+        }
+        4 => out.extend(month_day_forms(d.split_at(2)).into_iter().flatten()),
+        8 => {
+            let (y, md) = d.split_at(4);
+            let (m, day) = md.split_at(2);
+            let parsed = (y.parse::<i32>(), m.parse::<u32>(), day.parse::<u32>());
+            if let (Ok(y), Ok(m), Ok(day)) = parsed {
+                if (1000..=2999).contains(&y)
+                    && chrono::NaiveDate::from_ymd_opt(y, m, day).is_some()
+                {
+                    out.push(format!("{y}/{m:02}/{day:02}"));
+                    out.push(format!("{y}年{m}月{day}日"));
+                    out.push(format!("{y}-{m:02}-{day:02}"));
+                }
+            }
+        }
+        _ => {}
     }
     out
 }
@@ -856,6 +924,41 @@ mod tests {
         assert!(!has("1399", "13月99日") && !has("1299", "12時99分"));
         // a leading zero keeps the digits
         assert!(has("0120", "〇一二〇") && !has("0120", "百二十"));
+    }
+
+    #[test]
+    fn digits_list_their_dates_first() {
+        // user 2026-11-10: 1001 is 10月1日 before anything else
+        assert_eq!(
+            candidates("1001")[..7],
+            [
+                "10月1日",
+                "10/1",
+                "10/01",
+                "10:01",
+                "10時1分",
+                "1,001",
+                "１００１"
+            ]
+        );
+        assert_eq!(candidates("0930")[..3], ["9月30日", "9/30", "09/30"]);
+        // a day the month has (0229 in a leap year), none it lacks
+        assert!(has("0229", "2月29日") && !has("0231", "2月31日") && !has("1301", "13月1日"));
+        // three digits: M/DD or MM/D, a day typed 0x last
+        assert_eq!(
+            candidates("123")[..4],
+            ["1月23日", "1/23", "12月3日", "12/3"]
+        );
+        assert_eq!(candidates("101")[..2], ["10月1日", "10/1"]);
+        // eight: a year's date
+        assert_eq!(
+            candidates("20261001")[..3],
+            ["2026/10/01", "2026年10月1日", "2026-10-01"]
+        );
+        assert!(!has("20261301", "2026/13/01"));
+        // a number that is no date keeps its forms first, its times last
+        assert_eq!(candidates("2025")[0], "2,025");
+        assert_eq!(candidates("1200").last().unwrap(), "12時0分");
     }
 
     #[test]

@@ -1861,7 +1861,10 @@ impl EngineBridge {
                 // the engine has the list of this reading already
                 let reading = self.composing.hiragana().to_string();
                 let ready = reading == self.list_reading;
-                let dynamic = self.date_time_enabled && crate::date_time::is_reading(&reading);
+                let dynamic = self.date_time_enabled && crate::date_time::is_reading(&reading)
+                    // digits or a calculation: their forms need no model,
+                    // so the list opens whole before the engine answers
+                    || self.numbers_enabled && crate::numbers::stands_alone(&reading);
                 // A prefix list is not a conversion of the frozen whole reading.
                 let candidates = if ready && dynamic {
                     let normal = candidates
@@ -7377,5 +7380,24 @@ mod tests {
                 text: "かn".into()
             }]
         );
+    }
+
+    #[test]
+    fn space_on_digits_lists_their_dates_first_before_the_engine_answers() {
+        // user 2026-11-10: 1001 converts to 10月1日; the digits stay first
+        let (mut bridge, _mock) = bridge_with_mock();
+        type_str(&mut bridge, "1001");
+        let (list, selected) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(selected, 0);
+        assert_eq!(
+            list[..6],
+            v(&["1001", "10月1日", "10/1", "10/01", "10:01", "10時1分"])[..]
+        );
+        assert!(list.contains(&"千一".to_string()));
+        // two digits: their forms at once, no date
+        let (mut bridge, _mock) = bridge_with_mock();
+        type_str(&mut bridge, "10");
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[..3], v(&["10", "１０", "十"])[..]);
     }
 }
