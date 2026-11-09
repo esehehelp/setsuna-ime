@@ -21,8 +21,10 @@ import kotlin.math.abs
  * (the look is Setsuna's: `Palette`, the gradient Enter key, "Setsuna" on
  * the space key):
  * the あa1 key cycles あ (romaji into setsuna-core), a (letters as they
- * are) and 1 (Gboard's number pad, whose keys flick to symbols); in a, ?123
- * opens the calculator pad, and from there !?# the two pages of symbols.
+ * are) and 1 (Gboard's number pad, whose keys flick to symbols; its digits
+ * are composed as in あ, to be converted: 1001 to 10月1日, user
+ * 2026-11-10); in a, ?123 opens the calculator pad, and from there !?# the
+ * two pages of symbols.
  * Shift puts a JIS keyboard's symbols on the number row; the globe key is ?
  * while something is composed.
  * The space key's drag moves the caret (the segment while converting).
@@ -34,10 +36,10 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         /** A key for setsuna-core, as the keysym it types. */
         fun onKey(sym: Int, mods: Int)
 
-        /** Text to put in as it is: a symbol no keysym types, the number pad's. */
+        /** Text to put in as it is: a symbol no keysym types, the number pad's symbols. */
         fun onText(text: String)
 
-        /** A mode was chosen: the IME is on in あ, off in a and 1. */
+        /** A mode was chosen: the IME is on in あ and 1, off in a. */
         fun onMode(mode: Mode)
 
         /** The globe key: the next input method. */
@@ -298,8 +300,8 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     /** Follow the IME turned on or off elsewhere (a hardware key). */
     fun syncEnabled(enabled: Boolean) {
         if (page != Page.KEYS) return
-        if (enabled && mode != Mode.JA) choose(Mode.JA)
-        if (!enabled && mode == Mode.JA) choose(Mode.EN)
+        if (enabled && mode == Mode.EN) choose(Mode.JA)
+        if (!enabled && mode != Mode.EN) choose(Mode.EN)
     }
 
     /** The settings page's キーボード: vibrations, the bubble, the height. */
@@ -385,7 +387,11 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             symbolNow(k) -> k.shifted
             else -> k.label
         }
-        Type.SPACE -> k.label.ifEmpty { if (composing && mode == Mode.JA && page == Page.KEYS) "変換" else "Setsuna" }
+        Type.SPACE -> when {
+            // the number pad's ⎵ converts the digits composed
+            composing && mode == Mode.NUM && page == Page.KEYS -> "変換"
+            else -> k.label.ifEmpty { if (composing && mode == Mode.JA && page == Page.KEYS) "変換" else "Setsuna" }
+        }
         Type.ENTER -> if (composing) "確定" else ""
         else -> k.label
     }
@@ -637,7 +643,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                     }
                     if (!p.fired && p.dragged == 0) {
                         if (p.key.type == Type.FLICK) {
-                            listener.onText(flicked(p.key, direction(p, e.getX(i), e.getY(i))))
+                            typeFlicked(flicked(p.key, direction(p, e.getX(i), e.getY(i))))
                         } else {
                             fire(p.key, p)
                         }
@@ -657,6 +663,11 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         return true
     }
 
+    /** What a number pad key types: a digit as its key (composed), a symbol as text. */
+    private fun typeFlicked(s: String) {
+        if (s.length == 1 && s[0] in '0'..'9') listener.onKey(s[0].code, 0) else listener.onText(s)
+    }
+
     private fun fire(k: Key, p: Press?) {
         when (k.type) {
             Type.CHAR -> {
@@ -668,7 +679,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 if ((letter(k) || k.shifted.isNotEmpty()) && shift && !capsLock) shift = false
             }
             Type.TEXT -> listener.onText(k.text)
-            Type.FLICK -> listener.onText(k.text)
+            Type.FLICK -> typeFlicked(k.text)
             Type.COLUMN -> {
                 val s = k.more[p?.index ?: 0]
                 val c = s[0].code

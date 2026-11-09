@@ -315,6 +315,13 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     // ---- keys ----
 
     override fun onKey(sym: Int, mods: Int) {
+        // the number pad and the pages it opens: the digits are composed (to
+        // be converted: 1001 to 10月1日), the symbols go in as they are, as
+        // they did with the IME off there (`,` no 、)
+        if (keyboard?.mode == KeyboardView.Mode.NUM && sym in 0x21..0x7e && sym.toChar() !in '0'..'9') {
+            onText(sym.toChar().toString())
+            return
+        }
         if (!take(sym, mods)) sendToApp(sym)
     }
 
@@ -323,10 +330,10 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         currentInputConnection?.commitText(text, 1)
     }
 
-    /** The IME on in あ, off (keys as they are) in a and 1. */
+    /** The IME on in あ and 1 (its digits composed), off (keys as they are) in a. */
     override fun onMode(mode: KeyboardView.Mode) {
         if (h == 0L) return
-        val on = mode == KeyboardView.Mode.JA
+        val on = mode != KeyboardView.Mode.EN
         if (enabled != on) {
             Native.toggle(h)
             render()
