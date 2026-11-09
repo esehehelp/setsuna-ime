@@ -306,6 +306,9 @@ pub struct ComposingText {
     /// The reading lexicon the mixed model reads words spelled wholly in
     /// kana by (`MixedModel::segment_with`).
     lexicon: Option<Arc<crate::lexicon::Lexicon>>,
+    /// ず and づ put as the mixed model's kana model reads them
+    /// (`typo::voicing`): つずく reads つづく.
+    voicing: bool,
 }
 
 /// Mixed Japanese / English input: the model splitting the typed text, what
@@ -407,6 +410,40 @@ impl ComposingText {
         }
     }
 
+    /// Whether ず and づ are put as the kana model reads them (つずく reads
+    /// つづく; with mixed input only, whose kana model judges).
+    pub fn set_voicing(&mut self, on: bool) {
+        self.voicing = on;
+        self.recompute(false);
+    }
+
+    /// The other reading to convert besides the one done typing (as
+    /// `commit_reading` reads it), as ず and づ go: the reading as typed
+    /// where they were swapped (きずいたら, read きづいたら: 築いたら) but for
+    /// sure (つずく), or the reading with them swapped where it reads better
+    /// short of correcting it (きずく: 気づく). `None` for none.
+    pub fn voicing_alt(&self) -> Option<String> {
+        let mixed = self.mixed.as_ref().filter(|_| self.voicing)?;
+        let typed = self.convert_as_typed(&self.raw, true).text;
+        let voiced = self.voiced(typed.clone());
+        if voiced != typed {
+            // not where all of it is sure (つずく: no word)
+            let sure = crate::typo::voicing(&typed, &mixed.model, crate::typo::VOICING_SURE);
+            return (sure.as_ref() != Some(&voiced)).then_some(typed);
+        }
+        crate::typo::voicing(&typed, &mixed.model, crate::typo::VOICING_OFFER)
+    }
+
+    /// `text` with ず and づ as the kana model reads them, when it does.
+    fn voiced(&self, text: String) -> String {
+        match self.mixed.as_ref().filter(|_| self.voicing) {
+            Some(mixed) => {
+                crate::typo::voicing(&text, &mixed.model, crate::typo::VOICING_FIX).unwrap_or(text)
+            }
+            None => text,
+        }
+    }
+
     /// The mixed-input model, if mixed input is on (its kana model judges
     /// typo corrections).
     pub fn mixed_model(&self) -> Option<Arc<MixedModel>> {
@@ -448,7 +485,7 @@ impl ComposingText {
             end: chars.len(),
         }];
         let (text, pending) = crate::mixed::render_parts(&chars, &all, true, &mixed.symbols);
-        text + &pending
+        self.voiced(text) + &pending
     }
 
     /// Whether the whole input is one word the mixed model has seen as
@@ -744,8 +781,16 @@ impl ComposingText {
         Converted { text, pending }
     }
 
-    /// `raw` as shown: romaji as kana, or with a mixed model its spans.
+    /// `raw` as shown: romaji as kana, or with a mixed model its spans, ず
+    /// and づ as the kana model reads them (`voicing`).
     fn convert(&self, raw: &str, flush_final_n: bool) -> Converted {
+        let mut converted = self.convert_as_typed(raw, flush_final_n);
+        converted.text = self.voiced(converted.text);
+        converted
+    }
+
+    /// `convert` with ず and づ as typed.
+    fn convert_as_typed(&self, raw: &str, flush_final_n: bool) -> Converted {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };

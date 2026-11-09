@@ -317,7 +317,9 @@ pub struct FrontendCfg {
     pub romaji_table: String,
     /// Typo correction (`typo`): where a letter reads as no kana, the
     /// reading one edit away (a neighbouring key, a key too many, two keys
-    /// swapped) is converted too, its candidates after the first ones.
+    /// swapped) is converted too, its candidates after the first ones; ず
+    /// and づ as the mixed model's kana model reads them (つずく is
+    /// converted as つづく, the reading typed too).
     pub typo_correction: bool,
     /// `/`, `$` or `@` typed at a line's start or after a space, and the
     /// name after it, go to the app as typed (an AI agent's `/command`,
@@ -1048,7 +1050,8 @@ impl Config {
              # The romaji table: \"standard\", \"azik\", \"kana_jis\" (kana input on the\n\
              # JIS layout) or the path of a table in Mozc's format.\n\
              romaji_table = \"standard\"\n\
-             # Typo correction where a letter reads as no kana (kaisga: かいしゃ).\n\
+             # Typo correction where a letter reads as no kana (kaisga: かいしゃ),\n\
+             # and of ず / づ (tuzuku: 続く).\n\
              typo_correction = true\n\
              # /command, $skill, @file typed at a line's start or after a space\n\
              # go to the app as typed.\n\

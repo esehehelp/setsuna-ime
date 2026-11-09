@@ -5,8 +5,32 @@
 //! Meltype waits for one, so that what reads is never "corrected". The
 //! correction is a second reading converted next to the one typed
 //! (`EngineBridge::alt_for_space`), whose top stays first.
+//!
+//! ず and づ, which read the same, are put as the kana model reads them
+//! (`voicing`): つずく is converted as つづく (user 2026-11-10: ずとづの補正).
 
 use crate::composing_text::{romaji_units, UnitKind};
+use crate::mixed::MixedModel;
+
+/// How much better (−ln P by the kana model) the reading with ず and づ
+/// swapped must read for the reading converted to be it (つずく as つづく,
+/// かたずける, みかずき, みづ as みず); the reading as typed is converted
+/// too short of `VOICING_SURE`, its candidates after the first (築いたら
+/// for きずいたら, made きづいたら). Measured: readings spelled right read
+/// best as they are, but for ず/づ both in use (きずく 0.95 築く / 気づく,
+/// いなづま 0.73, つまずく 1.51); the misspelt ones 1.9 (よこずな) to 18.
+/// Of the readings of wiki_fresh v2 / v3 with ず or づ (384, 377), 3 each
+/// are swapped: names (鹿角 かづの, 兎束 うづか, 牛頭 ごず) and a reading
+/// starting inside a word (づけた).
+pub const VOICING_FIX: f64 = 2.0;
+/// Short of `VOICING_FIX`, the reading with them swapped is converted too,
+/// its candidates after the first (気づく for きずく, 横綱 for よこずな).
+pub const VOICING_OFFER: f64 = 0.5;
+/// From this much better, the reading as typed is not converted too: it
+/// is no word (つずく 17.8, かたずける 7.3, おこずかい 8.7), its conversions
+/// noise (ツズク, 勝たずける); the words spelled so read better by 4.2 at
+/// most (築かれた, きずかれた).
+pub const VOICING_SURE: f64 = 6.0;
 
 /// Costs of the edits (azooKey's α, β, γ), and of a vowel left out.
 const ALPHA: f64 = 2.0;
@@ -110,6 +134,41 @@ pub fn correct(typed: &str, lm: Option<&crate::mixed::MixedModel>) -> Option<Str
     fine.then_some(kana)
 }
 
+/// `kana` with each ず and づ swapped where the other reads better by the
+/// kana model, by `margin` or more; `None` when none is. Only ず/づ: じ/ぢ
+/// would make 間近's まぢか まじか, as the kana model has it.
+pub fn voicing(kana: &str, lm: &MixedModel, margin: f64) -> Option<String> {
+    let mut chars: Vec<char> = kana.chars().collect();
+    let at: Vec<usize> = (0..chars.len())
+        .filter(|&i| matches!(chars[i], 'ず' | 'づ'))
+        .collect();
+    if at.is_empty() {
+        return None;
+    }
+    let swap = |c: char| if c == 'ず' { 'づ' } else { 'ず' };
+    let mut cost = lm.kana_cost(kana);
+    let mut changed = false;
+    // two passes: a swap can change how a ず/づ beside it reads
+    for _ in 0..2 {
+        let mut again = false;
+        for &i in &at {
+            chars[i] = swap(chars[i]);
+            let swapped = lm.kana_cost(&chars.iter().collect::<String>());
+            if cost - swapped >= margin {
+                cost = swapped;
+                again = true;
+            } else {
+                chars[i] = swap(chars[i]);
+            }
+        }
+        changed |= again;
+        if !again {
+            break;
+        }
+    }
+    changed.then(|| chars.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +203,57 @@ mod tests {
         assert_eq!(correct("arigatuo", Some(&m)), None);
         assert_eq!(correct("", Some(&m)), None);
         assert_eq!(correct("Kaisga", Some(&m)).as_deref(), Some("かいしゃ"));
+    }
+
+    #[test]
+    fn zu_and_du_as_the_kana_model_reads_them() {
+        let m = lm();
+        let fix = |k: &str| voicing(k, &m, VOICING_FIX);
+        for (typed, meant) in [
+            ("つずく", "つづく"),
+            ("つずけてください", "つづけてください"),
+            ("かたずける", "かたづける"),
+            ("みかずき", "みかづき"),
+            ("こずつみ", "こづつみ"),
+            ("もとずく", "もとづく"),
+            ("おこずかい", "おこづかい"),
+            ("わかりずらい", "わかりづらい"),
+            ("みづ", "みず"),
+            ("づっと", "ずっと"),
+            ("おとづれる", "おとずれる"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(meant), "{typed}");
+        }
+        // spelled right, or both in use
+        for k in [
+            "つづく",
+            "みず",
+            "ずっと",
+            "すこしずつ",
+            "きずな",
+            "わずか",
+            "いなずま",
+            "きずく",
+            "つまずく",
+            "ひざまずく",
+            "きずつく",
+            "ちず",
+            "じめん",
+            "まぢか",
+            "はなぢ",
+            "かんじ",
+        ] {
+            assert_eq!(fix(k), None, "{k}");
+        }
+        // short of it, offered: 気づく as well as 築く
+        assert_eq!(
+            voicing("きずく", &m, VOICING_OFFER).as_deref(),
+            Some("きづく")
+        );
+        assert_eq!(
+            voicing("よこずな", &m, VOICING_OFFER).as_deref(),
+            Some("よこづな")
+        );
+        assert_eq!(voicing("かな", &m, VOICING_OFFER), None);
     }
 }

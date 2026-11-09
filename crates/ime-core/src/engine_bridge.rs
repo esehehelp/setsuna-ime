@@ -496,6 +496,8 @@ impl EngineBridge {
             .filter(|dir| !dir.is_empty() && !kana_keys)
             .and_then(|dir| crate::mixed::shared(dir, frontend.name_dictionary_file.as_deref()));
         bridge.set_mixed(mixed, &frontend.symbols, crate::mixed::Casing::of(frontend));
+        // つずく read as つづく, by the mixed model's kana model
+        bridge.composing.set_voicing(frontend.typo_correction);
         bridge
     }
 
@@ -1323,8 +1325,9 @@ impl EngineBridge {
         ]
     }
 
-    /// Mixed input, Space on a composition with English in it: the other
-    /// reading to offer (every letter as romaji), or `None`.
+    /// Space: the other reading to offer, or `None`: with English in the
+    /// composition, every letter as romaji; a typo's correction; ず and づ
+    /// the other way (`ComposingText::voicing_alt`).
     fn alt_for_space(&self) -> Option<AltList> {
         // a typo: the reading one edit away, when a letter reads as no kana
         // and nothing was read as English
@@ -1343,6 +1346,7 @@ impl EngineBridge {
                 &self.composing.romaji(),
                 self.composing.mixed_model().as_deref(),
             )
+            .or_else(|| self.composing.voicing_alt())
         };
         if !self.composing.is_mixed() {
             return typo().map(|reading| AltList {
@@ -7399,5 +7403,60 @@ mod tests {
         type_str(&mut bridge, "10");
         let (list, _) = shown(&bridge.handle_space().actions).unwrap();
         assert_eq!(list[..3], v(&["10", "１０", "十"])[..]);
+    }
+
+    fn voicing_bridge() -> (EngineBridge, MockClient) {
+        let (mut bridge, mock) = bridge_with_mock();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        bridge.set_mixed(
+            Some(std::sync::Arc::new(
+                crate::mixed::MixedModel::load(&dir).unwrap(),
+            )),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
+        (bridge, mock)
+    }
+
+    #[test]
+    fn zu_for_du_converts_as_du_and_the_reading_typed_comes_too() {
+        let (mut bridge, mock) = voicing_bridge();
+        type_str(&mut bridge, "kizuitara");
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "きづいたら");
+        mock.set_result("きづいたら", &["気づいたら", "気付いたら"]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "気づいたら");
+        // the reading as typed, its candidates after the first
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "きずいたら");
+        mock.set_result("きずいたら", &["築いたら", "きずいたら"]);
+        let (list, selected) = shown(&bridge.apply_async_result()).unwrap();
+        assert_eq!((list[0].as_str(), selected), ("気づいたら", 0));
+        assert!(list.contains(&"築いたら".to_string()), "{list:?}");
+
+        // no word as typed (つずく): converted as つづく, alone
+        let (mut bridge, mock) = voicing_bridge();
+        type_str(&mut bridge, "tuzuku");
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "つづく");
+        mock.set_result("つづく", &["続く", "つづく"]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "続く");
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "つづく");
+
+        // both in use (築く, 気づく): converted as typed, the other offered
+        let (mut bridge, mock) = voicing_bridge();
+        type_str(&mut bridge, "kizuku");
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "きずく");
+        mock.set_result("きずく", &["築く"]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "きづく");
+
+        // off with typo correction
+        let (mut bridge, mock) = voicing_bridge();
+        bridge.composing.set_voicing(false);
+        type_str(&mut bridge, "tuzuku");
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "つずく");
     }
 }
