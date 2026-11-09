@@ -4,6 +4,7 @@
 #   pwsh -File crates\tsf\install.ps1                           # download pinned model, lexicon, analyzer + install
 #   pwsh -File crates\tsf\install.ps1 -NoDictionaries           # the model only
 #   pwsh -File crates\tsf\install.ps1 -ModelPrecision fp32      # download pinned fp32 model instead
+#   pwsh -File crates\tsf\install.ps1 -Model Bletilla-v0.1-small  # another model models.json pins
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m>             # local model, no download (UAC for regsvr32)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NoElevate  # files-only (CI)
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Force      # overwrite even if same
@@ -13,7 +14,8 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Analyzer <a>  # also the analyzer (segment editing)
 #
 # Without -Manifest, fetch-model.ps1 downloads the public artifact pinned in
-# models.json, verifies its size/SHA-256, and reuses verified cache files offline;
+# models.json (its own model, or -Model another one it pins),
+# verifies its size/SHA-256, and reuses verified cache files offline;
 # the reading lexicon and the analyzer pinned there come too (unless -Lexicon /
 # -Analyzer name local ones, or -NoDictionaries), and when they cannot be had
 # the IME is installed without them.
@@ -98,6 +100,9 @@ param(
     [Parameter(ParameterSetName = 'Download')]
     [ValidateSet('int8', 'fp32')]
     [string]$ModelPrecision = 'int8',
+    # The model models.json pins by this name (default: its own).
+    [Parameter(ParameterSetName = 'Download')]
+    [string]$Model,
     # LM scorer manifest (neo-ime-lm-scorer-export-v1): install the reranker too.
     [string]$RerankManifest,
     # Mixed input model directory (kana.tsv, latin.tsv, params.txt): English
@@ -678,7 +683,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Download') {
     # what an earlier install put in place is not downloaded again
     $Seeds = @('onnx', 'lexicon', 'analyzer') | ForEach-Object { Join-Path $InstallDir "models\$_" }
     try {
-        $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision -SeedDir $Seeds
+        $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision -Model $Model -SeedDir $Seeds
     } catch {
         Write-Log ERROR "model download failed: $_ (retry, or use -Manifest for a local artifact)"; exit 30
     }

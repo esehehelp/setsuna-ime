@@ -15,8 +15,13 @@ Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言�
 ## 状態
 
 研究段階のプロジェクト。変換モデル
-[Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)
-（Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定でこれを自動取得する。
+[Cymbidium-v1.0-xsmall](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall)（約 14 MB）と
+[Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（約 130 MB）
+（どちらも Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定で
+Cymbidium を自動取得する（Bletilla は `-Model Bletilla-v0.1-small`、Linux は
+`--model Bletilla-v0.1-small`）。Cymbidium は Bletilla から切り出して学習し直した
+小さいモデルで、1 位の正解率はほぼ同じ、変換は約 4 倍速い（上位 5 位までに正解が
+入る率は Bletilla が少し高い）。
 
 - エンジンと IME はこの変換モデルを前提に調整している（記号分割、
   前の文脈 64 トークン、読みは 80 文字までなら文をまたいで一度に変換し、それより長い
@@ -243,6 +248,7 @@ pwsh target/dist/setup.ps1 -Archive target/dist/setsuna-ime-<version>-windows-x6
 cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
 pwsh crates/tsf/install.ps1                  # 公開モデルと辞書を自動取得してインストール
+# Bletilla で入れる場合: -Model Bletilla-v0.1-small
 # 取得済み・独自のモデル（ネット接続不要）:
 # pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
 # リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
@@ -308,12 +314,15 @@ IME の処理で想定外のエラー（panic）が起きても、アプリを�
 並べ直しの表を検証してから配置する。キャッシュは `%LOCALAPPDATA%\setsuna-ime\cache\models`。
 再実行では検証済みファイルを再利用するので、取得完了後はオフラインでも使える。
 通信・検証に失敗するとインストールを中止する（終了コード 30）。`-Manifest` と
-`-ModelPrecision` は併用できない。ビルドと ONNX Runtime の取得は上記の手順が別途必要。
+`-ModelPrecision`・`-Model` は併用できない。既定のモデルは `models.json` の最上位、
+`-Model` で選べるほかのモデルは `models` に固定する。前のインストールのモデル
+（既定が変わったときの前のモデル）は、`config.toml` が名指ししていなければ消える。ビルドと ONNX Runtime の取得は上記の手順が別途必要。
 
 モデルだけ取得する場合（標準出力にローカル manifest のパスを返す）:
 
 ```powershell
 pwsh crates/tsf/fetch-model.ps1 -Precision int8 -CacheDir local/models/downloads
+pwsh crates/tsf/fetch-model.ps1 -Model Bletilla-v0.1-small
 # ダウンローダーの回帰テスト（ネット接続不要）:
 pwsh tests/model-download.ps1
 ```
@@ -328,13 +337,15 @@ curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/ins
 # 英日混在入力の名前の辞書も入れる場合: ... | sudo bash -s -- --name-dictionary <names tsv>
 # 手元の読みの辞書・解析器を使う場合: ... | sudo bash -s -- --lexicon <file.lexicon> --analyzer <analyzer manifest>
 # 読みの辞書と解析器を取得しない場合: ... | sudo bash -s -- --no-dictionaries
+# 変換モデルを Bletilla にする場合: ... | sudo bash -s -- --model Bletilla-v0.1-small
 # アンインストール: sudo /usr/lib/setsuna-ime/uninstall.sh
 ```
 
 `install.sh`（`crates/linux/install.sh`）は root で動く前提で、中で権限昇格はしない。
 自分と組になった release アーカイブ（SHA-256 固定）と、そのアーカイブが固定する
 変換モデル・読みの辞書（lexicon-v1、222 MB）・解析器（nid-ma v2-600k-tb、288 MB）
-（`crates/tsf/models.json` の `variants` と `components` と同じ）を取ってきて入れる。
+（`crates/tsf/models.json` の `variants`（`--model` なら `models` のそれ）と
+`components` と同じ）を取ってきて入れる。前のモデルのファイルは消す。
 どのファイルも 1 部だけ持つ: `/var/cache/setsuna-ime/models` に取得・検証したものを
 入れる場所へハードリンクで置き（リンクできないファイルシステムならコピー）、入れ終わったら
 キャッシュを消す。次のインストールでは、入っているファイルが固定したものと一致すればそのまま
@@ -445,7 +456,9 @@ cargo run --release -p setsuna-settings
   頻度）を持つモデルでは、`decode_defaults` の `pair_weight` / `word_weight` の
   重みで beam の候補のスコアに足して並べ直す（0 か未指定ならその項は使わない）。
   公開モデル Bletilla-v0.1-small は int8 版（MoE の専門家は int4、約 116 MB）と
-  並べ直しの表（約 28 MB）。
+  並べ直しの表（約 28 MB）。Cymbidium-v1.0-xsmall は、Linear と専門家を群ごとの
+  スケールと零点つきの低ビット符号で持ち（`LinearQ4G`、`TokenMoEQ4G`、専門家は
+  3 bit・ほかは 4 bit）、約 13.6 MB。並べ直しの表は持たない。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の
   `tokenizer.model`）を持つ。書いてあればリランカはそれで区切る（sarashina2.2 は
@@ -529,6 +542,7 @@ MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）か�
 （`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
 出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と
 THIRD_PARTY_NOTICES.md）。かな漢字変換モデルは
+[Cymbidium-v1.0-xsmall](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) と
 [Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（Apache-2.0）。
 辞書データとかな漢字変換モデルの重みはこのリポジトリに含まない。
 配布する辞書ファイルのライセンスと出典表示は、

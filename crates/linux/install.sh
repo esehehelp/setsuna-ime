@@ -13,6 +13,8 @@
 #
 # Options:
 #   --precision int8|fp32   the model (default int8)
+#   --model <name>          another model the archive pins (Bletilla-v0.1-small)
+#                           instead of its own
 #   --archive <file>        a local release archive instead of the download
 #   --lexicon <file>        a local reading lexicon (a compiled .lexicon) instead
 #                           of the download: the dictionary's words come into
@@ -64,6 +66,7 @@ ARCHIVE_SHA256_X86_64=@ARCHIVE_SHA256_X86_64@
 RELEASES=https://github.com/esehehelp/setsuna-ime/releases/download
 
 precision=int8
+model=
 archive=
 register=1
 root=
@@ -84,6 +87,7 @@ fail() {
 while (($#)); do
     case $1 in
         --precision) precision=${2:?}; shift 2 ;;
+        --model) model=${2:?}; shift 2 ;;
         --archive) archive=${2:?}; shift 2 ;;
         --rerank-manifest) rerank_manifest=${2:?}; shift 2 ;;
         --name-dictionary) name_dictionary=${2:?}; shift 2 ;;
@@ -97,6 +101,7 @@ while (($#)); do
     esac
 done
 [[ $precision == int8 || $precision == fp32 ]] || fail 1 "--precision must be int8 or fp32"
+[[ -z $model || $model =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 1 "invalid --model: $model"
 if [[ -n $root ]]; then
     mkdir -p "$root"
     root=$(cd "$root" && pwd)
@@ -256,18 +261,31 @@ obtain() {
     pinned_dst+=("$dst")
 }
 
-# the model (models.tsv's repository, revision and <precision> lines)
-repository=$(awk -F'\t' '$1 == "repository" { print $2 }' "$src/models.tsv")
-revision=$(awk -F'\t' '$1 == "revision" { print $2 }' "$src/models.tsv")
+# the model (models.tsv's repository, revision and <precision> lines; with
+# --model another one's "model <name> <repository> <revision>" line and its
+# <name>:<precision> lines)
+[[ $model != $(awk -F'\t' '$1 == "name" { print $2 }' "$src/models.tsv") ]] || model=
+if [[ -z $model ]]; then
+    repository=$(awk -F'\t' '$1 == "repository" { print $2 }' "$src/models.tsv")
+    revision=$(awk -F'\t' '$1 == "revision" { print $2 }' "$src/models.tsv")
+    key=$precision
+else
+    repository=$(awk -F'\t' -v m="$model" '$1 == "model" && $2 == m { print $3 }' "$src/models.tsv")
+    revision=$(awk -F'\t' -v m="$model" '$1 == "model" && $2 == m { print $4 }' "$src/models.tsv")
+    [[ -n $repository ]] || fail 1 "the archive pins no model $model"
+    key=$model:$precision
+fi
 [[ $repository =~ $repository_re && $revision =~ ^[a-f0-9]{40}$ ]] ||
     fail 30 "invalid model pins in the archive"
 manifest=
+model_files=() # the model's files, under models/onnx
 while IFS=$'\t' read -r p path size sha; do
-    [[ $p == "$precision" ]] || continue
+    [[ $p == "$key" ]] || continue
     [[ $path =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $size =~ ^[1-9][0-9]*$ && $sha =~ ^[a-f0-9]{64}$ ]] ||
         fail 30 "invalid model pin: $path"
     obtain model "$repository" "$revision" "$path" "$size" "$sha" "$module/models/onnx/$path" ||
         fail 30 "could not get the model"
+    model_files+=("$path")
     [[ $path == *manifest.json ]] && manifest=$path
 done <"$src/models.tsv"
 [[ -n $manifest ]] || fail 30 "the archive pins no $precision model"
@@ -399,11 +417,15 @@ put "$src/addon/setsuna.so" "$addon_dir/setsuna.so" 755
 put_tree "$src/share" /usr/share
 put_tree "$src/module" "$module"
 # Another model's manifest would compete with this one (the engine reads the
-# only one in models/onnx).
-for m in "$root$module"/models/onnx/*manifest.json; do
-    if [[ -e $m && $(basename "$m") != "$manifest" ]]; then
-        rm -f -- "$m"
-    fi
+# only one in models/onnx), and its files would be kept for nothing (the
+# model before, on a change of the default).
+for m in "$root$module"/models/onnx/*; do
+    [[ -f $m ]] || continue
+    keep=0
+    for f in "${model_files[@]}"; do
+        [[ $(basename "$m") != "$f" ]] || keep=1
+    done
+    ((keep)) || rm -f -- "$m"
 done
 # One analyzer: the addon gives the engine the only manifest there.
 if ((have_analyzer)); then

@@ -15,7 +15,8 @@
 # %APPDATA%\setsuna-ime\config.toml names. Each file goes to /data/local/tmp
 # and from there into the app's directory by `run-as`, which only a
 # debuggable build (build.ps1 without -Release) lets in; a file already there
-# with the same size is not sent again. The app's private directory, not
+# with the same size is not sent again, and what an earlier push left in the
+# directories pushed into (another model) is removed. The app's private directory, not
 # /sdcard/Android/data: a file adb puts there is the shell's, which the app
 # cannot read.
 
@@ -121,4 +122,26 @@ foreach ($f in $Files) {
     if ($there -ne "$size") { throw "copy of $rel into the app failed" }
 }
 & $Adb shell "rmdir $Stage 2>/dev/null" | Out-Null
+
+# What an earlier push left in the directories pushed into goes: the app
+# takes the only model, lexicon and analyzer there (another model's
+# manifest beside this one's, and none starts), and the one before is
+# kept for nothing (the model before, once the default changed).
+$pushed = @{}
+foreach ($f in $Files) { $pushed[$f[1]] = $true }
+foreach ($top in @($Files | ForEach-Object { $_[1].Split('/')[0] } | Sort-Object -Unique)) {
+    if ($top -eq 'names') { continue }
+    # analyzer/<name>/...: the other analyzers' directories; elsewhere the files
+    $depth = if ($top -eq 'analyzer') { 2 } else { 1 }
+    $kept = @($pushed.Keys | Where-Object { $_.StartsWith("$top/") } | ForEach-Object {
+        ($_.Split('/')[0..($depth - 1)]) -join '/'
+    } | Sort-Object -Unique)
+    $there = & $Adb shell "run-as $Package sh -c 'cd files/models/$top 2>/dev/null && ls -1'"
+    foreach ($name in @($there | ForEach-Object { "$_".Trim() } | Where-Object { $_ })) {
+        if ($name -match "['\s/]") { continue }
+        if ($kept -contains "$top/$name") { continue }
+        Write-Host "drop  $top/$name"
+        & $Adb shell "run-as $Package rm -rf files/models/$top/$name" | Out-Null
+    }
+}
 Write-Host "models in the app's files/models"

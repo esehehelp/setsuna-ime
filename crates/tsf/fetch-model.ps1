@@ -1,4 +1,6 @@
 # Fetch a public conversion artifact pinned by models.json. No login required.
+# The model is the catalog's own (its name, repository, revision, variants),
+# or with -Model one of the others it pins under `models`.
 # Writes only to the download cache; returns the local manifest path on stdout.
 # Verified cache files work offline. Downloads are staged before replacement.
 # With -Component, one of the catalog's components (the reading lexicon, the
@@ -9,6 +11,7 @@
 #
 # Usage:
 #   pwsh -File crates/tsf/fetch-model.ps1
+#   pwsh -File crates/tsf/fetch-model.ps1 -Model Bletilla-v0.1-small
 #   pwsh -File crates/tsf/fetch-model.ps1 -Precision fp32 -CacheDir local/models/downloads
 #   pwsh -File crates/tsf/fetch-model.ps1 -Component lexicon
 
@@ -17,6 +20,9 @@
 param(
     [ValidateSet('int8', 'fp32')]
     [string]$Precision = 'int8',
+    # The model by its name: the catalog's own (the default) or one of its
+    # `models`.
+    [string]$Model,
     [ValidateSet('lexicon', 'analyzer')]
     [string]$Component,
     [string]$CacheDir = (Join-Path $env:LOCALAPPDATA 'setsuna-ime\cache\models'),
@@ -55,12 +61,18 @@ function Test-VerifiedFile {
 
 $catalog = Get-Content -LiteralPath $CatalogPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($catalog.schema -ne 'setsuna-model-download-v1') { throw 'invalid model catalog (unknown schema)' }
-# what is fetched: the conversion model, or a component with a repository
-# and revision of its own
+# what is fetched: the conversion model (the catalog's own, or another it
+# pins), or a component with a repository and revision of its own
 $source = $catalog
 if ($Component) {
     $source = $catalog.components.$Component
     if (-not $source) { throw "model catalog has no $Component component" }
+} elseif ($Model -and $Model -ne $catalog.name) {
+    if ($Model -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or -not $catalog.models -or
+        -not ($catalog.models.PSObject.Properties.Name -ccontains $Model)) {
+        throw "model catalog has no model $Model"
+    }
+    $source = $catalog.models.$Model
 }
 if ($source.repository -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$' -or
     $source.revision -notmatch '^[a-f0-9]{40}$') {
@@ -71,7 +83,7 @@ if ($Component) {
     Assert-ArtifactPath $source.entry
     $files = $source.files
 } else {
-    $variant = $catalog.variants.$Precision
+    $variant = $source.variants.$Precision
     if (-not $variant) { throw "model catalog has no $Precision variant" }
     Assert-ArtifactPath $variant.manifest
     $files = $variant.files

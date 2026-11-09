@@ -126,4 +126,19 @@ assert_fails "refuses a duplicate file" "invalid or duplicate file specification
 new_fixture model.onnx
 assert_fails "refuses a missing variant" "no fp32 variant" --precision fp32
 
+# Another model the catalog pins under `models`, by its name (--model): its
+# own repository, revision and variants; the catalog's own by its name.
+new_fixture graphs/model.onnx
+mkdir -p "$mirror/example/other/resolve"
+cp -r "$served" "$mirror/example/other/resolve/"
+edit_catalog '.name = "Main-v1" | .models = {"Other-v1": {repository: "example/other", revision, variants}}
+    | .repository = "example/main"'
+out=$(run --model Other-v1 2>/dev/null)
+assert "--model prints the other model's manifest" [ "$out" = "$root/cache/example/other/$revision/model.int8.manifest.json" ]
+assert "--model downloads from its repository" cmp -s "$served/graphs/model.onnx" "$root/cache/example/other/$revision/graphs/model.onnx"
+assert "--model downloads nothing of the catalog's own" [ ! -e "$root/cache/example/main" ]
+assert_fails "the catalog's own model by its name" "download failed" --model Main-v1
+assert_fails "refuses an unknown model" "has no model Nope-v1" --model Nope-v1
+assert_fails "refuses a model name leaving the catalog" "has no model" --model 'Other-v1"]'
+
 echo "all $checks checks passed ($root)"

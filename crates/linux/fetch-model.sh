@@ -2,10 +2,12 @@
 # Fetch a public conversion artifact pinned by crates/tsf/models.json. No login
 # required. Writes only to the download cache; prints the local manifest path
 # on stdout (progress goes to stderr). Verified cache files work offline.
-# Downloads are staged before replacement.
+# Downloads are staged before replacement. The model is the catalog's own, or
+# with --model one of the others it pins under `models`.
 #
 # Usage:
 #   crates/linux/fetch-model.sh
+#   crates/linux/fetch-model.sh --model Bletilla-v0.1-small
 #   crates/linux/fetch-model.sh --precision fp32 --cache-dir local/models/downloads
 #
 # --base-url replaces https://huggingface.co (a mirror, or file:// in
@@ -15,6 +17,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 precision=int8
+model=
 cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/setsuna-ime/models
 catalog=$here/../tsf/models.json
 base_url=https://huggingface.co
@@ -27,6 +30,7 @@ die() {
 while (($#)); do
     case $1 in
         --precision) precision=${2:?}; shift 2 ;;
+        --model) model=${2:?}; shift 2 ;;
         --cache-dir) cache_dir=${2:?}; shift 2 ;;
         --catalog) catalog=${2:?}; shift 2 ;;
         --base-url) base_url=${2:?}; shift 2 ;;
@@ -63,21 +67,34 @@ verified() {
 [[ -f $catalog ]] || die "model catalog not found: $catalog"
 jq -e . "$catalog" >/dev/null 2>&1 || die "model catalog is not JSON: $catalog"
 schema=$(jq -r '.schema // ""' "$catalog")
-repository=$(jq -r '.repository // ""' "$catalog")
-revision=$(jq -r '.revision // ""' "$catalog")
+# the model: the catalog's own, or another it pins (`models`), as `src`
+[[ $model != $(jq -r '.name // ""' "$catalog") ]] || model=
+if [[ -n $model ]]; then
+    [[ $model =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] &&
+        jq -e --arg m "$model" '.models[$m] | type == "object"' "$catalog" >/dev/null ||
+        die "model catalog has no model $model"
+fi
+# cat_q <jq filter> [jq args]: the filter on the model's part of the catalog
+cat_q() {
+    local filter=$1
+    shift
+    jq -r --arg m "$model" "$@" "def src: if \$m == \"\" then . else .models[\$m] end; $filter" "$catalog"
+}
+repository=$(cat_q 'src.repository // ""')
+revision=$(cat_q 'src.revision // ""')
 if [[ $schema != setsuna-model-download-v1 ||
     ! $repository =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ||
     ! $revision =~ ^[a-f0-9]{40}$ ]]; then
     die "invalid model catalog (expected a repository and pinned commit)"
 fi
 check_path "$repository"
-jq -e --arg p "$precision" '.variants[$p] | type == "object"' "$catalog" >/dev/null ||
+[[ $(cat_q 'src.variants[$p] | type == "object"' --arg p "$precision") == true ]] ||
     die "model catalog has no $precision variant"
-manifest_rel=$(jq -r --arg p "$precision" '.variants[$p].manifest // ""' "$catalog")
+manifest_rel=$(cat_q 'src.variants[$p].manifest // ""' --arg p "$precision")
 check_path "$manifest_rel"
 
-specs=$(jq -r --arg p "$precision" \
-    '.variants[$p].files[] | [.path, (.size | tostring), (.sha256 // "")] | @tsv' "$catalog") ||
+specs=$(cat_q 'src.variants[$p].files[] | [.path, (.size | tostring), (.sha256 // "")] | @tsv' \
+    --arg p "$precision") ||
     die "invalid file specifications in the catalog"
 declare -A spec_size spec_sha
 while IFS=$'\t' read -r path size sha; do

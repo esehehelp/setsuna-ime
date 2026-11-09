@@ -13,6 +13,8 @@ $revision = '0123456789abcdef0123456789abcdef01234567'
 $prefix = "https://huggingface.co/example/converter/resolve/$revision/"
 $dictRevision = 'fedcba9876543210fedcba9876543210fedcba98'
 $dictPrefix = "https://huggingface.co/example/dict/resolve/$dictRevision/"
+# another model the catalog pins (-Model), served the same files
+$otherPrefix = "https://huggingface.co/example/other/resolve/$revision/"
 
 function Assert {
     param([bool]$Condition, [string]$Message)
@@ -80,6 +82,7 @@ function Invoke-WebRequest {
           [int]$ConnectionTimeoutSeconds, [int]$OperationTimeoutSeconds)
     $state.requests += $Uri
     if ($state.offline) { throw 'network disabled by test' }
+    if ($Uri.StartsWith($otherPrefix)) { $Uri = $prefix + $Uri.Substring($otherPrefix.Length) }
     if ($Uri.StartsWith($dictPrefix)) {
         $relative = [Uri]::UnescapeDataString($Uri.Substring($dictPrefix.Length))
         if (-not $state.dict.ContainsKey($relative)) { throw "unexpected artifact: $relative" }
@@ -228,6 +231,25 @@ $catalog.Remove('components')
 Save-Catalog
 Assert-Throws { & $fetch -Component analyzer -CacheDir $cache -CatalogPath $catalogPath } 'has no analyzer component'
 
+# Another model the catalog pins under `models`, by its name (-Model): its
+# own repository, revision and variants; the catalog's own by its name or
+# none.
+New-Fixture 'other-model'
+$catalog.name = 'Main-v1'
+$catalog.models = @{ 'Other-v1' = @{ repository = 'example/other'; revision = $revision; variants = $catalog.variants } }
+$catalog.repository = 'example/main'
+Save-Catalog
+$other = @(& $fetch -Model Other-v1 -CacheDir $cache -CatalogPath $catalogPath)
+Assert ($other.Count -eq 1 -and $other[0] -eq (Join-Path $cache "example/other/$revision/bundle/model.manifest.json")) '-Model returns the other model in its own revision-scoped cache'
+Assert ($state.requests.Count -eq 7 -and @($state.requests | Where-Object { -not $_.StartsWith($otherPrefix) }).Count -eq 0) '-Model fetches from its repository only'
+$state.requests = @()
+Assert-Throws { & $fetch -Model Main-v1 -CacheDir $cache -CatalogPath $catalogPath } 'unexpected URL'
+Assert ($state.requests.Count -eq 1 -and $state.requests[0].StartsWith('https://huggingface.co/example/main/')) 'the catalog''s own model by its name'
+$state.requests = @()
+Assert-Throws { & $fetch -Model Nope-v1 -CacheDir $cache -CatalogPath $catalogPath } 'has no model Nope-v1'
+Assert-Throws { & $fetch -Model 'Other-v1/../x' -CacheDir $cache -CatalogPath $catalogPath } 'has no model'
+Assert ($state.requests.Count -eq 0) 'an unknown model rejected before HTTP'
+
 # Installer parameter sets preserve local/offline installs without ambiguity.
 $installer = Join-Path $repo 'crates/tsf/install.ps1'
 $sets = (Get-Command $installer).ParameterSets
@@ -236,6 +258,7 @@ $local = $sets | Where-Object { $_.Name -eq 'Local' }
 Assert (@($local.Parameters | Where-Object { $_.Name -eq 'Manifest' -and $_.IsMandatory }).Count -eq 1) 'local manifest remains supported'
 Assert (@($local.Parameters | Where-Object { $_.Name -eq 'ModelPrecision' }).Count -eq 0) 'local manifest and download precision are mutually exclusive'
 Assert (@($local.Parameters | Where-Object { $_.Name -eq 'NoDictionaries' }).Count -eq 0) 'local manifest downloads no dictionaries'
+Assert (@($local.Parameters | Where-Object { $_.Name -eq 'Model' }).Count -eq 0) 'local manifest and a model by name are mutually exclusive'
 
 # A real child installer must propagate network failure as code 30, without
 # publishing models, writing config or reaching COM/registry operations.

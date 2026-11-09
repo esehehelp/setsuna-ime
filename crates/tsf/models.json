@@ -1,43 +1,78 @@
 {
   "schema": "setsuna-model-download-v1",
-  "repository": "esehe/Bletilla-v0.1-small",
-  "revision": "002b3a59ab97d3ed46576ad1f773d7e7ee1af3be",
+  "name": "Cymbidium-v1.0-xsmall",
+  "repository": "esehe/Cymbidium-v1.0-xsmall",
+  "revision": "8a5ae4880161dedad14dd35797e4baa59bca2834",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
-      "manifest": "Bletilla-v0.1-small.int8.manifest.json",
+      "manifest": "Cymbidium-v1.0-xsmall.int8.manifest.json",
       "files": [
         {
-          "path": "Bletilla-v0.1-small.int8.manifest.json",
-          "size": 697,
-          "sha256": "01c5f1657efada677685a7aa20064e472deaefd19a82d22e8d1181fb706e964b"
+          "path": "Cymbidium-v1.0-xsmall.int8.manifest.json",
+          "size": 568,
+          "sha256": "6d875e2a44b46f7fad7fcb3452d72ab6b6ca1b3454f1a576fc11dc5cb597d832"
         },
         {
-          "path": "Bletilla-v0.1-small.int8.onnx",
-          "size": 115989185,
-          "sha256": "2424da819ac2377ce336a631bee8ea79c86acd151ae3d2b37ae94da5fe653d3b"
+          "path": "Cymbidium-v1.0-xsmall.int8.onnx",
+          "size": 13570989,
+          "sha256": "8c2511b97623716c12d4966ef9f3b796d87c8fcd2e174b2afb047de2e73dc9a5"
         },
         {
-          "path": "Bletilla-v0.1-small.vocab.hex.tsv",
+          "path": "Cymbidium-v1.0-xsmall.vocab.hex.tsv",
           "size": 95166,
           "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
         },
         {
-          "path": "Bletilla-v0.1-small.pairs.bin",
-          "size": 14908280,
-          "sha256": "b781f34fcb598244f8230bae80c5bea996b8d37a0fabffab0254e8b497c94976"
-        },
-        {
-          "path": "Bletilla-v0.1-small.words.tsv",
-          "size": 13153598,
-          "sha256": "ed56c407ad4512954dee62b5b122901b1194272d32e39643f8b895adec27d110"
-        },
-        {
           "path": "config.json",
-          "size": 116,
-          "sha256": "e0fd510a0b2a1b13f65eb77e0b29a47501b267d37f04301c2d939171cd5f82b2"
+          "size": 118,
+          "sha256": "0c0f651f22441298993085c3b11da51216d67bce5ccc4b5ccce714d368f448ab"
         }
       ]
+    }
+  },
+  "models": {
+    "Bletilla-v0.1-small": {
+      "repository": "esehe/Bletilla-v0.1-small",
+      "revision": "002b3a59ab97d3ed46576ad1f773d7e7ee1af3be",
+      "license": "Apache-2.0",
+      "variants": {
+        "int8": {
+          "manifest": "Bletilla-v0.1-small.int8.manifest.json",
+          "files": [
+            {
+              "path": "Bletilla-v0.1-small.int8.manifest.json",
+              "size": 697,
+              "sha256": "01c5f1657efada677685a7aa20064e472deaefd19a82d22e8d1181fb706e964b"
+            },
+            {
+              "path": "Bletilla-v0.1-small.int8.onnx",
+              "size": 115989185,
+              "sha256": "2424da819ac2377ce336a631bee8ea79c86acd151ae3d2b37ae94da5fe653d3b"
+            },
+            {
+              "path": "Bletilla-v0.1-small.vocab.hex.tsv",
+              "size": 95166,
+              "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
+            },
+            {
+              "path": "Bletilla-v0.1-small.pairs.bin",
+              "size": 14908280,
+              "sha256": "b781f34fcb598244f8230bae80c5bea996b8d37a0fabffab0254e8b497c94976"
+            },
+            {
+              "path": "Bletilla-v0.1-small.words.tsv",
+              "size": 13153598,
+              "sha256": "ed56c407ad4512954dee62b5b122901b1194272d32e39643f8b895adec27d110"
+            },
+            {
+              "path": "config.json",
+              "size": 116,
+              "sha256": "e0fd510a0b2a1b13f65eb77e0b29a47501b267d37f04301c2d939171cd5f82b2"
+            }
+          ]
+        }
+      }
     }
   },
   "components": {

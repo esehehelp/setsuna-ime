@@ -67,13 +67,18 @@ sys=$(sed -n '/^name = "llama-cpp-sys-2"$/{n;s/^version = "\(.*\)"$/\1/p}' "$rep
 install -m644 "$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/llama-cpp-sys-2-"$sys"/llama.cpp/LICENSE | head -1)" \
     "$out/module/licenses/llama.cpp/LICENSE"
 
-# models.tsv: "repository" / "revision" lines, then <precision> <path> <size> <sha256>;
-# then per component (lexicon, analyzer) "component <name> <repository> <revision>
-# <entry>" and its files as <name> <path> <size> <sha256>
+# models.tsv: "repository" / "revision" / "name" lines, then <precision> <path> <size>
+# <sha256>; per other model (install.sh --model) "model <name> <repository> <revision>"
+# and its files as <name>:<precision> <path> <size> <sha256>; then per component
+# (lexicon, analyzer) "component <name> <repository> <revision> <entry>" and its
+# files as <name> <path> <size> <sha256>
 catalog=$repo/crates/tsf/models.json
 {
-    jq -r '"repository\t\(.repository)", "revision\t\(.revision)"' "$catalog"
+    jq -r '"repository\t\(.repository)", "revision\t\(.revision)", "name\t\(.name // "")"' "$catalog"
     jq -r '.variants | to_entries[] | .key as $p | .value.files[] | [$p, .path, .size, .sha256] | @tsv' "$catalog"
+    jq -r '.models // {} | to_entries[] | .key as $n | .value |
+        (["model", $n, .repository, .revision] | @tsv),
+        (.variants | to_entries[] | .key as $p | .value.files[] | ["\($n):\($p)", .path, .size, .sha256] | @tsv)' "$catalog"
     jq -r '.components // {} | to_entries[] | .key as $n | .value |
         (["component", $n, .repository, .revision, .entry] | @tsv),
         (.files[] | [$n, .path, .size, .sha256] | @tsv)' "$catalog"
