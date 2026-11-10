@@ -464,7 +464,10 @@ cargo run --release -p setsuna-settings
   公開モデル Bletilla-v0.1-small は int8 版（MoE の専門家は int4、約 116 MB）と
   並べ直しの表（約 28 MB）。Cymbidium-v1.0-xsmall は、Linear と専門家を群ごとの
   スケールと零点つきの低ビット符号で持ち（`LinearQ4G`、`TokenMoEQ4G`、専門家は
-  3 bit・ほかは 4 bit）、約 13.6 MB。並べ直しの表は持たない。
+  3 bit・ほかは 4 bit）、約 13.6 MB。並べ直しの表は持たない。この 2 つの op は
+  AVX-512 VNNI・AVX-VNNI・AVX2・ARM の dotprod のカーネルで計算し（どれも同じ結果）、
+  そのどれもない CPU では素の Rust で計算する（Ryzen 9 9950X3D で 1 文の中央値
+  2.9 / 3.1 / 3.5 / 33 ms）。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の
   `tokenizer.model`）を持つ。書いてあればリランカはそれで区切る（sarashina2.2 は

@@ -14,8 +14,10 @@
 //! expanded). With AVX-512 VNNI one kernel keeps each group's integer sums of a tile of 6 rows x 64 outputs in
 //! registers, by u8 x i8 dot products of four on the codes unpacked to a byte each when the session loads (the file
 //! keeps the nibbles), and at the group's end turns them to float and scales them into the output's running sums (two
-//! FMAs); elsewhere the same arithmetic in plain Rust (`mul_add` is the same fused multiply-add), so every path gives
-//! the same bits. (The first version called the experts' int4 GEMM once a group and
+//! FMAs); AVX-VNNI, AVX2 (`vpmaddubsw` + `vpmaddwd`) and ARM's UDOT do the same on 4 rows x 16 outputs, and elsewhere
+//! the same arithmetic in plain Rust (`mul_add` is the same fused multiply-add), so every path gives the same bits.
+//! (Until 0.2.3 only AVX-512 VNNI had a kernel: Cymbidium-v1.0-xsmall converted in 106-130 ms on an x86 without it,
+//! Bletilla-v0.1-small in 11.) (The first version called the experts' int4 GEMM once a group and
 //! scaled its sums from memory: the 4M's 43 Linears 0.47 ms slower than ONNX Runtime's dynamic int8 MatMuls on a
 //! conversion; ONNX Runtime 1.28's MatMulNBits 1.9 ms slower.)
 
@@ -178,13 +180,11 @@ pub(crate) struct GroupMoeScratch {
 impl GroupMoe {
     pub(crate) fn forward(&self, x: &[f32], y: &mut [f32], s: &mut GroupMoeScratch) {
         #[cfg(target_arch = "x86_64")]
-        if self
-            .experts
-            .first()
-            .is_some_and(|(l1, _)| l1.path == Path::Vnni512)
-        {
+        match self.experts.first().map(|(l1, _)| l1.path) {
             // SAFETY: the CPU has the features (`detect`)
-            return unsafe { self.forward_avx512(x, y, s) };
+            Some(Path::Vnni512) => return unsafe { self.forward_avx512(x, y, s) },
+            Some(Path::Vnni256 | Path::Avx2) => return unsafe { self.forward_avx2(x, y, s) },
+            _ => {}
         }
         self.forward_body(x, y, s)
     }
@@ -192,6 +192,12 @@ impl GroupMoe {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx2,fma")]
     unsafe fn forward_avx512(&self, x: &[f32], y: &mut [f32], s: &mut GroupMoeScratch) {
+        self.forward_body(x, y, s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn forward_avx2(&self, x: &[f32], y: &mut [f32], s: &mut GroupMoeScratch) {
         self.forward_body(x, y, s)
     }
 
@@ -311,9 +317,18 @@ impl Kernel for GroupKernel {
     }
 }
 
+/// The kernel the CPU takes (`detect`): every one gives the same bits.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Path {
+    /// AVX-512 VNNI: tiles of 6 rows x 64 outputs (`x86::inner`).
     Vnni512,
+    /// AVX-VNNI (VEX, 256 bits; Intel's since Alder Lake, AMD's since Zen 5): `x86::inner_vnni256`.
+    Vnni256,
+    /// AVX2 without VNNI: each dot product of four by `vpmaddubsw` + `vpmaddwd` (`x86::inner_avx2`).
+    Avx2,
+    /// ARMv8.2 dot products (phones since about 2018): `arm::inner`.
+    Dot,
     Plain,
 }
 
@@ -434,6 +449,8 @@ impl GroupWeights {
         match self.path {
             #[cfg(target_arch = "x86_64")]
             Path::Vnni512 => unsafe { x86::forward(self, x, y, s) },
+            #[cfg(target_arch = "x86_64")]
+            Path::Vnni256 | Path::Avx2 => unsafe { x86::forward_avx2(self, x, y, s) },
             _ => self.forward_with(x, y, s),
         }
     }
@@ -465,6 +482,12 @@ impl GroupWeights {
         match self.path {
             #[cfg(target_arch = "x86_64")]
             Path::Vnni512 => unsafe { x86::inner(self, &s.q, &s.a, rows, y) },
+            #[cfg(target_arch = "x86_64")]
+            Path::Vnni256 => unsafe { x86::inner_vnni256(self, &s.q, &s.a, rows, y) },
+            #[cfg(target_arch = "x86_64")]
+            Path::Avx2 => unsafe { x86::inner_avx2(self, &s.q, &s.a, rows, y) },
+            #[cfg(target_arch = "aarch64")]
+            Path::Dot => unsafe { arm::inner(self, &s.q, &s.a, rows, y) },
             _ => self.inner_plain(&s.q, &s.a, rows, y),
         }
         for r in 0..rows {
@@ -476,21 +499,37 @@ impl GroupWeights {
         }
     }
 
-    /// The running sums sum_g [ s_g acc_g - s_g z_g A_g ] in plain Rust, as the VNNI kernel orders them.
+    /// The running sums sum_g [ s_g acc_g - s_g z_g A_g ] in plain Rust, as the SIMD kernels order them: each
+    /// group's integer sums of 16 outputs from the unpacked codes, block by block, then two fused multiply-adds per
+    /// output. (It read each code from its nibble: the 4M's conversion 10 times Bletilla's on x86 without AVX-512.)
     fn inner_plain(&self, q: &[u8], a: &[f32], rows: usize, y: &mut [f32]) {
         let (n, k, g) = (self.n, self.k, self.g);
-        let groups = k / g;
-        for r in 0..rows {
-            for o in 0..n {
-                let mut f = 0f32;
-                for gi in 0..groups {
-                    let acc: i32 = (0..g)
-                        .map(|i| q[r * k + gi * g + i] as i32 * self.code(o, gi * g + i) as i32)
-                        .sum();
-                    f = (acc as f32).mul_add(self.scale[gi * n + o], f);
-                    f = self.scale_zero[gi * n + o].mul_add(a[r * groups + gi], f);
+        let (groups, steps) = (k / g, g / 4);
+        let y = &mut y[..rows * n];
+        y.fill(0.0);
+        for gi in 0..groups {
+            for ob in 0..n / 16 {
+                let wb = &self.unpacked[gi * n * g + ob * steps * 64..][..steps * 64];
+                for r in 0..rows {
+                    let xq = &q[r * k + gi * g..][..g];
+                    let mut acc = [0i32; 16];
+                    for (x4, wv) in xq.chunks_exact(4).zip(wb.chunks_exact(64)) {
+                        for (j, aj) in acc.iter_mut().enumerate() {
+                            let w4 = &wv[j * 4..j * 4 + 4];
+                            *aj += x4
+                                .iter()
+                                .zip(w4)
+                                .map(|(&xv, &wv)| xv as i32 * wv as i32)
+                                .sum::<i32>();
+                        }
+                    }
+                    for (j, &aj) in acc.iter().enumerate() {
+                        let o = ob * 16 + j;
+                        let yv = &mut y[r * n + o];
+                        *yv = (aj as f32).mul_add(self.scale[gi * n + o], *yv);
+                        *yv = self.scale_zero[gi * n + o].mul_add(a[r * groups + gi], *yv);
+                    }
                 }
-                y[r * n + o] = f;
             }
         }
     }
@@ -505,13 +544,21 @@ impl GroupWeights {
 fn detect() -> Path {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("fma")
-        {
+        use std::arch::is_x86_feature_detected as has;
+        if has!("avx512f") && has!("avx512vnni") && has!("avx512bw") && has!("fma") {
             return Path::Vnni512;
         }
+        if has!("avx2") && has!("fma") {
+            return if has!("avxvnni") {
+                Path::Vnni256
+            } else {
+                Path::Avx2
+            };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Path::Dot;
     }
     Path::Plain
 }
@@ -622,6 +669,205 @@ mod x86 {
             ob += if c4 { 4 } else { 1 };
         }
     }
+
+    /// `GroupWeights::forward_with` compiled for AVX2 (the 256-bit kernels' CPUs).
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn forward_avx2(
+        w: &GroupWeights,
+        x: &[f32],
+        y: &mut [f32],
+        s: &mut super::GroupScratch,
+    ) {
+        w.forward_with(x, y, s)
+    }
+
+    /// AVX-VNNI's u8 x i8 dot products of four.
+    #[inline]
+    #[target_feature(enable = "avx2,avxvnni")]
+    unsafe fn dot_vnni(acc: __m256i, x: __m256i, w: __m256i) -> __m256i {
+        _mm256_dpbusd_avx_epi32(acc, x, w)
+    }
+
+    /// The same with AVX2: u8 x i8 products summed in pairs to i16 (at most 2 x 255 x 15, no saturation), the pairs
+    /// to i32.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_avx2(acc: __m256i, x: __m256i, w: __m256i) -> __m256i {
+        let pairs = _mm256_maddubs_epi16(x, w);
+        _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)))
+    }
+
+    /// The 256-bit kernels: RT rows x one output block (16 outputs, two vectors of 8, each lane an output's four
+    /// codes), every group's integer sums in registers, scaled into the running sums in `y` at the group's end as
+    /// `tile` does; `inner_*` the tiles of up to 4 rows (8 sums, of 16 registers) block by block.
+    macro_rules! kernels256 {
+        ($tile:ident, $inner:ident, $feat:literal, $dot:ident) => {
+            #[target_feature(enable = $feat)]
+            unsafe fn $tile<const RT: usize>(
+                w: &GroupWeights,
+                q: *const u8,
+                a: *const f32,
+                ob: usize,
+                y: *mut f32,
+            ) {
+                let (n, k, g) = (w.n, w.k, w.g);
+                let (groups, steps, gstride) = (k / g, g / 4, n * g);
+                let codes = w.unpacked.as_ptr();
+                let (sc, sz) = (w.scale.as_ptr(), w.scale_zero.as_ptr());
+                for gi in 0..groups {
+                    let mut acc = [[_mm256_setzero_si256(); 2]; RT];
+                    let wg = codes.add(gi * gstride + ob * steps * 64);
+                    for s in 0..steps {
+                        let w0 = _mm256_loadu_si256(wg.add(s * 64) as *const _);
+                        let w1 = _mm256_loadu_si256(wg.add(s * 64 + 32) as *const _);
+                        for (r, ar) in acc.iter_mut().enumerate() {
+                            let x = _mm256_set1_epi32(bcast4(q.add(r * k + gi * g + s * 4)));
+                            ar[0] = $dot(ar[0], x, w0);
+                            ar[1] = $dot(ar[1], x, w1);
+                        }
+                    }
+                    for h in 0..2 {
+                        let s1 = _mm256_loadu_ps(sc.add(gi * n + ob * 16 + h * 8));
+                        let s2 = _mm256_loadu_ps(sz.add(gi * n + ob * 16 + h * 8));
+                        for (r, ar) in acc.iter().enumerate() {
+                            let av = _mm256_set1_ps(*a.add(r * groups + gi));
+                            let yp = y.add(r * n + ob * 16 + h * 8);
+                            let f =
+                                _mm256_fmadd_ps(_mm256_cvtepi32_ps(ar[h]), s1, _mm256_loadu_ps(yp));
+                            _mm256_storeu_ps(yp, _mm256_fmadd_ps(s2, av, f));
+                        }
+                    }
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn $inner(
+                w: &GroupWeights,
+                q: &[u8],
+                a: &[f32],
+                rows: usize,
+                y: &mut [f32],
+            ) {
+                let (n, k, groups) = (w.n, w.k, w.k / w.g);
+                y[..rows * n].fill(0.0);
+                for ob in 0..n / 16 {
+                    let mut r0 = 0;
+                    while r0 < rows {
+                        let rt = (rows - r0).min(4);
+                        let (qp, ap, yp) = (
+                            q.as_ptr().add(r0 * k),
+                            a.as_ptr().add(r0 * groups),
+                            y.as_mut_ptr().add(r0 * n),
+                        );
+                        match rt {
+                            1 => $tile::<1>(w, qp, ap, ob, yp),
+                            2 => $tile::<2>(w, qp, ap, ob, yp),
+                            3 => $tile::<3>(w, qp, ap, ob, yp),
+                            _ => $tile::<4>(w, qp, ap, ob, yp),
+                        }
+                        r0 += rt;
+                    }
+                }
+            }
+        };
+    }
+
+    kernels256!(tile_vnni256, inner_vnni256, "avx2,avxvnni,fma", dot_vnni);
+    kernels256!(tile_avx2, inner_avx2, "avx2,fma", dot_avx2);
+}
+
+/// The kernel with ARMv8.2's UDOT (u8 x u8 dot products of four into each u32 lane: the activations and the codes
+/// 0..15 alike, no offset to take off): a block's 64 unpacked codes are four vectors, outputs 0-3, 4-7, 8-11 and
+/// 12-15, each lane an output's four, as the x86 kernels read them.
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::GroupWeights;
+    use std::arch::aarch64::*;
+
+    /// UDOT: each lane of `acc` plus the dot product of its four u8 of `w` and of `x` (the intrinsic is not stable).
+    #[inline(always)]
+    unsafe fn udot(acc: uint32x4_t, w: uint8x16_t, x: uint8x16_t) -> uint32x4_t {
+        let mut r = acc;
+        std::arch::asm!(
+            "udot {r:v}.4s, {w:v}.16b, {x:v}.16b",
+            r = inout(vreg) r,
+            w = in(vreg) w,
+            x = in(vreg) x,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        r
+    }
+
+    /// RT rows x one output block, as the x86 tiles: every group's sums in registers (16 of the 32 with 4 rows), then
+    /// two fused multiply-adds per output into the running sums in `y`.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn tile<const RT: usize>(
+        w: &GroupWeights,
+        q: *const u8,
+        a: *const f32,
+        ob: usize,
+        y: *mut f32,
+    ) {
+        let (n, k, g) = (w.n, w.k, w.g);
+        let (groups, steps, gstride) = (k / g, g / 4, n * g);
+        let codes = w.unpacked.as_ptr() as *const u8;
+        let (sc, sz) = (w.scale.as_ptr(), w.scale_zero.as_ptr());
+        for gi in 0..groups {
+            let mut acc = [[vdupq_n_u32(0); 4]; RT];
+            let wg = codes.add(gi * gstride + ob * steps * 64);
+            for s in 0..steps {
+                let p = wg.add(s * 64);
+                let wv = [
+                    vld1q_u8(p),
+                    vld1q_u8(p.add(16)),
+                    vld1q_u8(p.add(32)),
+                    vld1q_u8(p.add(48)),
+                ];
+                for (r, ar) in acc.iter_mut().enumerate() {
+                    let at = q.add(r * k + gi * g + s * 4) as *const u32;
+                    let x = vreinterpretq_u8_u32(vdupq_n_u32(at.read_unaligned()));
+                    for (av, wc) in ar.iter_mut().zip(&wv) {
+                        *av = udot(*av, *wc, x);
+                    }
+                }
+            }
+            for v in 0..4 {
+                let s1 = vld1q_f32(sc.add(gi * n + ob * 16 + v * 4));
+                let s2 = vld1q_f32(sz.add(gi * n + ob * 16 + v * 4));
+                for (r, ar) in acc.iter().enumerate() {
+                    let av = vdupq_n_f32(*a.add(r * groups + gi));
+                    let yp = y.add(r * n + ob * 16 + v * 4);
+                    let f = vfmaq_f32(vld1q_f32(yp), vcvtq_f32_u32(ar[v]), s1);
+                    vst1q_f32(yp, vfmaq_f32(f, s2, av));
+                }
+            }
+        }
+    }
+
+    /// `GroupWeights::inner_plain` with UDOT: tiles of up to 4 rows, block by block.
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn inner(w: &GroupWeights, q: &[u8], a: &[f32], rows: usize, y: &mut [f32]) {
+        let (n, k, groups) = (w.n, w.k, w.k / w.g);
+        y[..rows * n].fill(0.0);
+        for ob in 0..n / 16 {
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                let (qp, ap, yp) = (
+                    q.as_ptr().add(r0 * k),
+                    a.as_ptr().add(r0 * groups),
+                    y.as_mut_ptr().add(r0 * n),
+                );
+                match rt {
+                    1 => tile::<1>(w, qp, ap, ob, yp),
+                    2 => tile::<2>(w, qp, ap, ob, yp),
+                    3 => tile::<3>(w, qp, ap, ob, yp),
+                    _ => tile::<4>(w, qp, ap, ob, yp),
+                }
+                r0 += rt;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -661,9 +907,59 @@ mod tests {
         (*seed >> 40) as f32 / (1u64 << 24) as f32
     }
 
+    /// Every path this CPU has, the plain one included.
+    fn paths() -> Vec<Path> {
+        let mut out = vec![Path::Plain];
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::is_x86_feature_detected as has;
+            if has!("avx512f") && has!("avx512vnni") && has!("avx512bw") && has!("fma") {
+                out.push(Path::Vnni512);
+            }
+            if has!("avx2") && has!("fma") {
+                out.push(Path::Avx2);
+                if has!("avxvnni") {
+                    out.push(Path::Vnni256);
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            out.push(Path::Dot);
+        }
+        out
+    }
+
+    /// The output as the first plain path made it: each code read from its nibble, the sums output by output, the
+    /// same two fused multiply-adds per group, then `forward_with`'s last scaling.
+    fn reference(w: &GroupWeights, x: &[f32]) -> Vec<f32> {
+        let (n, k, g) = (w.n, w.k, w.g);
+        let groups = k / g;
+        let rows = x.len() / k;
+        let mut y = vec![0f32; rows * n];
+        for r in 0..rows {
+            let mut q = vec![0u8; k];
+            let (sx, zx) = quantize_row(&x[r * k..(r + 1) * k], &mut q);
+            for o in 0..n {
+                let mut f = 0f32;
+                for gi in 0..groups {
+                    let qg = &q[gi * g..(gi + 1) * g];
+                    let acc: i32 = (0..g)
+                        .map(|i| qg[i] as i32 * w.code(o, gi * g + i) as i32)
+                        .sum();
+                    let sum: u32 = qg.iter().map(|&v| v as u32).sum();
+                    f = (acc as f32).mul_add(w.scale[gi * n + o], f);
+                    f = w.scale_zero[gi * n + o].mul_add(sum as f32, f);
+                }
+                y[r * n + o] = (f - zx as f32 * w.t[o]) * sx;
+            }
+        }
+        y
+    }
+
     /// The kernel against the dequantized weights times each row's quantized activations in f64 (the same
     /// quantization of x the kernel makes), for 4-bit codes, 3-bit ones (0..7) and a binary grid (zero 0.5), groups
-    /// of 64 and 16, odd output blocks, rows 1 to 31; and the VNNI path gives the plain path's bits.
+    /// of 64 and 16, odd output blocks, rows 1 to 31; and every path gives the first plain path's bits.
     #[test]
     fn linear_q4g_matches_the_dequantized_weights() {
         let mut seed = 9u64;
@@ -718,23 +1014,26 @@ mod tests {
                         );
                     }
                 }
-                let plain = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }
-                    .unwrap()
-                    .with_path(Path::Plain);
-                let mut yp = vec![0f32; rows * n];
-                plain.forward(&x, &mut yp, &mut GroupScratch::default());
-                assert_eq!(
-                    y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    yp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    "the kernel and the plain path, n {n} k {k} g {g} rows {rows}"
-                );
+                let want = reference(&weights, &x);
+                for path in paths() {
+                    let p = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }
+                        .unwrap()
+                        .with_path(path);
+                    let mut yp = vec![0f32; rows * n];
+                    p.forward(&x, &mut yp, &mut GroupScratch::default());
+                    assert_eq!(
+                        yp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{path:?} and the reference, n {n} k {k} g {g} rows {rows}"
+                    );
+                }
             }
         }
     }
 
     /// `GroupMoe` against its parts frame by frame: `route`, then for each chosen expert its first Linear on the
     /// frame alone, GELU of it plus b1, the second Linear, plus b2, weighted and summed in expert order; the same bits
-    /// (each Linear quantizes and computes its rows independently).
+    /// (each Linear quantizes and computes its rows independently), on every path.
     #[test]
     fn group_moe_matches_its_parts() {
         let mut seed = 21u64;
@@ -743,7 +1042,7 @@ mod tests {
         let mut experts = Vec::new();
         let mut keep = Vec::new();
         for _ in 0..e {
-            let mut layer = |n: usize, kk: usize, seed: &mut u64| {
+            let layer = |n: usize, kk: usize, seed: &mut u64| {
                 let codes: Vec<u8> = (0..n * kk).map(|_| (rnd(seed) * 8.0) as u8 % 8).collect();
                 let scales: Vec<f32> = (0..n * kk / g).map(|_| 0.01 + rnd(seed) * 0.05).collect();
                 let zeros: Vec<f32> = (0..n * kk / g).map(|_| (rnd(seed) * 8.0).floor()).collect();
@@ -759,7 +1058,7 @@ mod tests {
         }
         let b1: Vec<f32> = (0..e * f).map(|_| rnd(&mut seed) * 0.2 - 0.1).collect();
         let b2: Vec<f32> = (0..e * d).map(|_| rnd(&mut seed) * 0.2 - 0.1).collect();
-        let moe = GroupMoe {
+        let mut moe = GroupMoe {
             e,
             d,
             f,
@@ -771,34 +1070,45 @@ mod tests {
         };
         let n = 13;
         let x: Vec<f32> = (0..n * d).map(|_| rnd(&mut seed) * 2.0 - 1.0).collect();
-        let mut y = vec![0f32; n * d];
-        moe.forward(&x, &mut y, &mut GroupMoeScratch::default());
-        let mut rows = Vec::new();
-        route(&x, &router, e, d, k, &mut rows);
-        let mut want = vec![0f32; n * d];
-        let mut sc = GroupScratch::default();
-        for (ex, (l1, l2)) in moe.experts.iter().enumerate() {
-            for &(r, wt) in &rows[ex] {
-                let mut h = vec![0f32; f];
-                l1.forward(&x[r * d..(r + 1) * d], &mut h, &mut sc);
-                for (hv, &bv) in h.iter_mut().zip(&b1[ex * f..(ex + 1) * f]) {
-                    *hv = gelu(*hv + bv);
-                }
-                let mut o = vec![0f32; d];
-                l2.forward(&h, &mut o, &mut sc);
-                for ((wv, ov), &bv) in want[r * d..(r + 1) * d]
-                    .iter_mut()
-                    .zip(&o)
-                    .zip(&b2[ex * d..(ex + 1) * d])
-                {
-                    *wv += wt * (*ov + bv);
+        let mut first: Option<Vec<u32>> = None;
+        for path in paths() {
+            for (l1, l2) in moe.experts.iter_mut() {
+                l1.path = path;
+                l2.path = path;
+            }
+            let mut y = vec![0f32; n * d];
+            moe.forward(&x, &mut y, &mut GroupMoeScratch::default());
+            let mut rows = Vec::new();
+            route(&x, &router, e, d, k, &mut rows);
+            let mut want = vec![0f32; n * d];
+            let mut sc = GroupScratch::default();
+            for (ex, (l1, l2)) in moe.experts.iter().enumerate() {
+                for &(r, wt) in &rows[ex] {
+                    let mut h = vec![0f32; f];
+                    l1.forward(&x[r * d..(r + 1) * d], &mut h, &mut sc);
+                    for (hv, &bv) in h.iter_mut().zip(&b1[ex * f..(ex + 1) * f]) {
+                        *hv = gelu(*hv + bv);
+                    }
+                    let mut o = vec![0f32; d];
+                    l2.forward(&h, &mut o, &mut sc);
+                    for ((wv, ov), &bv) in want[r * d..(r + 1) * d]
+                        .iter_mut()
+                        .zip(&o)
+                        .zip(&b2[ex * d..(ex + 1) * d])
+                    {
+                        *wv += wt * (*ov + bv);
+                    }
                 }
             }
+            let bits: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                bits,
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{path:?}"
+            );
+            // and every path the plain one's
+            assert_eq!(&bits, first.get_or_insert_with(|| bits.clone()), "{path:?}");
         }
-        assert_eq!(
-            y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
         drop(keep);
     }
 
@@ -817,23 +1127,26 @@ mod tests {
             let scales: Vec<f32> = (0..n * groups).map(|_| 0.02).collect();
             let zeros: Vec<f32> = (0..n * groups).map(|_| 8.0).collect();
             let w = pack(&codes, n, k, g);
-            let weights = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }.unwrap();
             let rows = 30;
             let x: Vec<f32> = (0..rows * k).map(|_| rnd(&mut seed) * 2.0 - 1.0).collect();
-            let mut y = vec![0f32; rows * n];
-            let mut s = GroupScratch::default();
-            let mut t = Vec::new();
-            for _ in 0..500 {
-                let a = Instant::now();
-                weights.forward(&x, &mut y, &mut s);
-                t.push(a.elapsed().as_secs_f64());
+            for path in paths() {
+                let weights = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }
+                    .unwrap()
+                    .with_path(path);
+                let mut y = vec![0f32; rows * n];
+                let mut s = GroupScratch::default();
+                let mut t = Vec::new();
+                for _ in 0..500 {
+                    let a = Instant::now();
+                    weights.forward(&x, &mut y, &mut s);
+                    t.push(a.elapsed().as_secs_f64());
+                }
+                t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "LinearQ4G {k} -> {n} on {rows} rows ({path:?}): {:.4} ms",
+                    t[t.len() / 2] * 1e3
+                );
             }
-            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!(
-                "LinearQ4G {k} -> {n} on {rows} rows ({:?}): {:.4} ms",
-                weights.path,
-                t[t.len() / 2] * 1e3
-            );
         }
     }
 }
