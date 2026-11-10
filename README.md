@@ -219,6 +219,8 @@ x64 の Windows 10 / 11 なら release から入れられる（Windows PowerShel
 
 ```powershell
 irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
+# 変換モデルを Bletilla にする場合（オプションは install.ps1 と同じ）:
+& ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -Model Bletilla-v0.1-small
 ```
 
 `setup.ps1` は自分と組になった release の zip（SHA-256 固定）を取ってきて、その中の

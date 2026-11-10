@@ -6,9 +6,10 @@
 # Usage (Windows PowerShell 5.1 or pwsh):
 #   irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
 #   & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -RerankManifest <LM scorer manifest>
+#   & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -Model Bletilla-v0.1-small
 #   powershell -ExecutionPolicy Bypass -File setup.ps1 -Archive setsuna-ime-<version>-windows-x64.zip
 #
-# Options are install.ps1's (-ModelPrecision, -RerankManifest,
+# Options are install.ps1's (-ModelPrecision, -Model, -RerankManifest,
 # -NameDictionary, -NoDictionaries, -Force, -NoElevate), and -Archive <zip> installs a local
 # release zip instead of the download. Under iex this runs in the caller's
 # session: it throws on failure instead of exiting. ASCII only, as iex reads
@@ -17,6 +18,7 @@
 param(
     [ValidateSet('int8', 'fp32')]
     [string]$ModelPrecision = 'int8',
+    [string]$Model,
     [string]$RerankManifest,
     [string]$NameDictionary,
     [string]$Archive,
@@ -28,6 +30,7 @@ param(
 function Install-SetsunaIme {
     param(
         [string]$ModelPrecision,
+        [string]$Model,
         [string]$RerankManifest,
         [string]$NameDictionary,
         [string]$Archive,
@@ -73,6 +76,7 @@ function Install-SetsunaIme {
         if ($installer.Count -ne 1) { throw "not a Setsuna release zip: $zip" }
 
         $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer[0], '-ModelPrecision', $ModelPrecision)
+        if ($Model) { $argv += @('-Model', $Model) }
         if ($RerankManifest) { $argv += @('-RerankManifest', (Resolve-Path -LiteralPath $RerankManifest).Path) }
         if ($NameDictionary) { $argv += @('-NameDictionary', (Resolve-Path -LiteralPath $NameDictionary).Path) }
         if ($NoDictionaries) { $argv += '-NoDictionaries' }
@@ -87,5 +91,5 @@ function Install-SetsunaIme {
     }
 }
 
-Install-SetsunaIme -ModelPrecision $ModelPrecision -RerankManifest $RerankManifest -NameDictionary $NameDictionary `
+Install-SetsunaIme -ModelPrecision $ModelPrecision -Model $Model -RerankManifest $RerankManifest -NameDictionary $NameDictionary `
     -Archive $Archive -NoDictionaries:$NoDictionaries -Force:$Force -NoElevate:$NoElevate
