@@ -15,7 +15,15 @@
 # crates/linux/package.sh builds the release archive (crates/linux/install.sh
 # installs it) with these.
 cmake_minimum_required(VERSION 3.19)
-project(fcitx5-setsuna VERSION 0.1.3 LANGUAGES CXX)
+# The release's version (the workspace's in Cargo.toml), which the addon's
+# conf carries: fcitx5 shows it.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../../../Cargo.toml" setsuna_cargo_toml)
+string(REGEX MATCH "\\[workspace\\.package\\][^[]*\nversion = \"([0-9]+\\.[0-9]+\\.[0-9]+)\""
+    setsuna_version_line "${setsuna_cargo_toml}")
+if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR "no [workspace.package] version in Cargo.toml")
+endif()
+project(fcitx5-setsuna VERSION ${CMAKE_MATCH_1} LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(GNUInstallDirs)
