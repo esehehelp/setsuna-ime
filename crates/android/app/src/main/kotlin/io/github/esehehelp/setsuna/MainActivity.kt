@@ -131,6 +131,7 @@ class MainActivity : Activity() {
             appendLine(if (lexicon != null) "✓ 読みの辞書: ${lexicon.name}" else "・読みの辞書なし")
             append(if (analyzer != null) "✓ 解析器: ${analyzer.name}" else "・解析器なし")
             if (Downloads.state.isNotEmpty()) append("\n${Downloads.state}")
+            runCatching { Native.version() }.onSuccess { append("\nバージョン $it") }
         }
         // what each button gets as the catalog pins it and as things are (the full lexicon keeps the small one out)
         for ((button, what) in listOf(modelButton to Downloads.What.MODEL, dictionariesButton to Downloads.What.DICTIONARIES)) {

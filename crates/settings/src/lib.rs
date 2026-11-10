@@ -17,6 +17,9 @@ use setsuna_core::hidden::Hidden;
 use setsuna_core::learning::Learning;
 use setsuna_core::user_dict::{self, Entry};
 
+/// The version the page shows: the crate's and the commit built (build.rs).
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SETSUNA_COMMIT"), ")");
+
 /// The config being edited, as the page last loaded or saved it.
 pub struct Page {
     settings: Settings,
@@ -219,6 +222,7 @@ impl Settings {
         json!({
             "type": "state",
             "action": action,
+            "version": VERSION,
             "ok": ok,
             "status": status,
             "path": self.path.as_ref().map(|p| p.display().to_string()),
@@ -335,5 +339,9 @@ mod tests {
         let reply = page.handle(&json!({"type": "save", "config": {}})).unwrap();
         assert_eq!(reply["type"], "state");
         assert_eq!(reply["ok"], false);
+        assert!(reply["version"]
+            .as_str()
+            .unwrap()
+            .starts_with(concat!(env!("CARGO_PKG_VERSION"), " (")));
     }
 }

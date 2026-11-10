@@ -222,6 +222,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 </head>
 <body>
 <h1>Setsuna 設定</h1>
+<div class="path" id="version"></div>
 <div class="path" id="path"></div>
 <div class="banner" id="error" hidden></div>
 
@@ -1260,6 +1261,7 @@ window.setsuna = {
       return;
     }
     if (msg.type !== "state") return;
+    $("version").textContent = msg.version ? `バージョン ${msg.version}` : "";
     symbolKeys = msg.symbol_keys ?? [];
     learned = msg.learned;
     renderLearned();
