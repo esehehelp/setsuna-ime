@@ -45,9 +45,11 @@ object Assets {
 
     /**
      * The conversion model into `files/models/onnx`, where the engine takes
-     * the only manifest there, once per install of the app: the one unpacked
-     * before goes (the files `.bundled` lists after its stamp), and none is
-     * unpacked where another model is (one push-models.ps1 copied there).
+     * the only manifest there, once per install or update of the app: what
+     * the directory holds goes first, the model unpacked before or one
+     * push-models.ps1 copied there (user 2026-11-10: the update kept the
+     * Bletilla pushed before, not the Cymbidium it carries). A model pushed
+     * after the update is used until the next one (`.bundled`'s stamp).
      */
     private fun unpackModel(context: Context) {
         val names = context.assets.list(MODEL)?.toList().orEmpty()
@@ -57,11 +59,7 @@ object Assets {
         val installed = installed(context)
         val lines = if (stamp.isFile) stamp.readLines() else emptyList()
         if (lines.firstOrNull() == installed) return
-        for (name in lines.drop(1)) {
-            if (name.isNotEmpty() && !name.contains('/')) File(dir, name).delete()
-        }
-        stamp.delete()
-        if (dir.listFiles()?.any { it.name.endsWith(".manifest.json") } == true) return
+        dir.listFiles()?.forEach { if (it.isFile) it.delete() }
         dir.mkdirs()
         // stamped once all of it is in: else tried again at the next start
         if (names.all { copy(context, "$MODEL/$it", File(dir, it)) }) {

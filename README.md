@@ -436,8 +436,8 @@ pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモ
 ```
 
 モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`、`names/latin-names.tsv`）から読む。
-同梱の変換モデルは `onnx/` にほかのモデルがなければ展開し（アプリを更新すると前に展開したものと
-入れ替える）、`push-models.ps1` で入れたモデルがあればそちらを使う。`push-models.ps1` は
+アプリを入れるか更新するたびに、`onnx/` を同梱の変換モデルに入れ替える（前に `push-models.ps1`
+で入れたモデルも消える）。そのあと `push-models.ps1` で入れたモデルは、次の更新まで使う。`push-models.ps1` は
 `/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build（`-Release` なし）のときだけ使える。入れたあと、アプリの画面の「入力方法の設定を開く」で
 Setsuna を有効にし、キーボードの地球儀キーの長押し（入力方法の選択）で切り替える。
 `config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。
