@@ -21,11 +21,16 @@
         </activity>
 
         <!-- also the settings the system opens from its list of keyboards
-             (method.xml): exported for it -->
+             (method.xml): exported for it. Opened so (or by the keyboard's
+             gear) it is a task of its own, else the app's icon brought that
+             task back and the first screen, with the downloads, was out of
+             reach (user 2026-11-11: "設定画面しか見えないんだが"); from the
+             first screen's button it stays in that screen's task -->
         <activity
             android:name=".SettingsActivity"
             android:exported="true"
-            android:label="@string/settings" />
+            android:label="@string/settings"
+            android:taskAffinity="" />
 
         <service
             android:name=".SetsunaIme"
