@@ -180,8 +180,8 @@ struct AltList {
     user_words: Vec<String>,
 }
 
-/// Without a reading lexicon, the engine's candidates more than this below its
-/// top (log-probability) go: the lexicon drops what reads otherwise than the
+/// Without a reading lexicon (or with a partial one, `Lexicon::partial`), the
+/// engine's candidates more than this below its top (log-probability) go: the lexicon drops what reads otherwise than the
 /// reading (今陽, 況日, 日 for きょう), and without it they filled the list
 /// (user 2026-11-10, the phone without the dictionaries: "今日 日 今陽 昨日
 /// 今ウ 況日 京日 のような壊れた候補が多い"). Of the golds among
@@ -945,7 +945,10 @@ impl EngineBridge {
     /// and one the n-gram would favour, with fewer pairs to lose points on.
     fn order_engine_result(&self, result: &mut EngineResult) {
         use unicode_normalization::UnicodeNormalization;
-        if self.lexicon.is_none() {
+        // the lexicon that judges the engine's candidates: not a partial one,
+        // whose missing words are no slips (Lexicon::partial)
+        let ranking = self.lexicon.as_ref().filter(|l| !l.partial());
+        if ranking.is_none() {
             drop_far_below_top(result);
         }
         let mut n = result.candidates.len();
@@ -966,9 +969,7 @@ impl EngineBridge {
             .map(|c| scored && crate::postprocess::mixes_numerals(c))
             .collect();
         let any_mixed = mixed.iter().any(|&m| m);
-        if rest.is_empty()
-            && !any_mixed
-            && !(scored && (self.ngram.is_some() || self.lexicon.is_some()))
+        if rest.is_empty() && !any_mixed && !(scored && (self.ngram.is_some() || ranking.is_some()))
         {
             return;
         }
@@ -993,7 +994,7 @@ impl EngineBridge {
             }
             order = by.iter().map(|&k| order[k]).collect();
         }
-        if let (Some(lex), true) = (&self.lexicon, scored) {
+        if let (Some(lex), true) = (ranking, scored) {
             let r: String = reading.iter().collect();
             let mut costs: Vec<Option<f32>> = result
                 .candidates
@@ -7520,5 +7521,34 @@ mod tests {
         for gone in ["日", "今陽", "況日"] {
             assert!(!list.contains(&gone.to_string()), "{gone} in {list:?}");
         }
+    }
+
+    #[test]
+    fn a_partial_lexicon_lists_its_words_but_does_not_judge_the_engine() {
+        // the commoner words only (Lexicon::build_partial): 京 listed for
+        // きょう, the engine's order kept (its 今陽 unknown to the lexicon is
+        // no reason to drop 今日's neighbour), what is far below the top gone
+        let table = "今日	きょう	8.7	noun
+京	きょう	12.7	propn
+                     京都	きょうと	9.0	propn
+";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-partial-{}.lexicon",
+            std::process::id()
+        ));
+        let bytes = crate::lexicon::Lexicon::build_partial(table, None, 15.0).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "kyou");
+        answer_scored(&mock, &["今日", "今陽", "況日"], &[-0.1, -3.0, -9.0]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[..2], v(&["今日", "今陽"])[..]);
+        assert!(list.contains(&"京".to_string()), "{list:?}");
+        assert!(!list.contains(&"況日".to_string()), "{list:?}");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -2,7 +2,7 @@
 //! candidates up.
 //!
 //! ```text
-//! lexicon build <table.tsv> [connection.txt] <out.lexicon>
+//! lexicon build [--max-cost <nats>] <table.tsv> [connection.txt] <out.lexicon>
 //! lexicon cost <file.lexicon> <reading> <surface>...
 //! lexicon convert <file.lexicon> <reading>...
 //! lexicon words <file.lexicon> <reading>...
@@ -10,7 +10,8 @@
 //! ```
 //!
 //! `build` compiles the table and the connection costs (the module docs say
-//! what they hold) into the mapped file the IME reads; `cost` prints each
+//! what they hold) into the mapped file the IME reads (with `--max-cost`,
+//! the words up to that cost only, the file marked partial); `cost` prints each
 //! surface's cheapest reading as the reading, and the lexicon's entries for
 //! it; `convert` the lexicon's own conversions of each reading; `words` the
 //! words it lists for a reading of one word (`word_candidates`) and, for a
@@ -22,7 +23,16 @@ use anyhow::{bail, Context, Result};
 use setsuna_core::lexicon::{Lexicon, CLASSES};
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // build --max-cost <nats>: the commoner words only, a partial lexicon
+    let mut max_cost: Option<f32> = None;
+    if args.first().map(String::as_str) == Some("build")
+        && args.get(1).map(String::as_str) == Some("--max-cost")
+    {
+        let v = args.get(2).context("--max-cost <nats>")?;
+        max_cost = Some(v.parse().with_context(|| format!("--max-cost {v}"))?);
+        args.drain(1..3);
+    }
     match args.first().map(String::as_str) {
         Some("build") if args.len() == 3 || args.len() == 4 => {
             let table = std::fs::read_to_string(&args[1]).with_context(|| args[1].clone())?;
@@ -32,12 +42,16 @@ fn main() -> Result<()> {
             };
             let out = args.last().unwrap();
             let t = std::time::Instant::now();
-            let bytes = Lexicon::build(&table, connection.as_deref())?;
+            let bytes = match max_cost {
+                Some(m) => Lexicon::build_partial(&table, connection.as_deref(), m)?,
+                None => Lexicon::build(&table, connection.as_deref())?,
+            };
             std::fs::write(out, &bytes).with_context(|| out.clone())?;
             let lex = Lexicon::open(std::path::Path::new(out))?;
             eprintln!(
-                "{} entries, {:.1} MB, {:.1} s",
+                "{} entries{}, {:.1} MB, {:.1} s",
                 lex.len(),
+                if lex.partial() { " (partial)" } else { "" },
                 bytes.len() as f64 / 1e6,
                 t.elapsed().as_secs_f64()
             );

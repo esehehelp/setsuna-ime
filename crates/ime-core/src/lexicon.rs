@@ -22,7 +22,8 @@
 //! exp(-cost(r', l)), below 0 for a pair likelier than so. `build` compiles
 //! them into the file the IME maps (`LEXICON1`), little-endian: a 64-byte
 //! header (magic, version u32 = 3, keys u32, entries u32, key_bytes u32,
-//! reading_bytes u32, ids u32) and then, each padded to 8 bytes: key_off
+//! reading_bytes u32, ids u32, flags u32: bit 0 `partial`, zeros after) and
+//! then, each padded to 8 bytes: key_off
 //! u32[keys + 1] and key_blob u8[key_bytes] (the surfaces, UTF-8, ascending
 //! by bytes), key_first u32[keys + 1] (each surface's entries), entry
 //! u64[entries] (reading offset 32 bits, reading length 8, class 8, cost in
@@ -109,6 +110,8 @@ pub const CHAR_WORDS_AT: usize = 9;
 const MAGIC: &[u8; 8] = b"LEXICON1";
 const VERSION: usize = 3;
 const HEADER: usize = 64;
+/// The header's flag of a lexicon of the commoner words only (`partial`).
+const FLAG_PARTIAL: usize = 1;
 /// The context id of what has none: a kana, digit or symbol spelled as
 /// typed, a word of a table without ids. It follows and precedes anything
 /// at no cost.
@@ -178,6 +181,8 @@ pub struct Lexicon {
     entries: usize,
     /// The context ids the connection table has (0: none).
     ids: usize,
+    /// It holds the commoner words only (`build_partial`).
+    partial: bool,
     connection_weight: f32,
     /// Byte offsets of key_off, key_blob, key_first, entry, reading_blob,
     /// by_reading, context, connection.
@@ -228,6 +233,7 @@ impl Lexicon {
         let (keys, entries, key_bytes, reading_bytes) =
             (u32_at(12), u32_at(16), u32_at(20), u32_at(24));
         let ids = if version == 2 { 0 } else { u32_at(28) };
+        let partial = u32_at(32) & FLAG_PARTIAL != 0;
         let mut sizes = vec![
             4 * (keys + 1),
             key_bytes,
@@ -251,9 +257,18 @@ impl Lexicon {
             keys,
             entries,
             ids,
+            partial,
             connection_weight: CONNECTION_WEIGHT,
             at,
         })
+    }
+
+    /// Whether the lexicon holds the commoner words only (`build_partial`):
+    /// a candidate it reads at a high cost, or not at all, may well be
+    /// right, so the IME takes its words but neither ranks nor drops the
+    /// engine's candidates by it.
+    pub fn partial(&self) -> bool {
+        self.partial
     }
 
     /// Weigh the connection table's costs by `w` instead of
@@ -736,6 +751,18 @@ impl Lexicon {
     /// of a lexicon; without a connection table its words connect at no
     /// cost.
     pub fn build(table: &str, connection: Option<&str>) -> Result<Vec<u8>> {
+        Self::build_with(table, connection, None)
+    }
+
+    /// `build` of the table's words of a cost up to `max_cost` (nats), the
+    /// file marked `partial`: the 3,700,000 words of lexicon-v1 are 232 MB,
+    /// those up to 15 (68,000: 京 12.7, 橋 13.0, 箸 12.2) 3.0 MB without the
+    /// connection table (user 2026-11-10: 辞書でかいしインストールできなくない？).
+    pub fn build_partial(table: &str, connection: Option<&str>, max_cost: f32) -> Result<Vec<u8>> {
+        Self::build_with(table, connection, Some(max_cost))
+    }
+
+    fn build_with(table: &str, connection: Option<&str>, max_cost: Option<f32>) -> Result<Vec<u8>> {
         let mut raw: Vec<f64> = Vec::new();
         let mut ids = 0usize;
         if let Some(text) = connection {
@@ -770,6 +797,9 @@ impl Lexicon {
             let cost: f32 = c
                 .parse()
                 .with_context(|| format!("line {}: cost {c}", n + 1))?;
+            if max_cost.is_some_and(|m| cost > m) {
+                continue;
+            }
             let class = f
                 .next()
                 .and_then(|k| CLASSES.iter().position(|&x| x == k))
@@ -852,6 +882,7 @@ impl Lexicon {
             key_blob.len(),
             reading_blob.len(),
             ids,
+            if max_cost.is_some() { FLAG_PARTIAL } else { 0 },
         ] {
             out.extend_from_slice(&(v as u32).to_le_bytes());
         }
@@ -1107,5 +1138,31 @@ mod tests {
         assert_eq!(chars("まる"), ["丸", "円"]);
         // three kana are a word's reading, not a char's
         assert!(chars("まるい").is_empty());
+    }
+
+    #[test]
+    fn a_partial_lexicon_keeps_the_commoner_words_and_says_so() {
+        let table = "今日	きょう	8.7	noun
+京	きょう	12.7	propn
+卿	きょう	16.2	noun
+";
+        let full = Lexicon::from_bytes(Bytes::Owned(Lexicon::build(table, None).unwrap())).unwrap();
+        assert!(!full.partial());
+        assert_eq!(full.len(), 3);
+        let part = Lexicon::from_bytes(Bytes::Owned(
+            Lexicon::build_partial(table, None, 15.0).unwrap(),
+        ))
+        .unwrap();
+        assert!(part.partial());
+        assert_eq!(part.len(), 2);
+        let words: Vec<String> = part
+            .word_candidates("きょう")
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        assert!(
+            words.contains(&"京".to_string()) && !words.contains(&"卿".to_string()),
+            "{words:?}"
+        );
     }
 }
