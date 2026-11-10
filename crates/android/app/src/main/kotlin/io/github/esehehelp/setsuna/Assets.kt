@@ -8,62 +8,25 @@ object Assets {
     /** The mixed input model (crates/ime-core/data/mixed). */
     private val MIXED = listOf("kana.tsv", "latin.tsv", "params.txt")
 
-    /** The conversion model (assets/model: build.ps1 puts models.json's own there). */
-    private const val MODEL = "model"
-
-    /** When the app was installed or last updated: what an unpacking is stamped with. */
-    private fun installed(context: Context): String =
-        context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime.toString()
-
-    /** Copy the asset `path` to `to`, through a file beside it renamed over it. */
-    private fun copy(context: Context, path: String, to: File): Boolean {
-        val tmp = File(to.parentFile, "${to.name}.new")
-        context.assets.open(path).use { input ->
-            tmp.outputStream().use { input.copyTo(it) }
-        }
-        return tmp.renameTo(to)
-    }
-
     /**
      * Unpack the mixed input model into `files/mixed` once per install of
-     * the app (an update brings its own model), and the conversion model
-     * into `files/models/onnx` (see [unpackModel]).
+     * the app (an update brings its own model). The conversion model, the
+     * lexicon and the analyzer are downloaded ([Downloads]).
      */
     fun unpack(context: Context) {
-        // a full disk leaves the model out, not the keyboard
-        runCatching { unpackModel(context) }
         val dir = File(context.filesDir, "mixed")
         val stamp = File(dir, ".installed")
-        val installed = installed(context)
+        val installed = context.packageManager
+            .getPackageInfo(context.packageName, 0).lastUpdateTime.toString()
         if (stamp.isFile && stamp.readText() == installed) return
         dir.mkdirs()
         for (name in MIXED) {
-            copy(context, "mixed/$name", File(dir, name))
+            val tmp = File(dir, "$name.new")
+            context.assets.open("mixed/$name").use { input ->
+                tmp.outputStream().use { input.copyTo(it) }
+            }
+            tmp.renameTo(File(dir, name))
         }
         stamp.writeText(installed)
-    }
-
-    /**
-     * The conversion model into `files/models/onnx`, where the engine takes
-     * the only manifest there, once per install or update of the app: what
-     * the directory holds goes first, the model unpacked before or one
-     * push-models.ps1 copied there (user 2026-11-10: the update kept the
-     * Bletilla pushed before, not the Cymbidium it carries). A model pushed
-     * after the update is used until the next one (`.bundled`'s stamp).
-     */
-    private fun unpackModel(context: Context) {
-        val names = context.assets.list(MODEL)?.toList().orEmpty()
-        if (names.isEmpty()) return
-        val dir = File(context.filesDir, "models/onnx")
-        val stamp = File(dir, ".bundled")
-        val installed = installed(context)
-        val lines = if (stamp.isFile) stamp.readLines() else emptyList()
-        if (lines.firstOrNull() == installed) return
-        dir.listFiles()?.forEach { if (it.isFile) it.delete() }
-        dir.mkdirs()
-        // stamped once all of it is in: else tried again at the next start
-        if (names.all { copy(context, "$MODEL/$it", File(dir, it)) }) {
-            stamp.writeText((listOf(installed) + names).joinToString("\n"))
-        }
     }
 }

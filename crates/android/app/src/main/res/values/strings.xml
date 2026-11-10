@@ -3,7 +3,9 @@
     <string name="app_name">Setsuna</string>
     <string name="ime_name">Setsuna</string>
     <string name="subtype_ja">日本語（ローマ字）</string>
-    <string name="no_engine">変換モデルがありません（ひらがなのみ）</string>
+    <string name="no_engine">変換モデルがありません（Setsuna のアプリでダウンロード）</string>
+    <string name="download_model">変換モデルをダウンロード（約 14 MB）</string>
+    <string name="download_dictionaries">読みの辞書と解析器をダウンロード（約 510 MB）</string>
     <string name="settings">Setsuna の設定</string>
     <string name="open_settings">入力方法の設定を開く</string>
     <string name="pick_ime">入力方法を切り替える</string>

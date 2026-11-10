@@ -416,10 +416,11 @@ JIS 配列の記号（! " # $ % & ' ( ) と、0 は ~）になり、変換中は
 （アプリの「Setsuna の設定」、Android の入力方法の設定からも）で、PC 版の設定 GUI と同じ
 ページ（`crates/settings/web/index.html`）を WebView で開く。キーボードの振動（タップと長押しを別々に）・
 キーの吹き出し・高さはここで、書き直し・候補の窓・PC のキーボードのキーなど Android にないものは出さない。
-APK は変換モデル（`models.json` の既定のもの、今は Cymbidium-v1.0-xsmall）を同梱し、
-初回の起動でアプリの `files/models/onnx` に展開するので、入れればそのまま変換できる。読みの辞書と
-解析器のアプリ内でのダウンロードと、配布用の鍵での署名はまだ（release の APK は debug の鍵で署名
-している）。IME の
+変換モデル（`models.json` の既定のもの、今は Cymbidium-v1.0-xsmall、約 14 MB）と読みの辞書・
+解析器（約 510 MB）は、アプリの画面のボタンで Hugging Face から取得する（PC 版と同じ固定した revision、
+サイズと SHA-256 を確かめてから置き、前に入っていたものと入れ替える。そのためアプリはインターネットの
+権限を持つが、通信するのはこのダウンロードだけ）。配布用の鍵での署名はまだ（release の APK は debug の
+鍵で署名している）。IME の
 ロジックは fcitx5 版と同じ `session`（ime-core）で、キーは X の keysym として渡す。
 エンジンは APK に `libsetsuna_engine.so` として入れた実行ファイルを子プロセスで動かし、
 ONNX Runtime は Microsoft の onnxruntime-android（1.28.0）のものを使う。エンジンの MoE
@@ -431,13 +432,12 @@ build に要るもの: Android SDK（platform 35 と NDK。`ANDROID_HOME`、既�
 `rustup target add aarch64-linux-android`、`cargo install cargo-ndk`。
 
 ```powershell
-pwsh crates/android/build.ps1 -Install   # Rust 部分とエンジンを arm64 で build、モデルを同梱した APK を作って adb で入れる
+pwsh crates/android/build.ps1 -Install   # Rust 部分とエンジンを arm64 で build、APK を作って adb で入れる
 pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモデル・読みの辞書・解析器・名前の辞書をアプリへ
 ```
 
 モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`、`names/latin-names.tsv`）から読む。
-アプリを入れるか更新するたびに、`onnx/` を同梱の変換モデルに入れ替える（前に `push-models.ps1`
-で入れたモデルも消える）。そのあと `push-models.ps1` で入れたモデルは、次の更新まで使う。`push-models.ps1` は
+アプリでのダウンロードはそこへ入れ、`push-models.ps1` は
 `/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build（`-Release` なし）のときだけ使える。入れたあと、アプリの画面の「入力方法の設定を開く」で
 Setsuna を有効にし、キーボードの地球儀キーの長押し（入力方法の選択）で切り替える。
 `config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。

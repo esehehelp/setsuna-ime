@@ -19,8 +19,9 @@ import java.io.File
 
 /**
  * The app's first screen: whether Setsuna is on as an input method and has
- * a model, its settings ([SettingsActivity]), the way to turn it on, and a
- * field to try it in.
+ * a model, the downloads of the model and of the dictionaries ([Downloads]),
+ * its settings ([SettingsActivity]), the way to turn it on, and a field to
+ * try it in.
  */
 class MainActivity : Activity() {
     private lateinit var status: TextView
@@ -41,6 +42,14 @@ class MainActivity : Activity() {
             setPadding(0, pad, 0, pad)
         }
         column.addView(status)
+        column.addView(Button(this).apply {
+            text = getString(R.string.download_model)
+            setOnClickListener { Downloads.start(this@MainActivity, Downloads.What.MODEL) }
+        })
+        column.addView(Button(this).apply {
+            text = getString(R.string.download_dictionaries)
+            setOnClickListener { Downloads.start(this@MainActivity, Downloads.What.DICTIONARIES) }
+        })
         column.addView(Button(this).apply {
             text = getString(R.string.settings)
             setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
@@ -74,7 +83,13 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        Downloads.onChange = { runOnUiThread { refresh() } }
         refresh()
+    }
+
+    override fun onPause() {
+        Downloads.onChange = null
+        super.onPause()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -95,13 +110,25 @@ class MainActivity : Activity() {
             Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD) ==
                 ours.flattenToShortString()
         }
-        val onnx = File(filesDir, "models/onnx")
-        val manifest = onnx.listFiles()?.firstOrNull { it.name.endsWith("manifest.json") }
+        val models = File(filesDir, "models")
+        val manifest = File(models, "onnx").listFiles()?.firstOrNull { it.name.endsWith("manifest.json") }
+        val lexicon = File(models, "lexicon").listFiles()?.firstOrNull { it.name.endsWith(".lexicon") }
+        val analyzer = File(models, "analyzer").listFiles()?.firstOrNull {
+            File(it, "analyzer.manifest.json").isFile
+        }
         status.text = buildString {
             appendLine(if (enabled) "✓ 入力方法として有効" else "✗ 入力方法として無効（下のボタンから有効に）")
             appendLine(if (current) "✓ 今の入力方法" else "・今の入力方法ではありません")
-            appendLine(if (manifest != null) "✓ モデル: ${manifest.name}" else "✗ モデルがありません")
-            append("モデルの置き場所: ${onnx.path}")
+            appendLine(
+                if (manifest != null) {
+                    "✓ 変換モデル: ${manifest.name.removeSuffix(".manifest.json")}"
+                } else {
+                    "✗ 変換モデルがありません（下のボタンでダウンロード、約 14 MB）"
+                },
+            )
+            appendLine(if (lexicon != null) "✓ 読みの辞書: ${lexicon.name}" else "・読みの辞書なし")
+            append(if (analyzer != null) "✓ 解析器: ${analyzer.name}" else "・解析器なし")
+            if (Downloads.state.isNotEmpty()) append("\n${Downloads.state}")
         }
     }
 }
