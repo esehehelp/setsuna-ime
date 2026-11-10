@@ -180,6 +180,45 @@ struct AltList {
     user_words: Vec<String>,
 }
 
+/// Without a reading lexicon, the engine's candidates more than this below its
+/// top (log-probability) go: the lexicon drops what reads otherwise than the
+/// reading (今陽, 況日, 日 for きょう), and without it they filled the list
+/// (user 2026-11-10, the phone without the dictionaries: "今日 日 今陽 昨日
+/// 今ウ 況日 京日 のような壊れた候補が多い"). Of the golds among
+/// Cymbidium-v1.0-xsmall's 20 candidates, 99.47% (wiki_fresh_v2) / 98.35%
+/// (AJIMEE) stay, of what the lexicon would drop 13% (at 8: 99.77 / 98.90,
+/// 29%), the list 5.3 long; Bletilla-v0.1-small alike.
+const NO_LEXICON_MARGIN: f32 = 6.0;
+
+/// The engine's candidates more than `NO_LEXICON_MARGIN` below its top
+/// dropped, the top kept (the reading and its katakana come after, from
+/// `kana_candidates::arrange`).
+fn drop_far_below_top(result: &mut EngineResult) {
+    let n = result.candidates.len();
+    if result.scores.len() != n || n < 2 {
+        return;
+    }
+    let top = result
+        .scores
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let keep: Vec<bool> = result
+        .scores
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| i == 0 || s >= top - NO_LEXICON_MARGIN)
+        .collect();
+    let mut k = keep.iter();
+    result.candidates.retain(|_| *k.next().unwrap());
+    let mut k = keep.iter();
+    result.scores.retain(|_| *k.next().unwrap());
+    if result.reading_pos.len() == n {
+        let mut k = keep.iter();
+        result.reading_pos.retain(|_| *k.next().unwrap());
+    }
+}
+
 /// Candidates of the other reading offered (its first `ALT_EARLY` right
 /// after the first `ALT_EARLY` of the mixed one), besides its user
 /// dictionary words.
@@ -906,6 +945,9 @@ impl EngineBridge {
     /// and one the n-gram would favour, with fewer pairs to lose points on.
     fn order_engine_result(&self, result: &mut EngineResult) {
         use unicode_normalization::UnicodeNormalization;
+        if self.lexicon.is_none() {
+            drop_far_below_top(result);
+        }
         let mut n = result.candidates.len();
         if n < 2 {
             return;
@@ -7458,5 +7500,25 @@ mod tests {
         bridge.composing.set_voicing(false);
         type_str(&mut bridge, "tuzuku");
         assert_eq!(mock.dispatched_readings().last().unwrap(), "つずく");
+    }
+
+    #[test]
+    fn without_a_lexicon_the_candidates_far_below_the_top_go() {
+        // user 2026-11-10, a phone without the dictionaries: 今日 日 今陽 昨日 今ウ 況日 京日
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "kyou");
+        *mock.state.next.borrow_mut() = Some(EngineResult {
+            req_id: mock.state.dispatched.borrow().last().map_or(1, |d| d.0),
+            reading: "きょう".into(),
+            candidates: v(&["今日", "京", "日", "今陽", "況日"]),
+            scores: vec![-0.1, -4.0, -9.9, -12.4, -13.0],
+            ..Default::default()
+        });
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[..2], v(&["今日", "京"])[..]);
+        for gone in ["日", "今陽", "況日"] {
+            assert!(!list.contains(&gone.to_string()), "{gone} in {list:?}");
+        }
     }
 }
