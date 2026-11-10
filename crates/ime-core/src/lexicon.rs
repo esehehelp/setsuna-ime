@@ -112,6 +112,16 @@ const VERSION: usize = 3;
 const HEADER: usize = 64;
 /// The header's flag of a lexicon of the commoner words only (`partial`).
 const FLAG_PARTIAL: usize = 1;
+
+/// One kanji (CJK unified ideographs, their extensions, compatibility ones).
+fn one_kanji(s: &str) -> bool {
+    let mut c = s.chars();
+    match (c.next(), c.next()) {
+        (Some(k), None) => matches!(k as u32,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x3FFFF),
+        _ => false,
+    }
+}
 /// The context id of what has none: a kana, digit or symbol spelled as
 /// typed, a word of a table without ids. It follows and precedes anything
 /// at no cost.
@@ -754,10 +764,13 @@ impl Lexicon {
         Self::build_with(table, connection, None)
     }
 
-    /// `build` of the table's words of a cost up to `max_cost` (nats), the
-    /// file marked `partial`: the 3,700,000 words of lexicon-v1 are 232 MB,
-    /// those up to 15 (68,000: 京 12.7, 橋 13.0, 箸 12.2) 3.0 MB without the
-    /// connection table (user 2026-11-10: 辞書でかいしインストールできなくない？).
+    /// `build` of the table's words of a cost up to `max_cost` (nats) and
+    /// every one-char kanji with all its readings however dear (user
+    /// 2026-11-10: "単語辞書だけ作るか。絶対に一文字の漢字とその読みを複数"),
+    /// the file marked `partial`: the 3,700,000 words of lexicon-v1 are 232
+    /// MB, those up to 15 (68,000: 京 12.7, 橋 13.0, 箸 12.2) and the 5,254
+    /// one-char kanji's 24,831 readings 3.9 MB without the connection table
+    /// (user 2026-11-10: 辞書でかいしインストールできなくない？).
     pub fn build_partial(table: &str, connection: Option<&str>, max_cost: f32) -> Result<Vec<u8>> {
         Self::build_with(table, connection, Some(max_cost))
     }
@@ -797,7 +810,7 @@ impl Lexicon {
             let cost: f32 = c
                 .parse()
                 .with_context(|| format!("line {}: cost {c}", n + 1))?;
-            if max_cost.is_some_and(|m| cost > m) {
+            if max_cost.is_some_and(|m| cost > m) && !one_kanji(s) {
                 continue;
             }
             let class = f
@@ -1142,27 +1155,32 @@ mod tests {
 
     #[test]
     fn a_partial_lexicon_keeps_the_commoner_words_and_says_so() {
-        let table = "今日	きょう	8.7	noun
-京	きょう	12.7	propn
-卿	きょう	16.2	noun
-";
+        let table = "今日\tきょう\t8.7\tnoun\n京\tきょう\t12.7\tpropn\n\
+                     卿\tきょう\t16.2\tnoun\n京\tみやこ\t21.0\tnoun\n\
+                     教会\tきょうかい\t16.5\tnoun\n";
         let full = Lexicon::from_bytes(Bytes::Owned(Lexicon::build(table, None).unwrap())).unwrap();
         assert!(!full.partial());
-        assert_eq!(full.len(), 3);
+        assert_eq!(full.len(), 5);
         let part = Lexicon::from_bytes(Bytes::Owned(
             Lexicon::build_partial(table, None, 15.0).unwrap(),
         ))
         .unwrap();
         assert!(part.partial());
-        assert_eq!(part.len(), 2);
+        // the dear word goes, the one-char kanji stay with every reading
+        assert_eq!(part.len(), 4);
         let words: Vec<String> = part
             .word_candidates("きょう")
             .into_iter()
             .map(|(w, _)| w)
             .collect();
         assert!(
-            words.contains(&"京".to_string()) && !words.contains(&"卿".to_string()),
+            words.contains(&"京".to_string()) && words.contains(&"卿".to_string()),
             "{words:?}"
         );
+        assert!(!part
+            .word_candidates("きょうかい")
+            .iter()
+            .any(|(w, _)| w == "教会"));
+        assert!(part.cost("京", "みやこ").is_some());
     }
 }

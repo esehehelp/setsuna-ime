@@ -7528,10 +7528,8 @@ mod tests {
         // the commoner words only (Lexicon::build_partial): 京 listed for
         // きょう, the engine's order kept (its 今陽 unknown to the lexicon is
         // no reason to drop 今日's neighbour), what is far below the top gone
-        let table = "今日	きょう	8.7	noun
-京	きょう	12.7	propn
-                     京都	きょうと	9.0	propn
-";
+        let table = "今日\tきょう\t8.7\tnoun\n京\tきょう\t12.7\tpropn\n\
+                     京都\tきょうと\t9.0\tpropn\n";
         let path = std::env::temp_dir().join(format!(
             "setsuna-bridge-partial-{}.lexicon",
             std::process::id()
