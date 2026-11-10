@@ -89,6 +89,19 @@
         }
       ]
     },
+    "lexicon-small": {
+      "repository": "esehe/setsuna-ime-dict",
+      "revision": "c514bed1404c6b4be32ef42bfa430019da798905",
+      "license": "CC-BY-SA-4.0",
+      "entry": "lexicon-v1-small.lexicon",
+      "files": [
+        {
+          "path": "lexicon-v1-small.lexicon",
+          "size": 3562976,
+          "sha256": "2f09a8af09dd26a441a268c5f77ecdcc1354288ba1cd198d4c5b353a79effb44"
+        }
+      ]
+    },
     "analyzer": {
       "repository": "esehe/setsuna-ime-dict",
       "revision": "cc86612d5a0e19553e0799f3e7c7056c9f10cf5b",
