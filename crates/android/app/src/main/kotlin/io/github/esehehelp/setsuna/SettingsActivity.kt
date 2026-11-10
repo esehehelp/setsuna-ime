@@ -3,13 +3,16 @@ package io.github.esehehelp.setsuna
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.Intent
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.view.inputmethod.InputMethodManager
 import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -18,14 +21,19 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import org.json.JSONObject
+import java.io.File
 
 /**
- * The settings: the desktop app's page (crates/settings/web/index.html, an
- * asset) in a WebView. Its messages go to [Native.settings], which answers
- * the config's and the user dictionary's as the desktop app does, on the
- * app's own config.toml; the keyboard's (`keyboard_load`, `keyboard_save`)
- * are this activity's ([KeyboardPrefs]). The page hides what the app does
- * not have (the rewriter, the candidate window, a PC keyboard's keys).
+ * The app's one screen (user 2026-11-11: "設定画面だけにしたら？", a first
+ * screen of its own having been hidden behind this one): the desktop app's
+ * settings page (crates/settings/web/index.html, an asset) in a WebView. Its
+ * messages go to [Native.settings], which answers the config's and the user
+ * dictionary's as the desktop app does, on the app's own config.toml; the
+ * keyboard's (`keyboard_load`, `keyboard_save`) are this activity's
+ * ([KeyboardPrefs]), and so are the app's (`app_load`, `app_download`,
+ * `app_open_ime`, `app_pick_ime`: whether Setsuna is on, what models/ holds,
+ * the downloads of [Downloads]). The page hides what the app does not have
+ * (the rewriter, the candidate window, a PC keyboard's keys).
  */
 class SettingsActivity : Activity() {
     private lateinit var web: WebView
@@ -105,6 +113,69 @@ class SettingsActivity : Activity() {
         super.onDestroy()
     }
 
+    override fun onResume() {
+        super.onResume()
+        Downloads.onChange = { pushApp() }
+        pushApp()
+    }
+
+    override fun onPause() {
+        Downloads.onChange = null
+        super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // back from the input method picker or the system's settings
+        if (hasFocus) pushApp()
+    }
+
+    /** [appState] to the page, from any thread (before the page is up, nothing). */
+    private fun pushApp() {
+        val state = appState()
+        web.post { web.evaluateJavascript("window.setsuna && setsuna.receive($state)", null) }
+    }
+
+    /**
+     * The app's own state for the page's first section: whether Setsuna is on
+     * as an input method and the current one, what models/ holds, how the
+     * download goes, and what each download would get (label, MB).
+     */
+    private fun appState(): String {
+        // the input method settings themselves are closed to apps past API 33
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        val ours = ComponentName(this, SetsunaIme::class.java)
+        val enabled = imm.enabledInputMethodList.any { it.component == ours }
+        val current = if (Build.VERSION.SDK_INT >= 34) {
+            imm.currentInputMethodInfo?.component == ours
+        } else {
+            @Suppress("DEPRECATION")
+            Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD) ==
+                ours.flattenToShortString()
+        }
+        val models = File(filesDir, "models")
+        val manifest = File(models, "onnx").listFiles()?.firstOrNull { it.name.endsWith("manifest.json") }
+        val lexicon = File(models, "lexicon").listFiles()?.firstOrNull { it.name.endsWith(".lexicon") }
+        val analyzer = File(models, "analyzer").listFiles()?.firstOrNull {
+            File(it, "analyzer.manifest.json").isFile
+        }
+        val j = JSONObject()
+            .put("type", "app")
+            .put("enabled", enabled)
+            .put("current", current)
+            .put("model", manifest?.name?.removeSuffix(".manifest.json") ?: JSONObject.NULL)
+            .put("lexicon", lexicon?.name ?: JSONObject.NULL)
+            .put("analyzer", analyzer?.name ?: JSONObject.NULL)
+            .put("download", Downloads.state)
+            .put("running", Downloads.running)
+        for ((key, what) in listOf("get_model" to Downloads.What.MODEL, "get_dicts" to Downloads.What.DICTIONARIES)) {
+            runCatching { Downloads.describe(this, what) }.onSuccess { (label, size) ->
+                j.put(key, JSONObject().put("label", label).put("mb", Math.round(size / 1048576.0)))
+            }
+        }
+        return j.toString()
+    }
+
     /** The page's `SetsunaAndroid.post`, called on the WebView's bridge thread. */
     private inner class Bridge {
         @JavascriptInterface
@@ -116,6 +187,24 @@ class SettingsActivity : Activity() {
                 "keyboard_save" -> {
                     msg.optJSONObject("keyboard")?.let { KeyboardPrefs.save(context, it) }
                     keyboard(KeyboardPrefs.load(context), "保存しました。次の入力から反映されます。")
+                }
+                "app_load" -> appState()
+                "app_download" -> {
+                    val what = if (msg.optString("what") == "dictionaries") {
+                        Downloads.What.DICTIONARIES
+                    } else {
+                        Downloads.What.MODEL
+                    }
+                    Downloads.start(context, what)
+                    appState()
+                }
+                "app_open_ime" -> {
+                    runOnUiThread { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) }
+                    null
+                }
+                "app_pick_ime" -> {
+                    runOnUiThread { (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker() }
+                    null
                 }
                 else -> Native.settings(filesDir.path, message)
             } ?: return

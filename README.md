@@ -412,12 +412,13 @@ arm64 の Android 8 以降が対象。キーボードは Gboard の日本語 QWE
 JIS 配列の記号（! " # $ % & ' ( ) と、0 は ~）になり、変換中は地球儀キーが ? になる。ライブ変換・
 候補バー・確定のほか、ツールバーからテキスト編集（カーソル移動、選択、すべて選択、
 切り取り・コピー・貼り付け）とクリップボード（コピーした文字の一覧。1 時間、メモリだけに
-置き、パスワードなど機密の印のついたものは残さない）が使える。設定はツールバーの歯車
-（アプリの「Setsuna の設定」、Android の入力方法の設定からも）で、PC 版の設定 GUI と同じ
-ページ（`crates/settings/web/index.html`）を WebView で開く。キーボードの振動（タップと長押しを別々に）・
+置き、パスワードなど機密の印のついたものは残さない）が使える。アプリの画面は設定画面ひとつで
+（アプリのアイコン、ツールバーの歯車、Android の入力方法の設定のどこからでも同じ画面）、PC 版の設定 GUI と同じ
+ページ（`crates/settings/web/index.html`）を WebView で開く。先頭の「この端末」に、入力方法として有効か・
+今の入力方法か、入っているモデルと辞書、ダウンロードのボタン、入力方法の切り替えと試し書きの欄がある。キーボードの振動（タップと長押しを別々に）・
 キーの吹き出し・高さはここで、書き直し・候補の窓・PC のキーボードのキーなど Android にないものは出さない。
 変換モデル（`models.json` の既定のもの、今は Cymbidium-v1.0-xsmall、約 14 MB）と読みの辞書・
-解析器（約 510 MB）は、アプリの画面のボタンで Hugging Face から取得する（PC 版と同じ固定した revision、
+解析器（約 510 MB）は、「この端末」のボタンで Hugging Face から取得する（PC 版と同じ固定した revision、
 サイズと SHA-256 を確かめてから置き、前に入っていたものと入れ替える。そのためアプリはインターネットの
 権限を持つが、通信するのはこのダウンロードだけ）。配布用の鍵での署名はまだ（release の APK は debug の
 鍵で署名している）。`models.json` が `lexicon-small`（よく使う語と、すべての一文字の漢字とその読み、
@@ -440,7 +441,7 @@ pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモ
 
 モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`、`names/latin-names.tsv`）から読む。
 アプリでのダウンロードはそこへ入れ、`push-models.ps1` は
-`/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build（`-Release` なし）のときだけ使える。入れたあと、アプリの画面の「入力方法の設定を開く」で
+`/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build（`-Release` なし）のときだけ使える。入れたあと、「この端末」の「入力方法の設定」で
 Setsuna を有効にし、キーボードの地球儀キーの長押し（入力方法の選択）で切り替える。
 `config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。
 

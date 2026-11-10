@@ -254,16 +254,6 @@ pub unsafe extern "system" fn Java_io_github_esehehelp_setsuna_Native_view<'l>(
     }
 }
 
-/// The version and the commit built, as the settings page shows them.
-#[no_mangle]
-pub extern "system" fn Java_io_github_esehehelp_setsuna_Native_version<'l>(
-    env: JNIEnv<'l>,
-    _class: JClass<'l>,
-) -> jstring {
-    env.new_string(setsuna_settings::VERSION)
-        .map_or(std::ptr::null_mut(), |s| s.into_raw())
-}
-
 /// A message of the settings page (JSON) for the config under the app's
 /// files directory: the reply as JSON, null for none (`settings::handle`).
 /// Called on the WebView's bridge thread, not the service's.

@@ -72,8 +72,4 @@ object Native {
      */
     @JvmStatic
     external fun settings(files: String, message: String): String?
-
-    /** The version and the commit built ("0.2.3 (d4dbe59)"), as the settings page shows them. */
-    @JvmStatic
-    external fun version(): String
 }
