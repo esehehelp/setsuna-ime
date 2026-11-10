@@ -25,6 +25,8 @@ import java.io.File
  */
 class MainActivity : Activity() {
     private lateinit var status: TextView
+    private lateinit var modelButton: Button
+    private lateinit var dictionariesButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,14 +44,14 @@ class MainActivity : Activity() {
             setPadding(0, pad, 0, pad)
         }
         column.addView(status)
-        column.addView(Button(this).apply {
-            text = getString(R.string.download_model)
+        modelButton = Button(this).apply {
             setOnClickListener { Downloads.start(this@MainActivity, Downloads.What.MODEL) }
-        })
-        column.addView(Button(this).apply {
-            text = getString(R.string.download_dictionaries)
+        }
+        column.addView(modelButton)
+        dictionariesButton = Button(this).apply {
             setOnClickListener { Downloads.start(this@MainActivity, Downloads.What.DICTIONARIES) }
-        })
+        }
+        column.addView(dictionariesButton)
         column.addView(Button(this).apply {
             text = getString(R.string.settings)
             setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
@@ -123,12 +125,19 @@ class MainActivity : Activity() {
                 if (manifest != null) {
                     "✓ 変換モデル: ${manifest.name.removeSuffix(".manifest.json")}"
                 } else {
-                    "✗ 変換モデルがありません（下のボタンでダウンロード、約 14 MB）"
+                    "✗ 変換モデルがありません（下のボタンでダウンロード）"
                 },
             )
             appendLine(if (lexicon != null) "✓ 読みの辞書: ${lexicon.name}" else "・読みの辞書なし")
             append(if (analyzer != null) "✓ 解析器: ${analyzer.name}" else "・解析器なし")
             if (Downloads.state.isNotEmpty()) append("\n${Downloads.state}")
+        }
+        // what each button gets as the catalog pins it and as things are (the full lexicon keeps the small one out)
+        for ((button, what) in listOf(modelButton to Downloads.What.MODEL, dictionariesButton to Downloads.What.DICTIONARIES)) {
+            button.text = runCatching { Downloads.describe(this, what) }.fold(
+                { (label, size) -> getString(R.string.download, label, "%.0f".format(size / 1048576.0)) },
+                { getString(if (what == Downloads.What.MODEL) R.string.download_model else R.string.download_dictionaries) },
+            )
         }
     }
 }
