@@ -77,7 +77,8 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     override fun onCreate() {
         super.onCreate()
         Assets.unpack(this)
-        // the models are in files/models too (push-models.ps1)
+        // the models are in files/models too: the one the APK carries,
+        // unpacked, and those push-models.ps1 copies
         h = Native.create(filesDir.path, applicationInfo.nativeLibraryDir, filesDir.path, this)
         clips = ClipHistory(this)
         clips.onChange = {

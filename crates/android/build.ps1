@@ -16,7 +16,11 @@
 #                          the system extracts a library executable, another file not
 #   libonnxruntime.so      from Microsoft's onnxruntime-android (Gradle)
 #
-# The models are not in the APK: push-models.ps1 copies them onto the phone.
+# The APK carries the conversion model crates/tsf/models.json pins as its own
+# (assets/model, from app\build\model-assets: fetch-model.ps1 downloads it into
+# local\models\downloads, or finds it there), which the app unpacks where no
+# model is; push-models.ps1 copies another model, the lexicon and the analyzer
+# onto the phone.
 
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -47,6 +51,21 @@ try {
 } finally {
     Pop-Location
     Remove-Item Env:\CARGO_PROFILE_RELEASE_STRIP
+}
+
+# the conversion model, as models.json pins it: its manifest and the files it names
+$Manifest = & (Join-Path $Repo 'crates\tsf\fetch-model.ps1') -CacheDir (Join-Path $Repo 'local\models\downloads')
+$m = Get-Item -LiteralPath $Manifest
+$j = Get-Content -LiteralPath $m.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+$names = @($m.Name, $j.proposal.path, $j.vocab, $j.input_vocab, $j.rescore.pairs, $j.rescore.words) | Where-Object { $_ }
+if ($j.proposal.external_data) { $names += @($j.proposal.external_data) }
+if ($j.crf) { $names += $j.crf.path }
+$ModelAssets = Join-Path $App 'build\model-assets\model'
+if (Test-Path -LiteralPath $ModelAssets) { Remove-Item -LiteralPath $ModelAssets -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $ModelAssets | Out-Null
+foreach ($n in $names) {
+    if ($n -match '[\\/]') { throw "a model file in a subdirectory: $n (assets/model is flat)" }
+    Copy-Item -LiteralPath (Join-Path $m.Directory.FullName $n) -Destination $ModelAssets
 }
 
 $Out = Join-Path $Repo 'target\aarch64-linux-android\release'

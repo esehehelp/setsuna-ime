@@ -45,6 +45,9 @@ android {
         assets.srcDir("../../ime-core/data")
         // the settings page (index.html), the desktop app's (SettingsActivity)
         assets.srcDir("../../settings/web")
+        // the conversion model (assets/model, ../build.ps1 puts it there),
+        // unpacked into files/models/onnx where no model is
+        assets.srcDir(layout.buildDirectory.dir("model-assets"))
     }
 
     packaging {
