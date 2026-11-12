@@ -2,19 +2,19 @@
   "schema": "setsuna-model-download-v1",
   "name": "Cymbidium-v1.0-xsmall",
   "repository": "esehe/Cymbidium-v1.0-xsmall",
-  "revision": "8a5ae4880161dedad14dd35797e4baa59bca2834",
+  "revision": "0701d2c33f3c5a583019a3204db76e6985e7e15b",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
-      "manifest": "Cymbidium-v1.0-xsmall.int8.manifest.json",
+      "manifest": "Cymbidium-v1.0-xsmall.manifest.json",
       "files": [
         {
-          "path": "Cymbidium-v1.0-xsmall.int8.manifest.json",
-          "size": 568,
-          "sha256": "6d875e2a44b46f7fad7fcb3452d72ab6b6ca1b3454f1a576fc11dc5cb597d832"
+          "path": "Cymbidium-v1.0-xsmall.manifest.json",
+          "size": 563,
+          "sha256": "af4220fb73acd57836123de596074be9211098ab26f11b5a9ab89f988af3ecc2"
         },
         {
-          "path": "Cymbidium-v1.0-xsmall.int8.onnx",
+          "path": "Cymbidium-v1.0-xsmall.onnx",
           "size": 13570989,
           "sha256": "8c2511b97623716c12d4966ef9f3b796d87c8fcd2e174b2afb047de2e73dc9a5"
         },
@@ -25,13 +25,45 @@
         },
         {
           "path": "config.json",
-          "size": 118,
-          "sha256": "0c0f651f22441298993085c3b11da51216d67bce5ccc4b5ccce714d368f448ab"
+          "size": 117,
+          "sha256": "1e847be9e8a5db5ec332ca4d17a62cfacbe68b9464af25cb7e588815b07edc37"
         }
       ]
     }
   },
   "models": {
+    "Cymbidium-v1.1-xsmall": {
+      "repository": "esehe/Cymbidium-v1.1-xsmall",
+      "revision": "4f506001a580364b99a1db6c6d3b91409eeb3ef9",
+      "license": "Apache-2.0",
+      "variants": {
+        "int8": {
+          "manifest": "Cymbidium-v1.1-xsmall.manifest.json",
+          "files": [
+            {
+              "path": "Cymbidium-v1.1-xsmall.manifest.json",
+              "size": 563,
+              "sha256": "d7cfb0d9270da3a4d16b93078f81460a5ed5e81e71bdd3f49303a2902fce77b8"
+            },
+            {
+              "path": "Cymbidium-v1.1-xsmall.onnx",
+              "size": 22987122,
+              "sha256": "77dd51fd4fa13011bead0cc49c6be15291da53ffd4b641a0a23f2d7bb1ee008b"
+            },
+            {
+              "path": "Cymbidium-v1.1-xsmall.vocab.hex.tsv",
+              "size": 95166,
+              "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
+            },
+            {
+              "path": "config.json",
+              "size": 113,
+              "sha256": "9a772096081de5c536124551d9d7cf9e105fe94e084f4d9c3c914109aabe1f6d"
+            }
+          ]
+        }
+      }
+    },
     "Bletilla-v0.1-small": {
       "repository": "esehe/Bletilla-v0.1-small",
       "revision": "002b3a59ab97d3ed46576ad1f773d7e7ee1af3be",
