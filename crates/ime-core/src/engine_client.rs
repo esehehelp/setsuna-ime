@@ -34,7 +34,7 @@ pub struct EngineResult {
     pub scores: Vec<f32>,
     /// Time the engine spent on the conversion, when it reports it.
     pub engine_ms: Option<f64>,
-    /// From dispatch to the result arriving, queueing and pacing included.
+    /// From dispatch to the result arriving, queueing included.
     pub round_trip_ms: f64,
     /// The model's output frame by frame, as the engine sent it, when asked
     /// for (`EngineCfg::emit_frames`).

@@ -43,21 +43,6 @@ const ENGINE_EXE: &str = if cfg!(windows) {
     "setsuna-engine"
 };
 
-/// Dispatch→post delays a result is padded to, so the user always perceives
-/// raw hiragana first and the kanji rendering after a predictable beat: the
-/// shortest one the conversion has not already overrun. A conversion slower
-/// than 20 ms lands at 50 ms rather than whenever it finishes; one slower
-/// than the last step is posted as soon as it arrives.
-const PACING_STEPS: [Duration; 2] = [Duration::from_millis(20), Duration::from_millis(50)];
-
-/// How long to wait before posting a result `elapsed` after its dispatch.
-fn pacing_wait(elapsed: Duration) -> Duration {
-    PACING_STEPS
-        .iter()
-        .find(|step| **step >= elapsed)
-        .map_or(Duration::ZERO, |step| *step - elapsed)
-}
-
 #[derive(Serialize)]
 struct DaemonRequest<'a> {
     id: u64,
@@ -536,8 +521,8 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
 }
 
 /// A response line read: the request it answers taken out of flight, so
-/// that the next one goes at once (the engine overlaps it with this one's
-/// pacing). `None` for a blank line, one that does not parse, or an error.
+/// that the next one goes at once. `None` for a blank line, one that does
+/// not parse, or an error.
 fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<InFlight>)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -574,16 +559,12 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
     Some((resp, inflight))
 }
 
-/// Pace a result (`pacing_wait`), make it the latest and tell the frontend.
+/// Make a result the latest and tell the frontend, as soon as it arrives.
 fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, notify: &Notify) {
     let (reading, context, dispatched_at) = match inflight {
         Some(f) => (f.reading, f.context, f.dispatched_at),
         None => (String::new(), String::new(), Instant::now()),
     };
-    let wait = pacing_wait(dispatched_at.elapsed());
-    if !wait.is_zero() {
-        thread::sleep(wait);
-    }
     {
         let mut slot = shared.latest.lock().unwrap();
         *slot = Some(EngineResult {
@@ -887,17 +868,6 @@ mod tests {
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
-    }
-
-    #[test]
-    fn pacing_pads_to_20ms_then_50ms() {
-        let ms = Duration::from_millis;
-        assert_eq!(pacing_wait(ms(0)), ms(20));
-        assert_eq!(pacing_wait(ms(12)), ms(8));
-        assert_eq!(pacing_wait(ms(20)), ms(0));
-        assert_eq!(pacing_wait(ms(21)), ms(29));
-        assert_eq!(pacing_wait(ms(50)), ms(0));
-        assert_eq!(pacing_wait(ms(80)), ms(0));
     }
 
     #[test]

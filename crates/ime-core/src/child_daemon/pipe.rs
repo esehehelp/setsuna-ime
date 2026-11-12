@@ -313,7 +313,7 @@ impl Drop for PipeEngineClient {
             }
         }
         // the I/O thread gone, the channel is closed: the poster ends after
-        // the result it is pacing, if any
+        // the result it is posting, if any
         if let Some(poster) = self.poster.take() {
             if io_done {
                 let _ = poster.join();

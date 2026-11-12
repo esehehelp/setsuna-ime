@@ -3627,9 +3627,8 @@ impl EngineBridge {
 
     /// Fire an async convert job for the current full hiragana. Returns
     /// the candidate list currently held by the Composing phase (possibly
-    /// stale — the keystroke always renders immediately with raw hiragana
-    /// and the kanji version lands 20 ms later, or 50 ms when the conversion
-    /// is slower than that; see `child_daemon::PACING_STEPS`).
+    /// stale — the keystroke renders at once with what it has, and the
+    /// conversion's candidates land when the engine answers).
     fn dispatch_live(&mut self) -> Vec<String> {
         self.dispatch_live_inner(false)
     }
