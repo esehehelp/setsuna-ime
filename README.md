@@ -15,13 +15,16 @@ Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言�
 ## 状態
 
 研究段階のプロジェクト。変換モデル
+[Cymbidium-v1.1-xsmall](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)（約 23 MB）、
 [Cymbidium-v1.0-xsmall](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall)（約 14 MB）と
 [Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（約 130 MB）
-（どちらも Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定で
-Cymbidium を自動取得する（Bletilla は `-Model Bletilla-v0.1-small`、Linux は
-`--model Bletilla-v0.1-small`）。Cymbidium は Bletilla から切り出して学習し直した
-小さいモデルで、1 位の正解率はほぼ同じ、変換は約 4 倍速い（上位 5 位までに正解が
-入る率は Bletilla が少し高い）。
+（どれも Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定で
+Cymbidium-v1.1-xsmall を自動取得する（ほかは `-Model Cymbidium-v1.0-xsmall`・
+`-Model Bletilla-v0.1-small`、Linux は `--model` で同じ名前）。Cymbidium は Bletilla から
+切り出して学習し直した小さいモデルで、v1.1 の 1 位の正解率は wiki_fresh_v4 で Bletilla より
+高く（82.3 対 81.1）、AJIMEE では同程度（79.1 対 78.0）、変換は約 3 倍速い（1 スレッド・
+AJIMEE の 1 文の中央値 2.4〜2.6 ms 対 7.6〜8.4 ms）。上位 5 位までに正解が入る率は
+Bletilla が高い（wiki_fresh_v4 88.4 対 89.3、AJIMEE 87.4 対 92.5）。
 
 - エンジンと IME はこの変換モデルを前提に調整している（記号分割、
   前の文脈 64 トークン、読みは 80 文字までなら文をまたいで一度に変換し、それより長い
@@ -417,7 +420,7 @@ JIS 配列の記号（! " # $ % & ' ( ) と、0 は ~）になり、変換中は
 ページ（`crates/settings/web/index.html`）を WebView で開く。先頭の「この端末」に、入力方法として有効か・
 今の入力方法か、入っているモデルと辞書、ダウンロードのボタン、入力方法の切り替えと試し書きの欄がある。キーボードの振動（タップと長押しを別々に）・
 キーの吹き出し・高さはここで、書き直し・候補の窓・PC のキーボードのキーなど Android にないものは出さない。
-変換モデル（`models.json` の既定のもの、今は Cymbidium-v1.0-xsmall、約 14 MB）と読みの辞書・
+変換モデル（`models.json` の既定のもの、今は Cymbidium-v1.1-xsmall、約 23 MB）と読みの辞書・
 解析器（約 510 MB）は、「この端末」のボタンで Hugging Face から取得する（PC 版と同じ固定した revision、
 サイズと SHA-256 を確かめてから置き、前に入っていたものと入れ替える。そのためアプリはインターネットの
 権限を持つが、通信するのはこのダウンロードだけ）。配布用の鍵での署名はまだ（release の APK は debug の
@@ -465,11 +468,11 @@ cargo run --release -p setsuna-settings
   頻度）を持つモデルでは、`decode_defaults` の `pair_weight` / `word_weight` の
   重みで beam の候補のスコアに足して並べ直す（0 か未指定ならその項は使わない）。
   公開モデル Bletilla-v0.1-small は int8 版（MoE の専門家は int4、約 116 MB）と
-  並べ直しの表（約 28 MB）。Cymbidium-v1.0-xsmall は、Linear と専門家を群ごとの
+  並べ直しの表（約 28 MB）。Cymbidium（v1.0-xsmall・v1.1-xsmall）は、Linear と専門家を群ごとの
   スケールと零点つきの低ビット符号で持ち（`LinearQ4G`、`TokenMoEQ4G`、専門家は
-  3 bit・ほかは 4 bit）、約 13.6 MB。並べ直しの表は持たない。この 2 つの op は
+  3 bit・ほかは 4 bit）、v1.0 は約 13.6 MB、v1.1 は約 23.0 MB。並べ直しの表は持たない。この 2 つの op は
   AVX-512 VNNI・AVX-VNNI・AVX2・ARM の dotprod のカーネルで計算し（どれも同じ結果）、
-  そのどれもない CPU では素の Rust で計算する（Ryzen 9 9950X3D で 1 文の中央値
+  そのどれもない CPU では素の Rust で計算する（Ryzen 9 9950X3D で v1.0 の 1 文の中央値
   2.9 / 3.1 / 3.5 / 33 ms）。
 - リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
   `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の
@@ -554,6 +557,7 @@ MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）か�
 （`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
 出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と
 THIRD_PARTY_NOTICES.md）。かな漢字変換モデルは
+[Cymbidium-v1.1-xsmall](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)、
 [Cymbidium-v1.0-xsmall](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) と
 [Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（Apache-2.0）。
 辞書データとかな漢字変換モデルの重みはこのリポジトリに含まない。

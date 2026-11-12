@@ -1,64 +1,64 @@
 {
   "schema": "setsuna-model-download-v1",
-  "name": "Cymbidium-v1.0-xsmall",
-  "repository": "esehe/Cymbidium-v1.0-xsmall",
-  "revision": "0701d2c33f3c5a583019a3204db76e6985e7e15b",
+  "name": "Cymbidium-v1.1-xsmall",
+  "repository": "esehe/Cymbidium-v1.1-xsmall",
+  "revision": "4f506001a580364b99a1db6c6d3b91409eeb3ef9",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
-      "manifest": "Cymbidium-v1.0-xsmall.manifest.json",
+      "manifest": "Cymbidium-v1.1-xsmall.manifest.json",
       "files": [
         {
-          "path": "Cymbidium-v1.0-xsmall.manifest.json",
+          "path": "Cymbidium-v1.1-xsmall.manifest.json",
           "size": 563,
-          "sha256": "af4220fb73acd57836123de596074be9211098ab26f11b5a9ab89f988af3ecc2"
+          "sha256": "d7cfb0d9270da3a4d16b93078f81460a5ed5e81e71bdd3f49303a2902fce77b8"
         },
         {
-          "path": "Cymbidium-v1.0-xsmall.onnx",
-          "size": 13570989,
-          "sha256": "8c2511b97623716c12d4966ef9f3b796d87c8fcd2e174b2afb047de2e73dc9a5"
+          "path": "Cymbidium-v1.1-xsmall.onnx",
+          "size": 22987122,
+          "sha256": "77dd51fd4fa13011bead0cc49c6be15291da53ffd4b641a0a23f2d7bb1ee008b"
         },
         {
-          "path": "Cymbidium-v1.0-xsmall.vocab.hex.tsv",
+          "path": "Cymbidium-v1.1-xsmall.vocab.hex.tsv",
           "size": 95166,
           "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
         },
         {
           "path": "config.json",
-          "size": 117,
-          "sha256": "1e847be9e8a5db5ec332ca4d17a62cfacbe68b9464af25cb7e588815b07edc37"
+          "size": 113,
+          "sha256": "9a772096081de5c536124551d9d7cf9e105fe94e084f4d9c3c914109aabe1f6d"
         }
       ]
     }
   },
   "models": {
-    "Cymbidium-v1.1-xsmall": {
-      "repository": "esehe/Cymbidium-v1.1-xsmall",
-      "revision": "4f506001a580364b99a1db6c6d3b91409eeb3ef9",
+    "Cymbidium-v1.0-xsmall": {
+      "repository": "esehe/Cymbidium-v1.0-xsmall",
+      "revision": "0701d2c33f3c5a583019a3204db76e6985e7e15b",
       "license": "Apache-2.0",
       "variants": {
         "int8": {
-          "manifest": "Cymbidium-v1.1-xsmall.manifest.json",
+          "manifest": "Cymbidium-v1.0-xsmall.manifest.json",
           "files": [
             {
-              "path": "Cymbidium-v1.1-xsmall.manifest.json",
+              "path": "Cymbidium-v1.0-xsmall.manifest.json",
               "size": 563,
-              "sha256": "d7cfb0d9270da3a4d16b93078f81460a5ed5e81e71bdd3f49303a2902fce77b8"
+              "sha256": "af4220fb73acd57836123de596074be9211098ab26f11b5a9ab89f988af3ecc2"
             },
             {
-              "path": "Cymbidium-v1.1-xsmall.onnx",
-              "size": 22987122,
-              "sha256": "77dd51fd4fa13011bead0cc49c6be15291da53ffd4b641a0a23f2d7bb1ee008b"
+              "path": "Cymbidium-v1.0-xsmall.onnx",
+              "size": 13570989,
+              "sha256": "8c2511b97623716c12d4966ef9f3b796d87c8fcd2e174b2afb047de2e73dc9a5"
             },
             {
-              "path": "Cymbidium-v1.1-xsmall.vocab.hex.tsv",
+              "path": "Cymbidium-v1.0-xsmall.vocab.hex.tsv",
               "size": 95166,
               "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
             },
             {
               "path": "config.json",
-              "size": 113,
-              "sha256": "9a772096081de5c536124551d9d7cf9e105fe94e084f4d9c3c914109aabe1f6d"
+              "size": 117,
+              "sha256": "1e847be9e8a5db5ec332ca4d17a62cfacbe68b9464af25cb7e588815b07edc37"
             }
           ]
         }
