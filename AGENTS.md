@@ -16,6 +16,7 @@ Dependencies point one way: artifact -> runtime -> platform.
 | artifact | `crates/artifact`                      | manifest schemas only                                   |
 | runtime  | `crates/engine`, `crates/rerank`, `crates/analyzer`, `crates/pipe` | `crates/artifact`, `crates/pipe` for `serve`, and `crates/analyzer` for the engine's `--analyzer`; models load only through a manifest  |
 | platform | `crates/ime-core`, `crates/tsf`, `crates/tsf-shim`, `crates/tsf-reg`, `crates/linux`, `crates/android`, `crates/rewrite`, `crates/settings` | the engine, reranker and rewriter daemons' stdio protocol, and the shared engine's and reranker's named pipes (`crates/pipe`, Windows); `crates/settings` also links `crates/rewrite` (sign-in, keys, models) |
+| tool     | `crates/bench`                         | `crates/ime-core` (the session and its clients), and any installed input method through TSF; its sets (`crates/bench/sets`) are evaluation data, never training data |
 
 The engine does inference only (proposal -> CTC beam -> candidates), and so
 does the reranker (an LM's log-probability of each candidate), and so does

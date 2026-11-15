@@ -193,6 +193,165 @@ struct AltList {
 /// 29%), the list 5.3 long; Bletilla-v0.1-small alike.
 const NO_LEXICON_MARGIN: f32 = 6.0;
 
+/// The IME's order of the engine's candidates (`lexicon` and `ngram` as
+/// the bridge has them; public for evaluations): those that spell the
+/// reading out first, by their scores with the character n-gram terms
+/// added (`[ngram]`: those sums become their scores, which the LM reranker
+/// then adds to) and, below the first of them, their lexicon costs taken
+/// off (`[lexicon]`, which also adds its own conversions and drops those far
+/// above the cheapest), then those that do not, in the
+/// engine's order and scored no higher than the others. A candidate that
+/// does not has lost a char or put a kana out of place (ゼロプラモデル for
+/// ぜろせんぷらもでる): never the gold over wiki_fresh_v2 and AJIMEE,
+/// and one the n-gram would favour, with fewer pairs to lose points on.
+pub fn order_candidates(
+    lexicon: Option<&crate::lexicon::Lexicon>,
+    ngram: Option<(&crate::char_ngram::CharNgram, f32, f32)>,
+    result: &mut EngineResult,
+) {
+    use unicode_normalization::UnicodeNormalization;
+    // the lexicon that judges the engine's candidates: not a partial one,
+    // whose missing words are no slips (Lexicon::partial)
+    let ranking = lexicon.filter(|l| !l.partial());
+    if ranking.is_none() {
+        drop_far_below_top(result);
+    }
+    let mut n = result.candidates.len();
+    if n < 2 {
+        return;
+    }
+    let reading: Vec<char> = result.reading.nfkc().collect();
+    let (mut order, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..n).partition(|&i| crate::reading_align::spells_out(&result.candidates[i], &reading));
+    if order.is_empty() {
+        std::mem::swap(&mut order, &mut rest);
+    }
+    let scored = result.scores.len() == n;
+    // numbers in digits and in kanji in one candidate (postprocess::mixes_numerals)
+    let mixed: Vec<bool> = result
+        .candidates
+        .iter()
+        .map(|c| scored && crate::postprocess::mixes_numerals(c))
+        .collect();
+    let any_mixed = mixed.iter().any(|&m| m);
+    if rest.is_empty() && !any_mixed && !(scored && (ngram.is_some() || ranking.is_some())) {
+        return;
+    }
+    let mut scores = result.scores.clone();
+    for (s, &m) in scores.iter_mut().zip(&mixed) {
+        if m {
+            *s -= crate::postprocess::MIXED_NUMERALS;
+        }
+    }
+    if any_mixed {
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    }
+    if let (Some((table, w2, w3)), true) = (ngram, scored && order.len() >= 2) {
+        let cands: Vec<String> = order
+            .iter()
+            .map(|&i| result.candidates[i].clone())
+            .collect();
+        let own: Vec<f32> = order.iter().map(|&i| scores[i]).collect();
+        let (by, total) = table.rescore(&result.context, &cands, &own, w2, w3);
+        for (k, &i) in order.iter().enumerate() {
+            scores[i] = total[k];
+        }
+        order = by.iter().map(|&k| order[k]).collect();
+    }
+    if let (Some(lex), true) = (ranking, scored) {
+        // the model's top as ordered so far stays first: the lexicon's costs
+        // read no context, and putting their cheapest first lost more than
+        // it won (Cymbidium-v1.1-xsmall's top 20, EM1: AJIMEE v2-fix2 77.9
+        // -> 74.8, its homophones 77.1 -> 73.7, probe_v6's 83.3 -> 75.0;
+        // wiki_fresh_v4 82.3 -> 83.2). What the lexicon adds and orders below
+        // it put more golds in the first 20 (AJIMEE 87.9 -> 91.2, its proper
+        // nouns 78.3 -> 83.3) either way (user 2026-11-15: それでok).
+        let model_top = order.first().copied();
+        let r: String = reading.iter().collect();
+        let mut costs: Vec<Option<f32>> = result
+            .candidates
+            .iter()
+            .map(|c| lex.cost(&c.nfkc().collect::<String>(), &r))
+            .collect();
+        // the lexicon's own conversions the engine missed (大島村 for
+        // おおしまむら, where it gave おおしま村) and the homophones
+        // of its words (検収担当者 for 研修担当者), those no more than
+        // `ADDED_OVER` dearer than the engine's cheapest candidate,
+        // scored `ADDED_BELOW` under its top: the lexicon's cost and the
+        // reranker place them
+        let top = result.scores[0];
+        let cheapest = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
+        for (surface, cost) in lex.convert(&r, crate::lexicon::CONVERSIONS) {
+            if cost > cheapest + crate::lexicon::ADDED_OVER
+                || result
+                    .candidates
+                    .iter()
+                    .any(|c| c.nfkc().eq(surface.chars()))
+            {
+                continue;
+            }
+            order.push(result.candidates.len());
+            result.candidates.push(surface);
+            scores.push(top - crate::lexicon::ADDED_BELOW);
+            costs.push(Some(cost));
+            if result.reading_pos.len() == n {
+                result.reading_pos.push(Vec::new());
+            }
+            n += 1;
+        }
+        let best = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
+        if best.is_finite() {
+            let worst = best + crate::lexicon::MARGIN;
+            // the engine's top stays whatever it costs, and so does a
+            // one-char word of a reading of a kana or two (`char_words`)
+            let chars: Vec<String> = lex.char_words(&r).into_iter().map(|(w, _)| w).collect();
+            let keep = |i: &usize| {
+                *i == 0
+                    || Some(*i) == model_top
+                    || costs[*i].is_some_and(|c| c <= worst)
+                    || chars
+                        .iter()
+                        .any(|w| result.candidates[*i].nfkc().eq(w.chars()))
+            };
+            order.retain(keep);
+            rest.retain(keep);
+            if order.is_empty() {
+                std::mem::swap(&mut order, &mut rest);
+            }
+            for (i, c) in costs.iter().enumerate() {
+                scores[i] -= crate::lexicon::WEIGHT * c.unwrap_or(worst);
+            }
+            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            if let Some(pos) = model_top.and_then(|t| order.iter().position(|&i| i == t)) {
+                let t = order.remove(pos);
+                scores[t] = order.iter().map(|&i| scores[i]).fold(scores[t], f32::max);
+                order.insert(0, t);
+            }
+        }
+    }
+    if scored {
+        let floor = order
+            .iter()
+            .map(|&i| scores[i])
+            .fold(f32::INFINITY, f32::min);
+        for &i in &rest {
+            scores[i] = scores[i].min(floor);
+        }
+    }
+    order.extend(rest);
+    fn permute<T>(v: &mut Vec<T>, order: &[usize]) {
+        let mut old: Vec<Option<T>> = std::mem::take(v).into_iter().map(Some).collect();
+        *v = order.iter().map(|&i| old[i].take().unwrap()).collect();
+    }
+    permute(&mut result.candidates, &order);
+    if result.reading_pos.len() == n {
+        permute(&mut result.reading_pos, &order);
+    }
+    if scored {
+        result.scores = order.iter().map(|&i| scores[i]).collect();
+    }
+}
+
 /// The engine's candidates more than `NO_LEXICON_MARGIN` below its top
 /// dropped, the top kept (the reading and its katakana come after, from
 /// `kana_candidates::arrange`).
@@ -948,144 +1107,14 @@ impl EngineBridge {
         self.composing.set_lexicon(self.lexicon.clone());
     }
 
-    /// The engine's candidates that spell the reading out first, by their
-    /// scores with the character n-gram terms added (`[ngram]`: those sums
-    /// become their scores, which the LM reranker then adds to) and their
-    /// lexicon costs taken off (`[lexicon]`, which also drops those far
-    /// above the cheapest), then those that do not, in the engine's order
-    /// and scored no higher than the others. A candidate that does not has
-    /// lost a char or put a kana out of place (ゼロプラモデル for
-    /// ぜろせんぷらもでる): never the gold over wiki_fresh_v2 and AJIMEE,
-    /// and one the n-gram would favour, with fewer pairs to lose points on.
+    /// The engine's candidates in the IME's order (`order_candidates`),
+    /// with this bridge's lexicon and n-gram.
     fn order_engine_result(&self, result: &mut EngineResult) {
-        use unicode_normalization::UnicodeNormalization;
-        // the lexicon that judges the engine's candidates: not a partial one,
-        // whose missing words are no slips (Lexicon::partial)
-        let ranking = self.lexicon.as_ref().filter(|l| !l.partial());
-        if ranking.is_none() {
-            drop_far_below_top(result);
-        }
-        let mut n = result.candidates.len();
-        if n < 2 {
-            return;
-        }
-        let reading: Vec<char> = result.reading.nfkc().collect();
-        let (mut order, mut rest): (Vec<usize>, Vec<usize>) = (0..n)
-            .partition(|&i| crate::reading_align::spells_out(&result.candidates[i], &reading));
-        if order.is_empty() {
-            std::mem::swap(&mut order, &mut rest);
-        }
-        let scored = result.scores.len() == n;
-        // numbers in digits and in kanji in one candidate (postprocess::mixes_numerals)
-        let mixed: Vec<bool> = result
-            .candidates
-            .iter()
-            .map(|c| scored && crate::postprocess::mixes_numerals(c))
-            .collect();
-        let any_mixed = mixed.iter().any(|&m| m);
-        if rest.is_empty() && !any_mixed && !(scored && (self.ngram.is_some() || ranking.is_some()))
-        {
-            return;
-        }
-        let mut scores = result.scores.clone();
-        for (s, &m) in scores.iter_mut().zip(&mixed) {
-            if m {
-                *s -= crate::postprocess::MIXED_NUMERALS;
-            }
-        }
-        if any_mixed {
-            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-        }
-        if let (Some((table, w2, w3)), true) = (&self.ngram, scored && order.len() >= 2) {
-            let cands: Vec<String> = order
-                .iter()
-                .map(|&i| result.candidates[i].clone())
-                .collect();
-            let own: Vec<f32> = order.iter().map(|&i| scores[i]).collect();
-            let (by, total) = table.rescore(&result.context, &cands, &own, *w2, *w3);
-            for (k, &i) in order.iter().enumerate() {
-                scores[i] = total[k];
-            }
-            order = by.iter().map(|&k| order[k]).collect();
-        }
-        if let (Some(lex), true) = (ranking, scored) {
-            let r: String = reading.iter().collect();
-            let mut costs: Vec<Option<f32>> = result
-                .candidates
-                .iter()
-                .map(|c| lex.cost(&c.nfkc().collect::<String>(), &r))
-                .collect();
-            // the lexicon's own conversions the engine missed (大島村 for
-            // おおしまむら, where it gave おおしま村) and the homophones
-            // of its words (検収担当者 for 研修担当者), those no more than
-            // `ADDED_OVER` dearer than the engine's cheapest candidate,
-            // scored `ADDED_BELOW` under its top: the lexicon's cost and the
-            // reranker place them
-            let top = result.scores[0];
-            let cheapest = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
-            for (surface, cost) in lex.convert(&r, crate::lexicon::CONVERSIONS) {
-                if cost > cheapest + crate::lexicon::ADDED_OVER
-                    || result
-                        .candidates
-                        .iter()
-                        .any(|c| c.nfkc().eq(surface.chars()))
-                {
-                    continue;
-                }
-                order.push(result.candidates.len());
-                result.candidates.push(surface);
-                scores.push(top - crate::lexicon::ADDED_BELOW);
-                costs.push(Some(cost));
-                if result.reading_pos.len() == n {
-                    result.reading_pos.push(Vec::new());
-                }
-                n += 1;
-            }
-            let best = costs.iter().flatten().fold(f32::INFINITY, |a, &b| a.min(b));
-            if best.is_finite() {
-                let worst = best + crate::lexicon::MARGIN;
-                // the engine's top stays whatever it costs, and so does a
-                // one-char word of a reading of a kana or two (`char_words`)
-                let chars: Vec<String> = lex.char_words(&r).into_iter().map(|(w, _)| w).collect();
-                let keep = |i: &usize| {
-                    *i == 0
-                        || costs[*i].is_some_and(|c| c <= worst)
-                        || chars
-                            .iter()
-                            .any(|w| result.candidates[*i].nfkc().eq(w.chars()))
-                };
-                order.retain(keep);
-                rest.retain(keep);
-                if order.is_empty() {
-                    std::mem::swap(&mut order, &mut rest);
-                }
-                for (i, c) in costs.iter().enumerate() {
-                    scores[i] -= crate::lexicon::WEIGHT * c.unwrap_or(worst);
-                }
-                order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-            }
-        }
-        if scored {
-            let floor = order
-                .iter()
-                .map(|&i| scores[i])
-                .fold(f32::INFINITY, f32::min);
-            for &i in &rest {
-                scores[i] = scores[i].min(floor);
-            }
-        }
-        order.extend(rest);
-        fn permute<T>(v: &mut Vec<T>, order: &[usize]) {
-            let mut old: Vec<Option<T>> = std::mem::take(v).into_iter().map(Some).collect();
-            *v = order.iter().map(|&i| old[i].take().unwrap()).collect();
-        }
-        permute(&mut result.candidates, &order);
-        if result.reading_pos.len() == n {
-            permute(&mut result.reading_pos, &order);
-        }
-        if scored {
-            result.scores = order.iter().map(|&i| scores[i]).collect();
-        }
+        let ngram = self
+            .ngram
+            .as_ref()
+            .map(|(t, w2, w3)| (t.as_ref(), *w2, *w3));
+        order_candidates(self.lexicon.as_deref(), ngram, result);
     }
 
     /// Drop the composition without committing it (the host reset the
@@ -6759,11 +6788,11 @@ mod tests {
         bridge.apply_async_result();
         let (list, _) = shown(&bridge.handle_space().actions).unwrap();
         // 続投 15.0 and 続騰 17.0 by words, 続頭 24.3 by a prefix and a noun:
-        // 続投 first; 続当 (30 for 当) is more than MARGIN above 15.0 and goes,
-        // 続頭 stays as the engine's top was
-        assert_eq!(list[0], "続投");
+        // the engine's top 続頭 stays first, 続投 comes next; 続当 (30 for
+        // 当) is more than MARGIN above 15.0 and goes
+        assert_eq!(list[0], "続頭");
+        assert_eq!(list[1], "続投");
         assert!(!list.contains(&"続当".to_string()), "{list:?}");
-        assert!(list.contains(&"続頭".to_string()), "{list:?}");
         let _ = std::fs::remove_file(&path);
     }
 

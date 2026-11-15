@@ -2819,6 +2819,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "setsuna-bench"
+version = "0.2.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "setsuna-core",
+ "unicode-normalization",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "setsuna-core"
 version = "0.2.3"
 dependencies = [
