@@ -400,9 +400,28 @@ pub const ANALYZER_FAMILY: &str = "lattice_crf";
 #[serde(deny_unknown_fields)]
 pub struct AnalyzerDictionaryArtifact {
     pub path: PathBuf,
-    /// `vibrato-zstd` (a vibrato system dictionary, zstd-compressed) is the
-    /// only one.
+    /// [`DICTIONARY_VIBRATO`] or [`DICTIONARY_PACKED`].
     pub format: String,
+}
+
+/// A vibrato system dictionary, zstd-compressed; its features are columns
+/// the manifest's `features` name.
+pub const DICTIONARY_VIBRATO: &str = "vibrato-zstd";
+/// One in vibrato-packed's layout (`vendor/vibrato-packed`), zstd-compressed;
+/// its features are codes the manifest's `packed` table reads.
+pub const DICTIONARY_PACKED: &str = "vibrato-packed-zstd";
+
+/// What a packed dictionary's codes stand for. A word's features are one
+/// code char for its part of speech, then its reading: `=` the surface in
+/// hiragana, `*` none, `~` and the reading as it is, else one code char a
+/// kana. The code chars are `setsuna_analyzer::packed::CODE_CHARS`, in
+/// order: the `n`th stands for `pos[n]`, or for the `n`th char of `kana`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackedCodes {
+    /// Each code's (pos1, pos2).
+    pub pos: Vec<[String; 2]>,
+    pub kana: String,
 }
 
 /// Analysis settings the analyzer was verified with. Every field is
@@ -430,9 +449,13 @@ struct AnalyzerManifestFile {
     /// costs), when the analyzer gives them.
     #[serde(default)]
     alternates: Option<PathBuf>,
-    /// The names of the dictionary's feature columns, in order; `reading`
-    /// (hiragana, `*` when unknown) is required.
-    features: Vec<String>,
+    /// A `vibrato-zstd` dictionary's feature columns by name, in order;
+    /// `reading` (hiragana, `*` when unknown) is required.
+    #[serde(default)]
+    features: Option<Vec<String>>,
+    /// A `vibrato-packed-zstd` dictionary's codes.
+    #[serde(default)]
+    packed: Option<PackedCodes>,
     #[serde(default)]
     analyze_defaults: AnalyzeDefaults,
 }
@@ -444,8 +467,13 @@ struct AnalyzerManifestFile {
 pub struct AnalyzerManifest {
     pub manifest_path: PathBuf,
     pub dictionary_path: PathBuf,
+    /// [`DICTIONARY_VIBRATO`] or [`DICTIONARY_PACKED`].
+    pub dictionary_format: String,
     pub alternates_path: Option<PathBuf>,
+    /// A `vibrato-zstd` dictionary's feature columns (empty for a packed one).
     pub features: Vec<String>,
+    /// A `vibrato-packed-zstd` dictionary's codes.
+    pub packed: Option<PackedCodes>,
     pub analyze_defaults: AnalyzeDefaults,
 }
 
@@ -461,17 +489,38 @@ impl AnalyzerManifest {
         );
         let file: AnalyzerManifestFile = serde_json::from_value(value)
             .with_context(|| format!("parse analyzer manifest {}", path.display()))?;
-        anyhow::ensure!(
-            file.dictionary.format == "vibrato-zstd",
-            "manifest {}: unknown dictionary format {:?}",
-            path.display(),
-            file.dictionary.format
-        );
-        anyhow::ensure!(
-            file.features.iter().any(|f| f == "reading"),
-            "manifest {}: features name no reading",
-            path.display()
-        );
+        match file.dictionary.format.as_str() {
+            DICTIONARY_VIBRATO => {
+                anyhow::ensure!(
+                    file.packed.is_none(),
+                    "manifest {}: codes for a {DICTIONARY_VIBRATO} dictionary",
+                    path.display()
+                );
+                anyhow::ensure!(
+                    file.features
+                        .as_ref()
+                        .is_some_and(|f| f.iter().any(|f| f == "reading")),
+                    "manifest {}: features name no reading",
+                    path.display()
+                );
+            }
+            DICTIONARY_PACKED => {
+                anyhow::ensure!(
+                    file.features.is_none() && file.alternates.is_none(),
+                    "manifest {}: features or alternates for a {DICTIONARY_PACKED} dictionary",
+                    path.display()
+                );
+                anyhow::ensure!(
+                    file.packed.is_some(),
+                    "manifest {}: a {DICTIONARY_PACKED} dictionary without its codes",
+                    path.display()
+                );
+            }
+            other => anyhow::bail!(
+                "manifest {}: unknown dictionary format {other:?}",
+                path.display()
+            ),
+        }
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         let resolve = |p: &Path, what: &str| -> Result<PathBuf> {
             let full = base.join(p);
@@ -486,12 +535,14 @@ impl AnalyzerManifest {
         Ok(Self {
             manifest_path: path.to_path_buf(),
             dictionary_path: resolve(&file.dictionary.path, "dictionary")?,
+            dictionary_format: file.dictionary.format,
             alternates_path: file
                 .alternates
                 .as_deref()
                 .map(|p| resolve(p, "alternates"))
                 .transpose()?,
-            features: file.features,
+            features: file.features.unwrap_or_default(),
+            packed: file.packed,
             analyze_defaults: file.analyze_defaults,
         })
     }
@@ -779,6 +830,45 @@ mod tests {
             ("noreading.json", body("").replace("\"reading\",", "")),
             ("unknown.json", body(r#","extra":1"#)),
             ("schema.json", body("").replace("lattice_crf", "ctc_nat")),
+            (
+                "codes.json",
+                body(r#","packed":{"pos":[["名詞","普通名詞"]],"kana":"あ"}"#),
+            ),
+        ] {
+            let m = write(&dir, name, &text);
+            assert!(AnalyzerManifest::load(&m).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_packed_analyzer_has_codes_and_no_features() {
+        let dir = temp_dir("packed");
+        write(&dir, "system.dic.zst", "");
+        write(&dir, "alternates.bin", "");
+        let body = |extra: &str| {
+            format!(
+                r#"{{"schema":"{ANALYZER_SCHEMA}","model_family":"lattice_crf",
+                "dictionary":{{"path":"system.dic.zst","format":"{DICTIONARY_PACKED}"}}{extra}}}"#
+            )
+        };
+        let codes = r#","packed":{"pos":[["名詞","普通名詞"],["助詞","係助詞"]],"kana":"あい"}"#;
+        let m = write(&dir, "ok.json", &body(codes));
+        let a = AnalyzerManifest::load(&m).unwrap();
+        assert_eq!(a.dictionary_format, DICTIONARY_PACKED);
+        assert!(a.features.is_empty());
+        let p = a.packed.unwrap();
+        assert_eq!(p.pos[1], ["助詞".to_string(), "係助詞".to_string()]);
+        assert_eq!(p.kana, "あい");
+        for (name, text) in [
+            ("nocodes.json", body("")),
+            (
+                "features.json",
+                body(&format!(r#"{codes},"features":["pos1","pos2","reading"]"#)),
+            ),
+            (
+                "alternates.json",
+                body(&format!(r#"{codes},"alternates":"alternates.bin""#)),
+            ),
         ] {
             let m = write(&dir, name, &text);
             assert!(AnalyzerManifest::load(&m).is_err(), "{name}");

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# vibrato with a smaller dictionary layout (vendor/vibrato-packed/VENDORED.md),
+# a dependency of crates/analyzer kept as published
+exclude = ["vendor/vibrato-packed"]
 
 [workspace.package]
 edition = "2021"

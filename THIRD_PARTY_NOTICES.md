@@ -157,6 +157,14 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
+## vibrato
+
+`vendor/vibrato-packed` is vibrato 0.5.3 (<https://github.com/daac-tools/vibrato>),
+dual licensed under MIT or Apache-2.0, with changes to its dictionary layout
+listed in `vendor/vibrato-packed/VENDORED.md`. Its license texts are
+`vendor/vibrato-packed/LICENSE-MIT` (Copyright (c) 2022 legalforce-research)
+and `vendor/vibrato-packed/LICENSE-APACHE`.
+
 ## ChatGPT logo
 
 The settings GUI's "Continue with ChatGPT" button carries OpenAI's ChatGPT

@@ -901,6 +901,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fst"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2789,6 +2795,7 @@ dependencies = [
  "serde_json",
  "setsuna-artifact",
  "vibrato",
+ "vibrato-packed",
  "zstd",
 ]
 
@@ -3644,6 +3651,18 @@ dependencies = [
  "bincode",
  "crawdad",
  "csv-core",
+ "hashbrown 0.12.3",
+ "regex",
+ "rucrf",
+]
+
+[[package]]
+name = "vibrato-packed"
+version = "0.5.3"
+dependencies = [
+ "bincode",
+ "csv-core",
+ "fst",
  "hashbrown 0.12.3",
  "regex",
  "rucrf",

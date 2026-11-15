@@ -15,9 +15,10 @@ setsuna-artifact = { path = "../artifact" }
 anyhow.workspace = true
 serde.workspace = true
 vibrato = "0.5"
+# the packed dictionaries' layout (vendor/vibrato-packed/VENDORED.md)
+vibrato-packed = { path = "../../vendor/vibrato-packed" }
+serde_json.workspace = true
 zstd = "0.13"
 # the other readings' table is mapped, not read
 memmap2 = "0.9"
 
-[dev-dependencies]
-serde_json.workspace = true

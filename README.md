@@ -483,7 +483,12 @@ cargo run --release -p setsuna-settings
   zstd 圧縮）、素性の列の名前（`features`、`reading` は必須）、任意で別の読みの表
   （`alternates`、読みが複数ある語の項目と連接コスト。`examples/analyzer.rs
   alternates` が学習済みの `lex.csv` と `matrix.def` から作る）と
-  `analyze_defaults` を持つ。`setsuna-engine daemon|serve --analyzer <manifest>`
+  `analyze_defaults` を持つ。辞書の `format` が `vibrato-packed-zstd` のものは、
+  同じ解析をより少ないメモリで行う形式で、`vendor/vibrato-packed`（vibrato の
+  辞書の持ち方を変えたもの）で読む。`features` の代わりに語の品詞と読みの符号表
+  （`packed`）を持ち、別の読みの表は持たない。`examples/analyzer.rs build` が
+  学習済みの語と連接コストから作り、`usage` で数えた使われる回数で語を絞れる。
+  `setsuna-engine daemon|serve --analyzer <manifest>`
   で読み込み（ready の後に裏で読む）、`{"id":1,"analyze":["今日は晴れ"]}` に
   各文の語（表層、文字の範囲、読み、品詞、別の読みとそれで経路が何コスト高くなるか）
   を返す。辞書はメモリに展開するので、ログインで 1 つのエンジンのプロセスが持つ。
@@ -553,6 +558,8 @@ MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）か�
 実行時に読む / build 時に取り込む外部コンポーネントはそれぞれのライセンスに従う:
 [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、
 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）、
+[vibrato](https://github.com/daac-tools/vibrato)（MIT または Apache-2.0。
+`vendor/vibrato-packed` に変更を加えて同梱、THIRD_PARTY_NOTICES.md）、
 その他の Rust crate は `Cargo.lock` を参照。英日混在入力のモデル
 （`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
 出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と

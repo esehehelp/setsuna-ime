@@ -11,10 +11,16 @@
 //! readings are used for (a reading for text the user did not type, words to
 //! learn, a check of a conversion's candidates) is the host's.
 //!
+//! The dictionary is upstream vibrato's (`vibrato-zstd`), or a packed one
+//! (`vibrato-packed-zstd`): the same analyses in a fraction of the memory,
+//! read with `vendor/vibrato-packed`, without alternates.
+//!
 //! Modules:
 //!   - alternates: the other readings' table, built from the trained lexicon
+//!   - packed: packed dictionaries, their codes and their build
 
 pub mod alternates;
+pub mod packed;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -63,11 +69,22 @@ pub struct AnalyzeConfig {
     pub max_alts: usize,
 }
 
+/// The dictionary and how its words' features read.
+enum Engine {
+    Vibrato {
+        tokenizer: vibrato::Tokenizer,
+        alternates: Option<Alternates>,
+        reading_col: usize,
+        pos_cols: (usize, usize),
+    },
+    Packed {
+        tokenizer: vibrato_packed::Tokenizer,
+        codes: packed::Codes,
+    },
+}
+
 pub struct Analyzer {
-    tokenizer: vibrato::Tokenizer,
-    alternates: Option<Alternates>,
-    reading_col: usize,
-    pos_cols: (usize, usize),
+    engine: Engine,
     pub config: AnalyzeConfig,
 }
 
@@ -75,29 +92,42 @@ impl Analyzer {
     pub fn load(manifest: &AnalyzerManifest) -> Result<Self> {
         let path = &manifest.dictionary_path;
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let dict = vibrato::Dictionary::read(zstd::Decoder::new(file)?)
-            .with_context(|| format!("read dictionary {}", path.display()))?;
         let d = &manifest.analyze_defaults;
         let config = AnalyzeConfig {
             max_grouping_len: d.max_grouping_len.unwrap_or(MAX_GROUPING_LEN),
             alt_max_cost: d.alt_max_cost.unwrap_or(ALT_MAX_COST),
             max_alts: d.max_alts.unwrap_or(MAX_ALTS),
         };
-        Ok(Self {
-            tokenizer: vibrato::Tokenizer::new(dict).max_grouping_len(config.max_grouping_len),
-            alternates: manifest
-                .alternates_path
-                .as_deref()
-                .map(Alternates::open)
-                .transpose()?,
-            // checked by the manifest
-            reading_col: manifest.feature("reading").unwrap_or(0),
-            pos_cols: (
-                manifest.feature("pos1").unwrap_or(0),
-                manifest.feature("pos2").unwrap_or(1),
-            ),
-            config,
-        })
+        let read = || format!("read dictionary {}", path.display());
+        let engine = match &manifest.packed {
+            // the manifest's format, checked when it loaded
+            Some(codes) => Engine::Packed {
+                tokenizer: vibrato_packed::Tokenizer::new(
+                    vibrato_packed::Dictionary::read(zstd::Decoder::new(file)?)
+                        .with_context(read)?,
+                )
+                .max_grouping_len(config.max_grouping_len),
+                codes: packed::Codes::new(codes)?,
+            },
+            None => Engine::Vibrato {
+                tokenizer: vibrato::Tokenizer::new(
+                    vibrato::Dictionary::read(zstd::Decoder::new(file)?).with_context(read)?,
+                )
+                .max_grouping_len(config.max_grouping_len),
+                alternates: manifest
+                    .alternates_path
+                    .as_deref()
+                    .map(Alternates::open)
+                    .transpose()?,
+                // checked by the manifest
+                reading_col: manifest.feature("reading").unwrap_or(0),
+                pos_cols: (
+                    manifest.feature("pos1").unwrap_or(0),
+                    manifest.feature("pos2").unwrap_or(1),
+                ),
+            },
+        };
+        Ok(Self { engine, config })
     }
 
     /// Load the analyzer a manifest file names.
@@ -112,36 +142,67 @@ impl Analyzer {
         if text.is_empty() {
             return Vec::new();
         }
-        let mut worker = self.tokenizer.new_worker();
-        worker.reset_sentence(text);
-        worker.tokenize();
-        (0..worker.num_tokens())
-            .map(|i| {
-                let t = worker.token(i);
-                let features: Vec<&str> = t.feature().split(',').collect();
-                let reading = features
-                    .get(self.reading_col)
-                    .filter(|r| **r != "*" && !r.is_empty())
-                    .map(|r| r.to_string());
-                // a symbol the analysis took as an unknown word can be one
-                // the dictionary reads (/ as すらっしゅ)
-                let alts = match &self.alternates {
-                    Some(a) => self.alts(a, &worker, i, reading.as_deref().unwrap_or("*")),
-                    None => Vec::new(),
-                };
-                let range = t.range_char();
-                Token {
-                    surface: t.surface().to_string(),
-                    start: range.start,
-                    end: range.end,
-                    reading,
-                    pos: features.get(self.pos_cols.0).unwrap_or(&"").to_string(),
-                    pos2: features.get(self.pos_cols.1).unwrap_or(&"*").to_string(),
-                    alts,
-                    cost: t.total_cost(),
-                }
-            })
-            .collect()
+        match &self.engine {
+            Engine::Vibrato {
+                tokenizer,
+                alternates,
+                reading_col,
+                pos_cols,
+            } => {
+                let mut worker = tokenizer.new_worker();
+                worker.reset_sentence(text);
+                worker.tokenize();
+                (0..worker.num_tokens())
+                    .map(|i| {
+                        let t = worker.token(i);
+                        let features: Vec<&str> = t.feature().split(',').collect();
+                        let reading = features
+                            .get(*reading_col)
+                            .filter(|r| **r != "*" && !r.is_empty())
+                            .map(|r| r.to_string());
+                        // a symbol the analysis took as an unknown word can be
+                        // one the dictionary reads (/ as すらっしゅ)
+                        let alts = match alternates {
+                            Some(a) => self.alts(a, &worker, i, reading.as_deref().unwrap_or("*")),
+                            None => Vec::new(),
+                        };
+                        let range = t.range_char();
+                        Token {
+                            surface: t.surface().to_string(),
+                            start: range.start,
+                            end: range.end,
+                            reading,
+                            pos: features.get(pos_cols.0).unwrap_or(&"").to_string(),
+                            pos2: features.get(pos_cols.1).unwrap_or(&"*").to_string(),
+                            alts,
+                            cost: t.total_cost(),
+                        }
+                    })
+                    .collect()
+            }
+            Engine::Packed { tokenizer, codes } => {
+                let mut worker = tokenizer.new_worker();
+                worker.reset_sentence(text);
+                worker.tokenize();
+                (0..worker.num_tokens())
+                    .map(|i| {
+                        let t = worker.token(i);
+                        let (pos, pos2, reading) = codes.read(t.surface(), t.feature());
+                        let range = t.range_char();
+                        Token {
+                            surface: t.surface().to_string(),
+                            start: range.start,
+                            end: range.end,
+                            reading,
+                            pos,
+                            pos2,
+                            alts: Vec::new(),
+                            cost: t.total_cost(),
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// Token `i`'s other readings: each reading's cheapest entry, what the
@@ -272,5 +333,85 @@ mod tests {
         assert_eq!(t[0].reading, None);
         assert!(a.analyze("").is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_packed_dictionary_analyzes_as_the_vibrato_one() {
+        let src = tiny("packed-src");
+        // the same lexicon with its features as pos1, pos2, reading, and a
+        // word read as it is written
+        let lex = "今日,1,1,100,名詞,普通名詞,きょう\n\
+                   今日,1,1,1500,名詞,普通名詞,こんにち\n\
+                   は,2,2,50,助詞,係助詞,は\n\
+                   晴れ,1,1,300,名詞,普通名詞,はれ\n\
+                   ハレ,1,1,4000,名詞,普通名詞,はれ\n\
+                   \"1,000\",1,1,200,名詞,数詞,せん\n";
+        std::fs::write(src.join("lex3.csv"), lex).unwrap();
+        std::fs::write(
+            src.join("unk3.def"),
+            "DEFAULT,1,1,3000,名詞,一般,*\nKANJI,1,1,3000,名詞,一般,*\nHIRAGANA,1,1,3000,名詞,一般,*\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("char.def"),
+            "DEFAULT 0 1 0\nKANJI 0 0 2\nHIRAGANA 0 1 0\n0x3041..0x309F HIRAGANA\n0x4E00..0x9FFF KANJI\n",
+        )
+        .unwrap();
+        let input = |top: Option<usize>, usage: Option<PathBuf>| packed::BuildInput {
+            lex: src.join("lex3.csv"),
+            unk: src.join("unk3.def"),
+            char_def: src.join("char.def"),
+            connection: src.join("matrix.def"),
+            features: ["pos1", "pos2", "reading"].map(String::from).to_vec(),
+            usage,
+            top,
+        };
+        let out = src.join("packed");
+        let built = packed::build(&input(None, None), &out).unwrap();
+        assert_eq!(built.words, 6);
+        let plain = Analyzer::from_manifest_path(&src.join("analyzer.manifest.json")).unwrap();
+        let a = Analyzer::from_manifest_path(&built.manifest).unwrap();
+        let strip = |t: Vec<Token>| -> Vec<Token> {
+            t.into_iter()
+                .map(|t| Token {
+                    alts: Vec::new(),
+                    ..t
+                })
+                .collect()
+        };
+        for text in ["今日は晴れ", "雨", "今日", "はれ"] {
+            assert_eq!(strip(plain.analyze(text)), a.analyze(text), "{text}");
+        }
+        let t = a.analyze("1,000はハレ");
+        assert_eq!(t[0].reading.as_deref(), Some("せん"));
+        assert_eq!((t[0].pos.as_str(), t[0].pos2.as_str()), ("名詞", "数詞"));
+        assert_eq!(t[2].reading.as_deref(), Some("はれ"));
+        // the words the usage counts most, and those only
+        std::fs::write(
+            src.join("usage.tsv"),
+            "晴れ\t名詞\t普通名詞\tはれ\t9\nは\t助詞\t係助詞\tは\t5\n",
+        )
+        .unwrap();
+        let built = packed::build(
+            &input(Some(2), Some(src.join("usage.tsv"))),
+            &src.join("top"),
+        )
+        .unwrap();
+        assert_eq!(built.words, 2);
+        let a = Analyzer::from_manifest_path(&built.manifest).unwrap();
+        let words: Vec<(String, Option<String>)> = a
+            .analyze("今日は晴れ")
+            .into_iter()
+            .map(|t| (t.surface, t.reading))
+            .collect();
+        assert_eq!(
+            words[1..],
+            [
+                ("は".into(), Some("は".into())),
+                ("晴れ".into(), Some("はれ".into()))
+            ]
+        );
+        assert_eq!(words[0].1, None);
+        std::fs::remove_dir_all(&src).ok();
     }
 }
