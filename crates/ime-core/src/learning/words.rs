@@ -109,25 +109,67 @@ pub(super) fn derive(reading: &str, chosen: &str, rejected: &str) -> Vec<Word> {
     out
 }
 
-/// Whether `w` applies to `reading`: its span occurs there with the same
-/// context on at least one side (both sides for a one-char span, which
-/// would otherwise match almost anywhere).
-pub(super) fn applies(w: &Word, reading: &[char]) -> bool {
+/// Where `w` applies in `reading`: the starts of its span where it occurs
+/// with the same context on at least one side (both sides for a one-char
+/// span, which would otherwise match almost anywhere).
+pub(super) fn places(w: &Word, reading: &[char]) -> Vec<usize> {
     let span: Vec<char> = w.span.chars().collect();
     let n = span.len();
     if n == 0 || n > reading.len() {
-        return false;
+        return Vec::new();
     }
-    (0..=reading.len() - n).any(|p| {
-        if reading[p..p + n] != span[..] {
-            return false;
+    let left: Vec<char> = w.left.chars().collect();
+    let right: Vec<char> = w.right.chars().collect();
+    (0..=reading.len() - n)
+        .filter(|&p| {
+            if reading[p..p + n] != span[..] {
+                return false;
+            }
+            let left = !left.is_empty() && reading[..p].ends_with(&left);
+            let right = !right.is_empty() && reading[p + n..].starts_with(&right);
+            (n >= 2 && (left || right)) || (left && right)
+        })
+        .collect()
+}
+
+/// What `surface`, aligned to the reading as `ranges` (`align`), writes
+/// for the reading chars `p..e`; `None` when a char of it reads across `p`
+/// or `e`: the reading there is no word of that surface (今 of 今では
+/// reads across まで of いまでは).
+fn form_at(surface: &[char], ranges: &[(usize, usize)], p: usize, e: usize) -> Option<String> {
+    let mut out = String::new();
+    let (mut lo, mut hi) = (usize::MAX, 0);
+    for (&c, &(s, t)) in surface.iter().zip(ranges) {
+        if t <= p || s >= e {
+            continue;
         }
-        let left: Vec<char> = w.left.chars().collect();
-        let right: Vec<char> = w.right.chars().collect();
-        let left = !left.is_empty() && reading[..p].ends_with(&left);
-        let right = !right.is_empty() && reading[p + n..].starts_with(&right);
-        (n >= 2 && (left || right)) || (left && right)
-    })
+        if s < p || t > e {
+            return None;
+        }
+        out.push(c);
+        lo = lo.min(s);
+        hi = hi.max(t);
+    }
+    (lo == p && hi == e).then_some(out)
+}
+
+/// Whether `surface` writes `form` for the reading chars `p..e`: what it
+/// writes there (`form_at`, `ranges` its alignment, `None` when it does not
+/// fit the reading). Where that is no word of it, a form with a kanji (or
+/// another char whose reading is not written out) still counts when the
+/// surface holds it, inside a longer run of them (迄 in 今日迄は for まで of
+/// きょうまでは); a kana form does not (まで is not written in 今では).
+pub(super) fn writes(
+    surface: &[char],
+    ranges: Option<&[(usize, usize)]>,
+    p: usize,
+    e: usize,
+    form: &str,
+) -> bool {
+    match ranges.and_then(|r| form_at(surface, r, p, e)) {
+        Some(f) => f == form,
+        None => form.chars().any(is_free) && surface.iter().collect::<String>().contains(form),
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +238,43 @@ mod tests {
         );
         // unalignable chosen surface: nothing
         assert!(derive("かみ", "紙を", "髪").is_empty());
+    }
+
+    fn applies(w: &Word, reading: &[char]) -> bool {
+        !places(w, reading).is_empty()
+    }
+
+    fn writes_at(surface: &str, reading: &str, p: usize, e: usize, form: &str) -> bool {
+        let s = chars(surface);
+        let r = align(&s, &chars(reading));
+        writes(&s, r.as_deref(), p, e, form)
+    }
+
+    #[test]
+    fn a_form_is_what_the_surface_writes_for_that_reading() {
+        // まで of いまでは
+        assert!(writes_at("いまでは", "いまでは", 1, 3, "まで"));
+        assert!(!writes_at("今では", "いまでは", 1, 3, "まで"));
+        assert!(!writes_at("今では", "いまでは", 1, 3, "迄"));
+        // まで of きょうまでは
+        assert!(writes_at("今日までは", "きょうまでは", 3, 5, "まで"));
+        // a kanji form inside a longer run of kanji still counts
+        assert!(writes_at("今日迄は", "きょうまでは", 3, 5, "迄"));
+        // かみ at the start, not the 紙 at the end
+        assert!(writes_at(
+            "髪を切ってから紙",
+            "かみをきってからかみ",
+            0,
+            2,
+            "髪"
+        ));
+        assert!(!writes_at(
+            "髪を切ってから紙",
+            "かみをきってからかみ",
+            0,
+            2,
+            "紙"
+        ));
     }
 
     #[test]

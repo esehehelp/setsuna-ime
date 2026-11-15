@@ -28,9 +28,11 @@
 //! surfaces differ in, with their reading and up to two reading chars on
 //! each side (きしゃ: 記者 -> 貴社, before にれ). A word choice applies wherever
 //! its reading recurs next to the same context on one side, however
-//! different the rest of the reading is, and adds ±w to candidates containing the chosen / rejected
-//! word. A candidate list is reranked when a sentence-level or a word-level
-//! choice applies.
+//! different the rest of the reading is, and adds ±w to the candidates
+//! that write the chosen / rejected word at that place of the reading, when
+//! one of the list writes the rejected word there (`word_bonuses`). A
+//! candidate list is reranked when a sentence-level or a word-level choice
+//! applies.
 //!
 //! Choices are appended to `learning.jsonl` in the config directory, one
 //! JSON object per line. Every process that loads the IME appends to the
@@ -452,12 +454,14 @@ impl Learning {
     }
 
     /// The choices in effect that put `surface` up for `reading`: the
-    /// sentence choices of it, and the word choices of a word inside it
-    /// that apply to the reading (`words::applies`, as reranking takes
-    /// them): a word learned elsewhere is no part of it (傘 learned before
-    /// のし stays when 傘の下 is deleted for かさの).
+    /// sentence choices of it, and the word choices it writes where they
+    /// apply in the reading (`words::places`, `words::writes`, as
+    /// reranking takes them): a word learned elsewhere is no part of it (傘
+    /// learned before のし stays when 傘の下 is deleted for かさの).
     fn learned(&self, reading: &str, surface: &str) -> Vec<Learned> {
         let reading_chars: Vec<char> = reading.chars().collect();
+        let surface_chars: Vec<char> = surface.chars().collect();
+        let surface_ranges = crate::reading_align::align(&surface_chars, &reading_chars);
         let mut out: Vec<Learned> = self
             .by_key
             .iter()
@@ -469,14 +473,23 @@ impl Learning {
                 .iter()
                 .enumerate()
                 .filter(|(_, w)| {
+                    let n = w.word.span.chars().count();
+                    let mut places = words::places(&w.word, &reading_chars);
+                    // the word of a choice of the whole reading, which has
+                    // no context to apply by
+                    if w.word.span == reading && w.word.left.is_empty() && w.word.right.is_empty() {
+                        places.push(0);
+                    }
                     w.count > 0
-                        && surface.contains(&w.word.chosen)
-                        && (words::applies(&w.word, &reading_chars)
-                            // the word of a choice of the whole reading,
-                            // which has no context to apply by
-                            || (w.word.span == reading
-                                && w.word.left.is_empty()
-                                && w.word.right.is_empty()))
+                        && places.iter().any(|&p| {
+                            words::writes(
+                                &surface_chars,
+                                surface_ranges.as_deref(),
+                                p,
+                                p + n,
+                                &w.word.chosen,
+                            )
+                        })
                 })
                 .map(|(i, _)| Learned::Word(i)),
         );
@@ -538,10 +551,14 @@ impl Learning {
             return candidates;
         }
         let reading_chars: Vec<char> = reading.chars().collect();
-        let word_hits: Vec<&WordEntry> = self
+        let word_hits: Vec<(&WordEntry, Vec<usize>)> = self
             .words
             .iter()
-            .filter(|w| self.use_words && w.count > 0 && words::applies(&w.word, &reading_chars))
+            .filter(|w| self.use_words && w.count > 0)
+            .filter_map(|w| {
+                let places = words::places(&w.word, &reading_chars);
+                (!places.is_empty()).then_some((w, places))
+            })
             .collect();
         let rv = bigrams(reading);
         let mut seen: HashSet<usize> = HashSet::new();
@@ -560,6 +577,7 @@ impl Learning {
         if hits.is_empty() && word_hits.is_empty() {
             return candidates;
         }
+        let word_bonus = word_bonuses(&reading_chars, &candidates, &word_hits);
         let n = candidates.len() as f32;
         let scores: Vec<f32> = candidates
             .iter()
@@ -574,15 +592,7 @@ impl Learning {
                         sim * w * (cosine(&cv, &e.chosen) - cosine(&cv, &e.rejected)) / e.span
                     })
                     .sum();
-                let word_bonus: f32 = word_hits
-                    .iter()
-                    .map(|w| {
-                        let has = |s: &str| if c.contains(s) { 1.0 } else { 0.0 };
-                        (1.0 + (w.count as f32).ln())
-                            * (has(&w.word.chosen) - has(&w.word.rejected))
-                    })
-                    .sum();
-                -(rank as f32) / n + self.strength * (bonus + word_bonus)
+                -(rank as f32) / n + self.strength * (bonus + word_bonus[rank])
             })
             .collect();
         // First index of the highest score: ties keep the engine's order.
@@ -594,6 +604,67 @@ impl Learning {
         }
         candidates
     }
+}
+
+/// The word choices' bonus of each candidate: ±w where a word choice
+/// applies (`hits`, with the places of its reading) and the candidate
+/// writes its chosen / rejected form at that place of the reading
+/// (`words::writes`). Only where the list offers the rejected form there:
+/// otherwise the choice is not in question (までは chosen over 迄は is no
+/// reason to touch いまでは, which nothing writes with 迄). And never for the
+/// reading itself in kana, which the list always holds and which writes
+/// every kana word: a word chosen in kana would turn the whole sentence
+/// into kana.
+fn word_bonuses(
+    reading: &[char],
+    candidates: &[String],
+    hits: &[(&WordEntry, Vec<usize>)],
+) -> Vec<f32> {
+    let mut out = vec![0.0; candidates.len()];
+    if hits.is_empty() {
+        return out;
+    }
+    let aligned: Vec<(Vec<char>, Option<Vec<(usize, usize)>>)> = candidates
+        .iter()
+        .map(|c| {
+            let s: Vec<char> = c.chars().collect();
+            let r = crate::reading_align::align(&s, reading);
+            (s, r)
+        })
+        .collect();
+    let spelled: Vec<bool> = aligned
+        .iter()
+        .map(|(s, _)| {
+            s.len() == reading.len()
+                && s.iter().zip(reading).all(|(&c, &r)| {
+                    c == r
+                        || (crate::reading_align::is_kana(c)
+                            && crate::reading_align::to_hira(c) == r)
+                })
+        })
+        .collect();
+    for (w, places) in hits {
+        let weight = 1.0 + (w.count as f32).ln();
+        let n = w.word.span.chars().count();
+        let writes = |k: usize, p: usize, form: &str| {
+            let (s, r) = &aligned[k];
+            words::writes(s, r.as_deref(), p, p + n, form)
+        };
+        let contested: Vec<usize> = places
+            .iter()
+            .copied()
+            .filter(|&p| (0..aligned.len()).any(|k| !spelled[k] && writes(k, p, &w.word.rejected)))
+            .collect();
+        if contested.is_empty() {
+            continue;
+        }
+        for k in (0..aligned.len()).filter(|&k| !spelled[k]) {
+            let chosen = contested.iter().any(|&p| writes(k, p, &w.word.chosen));
+            let rejected = contested.iter().any(|&p| writes(k, p, &w.word.rejected));
+            out[k] += weight * (f32::from(u8::from(chosen)) - f32::from(u8::from(rejected)));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -720,6 +791,49 @@ mod tests {
         let mut l = Learning::at(t.0.clone(), &off);
         let cands = list(&["髪を切っておく", "紙を切っておく"]);
         assert_eq!(l.rerank("かみをきっておく", cands.clone()), cands);
+    }
+
+    #[test]
+    fn a_word_chosen_in_kana_does_not_turn_a_sentence_into_kana() {
+        // までは over 迄は learns まで over 迄 before は, which recurs in
+        // いまでは; the reading itself writes まで there, 今では does not.
+        // A whole sentence went to kana as soon as いまでは was typed.
+        let t = TempFile::new("kana-word");
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        l.record("までは", "までは", "迄は").unwrap();
+        let reading = "ちちはていねんごにそばうちをはじめた。いまでは";
+        let cands = list(&[
+            "父は定年後にそば打ちを始めた。今では",
+            "父は定年後にそば打ちを始めた。今は",
+            reading,
+            "父は定年後にそば打ちを始めた。いまでは",
+        ]);
+        assert_eq!(l.rerank(reading, cands.clone()), cands);
+        // where 迄 is in question it still applies
+        let got = l.rerank(
+            "きょうまでは",
+            list(&["今日迄は", "今日までは", "きょうまでは"]),
+        );
+        assert_eq!(got[0], "今日までは");
+        // the reading itself, punctuation and all, gets nothing for writing
+        // まで: what writes it of the conversions goes up
+        let got = l.rerank(
+            "きょうまでは。",
+            list(&["今日迄は。", "きょうまでは。", "今日までは。"]),
+        );
+        assert_eq!(got[0], "今日までは。");
+    }
+
+    #[test]
+    fn a_word_choice_counts_where_its_reading_is_written() {
+        // 紙 over 髪 learned before をき: 紙 elsewhere in a candidate is no
+        // reason to put it up
+        let t = TempFile::new("word-place");
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        l.record("かみをきる", "紙を切る", "髪を切る").unwrap();
+        let cands = list(&["髪を切ってから神", "髪を切ってから紙"]);
+        let got = l.rerank("かみをきってからかみ", cands);
+        assert_eq!(got[0], "髪を切ってから神");
     }
 
     #[test]
