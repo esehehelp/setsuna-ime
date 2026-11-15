@@ -31,19 +31,23 @@
 //! (the entries by reading, ascending by bytes, then by cost), context
 //! u32[entries] (lid 16 bits, rid 16) and connection i16[ids * ids] (in
 //! centinats, by right id then left id). Version 2 is the same without the
-//! last two. The file is mapped, not read, so the processes the IME runs in
-//! share one copy.
+//! last two. Version 4 (`packed`, `build_packed`) holds the same in a
+//! fraction of the bytes. The file is mapped, not read, so the processes
+//! the IME runs in share one copy.
 //!
 //! `convert` goes the other way, as a dictionary IME does: the cheapest
 //! sequences of the lexicon's words (and kana as typed) that read as a
 //! reading, for the conversions the model does not find (大島村 for
 //! おおしまむら, where it gave おおしま村).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, ensure, Context, Result};
+
+mod packed;
 
 /// What a candidate's score loses per nat of its lexicon cost, picked on the
 /// distributed model's wiki_fresh_v2 conversions (Shiran-v2 s14000, its top
@@ -163,9 +167,9 @@ impl std::ops::Deref for Bytes {
 }
 
 /// One reading of a surface, in one of its forms.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry<'a> {
-    pub reading: &'a str,
+    pub reading: Cow<'a, str>,
     pub cost: f32,
     pub class: u8,
     /// The context ids of its left and right ends (`NO_ID` for none).
@@ -197,6 +201,8 @@ pub struct Lexicon {
     /// Byte offsets of key_off, key_blob, key_first, entry, reading_blob,
     /// by_reading, context, connection.
     at: [usize; 8],
+    /// A version 4 file's sections (`at` unused).
+    packed: Option<packed::Packed>,
 }
 
 impl std::fmt::Debug for Lexicon {
@@ -237,9 +243,23 @@ impl Lexicon {
         let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
         let version = u32_at(8);
         ensure!(
-            version == 2 || version == VERSION,
-            "lexicon version {version} (this IME reads 2 and {VERSION})"
+            version == 2 || version == VERSION || version == packed::VERSION,
+            "lexicon version {version} (this IME reads 2, {VERSION} and {})",
+            packed::VERSION
         );
+        if version == packed::VERSION {
+            let p = packed::Packed::open(&bytes)?;
+            return Ok(Self {
+                keys: p.keys(),
+                entries: p.len(),
+                ids: p.ids(),
+                partial: u32_at(28) & FLAG_PARTIAL != 0,
+                connection_weight: CONNECTION_WEIGHT,
+                at: [0; 8],
+                packed: Some(p),
+                bytes,
+            });
+        }
         let (keys, entries, key_bytes, reading_bytes) =
             (u32_at(12), u32_at(16), u32_at(20), u32_at(24));
         let ids = if version == 2 { 0 } else { u32_at(28) };
@@ -270,6 +290,7 @@ impl Lexicon {
             partial,
             connection_weight: CONNECTION_WEIGHT,
             at,
+            packed: None,
         })
     }
 
@@ -292,6 +313,9 @@ impl Lexicon {
         let (r, l) = (rid as usize, lid as usize);
         if r >= self.ids || l >= self.ids {
             return 0.0;
+        }
+        if let Some(p) = &self.packed {
+            return p.connection(&self.bytes, r, l) / 100.0 * self.connection_weight;
         }
         let o = self.at[7] + 2 * (r * self.ids + l);
         let c = i16::from_le_bytes(self.bytes[o..o + 2].try_into().unwrap());
@@ -330,7 +354,9 @@ impl Lexicon {
         };
         Entry {
             // the blob holds what `build` wrote from a &str
-            reading: std::str::from_utf8(&self.bytes[start..start + len]).unwrap_or(""),
+            reading: Cow::Borrowed(
+                std::str::from_utf8(&self.bytes[start..start + len]).unwrap_or(""),
+            ),
             class: ((v >> 16) & 0xFF) as u8,
             cost: (v & 0xFFFF) as f32 / 100.0,
             lid,
@@ -376,6 +402,10 @@ impl Lexicon {
     /// Every surface of the lexicon that `text` starts with, as its length in
     /// bytes and its entries, shortest first.
     pub fn prefixes<'a>(&'a self, text: &str, mut f: impl FnMut(usize, Entry<'a>)) {
+        if let Some(p) = &self.packed {
+            p.prefixes(&self.bytes, text, MAX_KEY_CHARS, |len, e| f(len, e));
+            return;
+        }
         let (mut lo, mut hi) = (0, self.keys);
         for (n, (i, c)) in text.char_indices().enumerate() {
             if n == MAX_KEY_CHARS || lo == hi {
@@ -398,11 +428,11 @@ impl Lexicon {
     /// Every reading of the lexicon that `text` starts with, as its length
     /// in bytes and the surfaces read so with their entries, shortest first,
     /// each reading's cheapest first.
-    pub fn reading_prefixes<'a>(
-        &'a self,
-        text: &str,
-        mut f: impl FnMut(usize, &'a str, Entry<'a>),
-    ) {
+    pub fn reading_prefixes<'a>(&'a self, text: &str, mut f: impl FnMut(usize, &str, Entry<'a>)) {
+        if let Some(p) = &self.packed {
+            p.reading_prefixes(&self.bytes, text, MAX_KEY_CHARS, |len, s, e| f(len, s, e));
+            return;
+        }
         let at = |k: usize| self.u32_in(5, k);
         let lower = |mut lo: usize, mut hi: usize, probe: &[u8]| {
             while lo < hi {
@@ -467,30 +497,37 @@ impl Lexicon {
                 true
             });
             // (to, surface, cost, lid, rid)
-            let mut steps: Vec<(usize, &str, f32, u16, u16)> = Vec::new();
-            let mut per: (usize, Vec<&str>) = (usize::MAX, Vec::new());
+            let mut steps: Vec<(usize, String, f32, u16, u16)> = Vec::new();
+            let mut per: (usize, Vec<String>) = (usize::MAX, Vec::new());
             self.reading_prefixes(&reading[byte(j)..], |len, surface, e| {
                 // each reading's cheapest few surfaces
                 if per.0 != len {
                     per = (len, Vec::new());
                 }
-                if !per.1.contains(&surface) {
+                if !per.1.iter().any(|s| s == surface) {
                     if per.1.len() == PER_READING {
                         return;
                     }
-                    per.1.push(surface);
+                    per.1.push(surface.to_string());
                 }
                 let chars = reading[byte(j)..byte(j) + len].chars().count();
                 let last = j + chars == m;
-                steps.push((j + chars, surface, e.cost + e.ending(last), e.lid, e.rid));
+                steps.push((
+                    j + chars,
+                    surface.to_string(),
+                    e.cost + e.ending(last),
+                    e.lid,
+                    e.rid,
+                ));
             });
             let c = r[j].1;
             let typed = if is_kana(c) { KANA_COST } else { TYPED_COST };
             let piece = &reading[byte(j)..byte(j + 1)];
-            steps.push((j + 1, piece, typed, NO_ID, NO_ID));
+            steps.push((j + 1, piece.to_string(), typed, NO_ID, NO_ID));
             let here = std::mem::take(&mut paths[j]);
             for (cost, surface, rid) in &here {
-                for &(to, piece, c, lid, next) in &steps {
+                for (to, piece, c, lid, next) in &steps {
+                    let (to, c, lid, next) = (*to, *c, *lid, *next);
                     let c = cost + self.connection(*rid, lid) + c;
                     paths[to].push((c, format!("{surface}{piece}"), next));
                 }
@@ -512,11 +549,11 @@ impl Lexicon {
 
     /// Up to `n` of the lexicon's surfaces read `reading` whole, cheapest
     /// first, with their costs.
-    pub fn words(&self, reading: &str, n: usize) -> Vec<(&str, f32)> {
-        let mut out: Vec<(&str, f32)> = Vec::new();
+    pub fn words(&self, reading: &str, n: usize) -> Vec<(String, f32)> {
+        let mut out: Vec<(String, f32)> = Vec::new();
         self.reading_prefixes(reading, |len, surface, e| {
-            if len == reading.len() && out.len() < n && !out.iter().any(|(s, _)| *s == surface) {
-                out.push((surface, e.cost));
+            if len == reading.len() && out.len() < n && !out.iter().any(|(s, _)| s == surface) {
+                out.push((surface.to_string(), e.cost));
             }
         });
         out
@@ -761,7 +798,19 @@ impl Lexicon {
     /// of a lexicon; without a connection table its words connect at no
     /// cost.
     pub fn build(table: &str, connection: Option<&str>) -> Result<Vec<u8>> {
-        Self::build_with(table, connection, None)
+        Self::build_with(table, connection, None, false)
+    }
+
+    /// `build` as version 4 (`packed`): the same words, a fraction of the
+    /// bytes; the costs as `build` has them (centinats, up to 40.95 nats),
+    /// the connection costs a byte each. With `max_cost`, as
+    /// `build_partial`.
+    pub fn build_packed(
+        table: &str,
+        connection: Option<&str>,
+        max_cost: Option<f32>,
+    ) -> Result<Vec<u8>> {
+        Self::build_with(table, connection, max_cost, true)
     }
 
     /// `build` of the table's words of a cost up to `max_cost` (nats) and
@@ -772,10 +821,15 @@ impl Lexicon {
     /// one-char kanji's 24,831 readings 3.9 MB without the connection table
     /// (user 2026-11-10: 辞書でかいしインストールできなくない？).
     pub fn build_partial(table: &str, connection: Option<&str>, max_cost: f32) -> Result<Vec<u8>> {
-        Self::build_with(table, connection, Some(max_cost))
+        Self::build_with(table, connection, Some(max_cost), false)
     }
 
-    fn build_with(table: &str, connection: Option<&str>, max_cost: Option<f32>) -> Result<Vec<u8>> {
+    fn build_with(
+        table: &str,
+        connection: Option<&str>,
+        max_cost: Option<f32>,
+        packed: bool,
+    ) -> Result<Vec<u8>> {
         let mut raw: Vec<f64> = Vec::new();
         let mut ids = 0usize;
         if let Some(text) = connection {
@@ -863,6 +917,9 @@ impl Lexicon {
             })
             .collect();
         rows.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.2.cmp(&b.2)));
+        if packed {
+            return packed::build(&rows, &costs, ids, max_cost.is_some());
+        }
         let (mut key_off, mut key_blob, mut key_first) = (vec![0u32], Vec::new(), vec![0u32]);
         let (mut entry, mut reading_blob) = (Vec::with_capacity(rows.len()), Vec::new());
         for (k, (s, r, c, class, _)) in rows.iter().enumerate() {
@@ -1005,7 +1062,7 @@ mod tests {
         assert_eq!(got, [(3, "ぞく".to_string()), (6, "ぞくとう".to_string())]);
         let today = lex.get("今日");
         assert_eq!(today.len(), 2);
-        assert_eq!((today[0].reading, today[0].class), ("きょう", 1));
+        assert_eq!((today[0].reading.as_ref(), today[0].class), ("きょう", 1));
         assert!((today[0].cost - 8.7).abs() < 1e-6);
         assert!(lex.get("今").is_empty());
     }
@@ -1123,7 +1180,10 @@ mod tests {
         };
         // cheapest first, those WORD_MARGIN dearer than the cheapest left out
         assert_eq!(words("けんしゅう"), ["研修", "検収"]);
-        assert_eq!(lex.words("けんしゅう", 2), [("研修", 9.4), ("検収", 14.6)]);
+        assert_eq!(
+            lex.words("けんしゅう", 2),
+            [("研修".to_string(), 9.4), ("検収".to_string(), 14.6)]
+        );
         // a particle, okurigana or punctuation after the word, as typed
         assert_eq!(words("けんしゅうを"), ["研修を", "検収を"]);
         assert_eq!(words("きょう？"), ["今日？"]);
@@ -1182,5 +1242,153 @@ mod tests {
             .iter()
             .any(|(w, _)| w == "教会"));
         assert!(part.cost("京", "みやこ").is_some());
+        let packed = Lexicon::from_bytes(Bytes::Owned(
+            Lexicon::build_packed(table, None, Some(15.0)).unwrap(),
+        ))
+        .unwrap();
+        assert!(packed.partial());
+        assert_eq!(packed.len(), 4);
+    }
+
+    /// What a lexicon answers, to compare one file with another: its
+    /// entries by surface and by reading, conversions, costs, words and
+    /// splits for `texts` (surface, reading).
+    fn answers(lex: &Lexicon, texts: &[(&str, &str)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for &(surface, reading) in texts {
+            lex.prefixes(surface, |len, e| {
+                out.push(format!("p {surface} {len} {e:?}"))
+            });
+            lex.reading_prefixes(reading, |len, s, e| {
+                out.push(format!("r {reading} {len} {s} {e:?}"))
+            });
+            // costs to a tenth of a nat: the connection costs are a byte each
+            let conversions: Vec<(String, f32)> = lex
+                .convert(reading, 5)
+                .into_iter()
+                .map(|(s, c)| (s, (c * 10.0).round()))
+                .collect();
+            out.push(format!("c {conversions:?}"));
+            let cost = lex.cost(surface, reading).map(|c| (c * 10.0).round());
+            out.push(format!("k {surface} {reading} {cost:?}"));
+            out.push(format!("w {:?}", lex.word_candidates(reading)));
+            out.push(format!("h {:?}", lex.char_words(reading)));
+            out.push(format!("s {:?}", lex.split_reading(surface, reading)));
+        }
+        out
+    }
+
+    #[test]
+    fn a_packed_lexicon_answers_as_the_flat_one() {
+        let table = format!(
+            "{TABLE}大島\tおおしま\t12.0\tpropn\t\t1\t1\n村\tむら\t10.0\tnoun\t\t1\t1\n\
+             大島村\tおおしまむら\t18.3\tpropn\t\t1\t1\n大\tおお\t14.0\tpref\t\t3\t3\n\
+             島\tしま\t11.0\tnoun\t\t1\t1\n書い\tかい\t9.0\tverb\t\t2\t2\n貝\tかい\t8.5\tnoun\t\t1\t1\n\
+             た\tた\t3.5\taux\t\t4\t4\n東\tとう\t10.0\tnoun\t\t1\t1\n京\tきょう\t10.0\tnoun\t\t1\t1\n\
+             亜\tあ\t17.0\tnoun\t\t1\t1\n阿\tあ\t18.5\tsym\t\t1\t1\n"
+        );
+        let mut connection = String::from("5\n");
+        for r in 0..5 {
+            for l in 0..5 {
+                let c = if l == 4 && r != 2 {
+                    6.0
+                } else {
+                    1.0 + 0.3 * (r + l) as f64
+                };
+                connection.push_str(&format!("{c}\n"));
+            }
+        }
+        let flat = Lexicon::from_bytes(Bytes::Owned(
+            Lexicon::build(&table, Some(&connection)).unwrap(),
+        ))
+        .unwrap();
+        let packed = Lexicon::from_bytes(Bytes::Owned(
+            Lexicon::build_packed(&table, Some(&connection), None).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            (packed.len(), packed.keys, packed.ids),
+            (flat.len(), flat.keys, flat.ids)
+        );
+        let texts = [
+            ("続投が決まった", "ぞくとうがきまった"),
+            ("大島村", "おおしまむら"),
+            ("書いた", "かいた"),
+            ("東京", "とうきょう"),
+            ("今日", "きょう"),
+            ("亜", "あ"),
+            ("続頭", "ぞくとう"),
+            ("", ""),
+            ("ん", "ん"),
+        ];
+        assert_eq!(answers(&packed, &texts), answers(&flat, &texts));
+        // more than 256 chars: codes of one byte or two by how common
+        let mut many = String::new();
+        for k in 0..400u32 {
+            let c = char::from_u32(0x4E00 + k).unwrap();
+            let r = ["あ", "い", "う", "え", "お"][k as usize % 5];
+            many.push_str(&format!(
+                "{c}\t{r}{}\t{}.0\tnoun\n",
+                "か".repeat(k as usize % 3),
+                k % 20
+            ));
+            if k % 7 == 0 {
+                // a common char: in many surfaces
+                many.push_str(&format!("{c}一\t{r}いち\t9.0\tnoun\n"));
+            }
+        }
+        let flat = Lexicon::from_bytes(Bytes::Owned(Lexicon::build(&many, None).unwrap())).unwrap();
+        let packed = Lexicon::from_bytes(Bytes::Owned(
+            Lexicon::build_packed(&many, None, None).unwrap(),
+        ))
+        .unwrap();
+        let texts: Vec<(String, String)> = (0..400u32)
+            .step_by(13)
+            .map(|k| {
+                let c = char::from_u32(0x4E00 + k).unwrap();
+                (
+                    format!("{c}一"),
+                    format!("{}かいち", ["あ", "い", "う", "え", "お"][k as usize % 5]),
+                )
+            })
+            .collect();
+        let texts: Vec<(&str, &str)> = texts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(answers(&packed, &texts), answers(&flat, &texts));
+        assert_eq!(packed.get("丂").len(), flat.get("丂").len());
+        // readings of more than 256 chars too
+        let mut odd = String::new();
+        for k in 0..300u32 {
+            let c = char::from_u32(0x4E00 + k).unwrap();
+            let d = char::from_u32(0x3400 + k).unwrap();
+            let r = ["あ", "い", "う"][k as usize % 3];
+            odd.push_str(&format!("{c}\t{d}{r}\t{}.0\tnoun\n", k % 20));
+        }
+        let flat = Lexicon::from_bytes(Bytes::Owned(Lexicon::build(&odd, None).unwrap())).unwrap();
+        let packed = Lexicon::from_bytes(Bytes::Owned(
+            Lexicon::build_packed(&odd, None, None).unwrap(),
+        ))
+        .unwrap();
+        let texts: Vec<(String, String)> = (0..300u32)
+            .step_by(11)
+            .map(|k| {
+                let c = char::from_u32(0x4E00 + k).unwrap();
+                let d = char::from_u32(0x3400 + k).unwrap();
+                (
+                    c.to_string(),
+                    format!("{d}{}", ["あ", "い", "う"][k as usize % 3]),
+                )
+            })
+            .collect();
+        let texts: Vec<(&str, &str)> = texts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(answers(&packed, &texts), answers(&flat, &texts));
+        // a char no surface has, a reading no word has
+        assert!(packed.get("無").is_empty());
+        assert!(packed.words("ぬ", 3).is_empty());
     }
 }

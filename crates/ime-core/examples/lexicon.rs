@@ -2,7 +2,7 @@
 //! candidates up.
 //!
 //! ```text
-//! lexicon build [--max-cost <nats>] <table.tsv> [connection.txt] <out.lexicon>
+//! lexicon build [--packed] [--max-cost <nats>] <table.tsv> [connection.txt] <out.lexicon>
 //! lexicon cost <file.lexicon> <reading> <surface>...
 //! lexicon convert <file.lexicon> <reading>...
 //! lexicon words <file.lexicon> <reading>...
@@ -11,7 +11,8 @@
 //!
 //! `build` compiles the table and the connection costs (the module docs say
 //! what they hold) into the mapped file the IME reads (with `--max-cost`,
-//! the words up to that cost only, the file marked partial); `cost` prints each
+//! the words up to that cost only, the file marked partial; with `--packed`, as
+//! version 4, `Lexicon::build_packed`); `cost` prints each
 //! surface's cheapest reading as the reading, and the lexicon's entries for
 //! it; `convert` the lexicon's own conversions of each reading; `words` the
 //! words it lists for a reading of one word (`word_candidates`) and, for a
@@ -24,6 +25,12 @@ use setsuna_core::lexicon::{Lexicon, CLASSES};
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // build --packed: version 4
+    let packed = args.first().map(String::as_str) == Some("build")
+        && args.get(1).map(String::as_str) == Some("--packed");
+    if packed {
+        args.remove(1);
+    }
     // build --max-cost <nats>: the commoner words only, a partial lexicon
     let mut max_cost: Option<f32> = None;
     if args.first().map(String::as_str) == Some("build")
@@ -42,9 +49,10 @@ fn main() -> Result<()> {
             };
             let out = args.last().unwrap();
             let t = std::time::Instant::now();
-            let bytes = match max_cost {
-                Some(m) => Lexicon::build_partial(&table, connection.as_deref(), m)?,
-                None => Lexicon::build(&table, connection.as_deref())?,
+            let bytes = match (packed, max_cost) {
+                (true, m) => Lexicon::build_packed(&table, connection.as_deref(), m)?,
+                (false, Some(m)) => Lexicon::build_partial(&table, connection.as_deref(), m)?,
+                (false, None) => Lexicon::build(&table, connection.as_deref())?,
             };
             std::fs::write(out, &bytes).with_context(|| out.clone())?;
             let lex = Lexicon::open(std::path::Path::new(out))?;
