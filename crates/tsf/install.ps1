@@ -1148,6 +1148,50 @@ Set-ItemProperty $UninstReg NoModify        1 -Type DWord
 Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
 Write-Log INFO "registered HKCU Uninstall entry: $UninstReg"
 
+# ---- the engines this install replaced ----
+# An app's IME reads config.toml again at its next key or focus change and
+# starts the engine it names; an app left idle keeps the engine it had, with
+# the model and the analyzer that one loaded, as long as the app runs. Those
+# engines stop here, and only they (never an app): this session's
+# setsuna-engine processes from Setsuna's directories whose binary, model,
+# analyzer or ONNX Runtime is not what was installed. An app whose IME used
+# one starts the new engine before it converts again (its client tries a
+# broken pipe once more anyway), and their files go with the rest below.
+function Stop-ReplacedEngines {
+    param([string[]]$Dirs, [string]$Engine, [string[]]$Files)
+    $norm = { param([string]$p) $p.Replace('\', '/').TrimEnd('/') }
+    $session = (Get-Process -Id $PID).SessionId
+    $engineNorm = & $norm $Engine
+    $want = @($Files | Where-Object { $_ } | ForEach-Object { & $norm $_ })
+    $roots = @($Dirs | Where-Object { $_ } | ForEach-Object { (& $norm $_) + '/' })
+    $stopped = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name LIKE 'setsuna-engine%'" -ErrorAction SilentlyContinue)) {
+        if ($p.SessionId -ne $session -or -not $p.ExecutablePath) { continue }
+        $exe = & $norm $p.ExecutablePath
+        if (-not @($roots | Where-Object { $exe.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
+        $cmd = & $norm ([string]$p.CommandLine)
+        $missing = @($want | Where-Object { $cmd.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -lt 0 })
+        if ($exe -eq $engineNorm -and $missing.Count -eq 0) { continue }
+        try {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+            $stopped += $p.ProcessId
+            Write-Log INFO "stopped an engine this install replaced: pid=$($p.ProcessId) $($p.ExecutablePath)"
+        } catch {
+            Write-Log WARN "could not stop the engine pid=$($p.ProcessId): $_"
+        }
+    }
+    # their files free for the clean-up below
+    if ($stopped) { Wait-Process -Id $stopped -Timeout 10 -ErrorAction SilentlyContinue }
+}
+# (files-only installs, as the tests run them, leave the running ones be)
+if (-not $NoElevate) {
+    try {
+        Stop-ReplacedEngines -Dirs @($InstallDir, $UserDir) -Engine $EngineInstalled -Files @($InstalledManifest, $AnalyzerInstalled, $OrtInstalled)
+    } catch {
+        Write-Log WARN "could not stop the engines this install replaced: $_"
+    }
+}
+
 # ---- what earlier installs left ----
 $InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInstalled, $OrtInstalled, $RewriteInstalled, $RerankInstalled,
                     $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled)
