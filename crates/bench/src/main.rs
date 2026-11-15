@@ -55,6 +55,11 @@ enum Cmd {
         carry: bool,
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// Settings from this file instead of the user's config.toml, each
+        /// ${KAIRO_*} in it replaced by that variable: a run under Kairo
+        /// (kairo.toml) names the directories it is handed.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Keys this far apart; 0: one after another without waiting.
         #[arg(long, default_value_t = 0)]
         key_ms: u64,
@@ -117,6 +122,7 @@ fn main() -> Result<()> {
             no_lexicon,
             carry,
             manifest,
+            config,
             key_ms,
             quiet_ms,
             look_ms,
@@ -124,6 +130,7 @@ fn main() -> Result<()> {
         } => {
             let rows = set::load(&sets, &only)?;
             let opts = harness::Options {
+                config,
                 rerank: !no_rerank,
                 lexicon: !no_lexicon,
                 carry,

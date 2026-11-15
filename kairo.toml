@@ -1,0 +1,122 @@
+# Kairo ProjectSpec for setsuna-ime: the runs that make data (builds, model
+# downloads, benches, evaluations) go through Kairo, so what each makes lands
+# where it belongs without anyone copying it (AGENTS.md, "Data"):
+#
+#   durable   a task's output directory (KAIRO_OUTPUT_DIR), packed and copied
+#             to the durable store once its run ends: bench runs, scores,
+#             evaluation outputs, anything that cannot be made again.
+#   temporal  the output of a task declared `regenerable = true`: builds,
+#             public models fetched at a pinned revision. Kept on the volatile
+#             store, not copied; Kairo runs the task again when a reader needs
+#             it and it was evicted.
+#   volatile  scratch (KAIRO_SCRATCH, TMP) and the project's cache
+#             (KAIRO_CACHE_DIR: cargo's target and home, downloads), gone
+#             whenever room is short.
+#
+# Tasks run in the code snapshot made at apply (`source = "setsuna-ime"`),
+# read-only and confined: they write only those three directories, so a run
+# cannot leave results in local/ or _scratch/. A task reads another's output
+# as an input (`task = "..."`, KAIRO_INPUT_<NAME>), and data imported once with
+# `kairo data import` by name (`data = "..."`).
+#
+#   kairo project validate kairo.toml
+#   kairo project apply kairo.toml
+#
+# A task is immutable and runs once: a new run is a new task with a new name.
+schema_version = 1
+
+[project]
+name = "setsuna-ime"
+
+[sources.setsuna-ime]
+root = "."
+paths = ["Cargo.toml", "Cargo.lock", "crates", "vendor", "tests", "kairo"]
+exclude = ["target", "crates/android/app/build", "crates/android/app/.gradle"]
+
+[defaults]
+queue = "bench"
+policy = "RunToCompletion@v1"
+
+[defaults.execution]
+schema_version = 2
+source = "setsuna-ime"
+cwd = "."
+confine = true
+scratch_tmpdir = true
+# scratch, outputs and the cache (cargo's target) on D:, not the system drive
+store = "windows-d"
+priority = 5
+checkpointable = false
+preemptible = false
+
+[defaults.execution.executor]
+labels = { environment = "windows" }
+
+[defaults.execution.capacity]
+cpu_millis = 2000
+ram_bytes = 2147483648
+strength = "admitted"
+
+[[defaults.execution.capacity.disks]]
+filesystem = "D:"
+reserve_bytes = 1073741824
+min_free_after_bytes = 10737418240
+
+# kairo/smoke.ps1 tells what an attempt here can do (integrity, the KAIRO_*
+# directories, writes, toolchain, network): declare a smoke-* task with it
+# after a change to the executors. The tasks below that say `confine = false`
+# were declared before windows-host-1's agent had Kairo e3c02c8 (a confined
+# Windows attempt lost its environment, KAIRO_* included); later ones keep
+# the default.
+
+# --- temporal: made again from the snapshot when evicted --------------------
+
+# The engine, the bench and ONNX Runtime (kairo/build.ps1).
+[[tasks]]
+name = "build-20261116"
+queue = "build"
+[tasks.execution]
+argv = ["pwsh", "-NoProfile", "-File", "kairo/build.ps1"]
+regenerable = true
+confine = false
+[tasks.execution.capacity]
+cpu_millis = 8000
+ram_bytes = 8589934592
+
+# The installers' model and the reading lexicon at the revisions
+# crates/tsf/models.json pins (kairo/fetch.ps1).
+[[tasks]]
+name = "model-cymbidium-v1.1-xsmall"
+queue = "fetch"
+[tasks.execution]
+argv = ["pwsh", "-NoProfile", "-File", "kairo/fetch.ps1"]
+regenerable = true
+confine = false
+
+[[tasks]]
+name = "lexicon-v1"
+queue = "fetch"
+[tasks.execution]
+argv = ["pwsh", "-NoProfile", "-File", "kairo/fetch.ps1", "-Component", "lexicon"]
+regenerable = true
+confine = false
+
+# --- durable: results ---------------------------------------------------------
+
+# The bench's sets typed into the IME session as the installer sets it up
+# (kairo/bench.ps1, kairo/bench/harness.toml): run.jsonl and score.txt.
+[[tasks]]
+name = "bench-harness-20261116"
+depends_on = ["build-20261116", "model-cymbidium-v1.1-xsmall", "lexicon-v1"]
+[tasks.execution]
+argv = ["pwsh", "-NoProfile", "-File", "kairo/bench.ps1"]
+confine = false
+[[tasks.execution.inputs]]
+name = "BUILD"
+task = "build-20261116"
+[[tasks.execution.inputs]]
+name = "MODEL"
+task = "model-cymbidium-v1.1-xsmall"
+[[tasks.execution.inputs]]
+name = "LEXICON"
+task = "lexicon-v1"

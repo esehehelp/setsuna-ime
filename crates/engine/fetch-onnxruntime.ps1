@@ -5,6 +5,7 @@
 #   pwsh -File crates\engine\fetch-onnxruntime.ps1                 # 1.28.0 -> target\release
 #   pwsh -File crates\engine\fetch-onnxruntime.ps1 -Dest target\debug
 #   pwsh -File crates\engine\fetch-onnxruntime.ps1 -Version 1.30.0 # another pinned build
+#   pwsh -File crates\engine\fetch-onnxruntime.ps1 -CacheDir $env:KAIRO_CACHE_DIR\onnxruntime
 #
 # The pinned version matters for results, not only speed: int8 kernels differ
 # between releases. With Aster-v1.2-small int8 over the research general dev set,
@@ -13,8 +14,8 @@
 # and 1.30.0 changed the top-1 of 4-8% of rows (gold accuracy within noise).
 # Change the default only together with a re-benchmark.
 #
-# The download (GitHub release zip) is cached under local\onnxruntime and
-# checked against the SHA-256 below. Windows x64 only; elsewhere put
+# The download (GitHub release zip) is cached under local\onnxruntime (or
+# -CacheDir) and checked against the SHA-256 below. Windows x64 only; elsewhere put
 # libonnxruntime.so / .dylib next to the engine or set SETSUNA_ORT_DYLIB.
 
 #Requires -Version 5.1
@@ -22,7 +23,9 @@
 param(
     [string]$Version = '1.28.0',
     # Default: target\release
-    [string]$Dest
+    [string]$Dest,
+    # Where the download is kept. Default: local\onnxruntime
+    [string]$CacheDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +45,7 @@ if (-not $Known.ContainsKey($Version)) {
 }
 
 $Name = "onnxruntime-win-x64-$Version"
-$Cache = Join-Path $PSScriptRoot "..\..\local\onnxruntime"
+$Cache = if ($CacheDir) { $CacheDir } else { Join-Path $PSScriptRoot "..\..\local\onnxruntime" }
 New-Item -ItemType Directory -Force -Path $Cache | Out-Null
 $Zip = Join-Path $Cache "$Name.zip"
 

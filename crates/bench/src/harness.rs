@@ -3,9 +3,9 @@
 //! rows before forgotten, the row's context as the text before the caret),
 //! its keys one after another (or `key_ms` apart), Space once the view is
 //! still, Enter after a look (`look_ms`) once it is still again, as the TSF
-//! runner does. The user's config with learning, prediction and the
-//! rewriter off, so nothing is recorded; an engine child of its own and the
-//! login's reranker.
+//! runner does. The user's config (or `--config`'s, as a Kairo task gives
+//! it) with learning, prediction and the rewriter off, so nothing is
+//! recorded; an engine child of its own and the login's reranker.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,9 @@ const RETURN: u32 = 0xff0d;
 const SPACE: u32 = 0x20;
 
 pub struct Options {
+    /// Settings from this file (`load_config`) instead of the user's
+    /// config.toml.
+    pub config: Option<std::path::PathBuf>,
     pub rerank: bool,
     pub lexicon: bool,
     /// Keep the context of the rows before (an IME that cannot read the
@@ -105,9 +108,51 @@ fn view_key(s: &Session) -> String {
     )
 }
 
+/// Settings from `path`, every `${KAIRO_*}` in it replaced by that
+/// environment variable (`expand_kairo`): a run under Kairo names the
+/// directories it is handed (kairo.toml).
+pub fn load_config(path: &std::path::Path) -> Result<Config> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let text = expand_kairo(&text, |name| std::env::var(name).ok())?;
+    Config::load_from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))
+}
+
+/// `text` with each `${NAME}` replaced by `var(NAME)`, backslashes made
+/// forward slashes (the value goes into a TOML string). Only `KAIRO_*`
+/// names, and each must be set: a path left as written would be read as a
+/// relative one.
+pub fn expand_kairo(text: &str, var: impl Fn(&str) -> Option<String>) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| anyhow::anyhow!("unclosed ${{ in the config"))?;
+        let name = &after[..end];
+        ensure!(
+            name.starts_with("KAIRO_")
+                && name[6..]
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+            "only ${{KAIRO_*}} is expanded, not ${{{name}}}"
+        );
+        let value = var(name).ok_or_else(|| anyhow::anyhow!("{name} is not set"))?;
+        out.push_str(&value.replace('\\', "/"));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 impl Harness {
     pub fn new(opts: Options) -> Result<Self> {
-        let mut cfg = Config::load_default();
+        let mut cfg = match &opts.config {
+            Some(path) => load_config(path)?,
+            None => Config::load_default(),
+        };
         cfg.learning.enabled = false;
         cfg.frontend.prediction = false;
         cfg.rewriter.enabled = false;
@@ -275,5 +320,39 @@ impl Harness {
             done.push(t);
         }
         Ok(done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_kairo;
+
+    #[test]
+    fn a_config_names_the_directories_kairo_hands_the_run() {
+        let var = |name: &str| {
+            (name == "KAIRO_INPUT_BUILD").then(|| r"C:\store\outputs\exe_1".to_string())
+        };
+        assert_eq!(
+            expand_kairo(r#"engine_exe = "${KAIRO_INPUT_BUILD}/bin/e.exe""#, var).unwrap(),
+            r#"engine_exe = "C:/store/outputs/exe_1/bin/e.exe""#
+        );
+        // unset, not KAIRO_*, unclosed: refused rather than read as a path
+        assert!(expand_kairo("${KAIRO_INPUT_MODEL}", var).is_err());
+        assert!(expand_kairo("${HOME}", var).is_err());
+        assert!(expand_kairo("${KAIRO_INPUT_BUILD", var).is_err());
+        assert_eq!(expand_kairo("no variables", var).unwrap(), "no variables");
+    }
+
+    #[test]
+    fn the_kairo_bench_config_is_a_config() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kairo/bench/harness.toml"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let text = expand_kairo(&text, |name| Some(format!("C:/inputs/{name}"))).unwrap();
+        let cfg = setsuna_core::config::Config::load_from_str(&text).unwrap();
+        assert!(cfg.engine.engine_exe.is_some() && cfg.engine.model_manifest.is_some());
+        assert!(!cfg.learning.enabled && !cfg.rewriter.enabled);
     }
 }
