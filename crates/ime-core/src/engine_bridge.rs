@@ -2044,7 +2044,26 @@ impl EngineBridge {
 
     pub fn handle_enter(&mut self) -> KeyOutcome {
         self.passing = false;
-        self.await_live_conversion();
+        // mixed input reading the whole otherwise once typing is done
+        // (げんだいぶんめいok: お and a pending k while typed, ok when done):
+        // that reading is converted, as Space does (its kana went
+        // unconverted); one with no kana is committed as it reads (`ok`: OK)
+        let done_otherwise = self.composing.reads_otherwise_when_done();
+        let convert_done = done_otherwise
+            && self.live_conversion
+            && matches!(self.phase, Phase::Composing { .. })
+            && self.composing.cursor_at_end()
+            && !self.kana_shown
+            && self
+                .composing
+                .full_reading()
+                .chars()
+                .any(|c| matches!(c, 'ぁ'..='ゖ' | 'ァ'..='ヺ'));
+        if convert_done {
+            self.composing.commit_reading();
+            self.dispatch_live();
+        }
+        self.await_live_conversion(convert_done);
         self.invalidate_engine_results();
         match &self.phase {
             Phase::Empty => not_consumed(),
@@ -2079,9 +2098,9 @@ impl EngineBridge {
             Phase::Composing { candidates } => {
                 // with the caret moved the preedit is the kana, and so is
                 // the commit; so it is when mixed input reads the whole
-                // otherwise than what was typed so far (`ok`: OK, not お
-                // and k)
-                let done_otherwise = self.composing.reads_otherwise_when_done();
+                // otherwise than what was typed so far and has no kana to
+                // convert (`ok`: OK, not お and k)
+                let done_otherwise = done_otherwise && !convert_done;
                 // after Escape the kana shown is what goes
                 let kana = std::mem::take(&mut self.kana_shown);
                 let reading = self.composing.full_reading();
@@ -3829,13 +3848,14 @@ impl EngineBridge {
     /// none was in). Results for a shorter reading are taken on the way.
     /// Not when Enter commits the kana anyway (the caret moved, Escape, a
     /// reading too short to convert, mixed input reading the whole
-    /// otherwise) or the engine is not serving.
-    fn await_live_conversion(&mut self) {
+    /// otherwise, unless `done`: that reading is converted now, typing done)
+    /// or the engine is not serving.
+    fn await_live_conversion(&mut self, done: bool) {
         if !self.live_conversion
             || !matches!(self.phase, Phase::Composing { .. })
             || !self.composing.cursor_at_end()
             || self.kana_shown
-            || self.composing.reads_otherwise_when_done()
+            || !done && self.composing.reads_otherwise_when_done()
         {
             return;
         }
@@ -4214,6 +4234,9 @@ mod tests {
         gone: std::cell::Cell<bool>,
         /// What `analyze` answers for a text (none: no analyzer).
         analyses: RefCell<HashMap<String, Vec<crate::engine_client::Word>>>,
+        /// Readings answered as soon as they are dispatched, within the
+        /// wait of Enter (`wait_latest`).
+        answers: RefCell<HashMap<String, Vec<String>>>,
     }
 
     /// In-memory `EngineClient` for phase-machine tests. Cloning shares the
@@ -4289,6 +4312,17 @@ mod tests {
                 context.to_string(),
                 reading.to_string(),
             ));
+            if let Some(candidates) = self.state.answers.borrow().get(reading) {
+                *self.state.next.borrow_mut() = Some(EngineResult {
+                    req_id,
+                    reading: reading.to_string(),
+                    candidates: candidates.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+        fn wait_latest(&self, _timeout: std::time::Duration) -> bool {
+            !self.state.answers.borrow().is_empty() && self.state.next.borrow().is_some()
         }
         fn dispatch_more(&self, req_id: u64, context: &str, reading: &str, continue_beam: u32) {
             self.dispatch(req_id, context, reading);
@@ -4993,7 +5027,7 @@ mod tests {
     #[test]
     fn mixed_enter_commits_what_the_whole_reads_as() {
         // the shipped model knows ok
-        let (mut bridge, _mock) = bridge_with_mock();
+        let (mut bridge, mock) = bridge_with_mock();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
         bridge.set_mixed(
             Some(std::sync::Arc::new(
@@ -5005,6 +5039,15 @@ mod tests {
         bridge.live_conversion = true;
         type_str(&mut bridge, "ok");
         assert_eq!(commits(&bridge.handle_enter().actions), vec!["OK"]);
+        // with kana in it, that reading is converted, not committed as kana
+        // (げんだいぶんめいok: お and a pending k while typed)
+        mock.state
+            .answers
+            .borrow_mut()
+            .insert("げんだいぶんめいOK".into(), vec!["現代文明OK".into()]);
+        type_str(&mut bridge, "genndaibunnmeiok");
+        assert_eq!(bridge.live_preedit(), "げんだいぶんめいおk");
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["現代文明OK"]);
     }
 
     #[test]
