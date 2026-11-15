@@ -55,7 +55,7 @@
 //! going back to it loses the counts (each choice is as if made once).
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -355,7 +355,7 @@ impl Learning {
         let tmp = self
             .path
             .with_file_name(format!("{name}.{}.{now}.tmp", std::process::id()));
-        let moved = std::fs::write(&tmp, &out).and_then(|()| {
+        let moved = crate::private_file::write(&tmp, &out).and_then(|()| {
             // another process appended meanwhile: its line stays, compacted
             // another time
             if std::fs::metadata(&self.path)?.len() != len {
@@ -522,11 +522,7 @@ impl Learning {
         line.push(b'\n');
         // One append-mode write per line keeps lines from different
         // processes whole.
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?
-            .write_all(&line)?;
+        crate::private_file::append(&self.path)?.write_all(&line)?;
         self.sync();
         Ok(())
     }
@@ -603,6 +599,7 @@ impl Learning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     struct TempFile(PathBuf);
 

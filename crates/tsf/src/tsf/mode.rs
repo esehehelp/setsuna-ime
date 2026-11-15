@@ -145,7 +145,9 @@ fn open_settings() {
     let Some(exe) = crate::globals::dll_dir().map(|d| d.join(SETTINGS_EXE)) else {
         return;
     };
-    if let Err(e) = std::process::Command::new(&exe).spawn() {
+    let mut cmd = std::process::Command::new(&exe);
+    setsuna_core::config::scrub_env(&mut cmd);
+    if let Err(e) = cmd.spawn() {
         setsuna_core::diagnostics::log(format!("settings: {} did not start: {e}", exe.display()));
     }
 }

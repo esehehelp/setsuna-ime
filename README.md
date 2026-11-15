@@ -28,7 +28,8 @@ irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 
 - リリース zip（`setsuna-ime-<version>-windows-x64.zip`）を展開して `install.cmd` を実行しても同じです。Visual C++ ランタイム（14.44 以上）が無い場合は自動導入します。
 - **設定 GUI**: タスクバーの「あ / A」アイコンを右クリック →「設定...」から開けます。変更は次の入力から反映されます。
 - **起動中アプリへの更新反映**: TSF に登録した軽量シム（`setsuna_tsf_shim.dll`）が新バージョンの本体 DLL をホットスワップし、旧エンジンプロセスも自動停止するため、アプリを再起動せずに更新が届きます。
-- **アンインストール**: `%LOCALAPPDATA%\setsuna-ime\uninstall.ps1` を実行します。
+- **インストール先**: DLL・エンジン・モデル・辞書は `%ProgramFiles%\setsuna-ime` に入ります。IME はマシン全体に登録され、管理者として実行したアプリにも読み込まれるため、読み込むコードとファイルは管理者だけが書き換えられる場所に置き、管理者として実行したアプリの IME はそれらのパスを同じ場所の `installed.toml` からだけ取ります（`config.toml` と環境変数のパスは使いません）。インストールのログとダウンロードのキャッシュは `%LOCALAPPDATA%\setsuna-ime` です。
+- **アンインストール**: `%ProgramFiles%\setsuna-ime\uninstall.ps1` を実行します。
 
 ### Linux（fcitx5 / x86_64）
 

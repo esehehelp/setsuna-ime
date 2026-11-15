@@ -387,6 +387,7 @@ fn start(
         launch.args
     ));
     let mut cmd = Command::new(&launch.exe);
+    crate::config::scrub_env(&mut cmd);
     cmd.args(&launch.args);
     let stderr = stderr_log_path()
         .and_then(|path| crate::diagnostics::open_log(&path))
@@ -563,8 +564,7 @@ pub fn spawn_with_config(
 }
 
 fn find_exe(module_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SETSUNA_RERANK_EXE") {
-        let p = PathBuf::from(p);
+    if let Some(p) = crate::config::env_path("SETSUNA_RERANK_EXE") {
         if p.is_file() {
             return Some(p);
         }

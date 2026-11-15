@@ -8,8 +8,16 @@
 //! answers the requests of all of them in turn. Idle for `idle_after`, the
 //! service may free what it can make again; with no client for
 //! `exit_after`, the server exits.
+//!
+//! Any process of the user can reach the pipe, so what one may take is
+//! bounded: `MAX_CLIENTS` connected at once (one past that is let go: the
+//! IME's client then runs a child of its own app), a request line of
+//! `MAX_LINE` bytes (a longer one ends the connection), and one request in
+//! flight a client (it waits for its response), so the worker's queue holds
+//! one job a client at most. What a request asks for is the service's to
+//! bound.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -19,6 +27,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::win::{self, Pipe};
+
+/// Clients connected at once: one per app the IME runs in, with room.
+pub const MAX_CLIENTS: usize = 256;
+/// The longest request line, in bytes.
+pub const MAX_LINE: usize = 256 << 10;
 
 /// What a server answers with.
 pub trait Service {
@@ -151,6 +164,10 @@ pub fn serve<S: Service + 'static>(
     say(format!("{} up: {ready}", opts.pipe_name));
     loop {
         match instance.accept() {
+            Ok(()) if lock(&clients).connected >= MAX_CLIENTS => {
+                say(format!("{MAX_CLIENTS} clients connected, one let go"));
+                drop(instance);
+            }
             Ok(()) => {
                 lock(&clients).connected += 1;
                 let (clients, jobs, ready) = (clients.clone(), jobs.clone(), ready.clone());
@@ -190,8 +207,17 @@ fn serve_client(pipe: &Pipe, ready: &str, jobs: &mpsc::Sender<Job>) -> std::io::
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if (&mut reader)
+            .take(MAX_LINE as u64 + 1)
+            .read_line(&mut line)?
+            == 0
+        {
             return Ok(());
+        }
+        if line.len() > MAX_LINE {
+            return Err(std::io::Error::other(format!(
+                "a request line over {MAX_LINE} bytes"
+            )));
         }
         if line.trim().is_empty() {
             continue;
@@ -309,5 +335,15 @@ mod tests {
         .is_ok());
         assert_eq!(ask(&mut b, "d"), "4 D\n");
         assert!(!server.is_finished());
+        // a request line past MAX_LINE ends that client's connection, not
+        // the server
+        let mut c = connect();
+        line.clear();
+        c.read_line(&mut line).unwrap();
+        let long = "x".repeat(MAX_LINE + 10) + "\n";
+        let _ = (&*c.get_ref()).write_all(long.as_bytes());
+        line.clear();
+        assert!(matches!(c.read_line(&mut line), Ok(0) | Err(_)), "{line:?}");
+        assert_eq!(ask(&mut a, "e"), "5 E\n");
     }
 }

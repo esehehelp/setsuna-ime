@@ -6,7 +6,7 @@
 //! it does not bring them back.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -104,11 +104,7 @@ impl Hidden {
         }
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?
-            .write_all(&line)?;
+        crate::private_file::append(&self.path)?.write_all(&line)?;
         self.sync();
         Ok(())
     }

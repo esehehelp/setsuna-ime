@@ -31,6 +31,7 @@ pub mod numbers;
 pub mod postprocess;
 pub mod predict;
 pub mod privacy;
+mod private_file;
 mod reading_align;
 pub mod rerank_client;
 pub mod rewrite_client;

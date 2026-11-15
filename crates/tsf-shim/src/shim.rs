@@ -115,6 +115,10 @@ fn file_stamp(path: &Path) -> Stamp {
         .and_then(|m| Some((m.len(), m.modified().ok()?)))
 }
 
+/// [`CORE_ENV`]'s core. In an elevated process too: the name can only be one
+/// of a core in the shim's directory (`core_hash`: no separator, no `..`),
+/// checked against its hash, and that directory is Program Files, which
+/// only administrators can write; the installer's check runs elevated.
 fn core_override() -> Option<String> {
     std::env::var(CORE_ENV).ok().filter(|n| !n.is_empty())
 }

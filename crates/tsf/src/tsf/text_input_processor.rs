@@ -477,7 +477,8 @@ pub(crate) fn in_app_container() -> bool {
 
 /// `config.toml`: `%APPDATA%\setsuna-ime\config.toml`. In an AppContainer
 /// %APPDATA% may name the package's own folder; the user's file is then
-/// found from where the DLL is installed (`%LOCALAPPDATA%\setsuna-ime`,
+/// found in the user's profile (%USERPROFILE%, which stays the user's),
+/// else from where an older install put the DLL (`%LOCALAPPDATA%\setsuna-ime`,
 /// beside Roaming). The installer lets AppContainers read that one file,
 /// not the directory (learning, credentials).
 fn config_path() -> Option<PathBuf> {
@@ -485,6 +486,13 @@ fn config_path() -> Option<PathBuf> {
     if !in_app_container() {
         return appdata;
     }
+    let in_profile = std::env::var_os("USERPROFILE").map(|p| {
+        PathBuf::from(p)
+            .join("AppData")
+            .join("Roaming")
+            .join("setsuna-ime")
+            .join("config.toml")
+    });
     let beside_dll = dll_dir().and_then(|d| {
         Some(
             d.parent()?
@@ -494,11 +502,23 @@ fn config_path() -> Option<PathBuf> {
                 .join("config.toml"),
         )
     });
-    [appdata.clone(), beside_dll]
+    [appdata.clone(), in_profile, beside_dll]
         .into_iter()
         .flatten()
         .find(|p| p.is_file())
         .or(appdata)
+}
+
+/// The installer's list of the files the IME runs or loads
+/// (`installed.toml` beside the IME DLL, in its directory under Program
+/// Files, which only administrators can write); none when there is none
+/// (the files beside the DLL are found as before).
+fn installed_files() -> Config {
+    dll_dir()
+        .map(|d| d.join("installed.toml"))
+        .filter(|p| p.is_file())
+        .and_then(|p| Config::load_from_path(&p).ok())
+        .unwrap_or_default()
 }
 
 /// The file's modification time and size: a save changes them.
@@ -516,11 +536,29 @@ fn read_config(path: Option<&Path>) -> std::result::Result<Config, String> {
 }
 
 /// This process's settings: the file's, with its `[[apps]]` entry applied.
-fn config_for_process(cfg: &Config) -> (Config, Option<AppCfg>) {
+/// In `secure` mode (`ActivateEx`'s TF_TMF_SECUREMODE: a secure desktop,
+/// the sign-in screen or a UAC prompt) nothing typed is learned, kept for
+/// prediction, sent to the rewriter or logged.
+fn config_for_process(cfg: &Config, secure: bool) -> (Config, Option<AppCfg>) {
     let process = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (cfg, app) = cfg.for_app(&process);
+    let (mut cfg, app) = cfg.for_app(&process);
+    // elevated, the files the IME runs and loads come from the installer's
+    // list only: config.toml is the user's to change, from any process
+    if setsuna_core::config::process_is_elevated() {
+        cfg = cfg.with_installed_files(&installed_files());
+        setsuna_core::diagnostics::log("elevated: the IME's files as installed.toml names them");
+    }
+    if secure {
+        cfg.learning.enabled = false;
+        cfg.frontend.prediction = false;
+        cfg.rewriter.enabled = false;
+        cfg.diagnostics.log_typed_text = false;
+        setsuna_core::diagnostics::log(
+            "secure mode: no learning, prediction, rewriter or typed text in the logs",
+        );
+    }
     setsuna_core::diagnostics::log(format!("process {process} app settings={}", app.is_some()));
     (cfg, app)
 }
@@ -671,7 +709,8 @@ impl SetsunaTextService_Impl {
             match read_config(path.as_deref()) {
                 Ok(file) => {
                     setsuna_core::diagnostics::log("config.toml changed: applying it");
-                    Some(config_for_process(&file).0)
+                    let secure = self.inner.borrow().activate_flags & TF_TMF_SECUREMODE != 0;
+                    Some(config_for_process(&file, secure).0)
                 }
                 Err(e) => {
                     // a file being written, or one with a mistake: the
@@ -932,7 +971,7 @@ impl SetsunaTextService_Impl {
             setsuna_core::diagnostics::log(format!("config.toml not read, defaults: {e}"));
             Config::default()
         });
-        let (cfg, app) = config_for_process(&file);
+        let (cfg, app) = config_for_process(&file, dwflags & TF_TMF_SECUREMODE != 0);
         setsuna_core::diagnostics::log(format!(
             "config {:?} app container={} manifest={:?} model_dir={:?} engine={:?}",
             path,

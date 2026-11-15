@@ -33,6 +33,9 @@ use setsuna_artifact::LmScorerManifest;
 
 pub use scorer::{Stats, MAX_SEQ};
 
+/// The longest candidate scored, in chars.
+pub const MAX_CANDIDATE_CHARS: usize = 512;
+
 /// Settings a caller may give; unset ones come from the manifest's
 /// `score_defaults`, then the defaults here.
 #[derive(Debug, Clone, Default)]
@@ -170,6 +173,14 @@ impl Reranker {
             "at most {} candidates, got {}",
             self.config.max_candidates,
             candidates.len()
+        );
+        // any process of the user can reach the shared server: a candidate is
+        // a conversion of what was typed, not a document
+        anyhow::ensure!(
+            candidates
+                .iter()
+                .all(|c| c.chars().count() <= MAX_CANDIDATE_CHARS),
+            "a candidate over {MAX_CANDIDATE_CHARS} chars"
         );
         if candidates.is_empty() {
             return Ok((Vec::new(), Stats::default()));

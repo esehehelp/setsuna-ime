@@ -5,7 +5,7 @@
 //! The handles are synchronous: one thread at a time reads or writes one,
 //! in turn (a request, then its response).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
@@ -13,15 +13,16 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_PIPE_CONNECTED, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, TokenIsAppContainer, TokenUser,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
+    TokenIntegrityLevel, TokenIsAppContainer, TokenUser, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -35,11 +36,28 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    QueryFullProcessImageNameW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 
 const BUFFER: u32 = 64 * 1024;
+
+/// What a client may do with the pipe: read it (FILE_GENERIC_READ) and
+/// write to it (FILE_WRITE_DATA, FILE_WRITE_ATTRIBUTES). Not
+/// FILE_CREATE_PIPE_INSTANCE (FILE_APPEND_DATA, which GENERIC_WRITE maps
+/// to, so a client opens with `CLIENT_ACCESS`), WRITE_DAC or WRITE_OWNER.
+const CLIENT_RIGHTS: u32 = 0x0012_018B;
+/// What a client opens the pipe for: GENERIC_READ and FILE_WRITE_DATA.
+const CLIENT_ACCESS: u32 = GENERIC_READ | 0x2;
+/// The server's user adds instances too: FILE_GENERIC_READ and
+/// FILE_GENERIC_WRITE, as a duplex instance is made with.
+const SERVER_RIGHTS: u32 = 0x0012_019F;
+/// CreateFileW's SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION: the
+/// server may learn who the client is, never act as it.
+const IDENTIFY_ONLY: u32 = 0x0010_0000 | 0x0001_0000;
+/// SECURITY_MANDATORY_MEDIUM_RID.
+const MEDIUM_INTEGRITY: u32 = 0x2000;
 
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -157,9 +175,15 @@ pub fn cancel_io<T>(thread: &std::thread::JoinHandle<T>) {
 
 /// Start `exe args` on its own: no console, no handle of this process
 /// inherited (the server outlives the app that starts it), out of this
-/// process's job when the job lets it (so the app closing does not end it).
-/// Returns the pid and whether it left the job.
-pub fn spawn_detached(exe: &Path, args: &[&OsStr], cwd: Option<&Path>) -> io::Result<(u32, bool)> {
+/// process's job when the job lets it (so the app closing does not end it),
+/// with the environment `env` (none: this process's). Returns the pid and
+/// whether it left the job.
+pub fn spawn_detached(
+    exe: &Path,
+    args: &[&OsStr],
+    cwd: Option<&Path>,
+    env: Option<&[(OsString, OsString)]>,
+) -> io::Result<(u32, bool)> {
     let wide_z = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
     let mut line = quote(exe.as_os_str());
     for a in args {
@@ -169,6 +193,7 @@ pub fn spawn_detached(exe: &Path, args: &[&OsStr], cwd: Option<&Path>) -> io::Re
     line.push(0);
     let exe_w = wide_z(exe.as_os_str());
     let cwd_w = cwd.map(|d| wide_z(d.as_os_str()));
+    let env_w = env.map(env_block);
     let run = |flags: u32| -> io::Result<u32> {
         // CreateProcessW may write to the command line
         let mut line = line.clone();
@@ -185,7 +210,9 @@ pub fn spawn_detached(exe: &Path, args: &[&OsStr], cwd: Option<&Path>) -> io::Re
                 std::ptr::null(),
                 0,
                 flags | CREATE_UNICODE_ENVIRONMENT,
-                std::ptr::null(),
+                env_w
+                    .as_ref()
+                    .map_or(std::ptr::null(), |e| e.as_ptr().cast()),
                 cwd_w.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
                 &si,
                 &mut pi,
@@ -206,6 +233,27 @@ pub fn spawn_detached(exe: &Path, args: &[&OsStr], cwd: Option<&Path>) -> io::Re
         // a job that forbids breaking away refuses the flag
         Err(_) => run(flags).map(|pid| (pid, false)),
     }
+}
+
+/// `vars` as CreateProcessW's environment block: `name=value` each, sorted
+/// by name ignoring case, with a NUL after each and one more at the end.
+fn env_block(vars: &[(OsString, OsString)]) -> Vec<u16> {
+    let upper = |k: &OsString| k.to_string_lossy().to_uppercase();
+    let mut sorted: Vec<&(OsString, OsString)> = vars.iter().collect();
+    sorted.sort_by_cached_key(|(k, _)| upper(k));
+    let mut block = Vec::new();
+    for (k, v) in sorted {
+        block.extend(k.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(v.encode_wide());
+        block.push(0);
+    }
+    // an empty block is two NULs
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 /// Whether process `pid` (one [`spawn_detached`] started) still runs.
@@ -271,11 +319,15 @@ impl Pipe {
     /// `first` one claims the name: it fails ([`is_taken`]) when another
     /// server holds it.
     pub fn create(name: &str, first: bool, user_sid: &str) -> io::Result<Self> {
-        // owner and full access: this user (OW, and by SID should an
-        // elevated server's default owner be Administrators), SYSTEM and
-        // AppContainers; the low label lets low-integrity apps in
+        // owned by this user, who may add instances (the server does); SYSTEM
+        // and AppContainers may only connect; the owner's own rights (OW)
+        // read the security, not change it, nor anyone's; the low label lets
+        // low-integrity apps in. Any process of this user can still add an
+        // instance, which a client finds out by the server's process
+        // (`server_is`).
         let sddl = format!(
-            "O:{user_sid}D:(A;;GA;;;OW)(A;;GA;;;{user_sid})(A;;GA;;;SY)(A;;GA;;;AC)S:(ML;;NW;;;LW)"
+            "O:{user_sid}D:P(A;;0x20000;;;OW)(A;;{SERVER_RIGHTS:#x};;;{user_sid})\
+             (A;;{CLIENT_RIGHTS:#x};;;SY)(A;;{CLIENT_RIGHTS:#x};;;AC)S:(ML;;NW;;;LW)"
         );
         unsafe {
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -338,11 +390,11 @@ impl Pipe {
         let handle = unsafe {
             CreateFileW(
                 wide(name).as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                CLIENT_ACCESS,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                0,
+                IDENTIFY_ONLY,
                 std::ptr::null_mut(),
             )
         };
@@ -359,6 +411,53 @@ impl Pipe {
             return Err(io::Error::last_os_error());
         }
         Ok(pid)
+    }
+
+    /// Whether the server at the other end of a client's connection is one
+    /// the client would have started: its image is `exe` and it runs at
+    /// medium integrity or above (any process of the user can add an
+    /// instance of the name, a low-integrity one included). `Ok(None)` when
+    /// this process may not look at it (an AppContainer's client cannot
+    /// open another process).
+    pub fn server_is(&self, exe: &Path) -> io::Result<Option<bool>> {
+        let pid = self.server_pid()?;
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+            let image = {
+                let mut buf = vec![0u16; 32768];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) != 0;
+                ok.then(|| {
+                    use std::os::windows::ffi::OsStringExt;
+                    std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]))
+                })
+            };
+            let mut token: HANDLE = std::ptr::null_mut();
+            let integrity = if OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0 {
+                let rid = token_integrity(token);
+                CloseHandle(token);
+                rid
+            } else {
+                None
+            };
+            CloseHandle(process);
+            let (Some(image), Some(integrity)) = (image, integrity) else {
+                return Ok(None);
+            };
+            let same =
+                |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                    (Ok(a), Ok(b)) => a.as_os_str().eq_ignore_ascii_case(b.as_os_str()),
+                    _ => false,
+                };
+            Ok(Some(same(&image, exe) && integrity >= MEDIUM_INTEGRITY))
+        }
     }
 
     /// The SID owning the pipe: a client checks it is its own user's before
@@ -488,7 +587,8 @@ mod tests {
     fn a_started_process_runs_until_it_exits() {
         assert!(is_running(std::process::id()));
         let cmd = Path::new(r"C:\Windows\System32\cmd.exe");
-        let (pid, _) = spawn_detached(cmd, &[OsStr::new("/c"), OsStr::new("exit")], None).unwrap();
+        let (pid, _) =
+            spawn_detached(cmd, &[OsStr::new("/c"), OsStr::new("exit")], None, None).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while is_running(pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -518,6 +618,11 @@ mod tests {
             let pipe = Pipe::open(&client_name).unwrap();
             assert_eq!(pipe.owner_sid().unwrap(), user_sid().unwrap());
             assert_eq!(pipe.server_pid().unwrap(), std::process::id());
+            // the server is this test's own process, at medium integrity
+            let me = std::env::current_exe().unwrap();
+            assert_eq!(pipe.server_is(&me).unwrap(), Some(true));
+            let other = std::path::Path::new(r"C:\Windows\System32\cmd.exe");
+            assert_eq!(pipe.server_is(other).unwrap(), Some(false));
             (&pipe).write_all(b"ping\n").unwrap();
             let mut line = String::new();
             BufReader::new(&pipe).read_line(&mut line).unwrap();
@@ -535,5 +640,62 @@ mod tests {
         assert_eq!(reader.read_line(&mut line).unwrap(), 0);
         let missing = Pipe::open(&format!("{name}-missing")).err().expect("none");
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+/// Whether a client may talk to the server it connected to (after its
+/// owner check): the server is `exe` at medium integrity or above
+/// ([`Pipe::server_is`]), or this client, in an AppContainer, cannot look
+/// and takes what its user's pipe gives.
+pub fn trust_server(pipe: &Pipe, exe: &Path) -> io::Result<()> {
+    let ok = match pipe.server_is(exe)? {
+        Some(ok) => ok,
+        None => is_app_container().unwrap_or(false),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "the pipe's server (pid {}) is not {} at medium integrity",
+            pipe.server_pid().unwrap_or(0),
+            exe.display()
+        ),
+    ))
+}
+
+/// The integrity level (the mandatory label's RID) of `token`.
+fn token_integrity(token: HANDLE) -> Option<u32> {
+    unsafe {
+        let mut len = 0u32;
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &mut len,
+        );
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        if GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr().cast(),
+            len,
+            &mut len,
+        ) == 0
+        {
+            return None;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(sid, u32::from(count) - 1))
     }
 }

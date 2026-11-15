@@ -449,6 +449,10 @@ fn connect(shared: &Shared, server: &AtomicU32, target: &Target) -> io::Result<B
                         format!("{} is owned by {owner}", target.name),
                     ));
                 }
+                // any process of the user can add an instance of the name:
+                // the server must be the exe this client starts, not a
+                // low-integrity one
+                win::trust_server(&pipe, &target.exe)?;
                 // the server sends it once its model is up
                 let mut reader = BufReader::new(pipe);
                 let mut line = String::new();
@@ -476,7 +480,9 @@ fn connect(shared: &Shared, server: &AtomicU32, target: &Target) -> io::Result<B
                     let cwd = target.exe.parent();
                     let args: Vec<&std::ffi::OsStr> =
                         target.args.iter().map(OsString::as_os_str).collect();
-                    let (pid, own_job) = win::spawn_detached(&target.exe, &args, cwd)?;
+                    let env = crate::config::helper_env();
+                    let (pid, own_job) =
+                        win::spawn_detached(&target.exe, &args, cwd, env.as_deref())?;
                     crate::diagnostics::log(format!(
                         "engine server started pid={pid} out_of_job={own_job} args={:?}",
                         target.args

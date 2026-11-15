@@ -234,6 +234,7 @@ impl ChildDaemonClient {
         engine_cfg: &crate::config::EngineCfg,
     ) -> std::io::Result<Self> {
         let mut cmd = Command::new(engine_exe);
+        crate::config::scrub_env(&mut cmd);
         let args = daemon_args(manifest, engine_cfg);
         crate::diagnostics::log(format!(
             "spawn engine={} args={:?}",
@@ -609,21 +610,20 @@ pub fn spawn_with_config(
     module_dir: Option<&Path>,
     notify: Notify,
 ) -> Option<Box<dyn EngineClient>> {
-    let manifest = match resolve_manifest(&cfg.engine, module_dir, |key| {
-        std::env::var_os(key).map(PathBuf::from)
-    }) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            tracing::warn!("no model manifest found; engine disabled");
-            crate::diagnostics::log("engine disabled: no model manifest");
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!("model discovery failed: {e}; engine disabled");
-            crate::diagnostics::log(format!("engine disabled: {e}"));
-            return None;
-        }
-    };
+    let manifest =
+        match resolve_manifest(&cfg.engine, module_dir, |key| crate::config::env_path(key)) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::warn!("no model manifest found; engine disabled");
+                crate::diagnostics::log("engine disabled: no model manifest");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("model discovery failed: {e}; engine disabled");
+                crate::diagnostics::log(format!("engine disabled: {e}"));
+                return None;
+            }
+        };
     let engine_exe = cfg
         .engine
         .engine_exe
@@ -782,8 +782,7 @@ fn manifest_in_dir(dir: &Path) -> Result<Option<PathBuf>, String> {
 /// frontend module (the TSF DLL in the cargo target dir);
 /// `SETSUNA_ENGINE_EXE` overrides.
 fn find_engine_exe(module_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SETSUNA_ENGINE_EXE") {
-        let p = PathBuf::from(p);
+    if let Some(p) = crate::config::env_path("SETSUNA_ENGINE_EXE") {
         if p.is_file() {
             return Some(p);
         }

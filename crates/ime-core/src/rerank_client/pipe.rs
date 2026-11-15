@@ -326,6 +326,10 @@ fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Opt
                         format!("{} is owned by {owner}", target.name),
                     ));
                 }
+                // any process of the user can add an instance of the name:
+                // the server must be the exe this client starts, not a
+                // low-integrity one
+                win::trust_server(&pipe, &target.exe)?;
                 // the server sends it once its model is up
                 let mut reader = BufReader::new(pipe);
                 let mut line = String::new();
@@ -341,7 +345,9 @@ fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Opt
                     let cwd = target.exe.parent();
                     let args: Vec<&std::ffi::OsStr> =
                         target.args.iter().map(OsString::as_os_str).collect();
-                    let (pid, own_job) = win::spawn_detached(&target.exe, &args, cwd)?;
+                    let env = crate::config::helper_env();
+                    let (pid, own_job) =
+                        win::spawn_detached(&target.exe, &args, cwd, env.as_deref())?;
                     crate::diagnostics::log(format!(
                         "rerank server started pid={pid} out_of_job={own_job} args={:?}",
                         target.args

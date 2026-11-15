@@ -604,6 +604,28 @@ impl AnalyzerSlot {
     }
 }
 
+/// What one request may ask for (any process of the user can reach the
+/// shared server): a longer reading, more widening or a larger analysis is
+/// answered with an error; a longer context is cut to its end, the part the
+/// model reads (its 64 tokens). The IME converts readings of 80 chars at
+/// most in one go, and analyzes a conversion at a time.
+const MAX_READING_CHARS: usize = 1024;
+const MAX_CONTEXT_CHARS: usize = 4096;
+const MAX_CONTINUE_BEAM: usize = 32;
+const MAX_ANALYZE_TEXTS: usize = 16;
+const MAX_ANALYZE_CHARS: usize = 2048;
+
+/// The last `max` chars of `s`.
+fn tail(s: &str, max: usize) -> &str {
+    if max == 0 {
+        return "";
+    }
+    match s.char_indices().rev().nth(max - 1) {
+        Some((i, _)) => &s[i..],
+        None => s,
+    }
+}
+
 /// A loaded session answering request lines, the daemon's and the server's.
 struct Daemon {
     session: EngineSession,
@@ -645,12 +667,25 @@ impl Daemon {
         };
         let t0 = Instant::now();
         if let Some(texts) = &req.analyze {
+            if texts.len() > MAX_ANALYZE_TEXTS
+                || texts.iter().any(|t| t.chars().count() > MAX_ANALYZE_CHARS)
+            {
+                return to_line(&Response::err(req.id, 0.0, "analysis too large"));
+            }
             return self.analyze(req.id, texts, t0);
         }
         let Some(reading) = &req.reading else {
             return to_line(&Response::err(req.id, 0.0, "missing field `reading`"));
         };
-        let result = decode_one(&mut self.session, &req.context, reading, req.continue_beam);
+        if reading.chars().count() > MAX_READING_CHARS || req.continue_beam > MAX_CONTINUE_BEAM {
+            return to_line(&Response::err(
+                req.id,
+                0.0,
+                "reading or continue_beam too large",
+            ));
+        }
+        let context = tail(&req.context, MAX_CONTEXT_CHARS);
+        let result = decode_one(&mut self.session, context, reading, req.continue_beam);
         let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok((cands, perf, frames)) => {
@@ -838,6 +873,13 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_context_is_cut_to_its_end() {
+        assert_eq!(super::tail("あいうえお", 3), "うえお");
+        assert_eq!(super::tail("あい", 3), "あい");
+        assert_eq!(super::tail("あい", 0), "");
+    }
+
     use super::*;
 
     #[test]

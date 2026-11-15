@@ -38,42 +38,50 @@
 #   70 the new IME DLL did not come up (setsuna-tsf-check): core.txt still
 #      names the one before, which the apps keep
 #
-# Layout produced:
-#   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf_shim.dll  (the DLL registered as the IME: it loads the
+# Layout produced (<dir> is %ProgramFiles%\setsuna-ime, or -InstallDir): the
+# code and the models where only administrators may write. The IME is
+# registered for the whole machine and elevated apps load it too, so neither
+# it nor what it runs and loads may be the user's to change; an elevated
+# app's IME takes those files from <dir>\installed.toml, not config.toml.
+# Installs before this one put them in %LOCALAPPDATA%\setsuna-ime, which keeps
+# the install log and the download cache: what they left there goes once
+# nothing holds it.
+#   <dir>\setsuna_tsf_shim.dll  (the DLL registered as the IME: it loads the
 #                                  IME DLL core.txt names and swaps it for a newer one in the
 #                                  apps that are running; setsuna_tsf_shim_<sha256>.dll when locked)
-#   %LOCALAPPDATA%\setsuna-ime\setsuna_tsf_<sha256>.dll  (the IME DLL, named by its content; one an
+#   <dir>\setsuna_tsf_<sha256>.dll  (the IME DLL, named by its content; one an
 #                                  app still holds stays until a later install)
-#   %LOCALAPPDATA%\setsuna-ime\core.txt  (the IME DLL's name, written once setsuna-tsf-check saw it
+#   <dir>\core.txt  (the IME DLL's name, written once setsuna-tsf-check saw it
 #                                  come up through the registered shim)
-#   %LOCALAPPDATA%\setsuna-ime\setsuna-tsf-check.exe
-#   %LOCALAPPDATA%\setsuna-ime\setsuna-engine.exe
-#   %LOCALAPPDATA%\setsuna-ime\setsuna-engine_<sha256>.exe  (fallback when running daemons lock it;
+#   <dir>\installed.toml  (the files below the IME runs and loads, for elevated apps)
+#   <dir>\setsuna-tsf-check.exe
+#   <dir>\setsuna-engine.exe
+#   <dir>\setsuna-engine_<sha256>.exe  (fallback when running daemons lock it;
 #                                                     config engine_exe points at it)
-#   %LOCALAPPDATA%\setsuna-ime\onnxruntime.dll  (official ONNX Runtime the engine loads;
+#   <dir>\onnxruntime.dll  (official ONNX Runtime the engine loads;
 #                                           a content-addressed fallback when locked,
 #                                           config ort_dylib points at it)
-#   %LOCALAPPDATA%\setsuna-ime\setsuna-settings.exe  (settings GUI, when built)
-#   %LOCALAPPDATA%\setsuna-ime\setsuna-rewrite.exe  (rewriter, when built; a content-addressed
+#   <dir>\setsuna-settings.exe  (settings GUI, when built)
+#   <dir>\setsuna-rewrite.exe  (rewriter, when built; a content-addressed
 #                                            fallback when locked, config [rewriter] exe follows)
-#   %LOCALAPPDATA%\setsuna-ime\uninstall.ps1
-#   %LOCALAPPDATA%\setsuna-ime\models\onnx\<manifest> + the files it lists
-#   %LOCALAPPDATA%\setsuna-ime\rerank\setsuna-rerank.exe + llama.cpp's DLLs (with -RerankManifest;
+#   <dir>\uninstall.ps1
+#   <dir>\models\onnx\<manifest> + the files it lists
+#   <dir>\rerank\setsuna-rerank.exe + llama.cpp's DLLs (with -RerankManifest;
 #                                  rerank_<sha256>\ when a running reranker locks them)
-#   %LOCALAPPDATA%\setsuna-ime\models\rerank\<rerank manifest> + its weights
-#   %LOCALAPPDATA%\setsuna-ime\models\mixed\kana.tsv, latin.tsv, params.txt  (crates\ime-core\data\mixed,
+#   <dir>\models\rerank\<rerank manifest> + its weights
+#   <dir>\models\mixed\kana.tsv, latin.tsv, params.txt  (crates\ime-core\data\mixed,
 #                                  or -MixedModel <dir>)
-#   %LOCALAPPDATA%\setsuna-ime\models\names\<names dictionary>  (with -NameDictionary)
-#   %LOCALAPPDATA%\setsuna-ime\models\lexicon\<lexicon>  (downloaded, or -Lexicon)
-#   %LOCALAPPDATA%\setsuna-ime\models\analyzer\<its directory's name>\<manifest> + its files  (downloaded, or -Analyzer)
+#   <dir>\models\names\<names dictionary>  (with -NameDictionary)
+#   <dir>\models\lexicon\<lexicon>  (downloaded, or -Lexicon)
+#   <dir>\models\analyzer\<its directory's name>\<manifest> + its files  (downloaded, or -Analyzer)
 #   %LOCALAPPDATA%\setsuna-ime\cache\models\<repository>\<revision>\  (fetch-model.ps1's downloads while
-#                                  installing: the files are installed as hard links, the cache removed)
+#                                  installing: the files are copied from it, the cache removed)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
 #
 # AppContainers (the Start menu's search, Store apps: ALL APPLICATION
 # PACKAGES and ALL RESTRICTED APPLICATION PACKAGES) may read and run what is
-# in %LOCALAPPDATA%\setsuna-ime, and read config.toml: that one file, never
+# in <dir>, and read config.toml: that one file, never
 # %APPDATA%\setsuna-ime (the learning, the history and credentials.bin stay
 # closed to them). The IME in such an app then reaches the login's shared
 # engine; it never starts an engine of its own there.
@@ -122,7 +130,10 @@ param(
     [Parameter(ParameterSetName = 'Download')]
     [switch]$NoDictionaries,
     [switch]$Force,
-    [switch]$NoElevate
+    [switch]$NoElevate,
+    # Where the code and the models go (default %ProgramFiles%\setsuna-ime);
+    # a files-only install (-NoElevate) names one it may write.
+    [string]$InstallDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,9 +149,14 @@ if (-not $PSBoundParameters.ContainsKey('MixedModel')) {
 }
 
 # ---- constants ----
-$InstallDir = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
+if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramFiles 'setsuna-ime' }
+# a full path with no separator at its end (the quoted -InstallDir passed
+# on would end in \")
+$InstallDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir)
+if ($InstallDir.Length -gt 3) { $InstallDir = $InstallDir.TrimEnd('\', '/') }
+$UserDir    = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
 $ConfigDir  = Join-Path $env:APPDATA      'setsuna-ime'
-$LogFile    = Join-Path $InstallDir 'install.log'
+$LogFile    = Join-Path $UserDir 'install.log'
 $DllName    = 'setsuna_tsf.dll'
 $ShimName   = 'setsuna_tsf_shim.dll'
 $CheckExe   = 'setsuna-tsf-check.exe'
@@ -223,9 +239,19 @@ function Test-VcRuntime {
 }
 
 # Microsoft's redistributable, checked to carry Microsoft's signature, run
-# quietly (elevated).
+# quietly (elevated). It goes to a directory only Administrators and SYSTEM
+# may write (under %SystemRoot%\Temp, named at random, nothing inherited):
+# in the user's %TEMP% another process of the user could swap the file
+# between the check and the run.
 function Install-VcRuntime {
-    $exe = Join-Path ([IO.Path]::GetTempPath()) "setsuna-vc_redist-$PID.exe"
+    $dir = Join-Path $env:SystemRoot ('Temp\setsuna-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
+    $out = & icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        throw "icacls $dir failed: $out"
+    }
+    $exe = Join-Path $dir 'vc_redist.x64.exe'
     try {
         Write-Log INFO "downloading the Visual C++ runtime: $VcRuntimeUrl"
         $ProgressPreference = 'SilentlyContinue'
@@ -241,7 +267,7 @@ function Install-VcRuntime {
         }
         Write-Log INFO "Visual C++ runtime installed (exit code $($p.ExitCode))"
     } finally {
-        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -375,7 +401,7 @@ function Set-CoreName {
 # fetch-model.ps1's download cache: what is installed from it is a hard link
 # to the cached file, and the cache goes once the install is done (the next
 # install's fetch-model.ps1 takes the installed files back into it).
-$CacheDir = Join-Path $InstallDir 'cache'
+$CacheDir = Join-Path $UserDir 'cache'
 
 function Test-InCache {
     param([string]$Path)
@@ -393,8 +419,27 @@ function Test-HardLinked {
     @($names | Where-Object { $_ -ieq $tail }).Count -gt 0
 }
 
-# A model or dictionary file: one from the cache is linked (copied when the
-# file system will not link), any other copied by Copy-InstallFile. A locked
+# A file a manifest names, relative to the manifest's directory: not rooted,
+# no `..` and no drive or stream colon, and once joined still inside that
+# directory. The copies run elevated, so a manifest given on the command line
+# must not name a file elsewhere (the analyzer's `dictionary.path` and
+# `alternates` were not checked).
+function Assert-InsideDir {
+    param([string]$Rel, [string]$Dir, [string]$What)
+    $bad = [string]::IsNullOrWhiteSpace($Rel) -or [IO.Path]::IsPathRooted($Rel) -or
+        $Rel -match '(^|[\\/])\.\.([\\/]|$)' -or $Rel.Contains(':')
+    if (-not $bad) {
+        $root = [IO.Path]::GetFullPath($Dir).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        $full = [IO.Path]::GetFullPath((Join-Path $Dir $Rel))
+        $bad = -not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+    }
+    if ($bad) {
+        Write-Log ERROR "$What path $Rel leaves its directory $Dir"; exit 30
+    }
+}
+
+# A model or dictionary file, copied (from the cache too: a hard link would be
+# the cache's file, with the ACL of the user's directory). A locked
 # destination (a lexicon apps map) is kept when it has the content, else the
 # file goes beside it under a content-addressed name.
 function Install-ArtifactFile {
@@ -425,13 +470,10 @@ function Install-ArtifactFile {
             Write-Log WARN "$Destination was locked; installing $target"
         }
     }
-    try {
-        New-Item -ItemType HardLink -Path $target -Value $Source -ErrorAction Stop | Out-Null
-        Write-Log INFO "linked $Source -> $target"
-    } catch {
-        Copy-Item -LiteralPath $Source -Destination $target -Force
-        Write-Log INFO "copied $Source -> $target (no hard link: $_)"
-    }
+    # copied, not linked: a link is the cache's file, with the ACL of the
+    # user's directory it was downloaded to
+    Copy-Item -LiteralPath $Source -Destination $target -Force
+    Write-Log INFO "copied $Source -> $target"
     return $target
 }
 
@@ -655,7 +697,7 @@ function Update-ExistingConfig {
 }
 
 # ---- pre-flight ----
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+New-Item -ItemType Directory -Force -Path $UserDir | Out-Null
 Write-Log INFO "install starting (Source=$SourceDir, Manifest=$Manifest, Force=$Force, NoElevate=$NoElevate)"
 
 if ([Environment]::Is64BitOperatingSystem -ne $true) {
@@ -681,7 +723,10 @@ if (-not (Test-Path -LiteralPath $OrtSrc)) {
 # this local manifest, so it neither downloads again nor changes cache ownership.
 if ($PSCmdlet.ParameterSetName -eq 'Download') {
     # what an earlier install put in place is not downloaded again
-    $Seeds = @('onnx', 'lexicon', 'analyzer') | ForEach-Object { Join-Path $InstallDir "models\$_" }
+    $Seeds = @($InstallDir, $UserDir) | ForEach-Object {
+        $root = $_
+        @('onnx', 'lexicon', 'analyzer') | ForEach-Object { Join-Path $root "models\$_" }
+    }
     try {
         $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision -Model $Model -SeedDir $Seeds
     } catch {
@@ -722,9 +767,7 @@ if ($ManifestJson.crf) { $ArtifactFiles += @($ManifestJson.crf.path) }
 if ($ManifestJson.rescore.pairs) { $ArtifactFiles += @($ManifestJson.rescore.pairs) }
 if ($ManifestJson.rescore.words) { $ArtifactFiles += @($ManifestJson.rescore.words) }
 foreach ($rel in $ArtifactFiles) {
-    if ([IO.Path]::IsPathRooted($rel) -or $rel -match '(^|[\\/])\.\.([\\/]|$)') {
-        Write-Log ERROR "manifest path $rel leaves the artifact directory"; exit 30
-    }
+    Assert-InsideDir -Rel $rel -Dir $ManifestItem.Directory.FullName -What 'manifest'
     $src = Join-Path $ManifestItem.Directory.FullName $rel
     if (-not (Test-Path -LiteralPath $src)) {
         Write-Log ERROR "artifact file not found: $src"; exit 30
@@ -747,9 +790,7 @@ if ($RerankManifest) {
     $RerankModelFiles = @($RerankJson.weights.path)
     if ($RerankJson.tokenizer) { $RerankModelFiles += $RerankJson.tokenizer.path }
     foreach ($f in $RerankModelFiles) {
-        if ([IO.Path]::IsPathRooted($f) -or $f -match '(^|[\\/])\.\.([\\/]|$)') {
-            Write-Log ERROR "rerank manifest path $f leaves the artifact directory"; exit 30
-        }
+        Assert-InsideDir -Rel $f -Dir $RerankItem.Directory.FullName -What 'rerank manifest'
         if (-not (Test-Path -LiteralPath (Join-Path $RerankItem.Directory.FullName $f))) {
             Write-Log ERROR "rerank file not found: $f"; exit 30
         }
@@ -796,6 +837,7 @@ if ($Analyzer) {
     $AnalyzerFiles = @($AnalyzerJson.dictionary.path)
     if ($AnalyzerJson.alternates) { $AnalyzerFiles += @($AnalyzerJson.alternates) }
     foreach ($f in $AnalyzerFiles) {
+        Assert-InsideDir -Rel $f -Dir (Split-Path -Parent $Analyzer) -What 'analyzer manifest'
         if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Analyzer) $f))) {
             Write-Log ERROR "analyzer file not found: $f"; exit 30
         }
@@ -817,6 +859,7 @@ if (-not (Test-IsAdmin) -and -not $NoElevate) {
     if ($Lexicon) { $argv += @('-Lexicon', ("`"$Lexicon`"")) }
     if ($Analyzer) { $argv += @('-Analyzer', ("`"$Analyzer`"")) }
     if ($Force) { $argv += '-Force' }
+    if ($PSBoundParameters.ContainsKey('InstallDir')) { $argv += @('-InstallDir', ("`"$InstallDir`"")) }
     try {
         $p = Start-Process $PsExe -ArgumentList $argv -Verb RunAs -Wait -PassThru
         Write-Log INFO "elevated install exit code: $($p.ExitCode)"
@@ -844,6 +887,7 @@ if (Test-VcRuntime) {
 }
 
 # ---- copy files ----
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $ModelDstDir = Join-Path $InstallDir 'models\onnx'
 New-Item -ItemType Directory -Force -Path $ModelDstDir | Out-Null
 
@@ -1012,6 +1056,8 @@ try {
         $AnalyzerDir = Join-Path $InstallDir ('models\analyzer\' + (Split-Path -Leaf $AnalyzerSrcDir))
         New-Item -ItemType Directory -Force -Path $AnalyzerDir | Out-Null
         foreach ($f in $AnalyzerFiles) {
+            # checked when the manifest was read; again where it is copied to
+            Assert-InsideDir -Rel $f -Dir $AnalyzerDir -What 'analyzer manifest'
             Install-ArtifactFile -Source (Join-Path $AnalyzerSrcDir $f) -Destination (Join-Path $AnalyzerDir $f) | Out-Null
         }
         $AnalyzerInstalled = Install-ArtifactFile -Source $Analyzer -Destination (Join-Path $AnalyzerDir (Split-Path -Leaf $Analyzer))
@@ -1097,6 +1143,34 @@ shift_9 = "）"
     }
 }
 
+# ---- installed.toml: the files for elevated apps ----
+# An elevated app's IME runs and loads what this list beside it names, which
+# only administrators may write, not what config.toml names (config.toml
+# still says which features are on).
+function ConvertTo-TomlPath { param([string]$Path) '"' + $Path.Replace('\', '/').Replace('"', '\"') + '"' }
+$Installed = @(
+    '# Written by install.ps1: the files the IME runs and loads in an elevated app.',
+    '[engine]',
+    "model_manifest = $(ConvertTo-TomlPath $InstalledManifest)",
+    "engine_exe = $(ConvertTo-TomlPath $EngineInstalled)",
+    "ort_dylib = $(ConvertTo-TomlPath $OrtInstalled)"
+)
+if ($AnalyzerInstalled) { $Installed += "analyzer_manifest = $(ConvertTo-TomlPath $AnalyzerInstalled)" }
+$Installed += '[frontend]'
+if ($MixedInstalled) { $Installed += "mixed_model = $(ConvertTo-TomlPath $MixedInstalled)" }
+if ($NamesInstalled) { $Installed += "name_dictionary_file = $(ConvertTo-TomlPath $NamesInstalled)" }
+if ($LexiconInstalled) { $Installed += @('[lexicon]', "file = $(ConvertTo-TomlPath $LexiconInstalled)") }
+if ($RewriteInstalled) { $Installed += @('[rewriter]', "exe = $(ConvertTo-TomlPath $RewriteInstalled)") }
+if ($RerankInstalled) {
+    $Installed += @('[rerank]', "manifest = $(ConvertTo-TomlPath $RerankManifestInstalled)", "exe = $(ConvertTo-TomlPath $RerankInstalled)")
+}
+try {
+    Write-Utf8Lines -Path (Join-Path $InstallDir 'installed.toml') -Lines $Installed
+    Write-Log INFO "wrote $(Join-Path $InstallDir 'installed.toml')"
+} catch {
+    Write-Log ERROR "installed.toml not written: $_"; exit 50
+}
+
 # the file only: the directory holds the learning and credentials.bin (the
 # settings GUI keeps the grant when it saves)
 if (Test-Path -LiteralPath $ConfigPath) {
@@ -1143,7 +1217,7 @@ Set-ItemProperty $UninstReg InstallLocation $InstallDir
 Set-ItemProperty $UninstReg InstallDate     (Get-Date -Format 'yyyyMMdd')
 # Windows PowerShell: always there, whichever PowerShell installed this.
 $WinPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`""
+Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`" -InstallDir `"$InstallDir`""
 Set-ItemProperty $UninstReg NoModify        1 -Type DWord
 Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
 Write-Log INFO "registered HKCU Uninstall entry: $UninstReg"
@@ -1200,6 +1274,37 @@ try {
     Remove-StaleFiles -Keep $InstalledFiles -ConfigPath $ConfigPath
 } catch {
     Write-Log WARN "could not remove what earlier installs left: $_"
+}
+
+# ---- what installs before this one left in the user's directory ----
+# Their code and models, unless config.toml still names them or an app holds
+# them: the shims in apps running since keep theirs until they restart, and
+# core.txt there stays while one of them is left.
+if ($UserDir -ne $InstallDir) {
+    $named = @()
+    if (Test-Path -LiteralPath $ConfigPath) {
+        $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+        $named = @([regex]::Matches($text, '"([A-Za-z]:[/\\][^"]+)"') | ForEach-Object { [IO.Path]::GetFullPath($_.Groups[1].Value.Replace('/', '\')) })
+    }
+    $old = @(Get-ChildItem -LiteralPath $UserDir -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^(setsuna_tsf.*\.dll|setsuna-tsf-check.*\.exe|setsuna-engine.*\.exe|setsuna-rewrite.*\.exe|setsuna-settings\.exe|onnxruntime.*\.dll|uninstall\.ps1|core\.txt\.new|.*\.lexicon)$' })
+    $old += @(Get-ChildItem -LiteralPath $UserDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(models|rerank(_[0-9a-f]{12})?)$' })
+    foreach ($item in $old) {
+        $prefix = $item.FullName.TrimEnd('\') + '\'
+        if (@($named | Where-Object { $_ -eq $item.FullName -or $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
+            Write-Log INFO "kept $($item.FullName) (config.toml names it)"
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+            Write-Log INFO "removed what an earlier install left: $($item.FullName)"
+        } catch {
+            Write-Log INFO "kept $($item.FullName) (in use)"
+        }
+    }
+    if (-not (Get-ChildItem -LiteralPath $UserDir -Filter 'setsuna_tsf*.dll' -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath (Join-Path $UserDir 'core.txt') -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Log INFO "install complete at $InstallDir"

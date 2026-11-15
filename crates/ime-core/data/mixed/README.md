@@ -2,7 +2,7 @@
 
 The model `setsuna_core::mixed` reads (`[frontend] mixed_model` points at
 this directory; the Windows installer copies it to
-`%LOCALAPPDATA%\setsuna-ime\models\mixed`). It is counts only, with no text:
+`%ProgramFiles%\setsuna-ime\models\mixed`). It is counts only, with no text:
 
 - `kana.tsv` — `<n-gram>\t<count>`, n = 1..3, of hiragana readings: kana and
   `、。` as they are, a digit as `0`, any other char as `#`, an English word as

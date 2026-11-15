@@ -251,17 +251,27 @@ impl Settings {
         Ok("保存しました。次の入力から反映されます。".into())
     }
 
+    /// The learning and the prediction history both: what was committed
+    /// (the readings, the text and the commit before it) stays in the
+    /// latter, which the user takes for part of the learning. The hidden
+    /// candidates stay (`hidden.jsonl`: clearing must not bring them back).
     fn clear_learning(&mut self) -> Result<String, String> {
-        let Some(path) = Config::learning_path() else {
+        let Some(paths) = Config::learning_path().zip(Config::prediction_path()) else {
             return Err("学習履歴の場所が見つかりません".into());
         };
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok("学習履歴を消去しました。".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok("学習履歴はありません。".into())
+        let mut cleared = false;
+        for path in [paths.0, paths.1] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => cleared = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("消去できませんでした: {e}")),
             }
-            Err(e) => Err(format!("消去できませんでした: {e}")),
         }
+        Ok(if cleared {
+            "学習履歴（予測の履歴を含む）を消去しました。".into()
+        } else {
+            "学習履歴はありません。".into()
+        })
     }
 }
 

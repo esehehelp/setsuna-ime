@@ -394,7 +394,7 @@ pub fn save(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, to_text(entries))
+    crate::private_file::write(path, to_text(entries).as_bytes())
 }
 
 type Cached = Option<(PathBuf, Option<SystemTime>, Arc<UserDict>)>;

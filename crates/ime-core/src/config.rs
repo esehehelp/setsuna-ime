@@ -121,7 +121,102 @@ impl AppCfg {
     }
 }
 
+/// Whether this process runs elevated (Windows: an administrator's full
+/// token): it then takes no file the IME runs or loads from what the
+/// user's other processes can change (config.toml, the environment), only
+/// from the installer's list beside the IME (`Config::with_installed_files`).
+pub fn process_is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ELEVATED.get_or_init(|| setsuna_pipe::win::is_elevated().unwrap_or(true))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// The path environment variable `key` names (`SETSUNA_ENGINE_EXE`, ...),
+/// none in an elevated process ([`process_is_elevated`]).
+pub fn env_path(key: &str) -> Option<PathBuf> {
+    if process_is_elevated() {
+        return None;
+    }
+    std::env::var_os(key).map(PathBuf::from)
+}
+
+/// Whether environment variable `key` may name a file a helper loads or
+/// writes (`SETSUNA_*`, `ORT_*`, which the user's environment may set).
+fn names_files(key: &std::ffi::OsStr) -> bool {
+    let k = key.to_string_lossy().to_ascii_uppercase();
+    k.starts_with("SETSUNA_") || k.starts_with("ORT_")
+}
+
+/// A helper process's environment: in an elevated process without the
+/// variables that name files it would load or write ([`names_files`]), as
+/// [`env_path`] ignores them.
+pub fn scrub_env(cmd: &mut std::process::Command) {
+    if !process_is_elevated() {
+        return;
+    }
+    for (key, _) in std::env::vars_os() {
+        if names_files(&key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+/// The environment of a helper started on its own (the shared servers):
+/// [`scrub_env`]'s, none (this process's) when not elevated.
+pub fn helper_env() -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    process_is_elevated().then(|| {
+        std::env::vars_os()
+            .filter(|(key, _)| !names_files(key))
+            .collect()
+    })
+}
+
 impl Config {
+    /// This config with the files the IME runs or loads (executables,
+    /// libraries, models, dictionaries; not the user's own data) as
+    /// `installed` names them: for an elevated process, `installed` being
+    /// the installer's list beside the IME, which only administrators can
+    /// write. The engine's files are always the installed ones (none: found
+    /// beside the IME); an optional feature (the analyzer, mixed input, the
+    /// dictionaries, the reranker, the n-gram) stays as this config turns it
+    /// on or off, on with the installed file or off when none is installed.
+    pub fn with_installed_files(mut self, installed: &Config) -> Config {
+        fn on<T: Clone>(mine: &mut Option<T>, theirs: &Option<T>, off: impl Fn(&T) -> bool) {
+            if mine.as_ref().is_some_and(|m| !off(m)) {
+                *mine = theirs.clone();
+            }
+        }
+        let empty = |s: &String| s.is_empty();
+        let never = |_: &PathBuf| false;
+        let (e, i) = (&mut self.engine, &installed.engine);
+        e.model_manifest = i.model_manifest.clone();
+        e.model_dir = i.model_dir.clone();
+        e.engine_exe = i.engine_exe.clone();
+        e.ort_dylib = i.ort_dylib.clone();
+        on(&mut e.analyzer_manifest, &i.analyzer_manifest, never);
+        let (f, i) = (&mut self.frontend, &installed.frontend);
+        on(
+            &mut f.symbol_dictionary_file,
+            &i.symbol_dictionary_file,
+            empty,
+        );
+        // "" is mixed input turned off
+        on(&mut f.mixed_model, &i.mixed_model, empty);
+        on(&mut f.name_dictionary_file, &i.name_dictionary_file, empty);
+        on(&mut self.rerank.manifest, &installed.rerank.manifest, never);
+        self.rerank.exe = installed.rerank.exe.clone();
+        on(&mut self.ngram.table, &installed.ngram.table, empty);
+        on(&mut self.lexicon.file, &installed.lexicon.file, empty);
+        self.rewriter.exe = installed.rewriter.exe.clone();
+        self
+    }
+
     /// This config as the application `process` uses it: its `[[apps]]`
     /// entry's settings over the rest, and the entry itself.
     pub fn for_app(&self, process: &str) -> (Config, Option<AppCfg>) {
@@ -1256,6 +1351,46 @@ fn merge_table(doc: &mut toml_edit::Table, new: &toml_edit::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_elevated_process_takes_the_installed_files() {
+        let mine = Config::load_from_str(
+            "[engine]
+model_manifest = \"C:/u/evil.manifest.json\"
+engine_exe = \"C:/u/evil.exe\"
+             [frontend]
+mixed_model = \"\"
+name_dictionary_file = \"C:/u/names.tsv\"
+             [lexicon]
+file = \"C:/u/lex.lexicon\"
+",
+        )
+        .unwrap();
+        let installed = Config::load_from_str(
+            "[engine]
+model_manifest = \"C:/p/m.manifest.json\"
+engine_exe = \"C:/p/e.exe\"
+             analyzer_manifest = \"C:/p/a.json\"
+[frontend]
+mixed_model = \"C:/p/mixed\"
+",
+        )
+        .unwrap();
+        let c = mine.with_installed_files(&installed);
+        assert_eq!(
+            c.engine.model_manifest,
+            Some(PathBuf::from("C:/p/m.manifest.json"))
+        );
+        assert_eq!(c.engine.engine_exe, Some(PathBuf::from("C:/p/e.exe")));
+        assert_eq!(c.engine.ort_dylib, None);
+        // the analyzer is off in mine: it stays off
+        assert_eq!(c.engine.analyzer_manifest, None);
+        // mixed input turned off stays off
+        assert_eq!(c.frontend.mixed_model.as_deref(), Some(""));
+        // on in mine, none installed: off
+        assert_eq!(c.frontend.name_dictionary_file, None);
+        assert_eq!(c.lexicon.file, None);
+    }
 
     /// `[diagnostics]` is read, and written only when something in it is
     /// on: a config saved with it off stays readable by the builds before it.

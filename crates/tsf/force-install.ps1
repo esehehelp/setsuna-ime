@@ -30,18 +30,20 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-$InstallDir = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
+# where install.ps1 puts the code and the models; its log stays the user's
+$InstallDir = Join-Path $env:ProgramFiles 'setsuna-ime'
+$UserDir = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
 $ConfigPath = Join-Path $env:APPDATA 'setsuna-ime\config.toml'
 $DllName = 'setsuna_tsf.dll'
 $TextServiceClsid = '{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}'
 $ProfileGuid = '{ACEB29C0-964E-4FF1-8BDC-B507AAB78873}'
 $KeyboardTipCategory = '{34745C63-B2F0-4784-8B67-5E12C8701A31}'
 $ClsidReg = 'Registry::HKEY_CLASSES_ROOT\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
-$LogFile = Join-Path $InstallDir 'force-install.log'
+$LogFile = Join-Path $UserDir 'force-install.log'
 
 function Write-Log {
     param([string]$Level, [string]$Msg)
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $UserDir | Out-Null
     $line = "$(Get-Date -Format o) [$Level] $Msg"
     Write-Host $line
     try { Add-Content -Path $LogFile -Value $line -ErrorAction Stop } catch { }
@@ -218,7 +220,7 @@ function Clear-SetsunaProfilePin {
         return
     }
 
-    $backup = Join-Path $InstallDir 'ctf-assembly-keyboard-backup.txt'
+    $backup = Join-Path $UserDir 'ctf-assembly-keyboard-backup.txt'
     @(
         "time=$(Get-Date -Format o)"
         "key=$assemblyKey"

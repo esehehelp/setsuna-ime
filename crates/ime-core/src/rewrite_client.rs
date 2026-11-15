@@ -132,6 +132,7 @@ impl ChildRewriteClient {
         notify: Notify,
     ) -> std::io::Result<Self> {
         let mut cmd = Command::new(exe);
+        crate::config::scrub_env(&mut cmd);
         let args = daemon_args(cfg, credentials_dir);
         crate::diagnostics::log(format!(
             "spawn rewrite={} provider={} model={}",
@@ -363,8 +364,7 @@ pub fn spawn_with_config(
 }
 
 fn find_exe(module_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SETSUNA_REWRITE_EXE") {
-        let p = PathBuf::from(p);
+    if let Some(p) = crate::config::env_path("SETSUNA_REWRITE_EXE") {
         if p.is_file() {
             return Some(p);
         }
