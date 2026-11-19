@@ -2,7 +2,7 @@
   "schema": "setsuna-model-download-v1",
   "name": "Cymbidium-v1.2-xsmall",
   "repository": "esehe/Cymbidium-v1.2-xsmall",
-  "revision": "58ca8608ffee3104374464d0f10c8f935444abbc",
+  "revision": "7fe22dfd7c803fa913d44125fe7f92b28f0122ed",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
@@ -10,13 +10,18 @@
       "files": [
         {
           "path": "Cymbidium-v1.2-xsmall.manifest.json",
-          "size": 563,
-          "sha256": "7558aa675d9c9c915d4f67d8660c731efd1f1edd10cf5a761007c5d5a4ca9df8"
+          "size": 675,
+          "sha256": "454b72369a52ff1aca9fad13fd7b84dd1ed37c8d747741e266b0d1cb8b4a62b5"
         },
         {
           "path": "Cymbidium-v1.2-xsmall.onnx",
           "size": 22987122,
           "sha256": "e41ddc9c9c5312664a1c97fe49cf79b7faff33e6ddee1dde1055abaff740e360"
+        },
+        {
+          "path": "Cymbidium-v1.2-xsmall.encoder.safetensors",
+          "size": 22667388,
+          "sha256": "2f5d0a3fddbcece9c757b0e47a45086490a508c69d5b2afc9da35317f0785265"
         },
         {
           "path": "Cymbidium-v1.2-xsmall.vocab.hex.tsv",
@@ -32,107 +37,48 @@
     }
   },
   "models": {
-    "Cymbidium-v1.1-xsmall": {
-      "repository": "esehe/Cymbidium-v1.1-xsmall",
-      "revision": "4f506001a580364b99a1db6c6d3b91409eeb3ef9",
+    "Diphylleia-v1.0-flash": {
+      "repository": "esehe/Diphylleia-v1.0-flash",
+      "revision": "058599ec5cd95677cb3131670d26bf52745e1d70",
       "license": "Apache-2.0",
       "variants": {
         "int8": {
-          "manifest": "Cymbidium-v1.1-xsmall.manifest.json",
+          "manifest": "Diphylleia-v1.0-flash.manifest.json",
           "files": [
             {
-              "path": "Cymbidium-v1.1-xsmall.manifest.json",
-              "size": 563,
-              "sha256": "d7cfb0d9270da3a4d16b93078f81460a5ed5e81e71bdd3f49303a2902fce77b8"
+              "path": "Diphylleia-v1.0-flash.manifest.json",
+              "size": 1207,
+              "sha256": "5feac1c23176d93de48769254e70e34fa320980769973dcdf4de8369d98d1698"
             },
             {
-              "path": "Cymbidium-v1.1-xsmall.onnx",
-              "size": 22987122,
-              "sha256": "77dd51fd4fa13011bead0cc49c6be15291da53ffd4b641a0a23f2d7bb1ee008b"
+              "path": "Diphylleia-v1.0-flash.onnx",
+              "size": 22575623,
+              "sha256": "1a228b6168c5baedc4c0f9e8495216f5495e091fd41f9ee50148e07e6939ad1b"
             },
             {
-              "path": "Cymbidium-v1.1-xsmall.vocab.hex.tsv",
+              "path": "Diphylleia-v1.0-flash.encoder.safetensors",
+              "size": 22264649,
+              "sha256": "c04bc91a5a89a256d8255677a170f92d48c9419db74954ef8f4840c4c31fc1e7"
+            },
+            {
+              "path": "Diphylleia-v1.0-flash.ar_step.onnx",
+              "size": 3841808,
+              "sha256": "2f5612680045e429b8ece143f909735504fbd69a77b1699cfbf2378dfa59d32d"
+            },
+            {
+              "path": "Diphylleia-v1.0-flash.ar_step.safetensors",
+              "size": 2348990,
+              "sha256": "d4478c23153a6a50c21289d777c1ab6d5cb98bf9ce9f4972af6f5c676e39d797"
+            },
+            {
+              "path": "Diphylleia-v1.0-flash.vocab.hex.tsv",
               "size": 95166,
               "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
             },
             {
               "path": "config.json",
               "size": 113,
-              "sha256": "9a772096081de5c536124551d9d7cf9e105fe94e084f4d9c3c914109aabe1f6d"
-            }
-          ]
-        }
-      }
-    },
-    "Cymbidium-v1.0-xsmall": {
-      "repository": "esehe/Cymbidium-v1.0-xsmall",
-      "revision": "0701d2c33f3c5a583019a3204db76e6985e7e15b",
-      "license": "Apache-2.0",
-      "variants": {
-        "int8": {
-          "manifest": "Cymbidium-v1.0-xsmall.manifest.json",
-          "files": [
-            {
-              "path": "Cymbidium-v1.0-xsmall.manifest.json",
-              "size": 563,
-              "sha256": "af4220fb73acd57836123de596074be9211098ab26f11b5a9ab89f988af3ecc2"
-            },
-            {
-              "path": "Cymbidium-v1.0-xsmall.onnx",
-              "size": 13570989,
-              "sha256": "8c2511b97623716c12d4966ef9f3b796d87c8fcd2e174b2afb047de2e73dc9a5"
-            },
-            {
-              "path": "Cymbidium-v1.0-xsmall.vocab.hex.tsv",
-              "size": 95166,
-              "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
-            },
-            {
-              "path": "config.json",
-              "size": 117,
-              "sha256": "1e847be9e8a5db5ec332ca4d17a62cfacbe68b9464af25cb7e588815b07edc37"
-            }
-          ]
-        }
-      }
-    },
-    "Bletilla-v0.1-small": {
-      "repository": "esehe/Bletilla-v0.1-small",
-      "revision": "002b3a59ab97d3ed46576ad1f773d7e7ee1af3be",
-      "license": "Apache-2.0",
-      "variants": {
-        "int8": {
-          "manifest": "Bletilla-v0.1-small.int8.manifest.json",
-          "files": [
-            {
-              "path": "Bletilla-v0.1-small.int8.manifest.json",
-              "size": 697,
-              "sha256": "01c5f1657efada677685a7aa20064e472deaefd19a82d22e8d1181fb706e964b"
-            },
-            {
-              "path": "Bletilla-v0.1-small.int8.onnx",
-              "size": 115989185,
-              "sha256": "2424da819ac2377ce336a631bee8ea79c86acd151ae3d2b37ae94da5fe653d3b"
-            },
-            {
-              "path": "Bletilla-v0.1-small.vocab.hex.tsv",
-              "size": 95166,
-              "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
-            },
-            {
-              "path": "Bletilla-v0.1-small.pairs.bin",
-              "size": 14908280,
-              "sha256": "b781f34fcb598244f8230bae80c5bea996b8d37a0fabffab0254e8b497c94976"
-            },
-            {
-              "path": "Bletilla-v0.1-small.words.tsv",
-              "size": 13153598,
-              "sha256": "ed56c407ad4512954dee62b5b122901b1194272d32e39643f8b895adec27d110"
-            },
-            {
-              "path": "config.json",
-              "size": 116,
-              "sha256": "e0fd510a0b2a1b13f65eb77e0b29a47501b267d37f04301c2d939171cd5f82b2"
+              "sha256": "2090fe0f164650b4b0d5696294576c471ccf988e4435194c61f9c449e01be437"
             }
           ]
         }
@@ -181,6 +127,39 @@
           "path": "nid-ma-v2-600k-tb-packed/system.dic.zst",
           "size": 7148196,
           "sha256": "b64e2ff1e4b2e894c260704c103444b0d57b43a829b8380311b2afd8e5d92f39"
+        }
+      ]
+    },
+    "corrector": {
+      "repository": "esehe/Nandina-v1.0-tiny",
+      "revision": "db3907f055e901309125620bc6cada9b020a126d",
+      "license": "Apache-2.0",
+      "entry": "Nandina-v1.0-tiny.manifest.json",
+      "files": [
+        {
+          "path": "Nandina-v1.0-tiny.manifest.json",
+          "size": 3720,
+          "sha256": "4182ff31ec272d716d2b528f3447943bd97eaffb5a09308f2016210fe333ffa0"
+        },
+        {
+          "path": "Nandina-v1.0-tiny.onnx",
+          "size": 4277749,
+          "sha256": "58af51274dfc58f188fefdd0c229206badf74185ef1f3e589c5c7c6b40f72bbc"
+        },
+        {
+          "path": "Nandina-v1.0-tiny.encoder.safetensors",
+          "size": 4065808,
+          "sha256": "ffa053b8e30f4a65ae46cf36b418e7c31959e5c09d00defac784b704a27684d4"
+        },
+        {
+          "path": "Nandina-v1.0-tiny.vocab.hex.tsv",
+          "size": 95166,
+          "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
+        },
+        {
+          "path": "config.json",
+          "size": 109,
+          "sha256": "43a49d7f6657dccc756734741dacb96065a3df3f17ad1f453a90cfac6cd288aa"
         }
       ]
     }

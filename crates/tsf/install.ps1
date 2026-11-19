@@ -12,12 +12,14 @@
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -NameDictionary <tsv>  # also mixed input's names
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Lexicon <file>  # also the reading lexicon
 #   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Analyzer <a>  # also the analyzer (segment editing)
+#   pwsh -File crates\tsf\install.ps1 -Manifest <m> -Corrector <c>  # also the reading corrector
 #
 # Without -Manifest, fetch-model.ps1 downloads the public artifact pinned in
 # models.json (its own model, or -Model another one it pins),
 # verifies its size/SHA-256, and reuses verified cache files offline;
 # the reading lexicon and the analyzer pinned there come too (unless -Lexicon /
-# -Analyzer name local ones, or -NoDictionaries), and when they cannot be had
+# -Analyzer name local ones, or -NoDictionaries), and the reading corrector
+# (unless -Corrector names a local one, or -NoCorrector); when they cannot be had
 # the IME is installed without them.
 # <m> is the model's `*.manifest.json` written by export. The manifest and
 # every file it lists are copied, keeping their relative paths.
@@ -71,6 +73,7 @@
 #   <dir>\models\names\<names dictionary>  (with -NameDictionary)
 #   <dir>\models\lexicon\<lexicon>  (downloaded, or -Lexicon)
 #   <dir>\models\analyzer\<its directory's name>\<manifest> + its files  (downloaded, or -Analyzer)
+#   <dir>\models\corrector\<its name>\<manifest> + its files  (downloaded, or -Corrector)
 #   %LOCALAPPDATA%\setsuna-ime\cache\models\<repository>\<revision>\  (fetch-model.ps1's downloads while
 #                                  installing: the files are copied from it, the cache removed)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
@@ -123,9 +126,17 @@ param(
     # analyzer_manifest): the engine analyzes a conversion segment editing
     # cuts, which then cuts it by its words.
     [string]$Analyzer,
+    # A reading corrector's manifest (neo-ime-ctc-nat-export-v1 with its
+    # decode_defaults.corrector_threshold, [engine] corrector_manifest): the
+    # engine reads each reading with it first, one with a slip converted as
+    # it reads it.
+    [string]$Corrector,
     # Without -Manifest: do not download the lexicon and the analyzer.
     [Parameter(ParameterSetName = 'Download')]
     [switch]$NoDictionaries,
+    # Without -Manifest: do not download the reading corrector.
+    [Parameter(ParameterSetName = 'Download')]
+    [switch]$NoCorrector,
     [switch]$Force,
     [switch]$NoElevate,
     # Where the code and the models go (default %ProgramFiles%\setsuna-ime);
@@ -540,8 +551,10 @@ function Remove-StaleFiles {
         $dir = Join-Path $InstallDir $sub
         if (Test-Path -LiteralPath $dir) { $stale += @(Get-ChildItem -LiteralPath $dir -File -Recurse) }
     }
-    $dir = Join-Path $InstallDir 'models\analyzer'
-    if (Test-Path -LiteralPath $dir) { $stale += @(Get-ChildItem -LiteralPath $dir -Directory) }
+    foreach ($sub in 'models\analyzer', 'models\corrector') {
+        $dir = Join-Path $InstallDir $sub
+        if (Test-Path -LiteralPath $dir) { $stale += @(Get-ChildItem -LiteralPath $dir -Directory) }
+    }
     $cache = Join-Path $CacheDir 'models'
     if (Test-Path -LiteralPath $cache) { $stale += @(Get-ChildItem -LiteralPath $cache -Directory) }
 
@@ -644,7 +657,8 @@ function Update-ExistingConfig {
         [string]$MixedModelPath,
         [string]$NameDictionaryPath,
         [string]$LexiconPath,
-        [string]$AnalyzerPath
+        [string]$AnalyzerPath,
+        [string]$CorrectorPath
     )
 
     $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -ErrorAction Stop)
@@ -683,6 +697,10 @@ function Update-ExistingConfig {
         $q = '"' + ($AnalyzerPath.Replace('\','/').Replace('"','\"')) + '"'
         $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'analyzer_manifest' -Value $q
     }
+    if ($CorrectorPath) {
+        $q = '"' + ($CorrectorPath.Replace('\','/').Replace('"','\"')) + '"'
+        $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'corrector_manifest' -Value $q
+    }
     # The rewriter is found next to the DLL; a locked one's fallback is named.
     if ($RewriteExePath -and ($RewriteExePath -ne (Join-Path $InstallDir $RewriteExe))) {
         $qRewriteExe = '"' + ($RewriteExePath.Replace('\','/').Replace('"','\"')) + '"'
@@ -718,7 +736,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Download') {
     # what an earlier install put in place is not downloaded again
     $Seeds = @($InstallDir, $UserDir) | ForEach-Object {
         $root = $_
-        @('onnx', 'lexicon', 'analyzer') | ForEach-Object { Join-Path $root "models\$_" }
+        @('onnx', 'lexicon', 'analyzer', 'corrector') | ForEach-Object { Join-Path $root "models\$_" }
     }
     try {
         $Manifest = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Precision $ModelPrecision -Model $Model -SeedDir $Seeds
@@ -739,6 +757,14 @@ if ($PSCmdlet.ParameterSetName -eq 'Download') {
             $Analyzer = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component analyzer -SeedDir $Seeds
         } catch {
             Write-Log WARN "analyzer download failed, installing without it: $_ (run again to retry)"
+        }
+    }
+    # the reading corrector pinned with it: the IME converts without it too
+    if (-not $NoCorrector -and -not $Corrector) {
+        try {
+            $Corrector = & (Join-Path $PSScriptRoot 'fetch-model.ps1') -Component corrector -SeedDir $Seeds
+        } catch {
+            Write-Log WARN "reading corrector download failed, installing without it: $_ (run again to retry)"
         }
     }
 }
@@ -849,6 +875,27 @@ if ($Analyzer) {
     }
     Write-Log INFO "using analyzer: $Analyzer"
 }
+$CorrectorFiles = @()
+if ($Corrector) {
+    $Corrector = Resolve-Path-Safe $Corrector
+    if (-not (Test-Path -LiteralPath $Corrector)) {
+        Write-Log ERROR "reading corrector manifest not found: $Corrector"; exit 30
+    }
+    # a CTC-NAT manifest: every file it names, as the model's
+    $CorrectorJson = Get-Content -LiteralPath $Corrector -Raw -Encoding UTF8 | ConvertFrom-Json
+    $CorrectorFiles = @($CorrectorJson.proposal.path, $CorrectorJson.vocab)
+    if ($CorrectorJson.proposal.external_data) { $CorrectorFiles += @($CorrectorJson.proposal.external_data) }
+    if ($CorrectorJson.proposal.native) { $CorrectorFiles += @($CorrectorJson.proposal.native.path) }
+    if ($CorrectorJson.input_vocab) { $CorrectorFiles += @($CorrectorJson.input_vocab) }
+    $CorrectorFiles = @($CorrectorFiles | Select-Object -Unique)
+    foreach ($f in $CorrectorFiles) {
+        Assert-InsideDir -Rel $f -Dir (Split-Path -Parent $Corrector) -What 'reading corrector manifest'
+        if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Corrector) $f))) {
+            Write-Log ERROR "reading corrector file not found: $f"; exit 30
+        }
+    }
+    Write-Log INFO "using reading corrector: $Corrector"
+}
 
 # ---- elevate when regsvr32 needed ----
 if (-not (Test-IsAdmin) -and -not $NoElevate) {
@@ -863,6 +910,7 @@ if (-not (Test-IsAdmin) -and -not $NoElevate) {
     if ($NameDictionary) { $argv += @('-NameDictionary', ("`"$NameDictionary`"")) }
     if ($Lexicon) { $argv += @('-Lexicon', ("`"$Lexicon`"")) }
     if ($Analyzer) { $argv += @('-Analyzer', ("`"$Analyzer`"")) }
+    if ($Corrector) { $argv += @('-Corrector', ("`"$Corrector`"")) }
     if ($Force) { $argv += '-Force' }
     if ($PSBoundParameters.ContainsKey('InstallDir')) { $argv += @('-InstallDir', ("`"$InstallDir`"")) }
     try {
@@ -1021,6 +1069,7 @@ $MixedInstalled = $null
 $NamesInstalled = $null
 $LexiconInstalled = $null
 $AnalyzerInstalled = $null
+$CorrectorInstalled = $null
 try {
     if ($MixedModel) {
         $MixedInstalled = Join-Path $InstallDir 'models\mixed'
@@ -1056,6 +1105,19 @@ try {
             Install-ArtifactFile -Source (Join-Path $AnalyzerSrcDir $f) -Destination (Join-Path $AnalyzerDir $f) | Out-Null
         }
         $AnalyzerInstalled = Install-ArtifactFile -Source $Analyzer -Destination (Join-Path $AnalyzerDir (Split-Path -Leaf $Analyzer))
+    }
+    if ($Corrector) {
+        # its directory named as its manifest (a download's sits in a revision's directory): a running engine
+        # maps its weights, so another corrector goes beside it
+        $CorrectorSrcDir = Split-Path -Parent $Corrector
+        $CorrectorName = (Split-Path -Leaf $Corrector) -replace '\.manifest\.json$', ''
+        $CorrectorDir = Join-Path $InstallDir ('models\corrector\' + $CorrectorName)
+        New-Item -ItemType Directory -Force -Path $CorrectorDir | Out-Null
+        foreach ($f in $CorrectorFiles) {
+            Assert-InsideDir -Rel $f -Dir $CorrectorDir -What 'reading corrector manifest'
+            Install-ArtifactFile -Source (Join-Path $CorrectorSrcDir $f) -Destination (Join-Path $CorrectorDir $f) | Out-Null
+        }
+        $CorrectorInstalled = Install-ArtifactFile -Source $Corrector -Destination (Join-Path $CorrectorDir (Split-Path -Leaf $Corrector))
     }
 } catch {
     Write-Log ERROR "copy failed (mixed input): $_"; exit 50
@@ -1122,13 +1184,13 @@ shift_8 = "（"
 shift_9 = "）"
 "@
     Write-Utf8Lines -Path $ConfigPath -Lines ($DefaultConfig -split "`r?`n")
-    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled -or $LexiconInstalled -or $AnalyzerInstalled) {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
+    if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled -or $LexiconInstalled -or $AnalyzerInstalled -or $CorrectorInstalled) {
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled -CorrectorPath $CorrectorInstalled
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
     try {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled -CorrectorPath $CorrectorInstalled
         Write-Log INFO "updated engine config: $ConfigPath"
     } catch {
         Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"
@@ -1147,6 +1209,7 @@ $Installed = @(
     "engine_exe = $(ConvertTo-TomlPath $EngineInstalled)"
 )
 if ($AnalyzerInstalled) { $Installed += "analyzer_manifest = $(ConvertTo-TomlPath $AnalyzerInstalled)" }
+if ($CorrectorInstalled) { $Installed += "corrector_manifest = $(ConvertTo-TomlPath $CorrectorInstalled)" }
 $Installed += '[frontend]'
 if ($MixedInstalled) { $Installed += "mixed_model = $(ConvertTo-TomlPath $MixedInstalled)" }
 if ($NamesInstalled) { $Installed += "name_dictionary_file = $(ConvertTo-TomlPath $NamesInstalled)" }
@@ -1251,7 +1314,7 @@ function Stop-ReplacedEngines {
 # (files-only installs, as the tests run them, leave the running ones be)
 if (-not $NoElevate) {
     try {
-        Stop-ReplacedEngines -Dirs @($InstallDir, $UserDir) -Engine $EngineInstalled -Files @($InstalledManifest, $AnalyzerInstalled)
+        Stop-ReplacedEngines -Dirs @($InstallDir, $UserDir) -Engine $EngineInstalled -Files @($InstalledManifest, $AnalyzerInstalled, $CorrectorInstalled)
     } catch {
         Write-Log WARN "could not stop the engines this install replaced: $_"
     }
@@ -1259,7 +1322,8 @@ if (-not $NoElevate) {
 
 # ---- what earlier installs left ----
 $InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInstalled, $RewriteInstalled, $RerankInstalled,
-                    $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled)
+                    $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled,
+                    $CorrectorInstalled)
 $InstalledFiles += @($ArtifactFiles | ForEach-Object { Join-Path $ModelDstDir $_ })
 try {
     Remove-StaleFiles -Keep $InstalledFiles -ConfigPath $ConfigPath

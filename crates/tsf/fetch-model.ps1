@@ -23,7 +23,7 @@ param(
     # The model by its name: the catalog's own (the default) or one of its
     # `models`.
     [string]$Model,
-    [ValidateSet('lexicon', 'analyzer')]
+    [ValidateSet('lexicon', 'analyzer', 'corrector')]
     [string]$Component,
     [string]$CacheDir = (Join-Path $env:LOCALAPPDATA 'setsuna-ime\cache\models'),
     # Directories of installed files (a pinned file's path, or its name,
