@@ -232,22 +232,22 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="banner" id="error" hidden></div>
 
 <section data-android hidden>
-<h2>この端末</h2>
+<h2>セットアップ</h2>
 <div class="card">
   <div class="row">
     <div class="text"><div class="title">入力方法</div><div class="desc" id="app_ime"></div></div>
-    <div class="control"><button id="app_open_ime">入力方法の設定</button><button id="app_pick_ime">切り替える</button></div>
+    <div class="control"><button id="app_open_ime">入力方法の設定</button><button id="app_pick_ime">切り替え</button></div>
   </div>
   <div class="row">
     <div class="text"><div class="title">変換モデル</div><div class="desc lines" id="app_model"></div></div>
     <div class="control"><button class="primary" id="app_get_model">ダウンロード</button></div>
   </div>
   <div class="row">
-    <div class="text"><div class="title">読みの辞書と解析器</div><div class="desc lines" id="app_dicts"></div></div>
+    <div class="text"><div class="title">読み辞書・形態素解析器</div><div class="desc lines" id="app_dicts"></div></div>
     <div class="control"><button id="app_get_dicts">ダウンロード</button></div>
   </div>
   <div class="note" id="app_download" hidden></div>
-  <div class="row stack"><textarea id="app_try" placeholder="ここで試す"></textarea></div>
+  <div class="row stack"><textarea id="app_try" placeholder="ここで入力を試せます"></textarea></div>
 </div>
 </section>
 
@@ -255,20 +255,20 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <h2>キーボード</h2>
 <div class="card">
   <div class="row">
-    <div class="text"><div class="title">キーをタップしたときの振動</div></div>
+    <div class="text"><div class="title">タップ時の振動</div></div>
     <div class="control" id="kb_vibrate"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">長押ししたときの振動</div>
-      <div class="desc">地球儀キーを長押しして入力方法を選ぶとき</div>
+      <div class="title">長押し時の振動</div>
+      <div class="desc">地球儀キーの長押しで入力方法を切り替えるときなどに振動します。</div>
     </div>
     <div class="control" id="kb_vibrate_hold"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">キーの吹き出し</div>
-      <div class="desc">押しているキーの文字を、キーの上に大きく出します</div>
+      <div class="title">キーポップアップ</div>
+      <div class="desc">押したキーの文字をキーの上に拡大表示します。</div>
     </div>
     <div class="control" id="kb_preview"></div>
   </div>
@@ -283,24 +283,24 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 </section>
 
 <section data-desktop>
-<h2 data-linux-text="候補の表示">候補の窓</h2>
+<h2 data-linux-text="候補の表示">候補ウィンドウ</h2>
 <div class="card">
   <div data-windows>
     <div class="row">
       <div class="text">
         <div class="title">テーマ</div>
-        <div class="desc">自動は Windows のアプリのモード（ライト・ダーク）に合わせます</div>
+        <div class="desc">「自動」を選ぶと、Windows のアプリモード（ライト／ダーク）に合わせます。</div>
       </div>
       <div class="control"><div class="segmented" id="window_theme"></div></div>
     </div>
     <div class="row" data-window-range="size_percent" data-min="80" data-max="200" data-step="10" data-unit="%">
-      <div class="text"><div class="title">大きさ</div></div>
+      <div class="text"><div class="title">ウィンドウサイズ</div></div>
     </div>
     <div class="row" data-window-range="font_pt" data-min="10" data-max="32" data-step="1" data-unit="px">
-      <div class="text"><div class="title">文字の大きさ</div></div>
+      <div class="text"><div class="title">フォントサイズ</div></div>
     </div>
     <div class="row" data-window-range="font_weight" data-min="300" data-max="700" data-step="100" data-unit="">
-      <div class="text"><div class="title">文字の太さ</div><div class="desc">400 が標準、700 が太字</div></div>
+      <div class="text"><div class="title">フォントの太さ</div><div class="desc">400 が標準、700 が太字です。</div></div>
     </div>
     <div class="row" data-window-range="corner_radius" data-min="0" data-max="24" data-step="1" data-unit="px">
       <div class="text"><div class="title">角の丸み</div></div>
@@ -311,8 +311,8 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">ライブ変換の表示を一度だけ変える</div>
-      <div class="desc">リランカを使うとき、打つのを止めてから並べ替えが終わるまで（最長 0.25 秒）変換の表示を待ち、先頭が二度入れ替わらないようにします</div>
+      <div class="title">リランク完了までライブ変換の更新を待つ</div>
+      <div class="desc">LM リランカーの使用時、入力が止まってから並べ替えが完了するまで（最長 0.25 秒）変換表示の更新を待ち、先頭候補が 2 度切り替わるちらつきを抑えます。</div>
     </div>
     <div class="control" id="defer_switch"></div>
   </div>
@@ -323,50 +323,50 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">ローマ字表</div>
-      <div class="desc">AZIK は木村清氏の拡張ローマ字入力、かな入力は JIS 配列です。Mozc 形式（入力・出力・保留のタブ区切り）の表のファイルも使えます</div>
+      <div class="title">ローマ字・かな入力</div>
+      <div class="desc">AZIK は木村清氏考案の拡張ローマ字入力、JIS かなは JIS 配列のかな入力です。Mozc 形式（入力・出力・保留のタブ区切り）のカスタム表ファイルも指定できます。</div>
     </div>
     <div class="control"><div class="segmented" id="romaji_table"></div></div>
   </div>
   <div class="row" data-desktop>
     <div class="text">
-      <div class="title">表のファイル</div>
-      <div class="desc">ファイルの表を使うときのパス</div>
+      <div class="title">カスタム表ファイルのパス</div>
+      <div class="desc">「ファイル」選択時に読み込むローマ字表ファイルのパスを指定します。</div>
     </div>
     <div class="control"><input type="text" id="romaji_path" placeholder="C:/path/to/romaji.tsv"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">打ち間違いの補正</div>
-      <div class="desc">ローマ字として読めない文字があると、隣のキー・余計なキー・入れ替えを直した読みの候補も出します（kaisga → 会社）。ずとづの取り違えも直します（tuzuku → 続く）</div>
+      <div class="title">入力ミスの補正</div>
+      <div class="desc">ローマ字として解釈できない入力に対し、隣接キー・余分なキー・文字の入れ替えを補正した候補を提示します（例: kaisga → 会社）。「ず／づ」の取り違えも補正します（例: tuzuku → 続く）。</div>
     </div>
     <div class="control" data-switch="frontend.typo_correction"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">/コマンド・@ファイルをそのまま入力</div>
-      <div class="desc">行の先頭や空白の後の / $ @ と続く名前を、変換せずにアプリへ送ります（AI エージェントの補完が使えます）。アプリの文章を読めるときだけ働きます</div>
+      <div class="title">/コマンド・@ファイルを直接入力</div>
+      <div class="desc">行頭や空白の直後に続く /・$・@ で始まる文字列を変換せずそのままアプリへ送ります（AI エージェントの補完機能などに便利です）。カーソル前のテキストを取得できるアプリでのみ動作します。</div>
     </div>
     <div class="control" data-switch="frontend.pass_through_commands"></div>
   </div>
   <div class="row" data-desktop>
     <div class="text">
-      <div class="title">オン・オフを切り替えるキー</div>
-      <div class="desc">カンマ区切り。Zenkaku（半角/全角）、Henkan、Muhenkan、Eisu、Kana、Space、英字、F1〜F24 などに Ctrl+ / Shift+ / Alt+ を付けて書きます。Ctrl+Space は多くのアプリのショートカットなので、使うときだけ足してください</div>
+      <div class="title">IME のオン／オフ切替キー</div>
+      <div class="desc">カンマ区切りで指定します。Zenkaku（半角/全角）、Henkan、Muhenkan、Eisu、Kana、Space、英字、F1〜F24 などに Ctrl+ / Shift+ / Alt+ を組み合わせられます。Ctrl+Space は多くのアプリのショートカットと競合するため、必要な場合のみ追加してください。</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="toggle_keys" placeholder="Zenkaku, Alt+Zenkaku, Alt+`"></div>
   </div>
   <div class="row" data-desktop>
     <div class="text">
-      <div class="title">オンにするキー</div>
-      <div class="desc" data-linux-text="例: Henkan、Kana（fcitx5 が先に取るキーは fcitx5 側で設定してください）">ImeOn はオンにする専用のキー（VK_IME_ON）を送るキーボードのためのものです（例: Henkan）</div>
+      <div class="title">IME をオンにするキー</div>
+      <div class="desc" data-linux-text="IME をオンにする専用キーを指定します（例: Henkan、Kana）。fcitx5 が先に処理するキーは fcitx5 側で設定してください。">IME をオンにする専用キーを指定します。ImeOn は VK_IME_ON を送信するキーボード用です（例: Henkan）。</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="on_keys" placeholder="ImeOn"></div>
   </div>
   <div class="row" data-desktop>
     <div class="text">
-      <div class="title">オフにするキー</div>
-      <div class="desc" data-linux-text="例: Muhenkan、Eisu">ImeOff はオフにする専用のキー（VK_IME_OFF）です（例: Muhenkan）</div>
+      <div class="title">IME をオフにするキー</div>
+      <div class="desc" data-linux-text="IME をオフにする専用キーを指定します（例: Muhenkan、Eisu）。">IME をオフにする専用キーを指定します。ImeOff は VK_IME_OFF を送信するキーボード用です（例: Muhenkan）。</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="off_keys" placeholder="ImeOff"></div>
   </div>
@@ -376,72 +376,72 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">記号の全角・半角</div>
-      <div class="desc">自動：カーソルの前の文章の書き方に合わせます</div>
+      <div class="title">変換候補の記号幅</div>
+      <div class="desc">変換候補に含まれる記号の全角・半角を設定します。「自動」ではカーソル前の文章の表記に合わせます。</div>
     </div>
     <div class="control"><div class="segmented" id="symbol_width"></div></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">入力する記号</div>
-      <div class="desc">記号キーで入力する文字です。全角：！（）＃、半角：! ( ) #（どちらも 、。・「」 はそのまま）。下の表で記号ごとにも選べます</div>
+      <div class="title">記号キーの入力文字</div>
+      <div class="desc">記号キーを押したときに入力される文字を一括設定します（全角: ！（）＃、半角: ! ( ) #。どちらも 、。・「」 は維持されます）。下のメニューからキーごとに個別設定もできます。</div>
     </div>
     <div class="control"><div class="segmented" id="symbol_preset"></div></div>
   </div>
   <details class="syms">
-    <summary>記号ごとに選ぶ</summary>
+    <summary>キーごとに個別設定</summary>
     <div class="symgrid" id="symbols"></div>
   </details>
   <div class="row">
     <div class="text">
-      <div class="title">句読点</div>
-      <div class="desc">候補の句読点をこの組にそろえます</div>
+      <div class="title">句読点のスタイル</div>
+      <div class="desc">変換候補の句読点を指定した組み合わせに統一します。</div>
     </div>
     <div class="control"><select id="punctuation"></select></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">中黒をそろえる</div>
-      <div class="desc">･ · ‧ ⋅ ∙ を「・」にします</div>
+      <div class="title">中黒を「・」に統一</div>
+      <div class="desc">変換候補の ･ · ‧ ⋅ ∙ をすべて「・」に統一します。</div>
     </div>
     <div class="control" data-switch="frontend.normalize_middle_dot"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">入力していない記号を含む候補を出さない</div>
-      <div class="desc">句読点や括弧など、読みにない記号が付いた候補を除きます</div>
+      <div class="title">未入力の記号を含む候補を除外</div>
+      <div class="desc">句読点や括弧など、入力していない記号が付与された候補を除外します。</div>
     </div>
     <div class="control" data-switch="frontend.drop_untyped_symbols"></div>
   </div>
   <div class="row">
     <div class="text">
       <div class="title">記号辞書</div>
-      <div class="desc">やじるし → 「→」、かっこ → 「（）」のように記号を候補に出します</div>
+      <div class="desc">「やじるし」→「→」、「かっこ」→「（）」のように、読みから記号を変換候補に表示します。</div>
     </div>
     <div class="control" data-switch="frontend.symbol_dictionary"></div>
   </div>
 </div>
 
-<h2>日付・時間・数字・絵文字</h2>
+<h2>日付・時刻・数字・絵文字</h2>
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">日付・時間の候補</div>
-      <div class="desc">きょう・いま・1じかんご などから作ります。端末のローカル時刻を使い、曜日は今日を含む次の曜日、週は月曜始まりです</div>
+      <div class="title">日付・時刻の変換候補</div>
+      <div class="desc">「きょう」「いま」「1じかんご」などの読みから日付・時刻の候補を生成します。端末のローカル時刻を使用し、曜日は今日以降の直近の日付、週は月曜始まりとして計算します。</div>
     </div>
     <div class="control" data-switch="frontend.date_time_candidates"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">数字の候補</div>
-      <div class="desc">1234 → 1,234・千二百三十四・壱阡弐百参拾四・12:34、じゅうに → 12、2025ねん → 令和7年、れいわ7ねん → 2025年、1+2= → 3、U+3042 → あ</div>
+      <div class="title">数字・計算の変換候補</div>
+      <div class="desc">数値・和暦・簡易計算・文字コードの変換候補を生成します（例: 1234 → 1,234／千二百三十四／壱阡弐百参拾四／12:34、じゅうに → 12、2025ねん → 令和7年、れいわ7ねん → 2025年、1+2= → 3、U+3042 → あ）。</div>
     </div>
     <div class="control" data-switch="frontend.number_candidates"></div>
   </div>
   <div class="row">
     <div class="text">
-      <div class="title">絵文字・顔文字の候補</div>
-      <div class="desc">にこにこ → 😊 ＼(^o^)／ など。えもじ・かおもじ ですべてを出します</div>
+      <div class="title">絵文字・顔文字の変換候補</div>
+      <div class="desc">「にこにこ」→「😊」「＼(^o^)／」などの候補を表示します。「えもじ」「かおもじ」と入力すると一覧から選べます。</div>
     </div>
     <div class="control" data-switch="frontend.emoji_candidates"></div>
   </div>
@@ -451,26 +451,26 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">小文字で打った英語の表記</div>
-      <div class="desc">固有名詞：名前の辞書の表記にします（github → GitHub、iphone → iPhone）。略語：英単語として読めないつづり（pc → PC、sns → SNS、usb → USB）と ok・api・id なども大文字にします。word や apple のように普通の語でもある名前はそのままです（混在入力のモデルを使うとき）</div>
+      <div class="title">小文字入力時の自動大文字化</div>
+      <div class="desc">英日混在入力モデルの使用時、小文字で入力した英単語の表記を自動調整します。「固有名詞」は辞書に基づき変換し（例: github → GitHub、iphone → iPhone）、「略語」は英単語として読めないつづり（pc → PC、sns → SNS、usb → USB）や ok・api・id などを大文字にします。word や apple など一般名詞としても使われる語はそのまま残します。</div>
     </div>
     <div class="control"><div class="segmented" id="name_case"></div></div>
   </div>
   <div class="row">
     <div class="text">
       <div class="title">英文の文頭を大文字にする</div>
-      <div class="desc">2 語以上の英文の文頭と . ! ? の後を大文字にし、i を I に、文中の . , を英文のまま残します</div>
+      <div class="desc">2 語以上の英文では文頭および . ! ? の直後を大文字にし、単独の i を I に変換します。また、文中の . や , を句読点に変換せずそのまま保持します。</div>
     </div>
     <div class="control" data-switch="frontend.sentence_case"></div>
   </div>
 </div>
 
-<h2>補正モデル</h2>
+<h2>読み補正モデル</h2>
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">補正した読みを先頭にする基準</div>
-      <div class="desc">補正モデルが、打ったままの読みより補正した読みをこの値を超えて確かだと見たとき、補正した読みの変換を先頭にします（それ以下では 2 番目）。小さいほど打ち間違いが直って出やすくなり、正しく打った読みが書き換わることも増えます。目安は 4〜5。「既定」はモデルの値です</div>
+      <div class="title">補正候補を先頭に表示するしきい値</div>
+      <div class="desc">読み補正モデルが「元の読みより補正後の読みのほうが確かだ」と判断する基準値です。この値を超えたら補正後の変換を先頭に、この値以下なら 2 番目に表示します。値を下げるほど誤入力が自動補正されやすくなりますが、正しい読みが意図せず書き換わる場合も増えます（目安: 4〜5）。「既定」の値は 4 です。</div>
     </div>
     <div class="control">
       <input type="range" id="corrector_threshold" min="0" max="15" step="0.5" data-default="4">
@@ -480,24 +480,24 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
 </div>
 
-<h2>任意置換</h2>
+<h2>文字列の置換</h2>
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">候補の文字列を置き換える</div>
-      <div class="desc">上から順に、すべての候補に適用します</div>
+      <div class="title">変換候補の文字列を自動置換</div>
+      <div class="desc">登録したルールを上から順にすべての変換候補へ適用します。</div>
     </div>
     <div class="control"><button id="add_rep">追加</button></div>
   </div>
   <div class="reps" id="reps"></div>
 </div>
 
-<h2>アプリ別の設定</h2>
+<h2>アプリ別設定</h2>
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">アプリごとに変える</div>
-      <div class="desc" data-android-text="パッケージ名（com.android.chrome など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります" data-linux-text="プログラム名（firefox、konsole など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります">実行ファイル名（code.exe など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります</div>
+      <div class="title">アプリごとの個別設定</div>
+      <div class="desc" data-android-text="パッケージ名（例: com.android.chrome）ごとに、開始時の IME オン／オフや各機能の有効・無効を設定できます。「既定」を選ぶと全体設定に従います。なお、URL・メール・数値・パスワードなどの入力欄ではすべてのアプリで直接入力になります。" data-linux-text="プログラム名（例: firefox、konsole）ごとに、起動時の IME オン／オフや各機能の有効・無効を設定できます。「既定」を選ぶと全体設定に従います。なお、URL・メール・数値・パスワードなどの入力欄ではすべてのアプリで直接入力になります。">実行ファイル名（例: code.exe）ごとに、起動時の IME オン／オフや各機能の有効・無効を設定できます。「既定」を選ぶと全体設定に従います。なお、URL・メール・数値・パスワードなどの入力欄ではすべてのアプリで直接入力になります。</div>
     </div>
     <div class="control"><button id="add_app">追加</button></div>
   </div>
@@ -508,8 +508,8 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">登録した語</div>
-      <div class="desc" id="dict_desc">読みはひらがな（ローマ字でも入力できます）。英字・記号だけの読み（w → (笑)）は、そのとおり打って Space で出ます。読み全体のほか、長い読みの一部に一致しても候補に入ります。品詞「短縮よみ」は読み全体だけ、「抑制単語」はその語を出さなくなります</div>
+      <div class="title">登録単語</div>
+      <div class="desc" id="dict_desc">読みはひらがなで入力します（ローマ字入力可）。英字・記号のみの読み（例: w → (笑)）はそのまま入力して Space キーで変換できます。読み全体だけでなく一部に一致した場合も候補に表示されます。品詞に「短縮よみ」を指定すると完全一致時のみ表示され、「抑制単語」を指定すると変換候補から除外されます。</div>
     </div>
     <div class="control">
       <input type="text" id="dict_search" placeholder="検索">
@@ -519,28 +519,29 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="reps" id="dict_rows"></div>
   <div class="row">
     <div class="text">
-      <div class="desc">Google 日本語入力 / Mozc、Microsoft IME、ATOK、Gboard の書き出したファイルを読み込めます</div>
+      <div class="desc">Google 日本語入力 / Mozc、Microsoft IME、ATOK、Gboard からエクスポートした辞書ファイルをインポートできます。</div>
     </div>
     <div class="control">
       <input type="file" id="dict_file" accept=".txt,.tsv,.csv" hidden>
-      <button id="dict_import">読み込む…</button>
+      <button id="dict_import">インポート…</button>
       <button id="dict_save" class="primary">辞書を保存</button>
     </div>
   </div>
 </div>
 
-<h2>学習</h2>
+<h2>学習・予測</h2>
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">選んだ候補を学習して並べ替える</div>
+      <div class="title">選択した候補を学習する</div>
+      <div class="desc">確定した変換候補を記憶し、次回以降の候補順位に反映します。</div>
     </div>
     <div class="control" data-switch="learning.enabled"></div>
   </div>
   <div class="row" data-learning>
     <div class="text">
-      <div class="title">強さ</div>
-      <div class="desc">1.0 で、同じ読みで選んだ候補が先頭に来ます</div>
+      <div class="title">学習の強さ</div>
+      <div class="desc">1.0 にすると、同じ読みで以前選択した候補が先頭に表示されます。</div>
     </div>
     <div class="control">
       <input type="range" id="strength" min="0" max="3" step="0.1">
@@ -549,8 +550,8 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="row" data-learning>
     <div class="text">
-      <div class="title">似た読みへの適用</div>
-      <div class="desc">読み全体の文字 bigram のコサイン類似度がこの値以上なら適用します。1.00 で同じ読みのみ</div>
+      <div class="title">類似する読みへの適用範囲</div>
+      <div class="desc">読み全体の文字 bigram コサイン類似度がこの値以上の場合に学習結果を適用します。1.00 で完全一致のみに適用されます。</div>
     </div>
     <div class="control">
       <input type="range" id="similarity_threshold" min="0.3" max="1" step="0.05">
@@ -559,15 +560,15 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="row" data-learning>
     <div class="text">
-      <div class="title">単語単位でも学習する</div>
-      <div class="desc">変えた語を、前後の読みが同じ別の文にも適用します<span class="nobr">（きしゃ：記者 → 貴社）</span></div>
+      <div class="title">単語単位で学習する</div>
+      <div class="desc">選び直した単語を、前後の読みが共通する別の文にも反映します<span class="nobr">（例: きしゃ「記者」→「貴社」）</span>。</div>
     </div>
     <div class="control" data-switch="learning.words"></div>
   </div>
   <div class="row" data-desktop>
     <div class="text">
-      <div class="title">入力の予測</div>
-      <div class="desc">確定した変換を覚えて、読みの始めを打って Tab を押すと候補の窓に出します</div>
+      <div class="title">予測変換</div>
+      <div class="desc">確定した変換履歴を記憶し、読みの途中まで入力して Tab キーを押すと予測候補を表示します。</div>
     </div>
     <div class="control" data-switch="frontend.prediction"></div>
   </div>
@@ -580,8 +581,8 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="row" data-desktop>
     <div class="text">
-      <div class="title">表示しない候補</div>
-      <div class="desc">変換中に Ctrl+Delete で消した候補です（学習で上がっていた候補は、学習の取り消しになります）</div>
+      <div class="title">非表示にした候補</div>
+      <div class="desc">変換中に Ctrl+Delete で非表示にした候補の一覧です（学習によって上位に来ていた候補の場合は、学習の取り消しのみが行われます）。</div>
       <div id="hidden_list"></div>
     </div>
   </div>
@@ -592,8 +593,8 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 <div class="card">
   <div class="row">
     <div class="text">
-      <div class="title">書き直し</div>
-      <div class="desc">Space で変換すると、入力を自然な日本語に書き直した候補を先頭に出します。オンの間、タスクバーの表示は「直」になります</div>
+      <div class="title">書き直しを有効にする</div>
+      <div class="desc">Space キーで変換すると、入力内容を自然な日本語に書き直した候補を先頭に表示します。有効時は入力モード表示が「直」になります。</div>
     </div>
     <div class="control" data-switch="rewriter.enabled"></div>
   </div>
@@ -614,7 +615,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row" data-rw data-provider="compatible">
     <div class="text">
       <div class="title">ベース URL</div>
-      <div class="desc">OpenAI 互換 API の URL（例: http://127.0.0.1:8080/v1）</div>
+      <div class="desc">OpenAI 互換 API のエンドポイント URL を指定します（例: http://127.0.0.1:8080/v1）。</div>
     </div>
     <div class="control"><input type="text" class="wide" id="base_url" placeholder="http://127.0.0.1:8080/v1"></div>
   </div>
@@ -638,7 +639,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row" data-rw>
     <div class="text">
       <div class="title">モデル</div>
-      <div class="desc" id="models_desc">一覧を取得して選ぶか、モデル名を入力します</div>
+      <div class="desc" id="models_desc">「一覧を取得」から選択するか、モデル名を直接入力してください。</div>
     </div>
     <div class="control">
       <input type="text" id="model" list="model_list" placeholder="モデル名">
@@ -648,33 +649,33 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="row" data-rw data-api="responses">
     <div class="text">
-      <div class="title">推論の強さ</div>
-      <div class="desc">推論するモデルで、低いほど速く返ります</div>
+      <div class="title">推論の深さ</div>
+      <div class="desc">推論モデル使用時の思考量を設定します。低いほど応答が速くなります。</div>
     </div>
     <div class="control"><select id="reasoning_effort"></select></div>
   </div>
   <div class="row" data-rw>
     <div class="text">
-      <div class="title">カーソルの前の文章も送る</div>
-      <div class="desc">文脈に合わせて書き直せますが、送る内容が増えます</div>
+      <div class="title">カーソル前の文脈を送信</div>
+      <div class="desc">カーソル直前の文章も送信して文脈に沿った書き直しを行います。送信されるテキスト量が増えます。</div>
     </div>
     <div class="control" data-switch="rewriter.send_context"></div>
   </div>
   <div class="row stack" data-rw>
     <div class="text">
-      <div class="title">指示</div>
-      <div class="desc">空欄なら既定の指示を使います</div>
+      <div class="title">書き直しの指示</div>
+      <div class="desc">空欄の場合は既定の指示を使用します。</div>
     </div>
     <textarea id="instructions"></textarea>
   </div>
-  <div class="note">書き直しモードで変換すると、読み・変換結果（と、オンならカーソルの前の文章）が選んだ接続先に送られます。</div>
+  <div class="note">書き直しモードでの変換時は、読み・変換結果（および有効時はカーソル前の文章）が選択した接続先へ送信されます。</div>
 </div>
 </section>
 
 <div class="modal" id="plan_notice" hidden>
   <div class="box">
     <h3>You're using your ChatGPT plan</h3>
-    <p>書き直しのリクエストには、ChatGPT プランの使用量（またはクレジット残高）が使われます。使用量は ChatGPT の設定で確認・管理できます。この使用量は Setsuna IME の料金とは関係ありません（Setsuna IME は無料です）。</p>
+    <p>書き直し機能のリクエストには、ChatGPT プランの利用枠（またはクレジット残高）が消費されます。使用状況は ChatGPT の設定画面で確認・管理できます。なお、この利用枠は Setsuna IME の料金とは無関係です（Setsuna IME は無料です）。</p>
     <div class="actions">
       <button class="link" data-open="https://chatgpt.com/settings/usage">Manage usage</button>
       <button class="primary" id="plan_ok">Got it</button>
@@ -694,7 +695,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 "use strict";
 
 const WIDTHS = [["as_typed", "入力どおり"], ["full", "全角"], ["half", "半角"], ["auto", "自動"]];
-const NAME_CASES = [["off", "オフ"], ["proper", "固有名詞"], ["acronyms", "固有名詞と略語"]];
+const NAME_CASES = [["off", "オフ"], ["proper", "固有名詞"], ["acronyms", "固有名詞・略語"]];
 const WINDOW_THEMES = [["auto", "自動"], ["setsuna", "ライト"], ["setsuna-dark", "ダーク"], ["classic", "クラシック"]];
 
 function renderWindow() {
@@ -728,7 +729,7 @@ function renderWindow() {
   }
 }
 
-const ROMAJI_TABLES = [["standard", "標準"], ["azik", "AZIK"], ["kana_jis", "かな入力"], ["file", "ファイル"]];
+const ROMAJI_TABLES = [["standard", "標準"], ["azik", "AZIK"], ["kana_jis", "JIS かな"], ["file", "ファイル"]];
 const PUNCTUATION = [
   ["as_is", "変換結果のまま"], ["toten_kuten", "、。"], ["comma_period", "，．"],
   ["comma_kuten", "，。"], ["toten_period", "、．"],
@@ -883,7 +884,7 @@ function renderSymbols() {
     const value = syms[k.name] ?? "";
     const list = [];
     if (k.japanese) list.push([k.japanese, k.japanese]);
-    list.push([k.full, `${k.full}　全角`], [k.half, `${k.half}　半角`]);
+    list.push([k.full, `${k.full} 全角`], [k.half, `${k.half} 半角`]);
     if (value && !list.some(([v]) => v === value)) list.push([value, value]);
     const sel = el("select", { title: k.name });
     options(sel, list, value);
@@ -924,7 +925,7 @@ function renderReplacements() {
   const list = cfg.frontend.replacements;
   const box = $("reps");
   if (list.length === 0) {
-    box.replaceChildren(el("div", { className: "empty", textContent: "置換はありません" }));
+    box.replaceChildren(el("div", { className: "empty", textContent: "置換ルールは登録されていません" }));
     return;
   }
   box.replaceChildren(...list.map((r, i) => {
@@ -945,7 +946,7 @@ const APP_FIELDS = [
   ["learning", "学習"],
   ["rewrite", "書き直し"],
   ["mixed_input", "英日混在"],
-  ["prediction", "予測"],
+  ["prediction", "予測変換"],
 ].filter(([key]) => !(ANDROID && (key === "rewrite" || key === "prediction")));
 
 function triState(value, onChange) {
@@ -968,9 +969,9 @@ function renderApps() {
     });
     name.addEventListener("input", () => { a.process = name.value; changed(); });
     const start = el("select", {},
-      el("option", { value: "keep", textContent: "開始: 既定" }),
-      el("option", { value: "on", textContent: "開始: オン" }),
-      el("option", { value: "off", textContent: "開始: オフ" }));
+      el("option", { value: "keep", textContent: "初期状態: 既定" }),
+      el("option", { value: "on", textContent: "初期状態: オン" }),
+      el("option", { value: "off", textContent: "初期状態: オフ" }));
     start.value = a.start ?? "keep";
     start.addEventListener("change", () => { a.start = start.value; changed(); });
     const fields = APP_FIELDS.map(([key, label]) => el("label", { className: "app-field" },
@@ -996,7 +997,7 @@ function renderDict() {
     .filter(([e]) => !query || e.reading.includes(query) || e.word.includes(query));
   $("dict_rows").replaceChildren(...rows.slice(0, 300).map(([e, i]) => {
     const reading = el("input", { type: "text", value: e.reading, placeholder: "読み" });
-    const word = el("input", { type: "text", value: e.word, placeholder: "語" });
+    const word = el("input", { type: "text", value: e.word, placeholder: "単語" });
     const pos = el("select", {}, ...[...new Set([...DICT_POS, e.pos])].map((p) =>
       el("option", { value: p, textContent: p, selected: p === e.pos })));
     const comment = el("input", { type: "text", value: e.comment, placeholder: "コメント" });
@@ -1038,11 +1039,11 @@ $("dict_file").addEventListener("change", async () => {
 function renderHidden() {
   const box = $("hidden_list");
   if (!hidden.length) {
-    box.replaceChildren(el("div", { className: "desc", textContent: "ありません" }));
+    box.replaceChildren(el("div", { className: "desc", textContent: "非表示にした候補はありません" }));
     return;
   }
   box.replaceChildren(...hidden.map(([reading, surface]) => {
-    const back = el("button", { textContent: "戻す" });
+    const back = el("button", { textContent: "表示に戻す" });
     back.addEventListener("click", () => send({ type: "show_hidden", reading, surface }));
     return el("div", { className: "rep" },
       el("span", { textContent: reading }), el("span", { className: "arrow", textContent: "→" }),
@@ -1052,15 +1053,15 @@ function renderHidden() {
 
 function renderLearned() {
   $("learned").textContent = learned === null
-    ? "学習履歴の場所が見つかりません"
-    : `学習済み ${learned} 件`;
+    ? "学習履歴の保存先が見つかりません。"
+    : `学習済み: ${learned} 件`;
   const box = $("clear_controls");
   if (confirmClear) {
-    const yes = el("button", { textContent: "消去する", className: "danger" });
-    const no = el("button", { textContent: "やめる" });
+    const yes = el("button", { textContent: "消去", className: "danger" });
+    const no = el("button", { textContent: "キャンセル" });
     yes.addEventListener("click", () => { confirmClear = false; send({ type: "clear_learning" }); });
     no.addEventListener("click", () => { confirmClear = false; renderLearned(); });
-    box.replaceChildren(el("span", { textContent: "本当に消去しますか？" }), yes, no);
+    box.replaceChildren(el("span", { textContent: "学習履歴をすべて消去しますか？" }), yes, no);
   } else {
     const clear = el("button", { textContent: "学習履歴を消去", disabled: !(learned > 0) });
     clear.addEventListener("click", () => { confirmClear = true; renderLearned(); });
@@ -1143,12 +1144,12 @@ const PROVIDERS = [
   ["compatible", "OpenAI 互換 API"],
 ];
 const PROVIDER_DESC = {
-  chatgpt: "ChatGPT にサインインし、ChatGPT プランの使用量で書き直します",
-  openai: "OpenAI の API キーで書き直します（API の利用料金がかかります）",
-  compatible: "OpenAI 互換の API を持つサーバー（ローカルの LLM など）で書き直します",
+  chatgpt: "ChatGPT アカウントにサインインし、ChatGPT プランの利用枠で書き直します。",
+  openai: "OpenAI の API キーを使用して書き直します（API の従量課金が発生します）。",
+  compatible: "OpenAI 互換 API を提供するサーバー（ローカル LLM など）を使用して書き直します。",
 };
 const APIS = [["chat_completions", "Chat Completions"], ["responses", "Responses"]];
-const EFFORTS = [["", "モデルの既定"], ["minimal", "minimal"], ["low", "low"], ["medium", "medium"], ["high", "high"]];
+const EFFORTS = [["", "モデルの既定値"], ["minimal", "minimal"], ["low", "low"], ["medium", "medium"], ["high", "high"]];
 
 let rw = { account: null, api_key_set: false, signing_in: false };
 
@@ -1209,36 +1210,36 @@ function renderAccount() {
   const box = $("account_controls");
   $("plan_pill").hidden = !(a && a.signed_in && a.plan_usage);
   if (rw.signing_in) {
-    desc.textContent = "ブラウザでサインインを待っています…";
-    const cancel = el("button", { textContent: "中止" });
+    desc.textContent = "ブラウザでのサインイン完了を待っています…";
+    const cancel = el("button", { textContent: "キャンセル" });
     cancel.addEventListener("click", () => send(endpoint("cancel_sign_in")));
     box.replaceChildren(cancel);
   } else if (a && a.signed_in) {
     desc.replaceChildren(
       `${a.label} ・ `,
-      a.plan_usage ? "ChatGPT プランの使用量で書き直します " : "ChatGPT プランの利用が許可されていません ",
+      a.plan_usage ? "ChatGPT プランの利用枠で書き直します。 " : "このアカウントでは ChatGPT プランの利用が許可されていません。 ",
       openButton("Manage usage", "https://chatgpt.com/settings/usage"));
     const out = el("button", { textContent: "サインアウト" });
     out.addEventListener("click", () => send(endpoint("sign_out")));
-    const other = el("button", { textContent: "別のアカウント" });
+    const other = el("button", { textContent: "アカウントを切り替え" });
     other.addEventListener("click", () => send(endpoint("sign_in", { new_account: true })));
     box.replaceChildren(other, out);
   } else {
-    desc.textContent = a ? `${a.label}（サインアウト中）` : "サインインしていません";
+    desc.textContent = a ? `${a.label}（サインアウト済み）` : "未サインイン";
     const go = el("button", { className: "chatgpt" });
     go.innerHTML = CHATGPT_LOGO + "<span>Continue with ChatGPT</span>";
     go.addEventListener("click", () => send(endpoint("sign_in")));
     const buttons = [go];
     if (a) {
-      const other = el("button", { textContent: "別のアカウント" });
+      const other = el("button", { textContent: "アカウントを切り替え" });
       other.addEventListener("click", () => send(endpoint("sign_in", { new_account: true })));
       buttons.unshift(other);
     }
     box.replaceChildren(...buttons);
   }
-  const optional = cfg.rewriter.provider === "compatible" ? "（不要なサーバーもあります）" : "";
+  const optional = cfg.rewriter.provider === "compatible" ? "（認証不要のサーバーでは空欄のままで構いません）" : "";
   $("key_desc").textContent =
-    (rw.api_key_set ? "保存済み（この PC のこのユーザーだけが読める形で保存）" : "未設定") + optional;
+    (rw.api_key_set ? "保存済み（この端末の現在のユーザーのみ参照可能な形式で保護されています）" : "未設定") + optional;
   $("delete_key").disabled = !rw.api_key_set;
 }
 
@@ -1274,7 +1275,7 @@ $("save_key").addEventListener("click", () => {
 });
 $("delete_key").addEventListener("click", () => send(endpoint("set_api_key", { key: "" })));
 $("list_models").addEventListener("click", () => {
-  $("models_desc").textContent = "取得しています…";
+  $("models_desc").textContent = "モデル一覧を取得しています…";
   send(endpoint("list_models"));
 });
 for (const b of document.querySelectorAll("[data-open]")) {
@@ -1307,16 +1308,19 @@ document.addEventListener("keydown", (e) => {
 // each download would get; sent again as a download goes and on coming back.
 function renderApp(a) {
   $("app_ime").textContent = !a.enabled
-    ? "無効です。「入力方法の設定」で Setsuna をオンにしてください"
-    : a.current ? "有効、今の入力方法です" : "有効ですが、今の入力方法ではありません（「切り替える」で選べます）";
-  const get = (g) => g ? `\nダウンロード: ${g.label}（約 ${g.mb} MB）` : "";
-  $("app_model").textContent = (a.model ? `${a.model}` : "ありません。ダウンロードしてください") +
-    `\n読みの補正: ${a.corrector ?? "なし"}` + get(a.get_model);
-  $("app_dicts").textContent = `読みの辞書: ${a.lexicon ?? "なし"}\n解析器: ${a.analyzer ?? "なし"}` + get(a.get_dicts);
+    ? "Setsuna が無効になっています。「入力方法の設定」から有効にしてください。"
+    : a.current
+      ? "有効です（現在のキーボードとして使用中）。"
+      : "有効ですが、現在は別のキーボードが選択されています。「切り替え」から Setsuna を選べます。";
+  const get = (g) => g ? `\nダウンロード対象: ${g.label}（約 ${g.mb} MB）` : "";
+  $("app_model").textContent = (a.model
+    ? `${a.model}\n読み補正モデル: ${a.corrector ?? "なし"}`
+    : "未ダウンロードです。「ダウンロード」を押して取得してください。") + get(a.get_model);
+  $("app_dicts").textContent = `読み辞書: ${a.lexicon ?? "なし"}\n形態素解析器: ${a.analyzer ?? "なし"}` + get(a.get_dicts);
   // one download at a time; nothing to get when all of it is in place
   for (const [id, g] of [["app_get_model", a.get_model], ["app_get_dicts", a.get_dicts]]) {
     $(id).disabled = a.running || !g;
-    $(id).textContent = g ? "ダウンロード" : "入っています";
+    $(id).textContent = g ? "ダウンロード" : "ダウンロード済み";
   }
   $("app_download").hidden = !a.download;
   $("app_download").textContent = a.download;
@@ -1345,7 +1349,7 @@ window.setsuna = {
       $("model_list").replaceChildren(...models.map((m) =>
         el("option", { value: m.id, textContent: m.label === m.id ? "" : m.label })));
       $("models_desc").textContent = msg.error
-        ?? (models.length ? `${models.length} 件のモデルから選べます` : "モデルがありません");
+        ?? (models.length ? `${models.length} 件のモデルから選択できます。` : "利用可能なモデルが見つかりませんでした。");
       return;
     }
     if (msg.type === "app") {
@@ -1386,7 +1390,7 @@ window.setsuna = {
       $("path").textContent = msg.path ? `設定ファイル: ${msg.path}` : "";
       const error = $("error");
       error.hidden = !msg.load_error;
-      error.textContent = msg.load_error ? `設定を読み込めないため保存できません: ${msg.load_error}` : "";
+      error.textContent = msg.load_error ? `設定ファイルを読み込めないため保存できません: ${msg.load_error}` : "";
       $("instructions").placeholder = msg.default_instructions ?? "";
       render();
       if (msg.action === "init") {

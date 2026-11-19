@@ -51,7 +51,9 @@ impl Rewriter {
     /// The reply to `action` from the page, if it has one now.
     pub fn handle(&mut self, action: &str, msg: &Value) -> Option<Value> {
         let Some(store) = self.store.clone() else {
-            return Some(json!({"type": "rewriter", "status": "設定ディレクトリが見つかりません"}));
+            return Some(
+                json!({"type": "rewriter", "status": "設定ディレクトリが見つかりません。"}),
+            );
         };
         let endpoint = endpoint_of(msg);
         self.last = endpoint.clone();
@@ -62,16 +64,16 @@ impl Rewriter {
                 if let Some(flag) = self.signing_in.take() {
                     flag.store(true, Ordering::SeqCst);
                 }
-                Some("サインインを中止しました".to_string())
+                Some("サインインをキャンセルしました。".to_string())
             }
             "sign_out" => {
                 let proxy = self.proxy.clone();
                 std::thread::spawn(move || {
                     let agent = api::agent(Duration::from_secs(15));
                     let status = match oauth::sign_out(&store, &agent) {
-                        Ok(true) => "サインアウトしました".to_string(),
-                        Ok(false) => "サインアウトしました（取り消しを確認できなかったため、ChatGPT の設定からもアプリの接続を解除してください）".to_string(),
-                        Err(e) => format!("サインアウトできませんでした: {e:#}"),
+                        Ok(true) => "サインアウトしました。".to_string(),
+                        Ok(false) => "サインアウトしました（トークンの取り消しを確認できなかったため、必要に応じて ChatGPT の設定からアプリの連携を解除してください）。".to_string(),
+                        Err(e) => format!("サインアウトに失敗しました: {e:#}"),
                     };
                     let _ = proxy.send_event(UserEvent::Reply(json!({
                         "type": "rewriter_refresh", "status": status,
@@ -91,9 +93,9 @@ impl Rewriter {
                     Ok(())
                 });
                 Some(match r {
-                    Ok(()) if key.is_empty() => "API キーを削除しました".to_string(),
-                    Ok(()) => "API キーを保存しました".to_string(),
-                    Err(e) => format!("API キーを保存できませんでした: {e:#}"),
+                    Ok(()) if key.is_empty() => "API キーを削除しました。".to_string(),
+                    Ok(()) => "API キーを保存しました。".to_string(),
+                    Err(e) => format!("API キーの保存に失敗しました: {e:#}"),
                 })
             }
             "ack_plan_notice" => {
@@ -111,7 +113,7 @@ impl Rewriter {
                         Ok(models) => json!({"type": "models", "models": models}),
                         Err(e) => json!({
                             "type": "models",
-                            "error": format!("モデルの一覧を取得できませんでした: {e:#}"),
+                            "error": format!("モデル一覧の取得に失敗しました: {e:#}"),
                         }),
                     };
                     let _ = proxy.send_event(UserEvent::Reply(reply));
@@ -194,23 +196,23 @@ impl Rewriter {
                     "signed_in": true,
                     "show_plan_notice": s.show_plan_notice,
                     "status": if s.plan_usage {
-                        format!("{} でサインインしました", s.label)
+                        format!("{} としてサインインしました。", s.label)
                     } else {
-                        format!("{} でサインインしましたが、ChatGPT プランの利用は許可されていません", s.label)
+                        format!("{} としてサインインしましたが、ChatGPT プランの利用が許可されていません。", s.label)
                     },
                 }),
                 Err(e) => json!({
                     "type": "rewriter_refresh",
                     "signed_in": false,
                     "status": match setsuna_rewrite::Coded::code_of(&e) {
-                        Some("declined") => "サインインが拒否されました".to_string(),
-                        _ => format!("サインインできませんでした: {e:#}"),
+                        Some("declined") => "サインインが拒否されました。".to_string(),
+                        _ => format!("サインインに失敗しました: {e:#}"),
                     },
                 }),
             };
             let _ = proxy.send_event(UserEvent::Reply(reply));
         });
-        "ブラウザでサインインしてください".to_string()
+        "ブラウザでサインインを完了してください。".to_string()
     }
 }
 

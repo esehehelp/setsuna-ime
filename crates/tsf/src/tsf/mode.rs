@@ -183,10 +183,10 @@ impl ITfLangBarItem_Impl for ModeItem_Impl {
 
     fn GetTooltipString(&self) -> Result<BSTR> {
         Ok(BSTR::from(match self.state.glyph() {
-            "A" => "直接入力 (半角/全角 でひらがな)",
-            _ if !self.state.converts.get() => "ひらがな・変換エンジンなし (半角/全角 で直接入力)",
-            "直" => "ひらがな・書き直し (半角/全角 で直接入力)",
-            _ => "ひらがな (半角/全角 で直接入力)",
+            "A" => "直接入力（半角/全角でひらがな）",
+            _ if !self.state.converts.get() => "ひらがな・変換エンジンなし（半角/全角で直接入力）",
+            "直" => "ひらがな・書き直し（半角/全角で直接入力）",
+            _ => "ひらがな（半角/全角で直接入力）",
         }))
     }
 }

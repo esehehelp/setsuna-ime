@@ -54,7 +54,7 @@ impl Page {
 /// The reply to a user dictionary message: its entries, and a status.
 fn dictionary(action: &str, message: &Value) -> Value {
     let Some(path) = user_dict::path() else {
-        return json!({"type": "dict", "entries": [], "status": "設定ディレクトリが見つかりません"});
+        return json!({"type": "dict", "entries": [], "status": "設定ディレクトリが見つかりません。"});
     };
     let as_json = |entries: &[Entry]| -> Vec<Value> {
         entries
@@ -99,14 +99,14 @@ fn dictionary(action: &str, message: &Value) -> Value {
             }
             let status = match user_dict::save(&path, &entries) {
                 Ok(()) if bad > 0 => format!(
-                    "{} 件を保存しました（読みか語のない {bad} 件は除きました）",
+                    "{} 件の単語を保存しました（読みまたは単語が不正な {bad} 件は除外しました）。",
                     entries.len()
                 ),
                 Ok(()) => format!(
-                    "{} 件を保存しました。変換にすぐ反映されます。",
+                    "{} 件の単語を保存しました。変換にすぐ反映されます。",
                     entries.len()
                 ),
-                Err(e) => format!("保存できませんでした: {e}"),
+                Err(e) => format!("辞書の保存に失敗しました: {e}"),
             };
             json!({"type": "dict", "entries": as_json(&user_dict::load(&path)), "status": status})
         }
@@ -114,12 +114,12 @@ fn dictionary(action: &str, message: &Value) -> Value {
             let (entries, skipped) = user_dict::parse(message["text"].as_str().unwrap_or_default());
             let status = if skipped.is_empty() {
                 format!(
-                    "{} 件を読み込みました。保存すると反映されます。",
+                    "{} 件の単語を読み込みました。「辞書を保存」を押すと反映されます。",
                     entries.len()
                 )
             } else {
                 format!(
-                    "{} 件を読み込みました。{} 行は読めませんでした（{}）",
+                    "{} 件の単語を読み込みました（{} 行はスキップ: {}）。",
                     entries.len(),
                     skipped.len(),
                     skipped
@@ -176,7 +176,7 @@ impl Settings {
             Some(_) => (Config::default(), None),
             None => (
                 Config::default(),
-                Some("設定ディレクトリが見つかりません".into()),
+                Some("設定ディレクトリが見つかりません。".into()),
             ),
         };
         Self {
@@ -213,11 +213,11 @@ impl Settings {
                     message["surface"].as_str().unwrap_or_default(),
                 );
                 match Hidden::open().map(|mut h| h.show(reading, surface)) {
-                    Some(Ok(())) => (true, Some(format!("「{surface}」をまた表示します。"))),
-                    _ => (false, Some("戻せませんでした".to_string())),
+                    Some(Ok(())) => (true, Some(format!("「{surface}」の非表示を解除しました。"))),
+                    _ => (false, Some("非表示を解除できませんでした。".to_string())),
                 }
             }
-            _ => (false, Some(format!("不明なメッセージです: {action}"))),
+            _ => (false, Some(format!("不明な操作です: {action}"))),
         };
         json!({
             "type": "state",
@@ -237,19 +237,19 @@ impl Settings {
 
     fn save(&mut self, config: &Value) -> Result<String, String> {
         if self.load_error.is_some() {
-            return Err("設定を読み込めなかったため保存できません".into());
+            return Err("設定ファイルを読み込めなかったため保存できません。".into());
         }
         let Some(path) = self.path.clone() else {
-            return Err("設定ファイルの場所が見つかりません".into());
+            return Err("設定ファイルの保存先が見つかりません。".into());
         };
         let cfg: Config = serde_json::from_value(config.clone())
-            .map_err(|e| format!("保存できませんでした: {e}"))?;
+            .map_err(|e| format!("設定の保存に失敗しました: {e}"))?;
         cfg.save_to_path(&path)
-            .map_err(|e| format!("保存できませんでした: {e:#}"))?;
+            .map_err(|e| format!("設定の保存に失敗しました: {e:#}"))?;
         #[cfg(windows)]
         grant_app_containers(&path);
         self.cfg = cfg;
-        Ok("保存しました。次の入力から反映されます。".into())
+        Ok("設定を保存しました。次の入力から反映されます。".into())
     }
 
     /// The learning and the prediction history both: what was committed
@@ -258,20 +258,20 @@ impl Settings {
     /// candidates stay (`hidden.jsonl`: clearing must not bring them back).
     fn clear_learning(&mut self) -> Result<String, String> {
         let Some(paths) = Config::learning_path().zip(Config::prediction_path()) else {
-            return Err("学習履歴の場所が見つかりません".into());
+            return Err("学習履歴の保存先が見つかりません。".into());
         };
         let mut cleared = false;
         for path in [paths.0, paths.1] {
             match std::fs::remove_file(&path) {
                 Ok(()) => cleared = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("消去できませんでした: {e}")),
+                Err(e) => return Err(format!("学習履歴の消去に失敗しました: {e}")),
             }
         }
         Ok(if cleared {
-            "学習履歴（予測の履歴を含む）を消去しました。".into()
+            "学習履歴（予測変換の履歴を含む）を消去しました。".into()
         } else {
-            "学習履歴はありません。".into()
+            "消去対象の学習履歴はありません。".into()
         })
     }
 }

@@ -58,8 +58,8 @@ object Downloads {
 
     /** [what]'s label: what its download brings. */
     fun label(context: Context, what: What): String = when {
-        what == What.DICTIONARIES -> "読みの辞書と解析器"
-        parts(context, what).size > 1 -> "変換モデルと読みの補正"
+        what == What.DICTIONARIES -> "読み辞書・形態素解析器"
+        parts(context, what).size > 1 -> "変換モデル・読み補正モデル"
         else -> "変換モデル"
     }
 
@@ -81,16 +81,16 @@ object Downloads {
             running = true
         }
         val app = context.applicationContext
-        var label = if (what == What.MODEL) "変換モデル" else "読みの辞書と解析器"
-        set("$label を確認中…")
+        var label = if (what == What.MODEL) "変換モデル" else "読み辞書・形態素解析器"
+        set("$label を確認しています…")
         Thread {
             try {
                 label = Downloads.label(app, what)
                 fetch(app, what, label)
-                set("✓ $label を入れました（キーボードを開き直すと使います）")
+                set("✓ $label のダウンロードが完了しました（キーボードを開き直すと反映されます）")
             } catch (e: Exception) {
                 Log.w(TAG, "download of $what failed", e)
-                set("✗ $label のダウンロードに失敗: ${e.message ?: e.javaClass.simpleName}")
+                set("✗ $label のダウンロードに失敗しました: ${e.message ?: e.javaClass.simpleName}")
             } finally {
                 running = false
                 onChange?.invoke()
@@ -170,7 +170,7 @@ object Downloads {
             val now = System.currentTimeMillis()
             if (now - shown > 300) {
                 shown = now
-                set("$label をダウンロード中 ${mb(done)} / ${mb(total)} MB")
+                set("$label をダウンロード中… ${mb(done)} / ${mb(total)} MB")
             }
         }
         // every file, as .part beside its place (none of them a manifest the engine would take)

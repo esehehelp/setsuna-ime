@@ -377,17 +377,17 @@ fn find_exe(module_dir: Option<&Path>) -> Option<PathBuf> {
 /// What the IME shows for a failed rewrite's `code`.
 pub fn failure_message(code: &str) -> &'static str {
     match code {
-        "not_signed_in" | "signed_out" => "書き直し: ChatGPT にサインインしてください（設定）",
+        "not_signed_in" | "signed_out" => "書き直し: 設定から ChatGPT にサインインしてください",
         "no_plan_usage" => "書き直し: ChatGPT プランの利用が許可されていません",
         "no_api_key" => "書き直し: API キーが設定されていません",
-        "no_model" => "書き直し: モデルが選ばれていません（設定）",
-        "usage_limit" => "書き直し: 利用上限に達しました（ChatGPT の設定 > 使用量）",
-        "not_eligible" => "書き直し: このアカウントではプランを利用できません",
-        "unavailable" => "書き直し: 一時的に利用できません",
-        "unsupported" | "not_found" => "書き直し: このモデルでは使えません",
+        "no_model" => "書き直し: 設定でモデルを選択してください",
+        "usage_limit" => "書き直し: 利用上限に達しました（ChatGPT 設定 > 使用量）",
+        "not_eligible" => "書き直し: このアカウントは対象プランではありません",
+        "unavailable" => "書き直し: サービスが一時的に利用できません",
+        "unsupported" | "not_found" => "書き直し: 指定されたモデルは利用できません",
         "auth" | "forbidden" => "書き直し: 認証に失敗しました",
-        "network" => "書き直し: 接続できませんでした",
-        "incomplete" => "書き直し: 応答が途中で終わりました",
+        "network" => "書き直し: サーバーに接続できませんでした",
+        "incomplete" => "書き直し: 応答が途中で中断されました",
         _ => "書き直しに失敗しました",
     }
 }

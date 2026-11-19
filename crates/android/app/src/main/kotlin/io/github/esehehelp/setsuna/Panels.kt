@@ -150,7 +150,7 @@ class ClipboardPanel(
             setPadding(dp(12), 0, dp(4), 0)
         }
         header.addView(TextView(context).apply {
-            text = "クリップボード（1時間）"
+            text = "クリップボード（1時間保持）"
             setTextColor(palette.dim)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
@@ -176,7 +176,7 @@ class ClipboardPanel(
         list.removeAllViews()
         if (clips.isEmpty()) {
             list.addView(TextView(context).apply {
-                text = "コピーしたテキストがここに出ます。\n1時間で消え、パスワードなどは残りません。"
+                text = "コピーしたテキストがここに表示されます。\n履歴は 1 時間で自動的に消去され、パスワードなどは保存されません。"
                 setTextColor(palette.dim)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setPadding(dp(16), dp(16), dp(16), dp(16))
@@ -202,7 +202,7 @@ class ClipboardPanel(
             row.addView(ImageView(context).apply {
                 setImageResource(R.drawable.ic_close)
                 setColorFilter(palette.dim)
-                contentDescription = "消す"
+                contentDescription = "削除"
                 setPadding(dp(12), dp(12), dp(12), dp(12))
                 setOnClickListener { onRemove(clip) }
             }, LayoutParams(dp(44), dp(44)))

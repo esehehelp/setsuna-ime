@@ -56,7 +56,7 @@ impl RomajiTable {
                 || cols[0].is_empty()
                 || (cols[1].is_empty() && cols.get(2).is_none_or(|p| p.is_empty()))
             {
-                errors.push(format!("{}行目: 入力と出力がありません", n + 1));
+                errors.push(format!("{}行目: 入力または出力が不足しています", n + 1));
                 continue;
             }
             let input = cols[0].to_string();
@@ -69,7 +69,7 @@ impl RomajiTable {
                     0
                 } else {
                     errors.push(format!(
-                        "{}行目: 保留の文字は入力の末尾にしてください",
+                        "{}行目: 保留文字列は入力の末尾と一致させてください",
                         n + 1
                     ));
                     continue;
@@ -85,7 +85,7 @@ impl RomajiTable {
             t.rules.insert(input, (output, again));
         }
         if t.rules.is_empty() {
-            errors.push("規則がありません".to_string());
+            errors.push("有効な変換規則がありません".to_string());
         }
         // kana input: digits and symbols are kana keys too
         t.kana_keys = t.rules.contains_key("3") && t.rules.contains_key("@");

@@ -154,11 +154,11 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
             // Kotoeri CSV: "reading","word","pos"
             line.split("\",\"").map(|c| c.trim_matches('"')).collect()
         } else {
-            skipped.push(format!("{line}（区切りがありません）"));
+            skipped.push(format!("{line}（区切り文字がありません）"));
             continue;
         };
         if cols.len() < 2 {
-            skipped.push(format!("{line}（列が足りません）"));
+            skipped.push(format!("{line}（列数が不足しています）"));
             continue;
         }
         let pos = match cols.get(2).map(|p| p.trim()) {
@@ -180,7 +180,7 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
         };
         let word = cols[1].trim().to_string();
         if word.is_empty() {
-            skipped.push(format!("{line}（語がありません）"));
+            skipped.push(format!("{line}（単語が空です）"));
             continue;
         }
         let comment = cols

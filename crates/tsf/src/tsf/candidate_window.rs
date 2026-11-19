@@ -434,7 +434,7 @@ pub(crate) unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
 /// The line above the list: the selection's position, then the status.
 fn heading(d: &RenderData) -> String {
     if d.suggest {
-        return "予測  Tab で選択".to_string();
+        return "予測候補  Tab で選択".to_string();
     }
     let mut h = format!("[{}/{}]", d.selected + 1, d.candidates.len());
     if !d.status.is_empty() {

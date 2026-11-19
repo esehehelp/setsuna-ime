@@ -939,11 +939,11 @@ impl EngineBridge {
             "学習を取り消しました"
         } else if stays {
             return consumed(vec![Action::Status {
-                text: "この候補は消せません".to_string(),
+                text: "この候補は非表示にできません".to_string(),
             }]);
         } else {
             match self.hidden.as_mut().map(|h| h.hide(&reading, &cand)) {
-                Some(Ok(())) => "この候補を表示しないようにしました",
+                Some(Ok(())) => "候補を非表示にしました",
                 _ => return consumed(Vec::new()),
             }
         };
@@ -1048,7 +1048,7 @@ impl EngineBridge {
                 selected: sel,
             },
             Action::Status {
-                text: "この予測を消しました".to_string(),
+                text: "予測候補を削除しました".to_string(),
             },
         ])
     }
@@ -4989,10 +4989,7 @@ mod tests {
         convert(&mut bridge);
         bridge.handle_down();
         let out = bridge.handle_forget_candidate();
-        assert_eq!(
-            status(&out.actions),
-            Some("この候補を表示しないようにしました")
-        );
+        assert_eq!(status(&out.actions), Some("候補を非表示にしました"));
         assert!(!shown(&out.actions).unwrap().0.contains(&"笠の".to_string()));
         bridge.handle_escape();
         bridge.handle_escape();
@@ -5017,7 +5014,7 @@ mod tests {
             bridge.handle_down();
         }
         let out = bridge.handle_forget_candidate();
-        assert_eq!(status(&out.actions), Some("この候補は消せません"));
+        assert_eq!(status(&out.actions), Some("この候補は非表示にできません"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7530,7 +7527,7 @@ mod tests {
         // not learned: it cannot go
         one(&mut bridge, "笠の");
         let out = bridge.handle_forget_candidate();
-        assert_eq!(status(&out.actions), Some("この候補は消せません"));
+        assert_eq!(status(&out.actions), Some("この候補は非表示にできません"));
         assert_eq!(bridge.current_list(), v(&["笠の"]));
         assert!(!dir.join("hidden.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);

@@ -328,11 +328,11 @@ impl PendingSignIn {
 }
 
 const PAGE_DONE: &str = "<!doctype html><meta charset=utf-8><title>Setsuna IME</title>\
-<body style=\"font-family:system-ui,sans-serif;margin:3em\"><h1>サインインしました</h1>\
-<p>このウィンドウを閉じて Setsuna IME の設定画面に戻ってください。</p>";
+<body style=\"font-family:system-ui,sans-serif;margin:3em\"><h1>サインインが完了しました</h1>\
+<p>このタブを閉じて、Setsuna IME の設定画面に戻ってください。</p>";
 const PAGE_FAILED: &str = "<!doctype html><meta charset=utf-8><title>Setsuna IME</title>\
-<body style=\"font-family:system-ui,sans-serif;margin:3em\"><h1>サインインできませんでした</h1>\
-<p>このウィンドウを閉じて、設定画面からもう一度お試しください。</p>";
+<body style=\"font-family:system-ui,sans-serif;margin:3em\"><h1>サインインに失敗しました</h1>\
+<p>このタブを閉じて、Setsuna IME の設定画面からもう一度お試しください。</p>";
 
 fn respond(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     let reason = match status {

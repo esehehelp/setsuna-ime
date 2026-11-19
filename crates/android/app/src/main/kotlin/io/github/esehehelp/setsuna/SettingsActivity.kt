@@ -193,7 +193,7 @@ class SettingsActivity : Activity() {
                 "keyboard_load" -> keyboard(KeyboardPrefs.load(context), null)
                 "keyboard_save" -> {
                     msg.optJSONObject("keyboard")?.let { KeyboardPrefs.save(context, it) }
-                    keyboard(KeyboardPrefs.load(context), "保存しました。次の入力から反映されます。")
+                    keyboard(KeyboardPrefs.load(context), "設定を保存しました。次の入力から反映されます。")
                 }
                 "app_load" -> appState()
                 "app_download" -> {

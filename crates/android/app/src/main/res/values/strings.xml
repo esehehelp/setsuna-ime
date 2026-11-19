@@ -3,5 +3,5 @@
     <string name="app_name">Setsuna</string>
     <string name="ime_name">Setsuna</string>
     <string name="subtype_ja">日本語（ローマ字）</string>
-    <string name="no_engine">変換モデルがありません（Setsuna のアプリでダウンロード）</string>
+    <string name="no_engine">変換モデルが未導入です（Setsuna アプリからダウンロードしてください）</string>
 </resources>
