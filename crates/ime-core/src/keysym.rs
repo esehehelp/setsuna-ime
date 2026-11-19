@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn default_on_off_keys_do_not_capture_bare_or_shifted_grave() {
+    fn default_on_off_keys_take_the_bare_grave_on_linux_and_never_the_shifted_one() {
         let (keys, bad) = OnOffKeys::from_config(&crate::config::FrontendCfg::default());
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(keys.role(&key(ZENKAKU_HANKAKU, 0)), Some(OnOff::Toggle));
@@ -528,8 +528,13 @@ mod tests {
             Some(OnOff::Toggle)
         );
         assert_eq!(keys.role(&key(GRAVE, MOD_ALT)), Some(OnOff::Toggle));
-        // Bare ` (US backquote) and Shift+@ (JIS backquote) stay free to type.
-        assert_eq!(keys.role(&key(GRAVE, 0)), None);
+        // Bare ` (US: the key where 半角/全角 is) toggles on Linux, where
+        // Alt+` is the desktop's; elsewhere it stays free to type.
+        assert_eq!(
+            keys.role(&key(GRAVE, 0)),
+            cfg!(target_os = "linux").then_some(OnOff::Toggle)
+        );
+        // Shift+@ (JIS backquote) stays free to type.
         assert_eq!(keys.role(&key(GRAVE, MOD_SHIFT)), None);
         // Shift+` on US types ～
         assert_eq!(keys.role(&key('~' as u32, MOD_SHIFT)), None);

@@ -747,6 +747,7 @@ function applyPlatform(p) {
   }
   if (!ANDROID && platform !== "windows") {
     $("romaji_path").placeholder = "/path/to/romaji.tsv";
+    document.querySelector('[data-keys="toggle_keys"]').placeholder = "Zenkaku, Alt+Zenkaku, `, Alt+`";
     document.querySelector('[data-keys="on_keys"]').placeholder = "Henkan";
     document.querySelector('[data-keys="off_keys"]').placeholder = "Muhenkan";
     for (const e of document.querySelectorAll("[data-linux-text]")) {

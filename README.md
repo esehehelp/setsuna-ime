@@ -130,7 +130,7 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 | 操作 | キー（既定） |
 |---|---|
-| IME オン / オフ（Windows / Linux） | `半角/全角`、`Alt+半角/全角`、`` Alt+` ``、`IME オン` / `IME オフ`（Windows のみ）。`toggle_keys` / `on_keys` / `off_keys` で変更可 |
+| IME オン / オフ（Windows / Linux） | `半角/全角`、`Alt+半角/全角`、`` Alt+` ``、`` ` ``（Linux のみ。US 配列で `半角/全角` の位置のキー）、`IME オン` / `IME オフ`（Windows のみ）。`toggle_keys` / `on_keys` / `off_keys` で変更可 |
 | 変換・次候補 | `Space` / `↓` / `↑` / `PageUp` / `PageDown` / 数字キー |
 | 文節移動・伸縮 | `←` / `→`（移動）、`Shift+←` / `Shift+→`（伸縮） |
 | 字種変換（全体 / 選択文節） | `F6` ひらがな、`F7` カタカナ、`F8` 半角カタカナ、`F9` 全角英数、`F10` 半角英数（`Ctrl+U/I/O/P/T`） |

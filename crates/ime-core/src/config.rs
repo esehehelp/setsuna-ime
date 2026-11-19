@@ -480,7 +480,8 @@ pub struct FrontendCfg {
     /// Keys that turn the IME on or off (Windows): a key name with
     /// `Ctrl+` / `Shift+` / `Alt+` / `Win+` before it, such as `Zenkaku`
     /// (半角/全角), `Alt+\``, `Henkan`, `Muhenkan`, `Ctrl+Space`. Ctrl+Space
-    /// is not in by default: it is a shortcut of many apps.
+    /// is not in by default: it is a shortcut of many apps. On Linux a
+    /// bare `` ` `` is in ([`default_toggle_keys`]).
     pub toggle_keys: Vec<String>,
     /// Keys that only turn it on (`ImeOn`: VK_IME_ON, which some keyboards
     /// send).
@@ -573,6 +574,23 @@ fn default_true() -> bool {
     true
 }
 
+/// `[frontend] toggle_keys` where config.toml names none. On Linux a bare
+/// `` ` `` is one of them, as it was before the keys could be named: it is
+/// the key where 半角/全角 is on a US keyboard, which has no other of these,
+/// and `` Alt+` `` is a shortcut of the desktop there (the application's next
+/// window on KDE and GNOME), so it may never reach the IME. JIS's backquote
+/// (Shift+@) is not the bare key and stays one to type. On Windows
+/// `` Alt+` `` is that keyboard's own IME key, and the bare one types, as it
+/// does on Android's keyboards.
+pub fn default_toggle_keys() -> Vec<String> {
+    let keys: &[&str] = if cfg!(target_os = "linux") {
+        &["Zenkaku", "Alt+Zenkaku", "`", "Alt+`"]
+    } else {
+        &["Zenkaku", "Alt+Zenkaku", "Alt+`"]
+    };
+    keys.iter().map(|k| k.to_string()).collect()
+}
+
 impl Default for FrontendCfg {
     fn default() -> Self {
         Self {
@@ -602,9 +620,7 @@ impl Default for FrontendCfg {
             name_dictionary_file: None,
             name_case: NameCase::Acronyms,
             sentence_case: true,
-            toggle_keys: ["Zenkaku", "Alt+Zenkaku", "Alt+`"]
-                .map(String::from)
-                .to_vec(),
+            toggle_keys: default_toggle_keys(),
             on_keys: vec!["ImeOn".to_string()],
             off_keys: vec!["ImeOff".to_string()],
         }
@@ -1197,7 +1213,7 @@ impl Config {
              # Henkan, Muhenkan, Eisu, Kana, Space, `, a letter, F1-F24, ...\n\
              # after Ctrl+ / Shift+ / Alt+ / Win+. Ctrl+Space is a shortcut of\n\
              # many apps (VS Code, Excel, Emacs): add it only if you want it.\n\
-             toggle_keys = [\"Zenkaku\", \"Alt+Zenkaku\", \"Alt+`\"]\n\
+             toggle_keys = {toggle_keys}\n\
              # Keys that only turn it on / off (ImeOn, ImeOff: VK_IME_ON / OFF).\n\
              on_keys = [\"ImeOn\"]\n\
              off_keys = [\"ImeOff\"]\n\
@@ -1299,6 +1315,8 @@ impl Config {
             rewriter_provider = d.rewriter.provider.as_str(),
             rewriter_context = d.rewriter.send_context,
             rewriter_timeout = d.rewriter.timeout_ms,
+            // a TOML array of basic strings, as Debug writes these names
+            toggle_keys = format_args!("{:?}", d.frontend.toggle_keys),
         )
     }
 

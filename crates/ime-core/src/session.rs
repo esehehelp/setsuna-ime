@@ -686,9 +686,9 @@ mod tests {
 
     #[test]
     fn on_off_keys_commit_and_switch_while_bare_backquote_stays_typable() {
-        let (mut s, _) = session();
+        // Alt+` and not the bare ` (Windows' default)
+        let (mut s, _) = session_with(|c| c.frontend.toggle_keys = vec!["Alt+`".into()]);
         type_str(&mut s, "kana");
-        // Default toggle is Alt+` (or Zenkaku), not bare `
         assert!(press(&mut s, '`' as u32, MOD_ALT));
         assert!(!s.enabled());
         assert_eq!(s.view().commits, vec!["かな"]);
@@ -728,6 +728,29 @@ mod tests {
         // Henkan turns back on
         assert!(press(&mut s, 0xff23, 0));
         assert!(s.enabled());
+    }
+
+    /// On Linux the bare ` is a default toggle (the key where 半角/全角 is
+    /// on a US keyboard, where Alt+` is the desktop's); JIS's Shift+@ is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_bare_backquote_turns_the_ime_off_and_on_by_default() {
+        let (mut s, _) = session();
+        type_str(&mut s, "kana");
+        assert!(press(&mut s, '`' as u32, 0));
+        assert!(!s.enabled());
+        assert_eq!(s.view().commits, vec!["かな"]);
+        assert!(s.view().preedit.is_empty());
+        // off: a letter and JIS's backquote go to the app, the bare ` turns it on
+        assert!(!press(&mut s, 'a' as u32, 0));
+        assert!(!press(&mut s, '`' as u32, MOD_SHIFT));
+        assert!(!s.enabled());
+        assert!(press(&mut s, '`' as u32, 0));
+        assert!(s.enabled());
+        // on: JIS's backquote is typed
+        assert!(press(&mut s, '`' as u32, MOD_SHIFT));
+        assert!(s.enabled());
+        assert!(!s.view().preedit.is_empty());
     }
 
     #[test]
