@@ -334,19 +334,27 @@ impl EngineSession {
     /// knob as: `explicit` value > the manifest's `decode_defaults` > engine
     /// default.
     pub fn from_manifest(manifest: &CtcNatManifest, explicit: &DecodeDefaults) -> Result<Self> {
-        Self::from_manifest_with_corrector(manifest, explicit, None)
+        Self::from_manifest_with_corrector(manifest, explicit, None, None)
     }
 
     /// `from_manifest` with a reading corrector's manifest of its own (the daemon's `--corrector`), taken as
-    /// SETSUNA_CORRECTOR_MANIFEST is.
+    /// SETSUNA_CORRECTOR_MANIFEST is, and a threshold for the corrector there is (`--corrector-threshold`), taken
+    /// as SETSUNA_CORRECTOR_THRESHOLD is.
     pub fn from_manifest_with_corrector(
         manifest: &CtcNatManifest,
         explicit: &DecodeDefaults,
         corrector: Option<&Path>,
+        corrector_threshold: Option<f32>,
     ) -> Result<Self> {
         let mut env = RuntimeEnv::read()?;
         if let Some(p) = corrector {
             env.corrector_manifest = Some(p.to_path_buf());
+        }
+        if let Some(t) = corrector_threshold {
+            if t.is_nan() {
+                bail!("the reading corrector's threshold is not a number");
+            }
+            env.corrector_threshold = Some(t);
         }
         Self::build(manifest, explicit, &env)
     }

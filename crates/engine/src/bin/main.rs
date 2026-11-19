@@ -175,6 +175,14 @@ struct EngineArgs {
     /// corrector, if its manifest carries one.
     #[arg(long)]
     corrector: Option<PathBuf>,
+
+    /// The margin log P(corrected) - log P(as typed) above which the reading
+    /// corrector's reading is converted first (as
+    /// SETSUNA_CORRECTOR_THRESHOLD): lower, and more slips are converted as
+    /// corrected, and more readings typed right are too. Default: the
+    /// corrector's own (its manifest's).
+    #[arg(long, allow_negative_numbers = true)]
+    corrector_threshold: Option<f32>,
 }
 
 impl EngineArgs {
@@ -191,7 +199,8 @@ impl EngineArgs {
             normalize_candidates: self.normalize_candidates,
             pair_weight: self.pair_weight,
             word_weight: self.word_weight,
-            // the corrector's own manifest's (or SETSUNA_CORRECTOR_THRESHOLD), not a conversion knob
+            // the corrector's own manifest's (or --corrector-threshold, SETSUNA_CORRECTOR_THRESHOLD), not a
+            // conversion knob
             corrector_threshold: None,
         }
     }
@@ -204,6 +213,7 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
         &manifest,
         &args.explicit_knobs(),
         args.corrector.as_deref(),
+        args.corrector_threshold,
     )
     .with_context(|| format!("load engine from {}", args.manifest.display()))?;
     session.inspect = args.emit_frames;
@@ -215,6 +225,8 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
         "encoder": manifest.proposal_native_path,
         "ar_step": manifest.ar_decoder.as_ref().and_then(|a| a.native_path.as_ref()),
         "corrector": session.corrector().map(|c| c.0),
+        // +inf (a corrector with no threshold: never converted first) has no JSON number
+        "corrector_threshold": session.corrector().map(|c| c.1).filter(|t| t.is_finite()),
         "precision": manifest.precision,
         "vocab": manifest.vocab_path,
         "beam_width": cfg.beam_width,

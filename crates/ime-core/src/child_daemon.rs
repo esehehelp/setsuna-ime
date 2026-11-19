@@ -852,6 +852,13 @@ fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
         "corrector",
         corrector_of(c).map(|p| p.display().to_string()),
     );
+    // not a number: left to the corrector's own, rather than an engine that does not start
+    flag(
+        "corrector-threshold",
+        c.corrector_threshold
+            .filter(|t| !t.is_nan())
+            .map(|t| t.to_string()),
+    );
     match &c.vocab_blacklist {
         // The bare flag clears a manifest blacklist.
         Some(ids) if ids.is_empty() => args.push("--vocab-blacklist".to_string()),
@@ -950,6 +957,28 @@ mod tests {
             ..EngineCfg::default()
         };
         assert!(!args_of(&none).iter().any(|a| a.starts_with("--corrector")));
+        // the corrector's threshold, when config.toml names one
+        let threshold = EngineCfg {
+            corrector_threshold: Some(4.0),
+            ..EngineCfg::default()
+        };
+        assert_eq!(
+            args_of(&threshold).last().unwrap(),
+            "--corrector-threshold=4"
+        );
+        let below = EngineCfg {
+            corrector_threshold: Some(-1.5),
+            ..EngineCfg::default()
+        };
+        assert_eq!(
+            args_of(&below).last().unwrap(),
+            "--corrector-threshold=-1.5"
+        );
+        let nan = EngineCfg {
+            corrector_threshold: Some(f32::NAN),
+            ..EngineCfg::default()
+        };
+        assert!(!args_of(&nan).iter().any(|a| a.starts_with("--corrector")));
         let empty = EngineCfg {
             analyzer_manifest: Some(PathBuf::new()),
             ..EngineCfg::default()

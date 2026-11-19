@@ -294,6 +294,14 @@ pub struct EngineCfg {
     /// corrector reads it, the reading as typed offered too. Empty = none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrector_manifest: Option<PathBuf>,
+    /// How much surer of its reading than of the one typed the reading
+    /// corrector must be for its reading to be converted first
+    /// (`--corrector-threshold`: log P(corrected) - log P(as typed), in
+    /// nats). Lower, and more slips come out corrected, and more readings
+    /// typed right are rewritten too. Unset: the corrector's own (its
+    /// manifest's `decode_defaults.corrector_threshold`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrector_threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1120,6 +1128,11 @@ impl Config {
              # digit_split = true\n\
              # Token IDs forced to -inf log-prob.\n\
              # vocab_blacklist = [724, 730, 734, 737, 776, 788]\n\
+             # How much surer of its reading than of the one typed the reading\n\
+             # corrector must be for its reading to be converted first (nats).\n\
+             # Lower corrects more slips, and rewrites more readings typed\n\
+             # right. Unset: the corrector's own.\n\
+             # corrector_threshold = 4.0\n\
              \n\
              [ui.candidate_window]\n\
              # setsuna, setsuna-dark, or classic (flat, in the colors below).\n\
@@ -1500,6 +1513,29 @@ mixed_model = \"C:/p/mixed\"
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# Setsuna TSF IME configuration"), "{text}");
         Config::load_from_path(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[engine] corrector_threshold`: unset by default and in the template
+    /// (the corrector's own), read when named, and written under `[engine]`
+    /// when the settings page sets it.
+    #[test]
+    fn the_correctors_threshold_is_read_and_saved() {
+        assert_eq!(Config::default().engine.corrector_threshold, None);
+        let template = Config::load_from_str(&Config::emit_default_toml()).unwrap();
+        assert_eq!(template.engine.corrector_threshold, None);
+        let c = Config::load_from_str("[engine]\ncorrector_threshold = 4.5").unwrap();
+        assert_eq!(c.engine.corrector_threshold, Some(4.5));
+        let dir =
+            std::env::temp_dir().join(format!("setsuna-config-threshold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let mut cfg = Config::default();
+        cfg.engine.corrector_threshold = Some(4.0);
+        cfg.save_to_path(&path).unwrap();
+        let saved = Config::load_from_path(&path).unwrap();
+        assert_eq!(saved.engine.corrector_threshold, Some(4.0));
+        assert_eq!(saved.engine.beam_width, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -312,6 +312,7 @@ mod tests {
         });
         cfg.learning.strength = 0.7;
         cfg.learning.similarity_threshold = 0.65;
+        cfg.engine.corrector_threshold = Some(4.5);
         cfg.rewriter.enabled = true;
         cfg.rewriter.provider = RewriteProvider::Compatible;
         cfg.rewriter.base_url = Some("http://127.0.0.1:8080/v1".into());
