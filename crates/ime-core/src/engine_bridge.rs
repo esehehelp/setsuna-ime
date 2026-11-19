@@ -221,8 +221,19 @@ pub fn order_candidates(
         return;
     }
     let reading: Vec<char> = result.reading.nfkc().collect();
-    let (mut order, mut rest): (Vec<usize>, Vec<usize>) =
-        (0..n).partition(|&i| crate::reading_align::spells_out(&result.candidates[i], &reading));
+    // the reading corrector's reading, when it changed the one typed: its
+    // candidates spell that one out, and the lexicon costs them by it
+    let corrected: Option<Vec<char>> = result
+        .corrected_reading
+        .as_ref()
+        .map(|r| r.nfkc().collect());
+    let (mut order, mut rest): (Vec<usize>, Vec<usize>) = (0..n).partition(|&i| {
+        let c = &result.candidates[i];
+        crate::reading_align::spells_out(c, &reading)
+            || corrected
+                .as_ref()
+                .is_some_and(|r| crate::reading_align::spells_out(c, r))
+    });
     if order.is_empty() {
         std::mem::swap(&mut order, &mut rest);
     }
@@ -268,10 +279,15 @@ pub fn order_candidates(
         // nouns 78.3 -> 83.3) either way (user 2026-11-15: それでok).
         let model_top = order.first().copied();
         let r: String = reading.iter().collect();
+        let fixed: Option<String> = corrected.as_ref().map(|r| r.iter().collect());
         let mut costs: Vec<Option<f32>> = result
             .candidates
             .iter()
-            .map(|c| lex.cost(&c.nfkc().collect::<String>(), &r))
+            .map(|c| {
+                let c: String = c.nfkc().collect();
+                lex.cost(&c, &r)
+                    .or_else(|| fixed.as_deref().and_then(|f| lex.cost(&c, f)))
+            })
             .collect();
         // the lexicon's own conversions the engine missed (大島村 for
         // おおしまむら, where it gave おおしま村) and the homophones
@@ -8024,5 +8040,42 @@ mod tests {
         assert_eq!(segments_shown(&out.actions), (v(&["ありがとう"]), 0));
         let (list, selected, _) = segment_list(&out.actions);
         assert_eq!(list[selected], "ありがとう");
+    }
+
+    #[test]
+    fn the_lexicon_keeps_the_corrected_readings_candidates() {
+        // what the lexicon costs by the reading typed alone, the corrected
+        // reading's words cost nothing and went (ごめんなさい for
+        // ごめんなさあい): they are costed by the corrected reading
+        let table = "有難う\tありがとう\t9.0\tinterj\n有り難う\tありがとう\t11.0\tinterj\n\
+                     有り\tあり\t8.0\tverb\n";
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-corrected-{}.lexicon",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        type_str(&mut bridge, "arigato");
+        // the typed reading's top first, the corrected reading's after it
+        answer_scored(
+            &mock,
+            &["有りがと", "有難う", "有り難う"],
+            &[-0.5, -0.7, -1.2],
+        );
+        mock.state
+            .next
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .corrected_reading = Some("ありがとう".into());
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        // the kana of the reading typed after the first two, as always
+        assert_eq!(list[..2], v(&["有りがと", "有難う"])[..]);
+        assert!(list.contains(&"有り難う".to_string()), "{list:?}");
+        let _ = std::fs::remove_file(&path);
     }
 }
