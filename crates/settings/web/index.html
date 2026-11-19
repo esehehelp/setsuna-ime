@@ -465,16 +465,17 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
 </div>
 
-<h2>打ち間違いの補正</h2>
+<h2>補正モデル</h2>
 <div class="card">
   <div class="row">
     <div class="text">
       <div class="title">補正した読みを先頭にする基準</div>
-      <div class="desc">補正のモデルが、打ったままの読みより補正した読みをこの値以上に確かだと見たとき、補正した読みの変換を先頭にします（それ未満では 2 番目）。小さいほど打ち間違いが直って出やすくなり、正しく打った読みが書き換わることも増えます。目安は 4〜5。「既定」はモデルの値です（Nandina-v1.0-tiny は 11.6）</div>
+      <div class="desc">補正モデルが、打ったままの読みより補正した読みをこの値を超えて確かだと見たとき、補正した読みの変換を先頭にします（それ以下では 2 番目）。小さいほど打ち間違いが直って出やすくなり、正しく打った読みが書き換わることも増えます。目安は 4〜5。「既定」はモデルの値です</div>
     </div>
     <div class="control">
       <input type="range" id="corrector_threshold" min="0" max="15" step="0.5">
       <span class="value" id="corrector_threshold_value"></span>
+      <button id="corrector_threshold_reset">既定に戻す</button>
     </div>
   </div>
 </div>
@@ -1098,6 +1099,7 @@ function changed() {
   $("similarity_threshold_value").textContent = Number(cfg.learning.similarity_threshold).toFixed(2);
   const threshold = cfg.engine.corrector_threshold;
   $("corrector_threshold_value").textContent = threshold == null ? "既定" : Number(threshold).toFixed(1);
+  $("corrector_threshold_reset").disabled = threshold == null;
   for (const row of document.querySelectorAll("[data-learning]")) {
     row.classList.toggle("disabled", !cfg.learning.enabled);
   }
@@ -1113,6 +1115,12 @@ $("similarity_threshold").addEventListener("input", (e) => {
 });
 $("corrector_threshold").addEventListener("input", (e) => {
   cfg.engine.corrector_threshold = Number(e.target.value); changed();
+});
+// Unset again: the key leaves the config, and saving takes its line out of config.toml.
+$("corrector_threshold_reset").addEventListener("click", () => {
+  delete cfg.engine.corrector_threshold;
+  $("corrector_threshold").value = $("corrector_threshold").max;
+  changed();
 });
 $("add_rep").addEventListener("click", () => {
   cfg.frontend.replacements.push({ from: "", to: "", enabled: true });

@@ -1085,6 +1085,14 @@ impl Config {
         if self.apps.is_empty() {
             doc.remove("apps");
         }
+        // the corrector's threshold unset again: its line goes, which is the
+        // settings page's way back to the corrector's own (the other engine
+        // knobs are not the page's, and stay as the file has them)
+        if self.engine.corrector_threshold.is_none() {
+            if let Some(engine) = doc.get_mut("engine").and_then(|e| e.as_table_like_mut()) {
+                engine.remove("corrector_threshold");
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
@@ -1536,6 +1544,20 @@ mixed_model = \"C:/p/mixed\"
         let saved = Config::load_from_path(&path).unwrap();
         assert_eq!(saved.engine.corrector_threshold, Some(4.0));
         assert_eq!(saved.engine.beam_width, None);
+        // unset again (the page's 既定に戻す): the line goes from the file,
+        // and a knob the page does not edit stays as the file has it
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("[engine]", "[engine]\nbeam_width = 30")).unwrap();
+        let mut back = Config::load_from_path(&path).unwrap();
+        assert_eq!(back.engine.beam_width, Some(30));
+        back.engine.corrector_threshold = None;
+        back.engine.beam_width = None;
+        back.save_to_path(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\ncorrector_threshold"), "{text}");
+        let reset = Config::load_from_path(&path).unwrap();
+        assert_eq!(reset.engine.corrector_threshold, None);
+        assert_eq!(reset.engine.beam_width, Some(30));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

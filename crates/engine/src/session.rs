@@ -131,8 +131,28 @@ struct RuntimeEnv {
     corrector_off: bool,
 }
 
+/// The reading corrector's threshold: the one `given` (the daemon's `--corrector-threshold`), else the environment's
+/// (`SETSUNA_CORRECTOR_THRESHOLD`, as its text), else none. Only the one taken is checked, so an environment value
+/// that is not a number does not stop an engine given its own.
+fn corrector_threshold_of(given: Option<f32>, env: Option<&str>) -> Result<Option<f32>> {
+    match (given, env) {
+        (Some(t), _) if t.is_nan() => {
+            bail!("the reading corrector's threshold is not a number")
+        }
+        (Some(t), _) => Ok(Some(t)),
+        (None, Some(s)) => Ok(Some(
+            s.parse::<f32>()
+                .ok()
+                .filter(|t| !t.is_nan())
+                .with_context(|| format!("SETSUNA_CORRECTOR_THRESHOLD={s} is not a number"))?,
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
 impl RuntimeEnv {
-    fn read() -> Result<Self> {
+    /// The environment, with the corrector's threshold `given` over its own ([`corrector_threshold_of`]).
+    fn read(given_corrector_threshold: Option<f32>) -> Result<Self> {
         let fusion_weight = match std::env::var("SETSUNA_FUSION_WEIGHT") {
             Ok(s) => s
                 .parse::<f32>()
@@ -141,15 +161,10 @@ impl RuntimeEnv {
                 .with_context(|| format!("SETSUNA_FUSION_WEIGHT={s} is not a number"))?,
             Err(_) => 1.0,
         };
-        let corrector_threshold = match std::env::var("SETSUNA_CORRECTOR_THRESHOLD") {
-            Ok(s) => Some(
-                s.parse::<f32>()
-                    .ok()
-                    .filter(|t| !t.is_nan())
-                    .with_context(|| format!("SETSUNA_CORRECTOR_THRESHOLD={s} is not a number"))?,
-            ),
-            Err(_) => None,
-        };
+        let corrector_threshold = corrector_threshold_of(
+            given_corrector_threshold,
+            std::env::var("SETSUNA_CORRECTOR_THRESHOLD").ok().as_deref(),
+        )?;
         let script_bias = match std::env::var("SETSUNA_SCRIPT_BIAS") {
             Ok(s) if !s.trim().is_empty() => parse_script_bias(&s).with_context(|| {
                 format!("SETSUNA_SCRIPT_BIAS={s}: four numbers, other,kanji,hiragana,katakana")
@@ -346,15 +361,9 @@ impl EngineSession {
         corrector: Option<&Path>,
         corrector_threshold: Option<f32>,
     ) -> Result<Self> {
-        let mut env = RuntimeEnv::read()?;
+        let mut env = RuntimeEnv::read(corrector_threshold)?;
         if let Some(p) = corrector {
             env.corrector_manifest = Some(p.to_path_buf());
-        }
-        if let Some(t) = corrector_threshold {
-            if t.is_nan() {
-                bail!("the reading corrector's threshold is not a number");
-            }
-            env.corrector_threshold = Some(t);
         }
         Self::build(manifest, explicit, &env)
     }
@@ -1223,6 +1232,32 @@ fn parse_script_bias(s: &str) -> Result<[f32; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's `--corrector-threshold` over the environment's, and only the one taken checked.
+    #[test]
+    fn the_given_corrector_threshold_wins_over_the_environments() {
+        assert_eq!(corrector_threshold_of(None, None).unwrap(), None);
+        assert_eq!(
+            corrector_threshold_of(None, Some("9.5")).unwrap(),
+            Some(9.5)
+        );
+        assert_eq!(
+            corrector_threshold_of(Some(4.0), Some("9.5")).unwrap(),
+            Some(4.0)
+        );
+        // an environment value that is not a number stops the engine only when it is the one taken
+        assert_eq!(
+            corrector_threshold_of(Some(4.0), Some("bogus")).unwrap(),
+            Some(4.0)
+        );
+        assert!(corrector_threshold_of(None, Some("bogus")).is_err());
+        assert!(corrector_threshold_of(None, Some("nan")).is_err());
+        assert!(corrector_threshold_of(Some(f32::NAN), None).is_err());
+        assert_eq!(
+            corrector_threshold_of(Some(f32::NEG_INFINITY), None).unwrap(),
+            Some(f32::NEG_INFINITY)
+        );
+    }
 
     fn env() -> RuntimeEnv {
         RuntimeEnv {
