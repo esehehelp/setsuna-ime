@@ -411,32 +411,21 @@ impl CtcNatManifest {
                 path.display()
             );
         }
-        let proposal_native_path = match &file.proposal.native {
-            None => None,
-            Some(n) => {
-                anyhow::ensure!(
-                    n.precision == "int8" && file.proposal.precision == "int8",
-                    "manifest {}: native encoder precision {:?} on a {:?} proposal, expected int8 on int8",
-                    path.display(),
-                    n.precision,
-                    file.proposal.precision
-                );
-                anyhow::ensure!(
-                    file.proposal.logit_ids.is_none(),
-                    "manifest {}: proposal.native is for the whole vocabulary's logits or an AR encoder, not cut \
-                     logit columns",
-                    path.display()
-                );
-                Some(resolve(&n.path, "native encoder")?)
-            }
-        };
-        if let Some(c) = &file.corrector {
+        // the native weights of a graph (int8 on int8); with logit_ids, its head holds those columns alone
+        let native = |p: &ProposalArtifact, what: &str| -> Result<Option<PathBuf>> {
+            let Some(n) = &p.native else {
+                return Ok(None);
+            };
             anyhow::ensure!(
-                c.proposal.native.is_none(),
-                "manifest {}: corrector.proposal.native is not read (the corrector runs its graph)",
-                path.display()
+                n.precision == "int8" && p.precision == "int8",
+                "manifest {}: {what} precision {:?} on a {:?} graph, expected int8 on int8",
+                path.display(),
+                n.precision,
+                p.precision
             );
-        }
+            Ok(Some(resolve(&n.path, what)?))
+        };
+        let proposal_native_path = native(&file.proposal, "native encoder")?;
         let vocab_path = resolve(&file.vocab, "vocab")?;
         let input_vocab_path = file
             .input_vocab
@@ -474,7 +463,7 @@ impl CtcNatManifest {
                         proposal_path: resolve(&c.proposal.path, "corrector proposal")?,
                         precision: c.proposal.precision.clone(),
                         logit_ids: c.proposal.logit_ids.clone(),
-                        proposal_native_path: None,
+                        proposal_native_path: native(&c.proposal, "corrector's native encoder")?,
                         vocab_path: vocab_path.clone(),
                         input_vocab_path: input_vocab_path.clone(),
                         special_ids: file.special_ids,
@@ -920,14 +909,19 @@ mod tests {
         assert!(with("fp32", &native("m.encoder.native.safetensors", "int8")).is_err());
         assert!(with("int8", &native("m.encoder.native.safetensors", "fp32")).is_err());
         assert!(with("int8", &native("missing.safetensors", "int8")).is_err());
-        assert!(with(
-            "int8",
-            &format!(
-                r#"{},"logit_ids":[4,6]"#,
-                native("m.encoder.native.safetensors", "int8")
+        // a cut head (a reading corrector's): its native weights hold those columns
+        assert_eq!(
+            with(
+                "int8",
+                &format!(
+                    r#"{},"logit_ids":[4,6]"#,
+                    native("m.encoder.native.safetensors", "int8")
+                )
             )
-        )
-        .is_err());
+            .unwrap()
+            .logit_ids,
+            Some(vec![4, 6])
+        );
         assert_eq!(
             with("int8", r#""logit_ids":[4,6]"#)
                 .unwrap()
@@ -969,6 +963,23 @@ mod tests {
         assert_eq!(c.manifest.decode_defaults.max_context, Some(0));
         assert!(c.manifest.corrector.is_none() && c.manifest.ar_decoder.is_none());
         assert_eq!(c.threshold, 11.5);
+        assert_eq!(c.manifest.proposal_native_path, None);
+        // its native weights, as a model's
+        write(&dir, "m.corrector.native.safetensors", "");
+        let m = with(
+            r#"{"proposal":{"path":"m.corrector.int8head.onnx","precision":"int8","logit_ids":[4,6],
+            "native":{"path":"m.corrector.native.safetensors","precision":"int8"}},"max_seq_len":128,"threshold":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.corrector.unwrap().manifest.proposal_native_path,
+            Some(canon(dir.join("m.corrector.native.safetensors")))
+        );
+        assert!(with(
+            r#"{"proposal":{"path":"m.corrector.int8head.onnx","precision":"int8","logit_ids":[4,6],
+            "native":{"path":"none.safetensors","precision":"int8"}},"max_seq_len":128,"threshold":1}"#,
+        )
+        .is_err());
         assert!(with(r#"{"proposal":{"path":"none.onnx","precision":"int8"},"max_seq_len":128,"threshold":1}"#)
             .is_err());
         assert!(with(

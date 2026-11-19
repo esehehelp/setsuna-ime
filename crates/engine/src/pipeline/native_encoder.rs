@@ -66,6 +66,11 @@ pub struct EncoderConfig {
     pub moe: Option<MoeConfig>,
     /// "ctc" (`decoder` and `head.*`) or "ar_cross" (`ar` and `ar.*`)
     pub output: String,
+    /// The CTC head's rows when it holds some of the vocabulary's tokens alone (a reading corrector's head cut to the
+    /// manifest's `proposal.logit_ids`, in their order; its input rows then the file's own `embedding.*`); none: one
+    /// a token.
+    #[serde(default)]
+    pub head_rows: Option<usize>,
     #[serde(default)]
     pub decoder: Option<DecoderConfig>,
     #[serde(default)]
@@ -603,9 +608,14 @@ impl NativeEncoder {
             c.layers > 0 && c.heads > 0 && d % c.heads == 0 && v > 0 && p > 0,
             "config {c:?}: sizes must be positive and hidden a multiple of heads"
         );
+        let rows = c.head_rows.unwrap_or(v);
+        anyhow::ensure!(
+            rows > 0 && rows <= v,
+            "config {c:?}: head_rows must be 1 to the vocabulary's {v}"
+        );
         let isa = detect_isa();
         let head = match (c.output.as_str(), &c.decoder, &c.ar) {
-            ("ctc", Some(_), None) => Some(Lin8::load(isa, w, "head", v, d, false)?),
+            ("ctc", Some(_), None) => Some(Lin8::load(isa, w, "head", rows, d, false)?),
             ("ar_cross", None, Some(_)) => None,
             (o, dec, ar) => anyhow::bail!(
                 "output {o:?} with decoder {} and ar {}: \"ctc\" takes a decoder, \"ar_cross\" the AR layers",
@@ -617,8 +627,8 @@ impl NativeEncoder {
             "own" => Table8::load(w, "embedding", v, d)?,
             "tied" => {
                 anyhow::ensure!(
-                    c.output == "ctc",
-                    "a tied embedding reads the CTC head's rows"
+                    c.output == "ctc" && rows == v,
+                    "a tied embedding reads the CTC head's rows, every token's"
                 );
                 Table8::load(w, "head", v, d)?
             }
@@ -801,7 +811,12 @@ impl NativeEncoder {
         }
     }
 
-    /// The CTC logits (T, vocab) of one row of ids.
+    /// The width of the CTC logits: the vocabulary's, or the head's rows when it holds some of its tokens.
+    pub fn logit_width(&self) -> usize {
+        self.config.head_rows.unwrap_or(self.config.vocab)
+    }
+
+    /// The CTC logits (T, `logit_width`) of one row of ids.
     pub fn logits(&mut self, ids: &[i64]) -> Result<Vec<f32>> {
         anyhow::ensure!(
             matches!(self.output, Output::Ctc { .. }),

@@ -348,13 +348,13 @@ impl ProposalRunner {
             "the native encoder takes a row without padding"
         );
         anyhow::ensure!(
-            width == tokenizer.vocab_size() && enc.config.vocab == width,
-            "native encoder logits of {} tokens, the tokenizer's vocabulary {} (columns {width})",
-            enc.config.vocab,
+            enc.logit_width() == width,
+            "native encoder logits of {} columns, {width} expected (the vocabulary's {}, or the manifest's              proposal.logit_ids)",
+            enc.logit_width(),
             tokenizer.vocab_size()
         );
         anyhow::ensure!(
-            (tokenizer.blank_id as usize) < width,
+            width != tokenizer.vocab_size() || (tokenizer.blank_id as usize) < width,
             "blank_id {} out of range for vocab {width}",
             tokenizer.blank_id
         );
