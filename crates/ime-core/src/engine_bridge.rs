@@ -167,6 +167,9 @@ struct AltList {
     /// reads as none (`google` → ごおgぇ: its conversions are noise).
     reading: Option<String>,
     req_id: Option<u64>,
+    /// Space waited for its list once (`await_alt`): never again, even
+    /// when it did not come (a later request took its place).
+    awaited: bool,
     candidates: Vec<String>,
     main: Vec<String>,
     ends_english: bool,
@@ -236,6 +239,14 @@ const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(150)
 /// in yet (`await_live_conversion`): a phone without SDOT takes 100-300 ms
 /// a conversion, and one may be in flight before it.
 const ENTER_WAIT: Duration = Duration::from_millis(1000);
+
+/// How long Space waits for the other reading's list (`await_alt`) before
+/// the list opens without it (it is added when it comes). One conversion of
+/// Cymbidium-v1.1-xsmall, warm, not cached, measured 2026-11-19 on a 4-vCPU
+/// Xeon at 2.1 GHz with AVX-512 VNNI: 2.6 ms (IMEの) to 8.0 ms (きょうはIMEの
+/// つかいかたをしらべた), median of 30; v1.0 takes 33 ms a sentence on a CPU
+/// with none of its SIMD kernels (README).
+const ALT_WAIT: Duration = Duration::from_millis(100);
 
 /// The engine's top of what is typed, waiting for the reranked one
 /// (`[rerank] defer_ms`).
@@ -1328,6 +1339,9 @@ impl EngineBridge {
         if current_hira != result.reading || result.candidates.is_empty() {
             return Vec::new();
         }
+        // the list opens with the other reading's
+        self.request_alt();
+        self.await_alt();
         let candidates = self.shown_list(result.candidates.clone());
         // Locally generated candidates may move when the model arrives.
         // Keep a deliberate choice on its text rather than its old index.
@@ -1358,7 +1372,6 @@ impl EngineBridge {
             selected: sel,
             seg: None,
         };
-        self.request_alt();
         vec![
             Action::UpdatePreedit { text },
             Action::ShowCandidates {
@@ -1397,6 +1410,7 @@ impl EngineBridge {
             return typo().map(|reading| AltList {
                 reading: Some(reading),
                 req_id: None,
+                awaited: false,
                 candidates: Vec::new(),
                 main: Vec::new(),
                 ends_english: false,
@@ -1418,6 +1432,7 @@ impl EngineBridge {
         Some(AltList {
             reading: slip().or_else(|| if other { Some(reading) } else { typo() }),
             req_id: None,
+            awaited: false,
             candidates: Vec::new(),
             main: Vec::new(),
             ends_english: self.composing.ends_in_english(),
@@ -1485,6 +1500,20 @@ impl EngineBridge {
         }
         let mut seen = std::collections::HashSet::new();
         list.retain(|c| !c.is_empty() && seen.insert(c.clone()));
+        // the user's choices over the whole list: one of the other
+        // reading's chosen before (IMEの for IMENo) comes first as one of
+        // the mixed reading's would, which `finish_list` reranked alone
+        let reading = self.composing.hiragana().to_string();
+        if let Some(learning) = self.learning.as_mut() {
+            list = learning.rerank(&reading, list);
+        }
+        // what Backspace left of the conversion shown stays first
+        if let Some((_, text, _)) = self.kept.as_ref().filter(|(r, _, _)| *r == reading) {
+            if let Some(i) = list.iter().position(|c| c == text) {
+                let kept = list.remove(i);
+                list.insert(0, kept);
+            }
+        }
         list
     }
 
@@ -1506,16 +1535,59 @@ impl EngineBridge {
         }
     }
 
-    /// The other reading's list arrived: add it to the open list, the
-    /// selection staying on its candidate.
-    fn apply_alt_result(&mut self, result: EngineResult) -> Vec<Action> {
-        let Some(alt) = self.alt.as_ref() else {
-            return Vec::new();
+    /// Space: wait, once, for the other reading's list just asked for
+    /// (`request_alt`), at most `ALT_WAIT`, so that the list opens with it
+    /// and with the user's choices over the whole (`mixed_list`) rather than
+    /// changing under the user when it comes. Results of earlier requests
+    /// met on the way are stale: the other reading was asked for after
+    /// them.
+    fn await_alt(&mut self) {
+        match self.alt.as_mut() {
+            Some(alt) if alt.req_id.is_some() && !alt.awaited => alt.awaited = true,
+            _ => return,
+        }
+        let deadline = Instant::now() + ALT_WAIT;
+        loop {
+            let Some(client) = self.client.as_ref() else {
+                return;
+            };
+            if !client.is_ready() || !client.is_alive() {
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !client.wait_latest(left) {
+                crate::diagnostics::log("space: the other reading did not come in time");
+                return;
+            }
+            let Some(mut result) = client.take_latest() else {
+                continue;
+            };
+            if result.req_id < self.result_floor {
+                continue;
+            }
+            self.order_engine_result(&mut result);
+            if self
+                .alt
+                .as_ref()
+                .is_some_and(|a| a.req_id == Some(result.req_id))
+            {
+                self.store_alt_result(result);
+                return;
+            }
+        }
+    }
+
+    /// Keep the other reading's list for the list shown (`mixed_list`);
+    /// `false` when `result` is not of the other reading.
+    fn store_alt_result(&mut self, result: EngineResult) -> bool {
+        let Some(reading) = self
+            .alt
+            .as_ref()
+            .and_then(|alt| alt.reading.clone())
+            .filter(|r| *r == result.reading)
+        else {
+            return false;
         };
-        let Some(reading) = alt.reading.clone().filter(|r| *r == result.reading) else {
-            return Vec::new();
-        };
-        let main = alt.main.clone();
         let candidates = self.finish_list(&reading, result.candidates, false);
         let user_words = self
             .user_dict()
@@ -1524,6 +1596,19 @@ impl EngineBridge {
         if let Some(alt) = self.alt.as_mut() {
             alt.candidates = candidates;
             alt.user_words = user_words;
+        }
+        true
+    }
+
+    /// The other reading's list arrived after the list opened (it did not
+    /// come within `ALT_WAIT`): add it to the open list, the selection
+    /// staying on its candidate.
+    fn apply_alt_result(&mut self, result: EngineResult) -> Vec<Action> {
+        let Some(main) = self.alt.as_ref().map(|alt| alt.main.clone()) else {
+            return Vec::new();
+        };
+        if !self.store_alt_result(result) {
+            return Vec::new();
         }
         let shown = match &self.phase {
             Phase::Converting {
@@ -1982,10 +2067,12 @@ impl EngineBridge {
                     self.list_starts.entry(text).or_insert(starts);
                 }
                 let source = candidates.first().cloned().unwrap_or_default();
-                let candidates = self.shown_list(candidates);
                 if ready {
+                    // the list opens with the other reading's
                     self.request_alt();
+                    self.await_alt();
                 }
+                let candidates = self.shown_list(candidates);
                 let first = self.with_pending(candidates.first().cloned().unwrap_or_default());
                 self.phase = Phase::Converting {
                     candidates: candidates.clone(),
@@ -7345,6 +7432,7 @@ mod tests {
         bridge.alt = Some(AltList {
             reading: Some("よろ".into()),
             req_id: Some(7),
+            awaited: false,
             candidates: Vec::new(),
             main: v(&["yoro"]),
             ends_english: false,
@@ -7610,6 +7698,40 @@ mod tests {
         mock.answer_last(&["IMENo"]);
         bridge.apply_async_result();
         assert_eq!(mock.dispatched_readings().last().unwrap(), "いめの");
+    }
+
+    #[test]
+    fn a_slip_put_right_chosen_once_comes_first_after() {
+        // issue #6: Space waits for the other reading's list, so the list
+        // opens with it and the user's choices apply over the whole: IMEの
+        // chosen over IMENo once is first the next time
+        let dir =
+            std::env::temp_dir().join(format!("setsuna-bridge-slip-learn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut bridge, mock) = voicing_bridge();
+        let cfg = crate::config::LearningCfg::default();
+        bridge.set_learning(Some(Learning::at(dir.join("learning.jsonl"), &cfg)));
+        // the engine answers the reading put right as soon as it is asked
+        mock.state
+            .answers
+            .borrow_mut()
+            .insert("IMEの".into(), v(&["IMEの", "IMEノ"]));
+        let convert = |bridge: &mut EngineBridge| {
+            type_str(bridge, "IMENo");
+            bridge.handle_space();
+            bridge.handle_space();
+            mock.answer_last(&["IMENo", "IMENO"]);
+            shown(&bridge.apply_async_result()).unwrap()
+        };
+        let (list, selected) = convert(&mut bridge);
+        assert_eq!(list[..3], v(&["IMENo ", "IMEの", "IMEノ"])[..]);
+        assert_eq!(selected, 0);
+        bridge.handle_down();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["IMEの"]);
+        let (list, selected) = convert(&mut bridge);
+        assert_eq!((list[0].as_str(), selected), ("IMEの", 0));
+        assert!(list.contains(&"IMENo ".to_string()), "{list:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
