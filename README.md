@@ -15,7 +15,7 @@ Setsuna (刹那) is a Japanese input method built around a non-autoregressive ne
 Windows PowerShell 5.1 または PowerShell 7 (`pwsh`) で実行します（`regsvr32` 登録時に UAC が表示されます）。
 
 ```powershell
-# 標準インストール（既定モデル Cymbidium-v1.1-xsmall + 読み辞書・解析器を自動取得）
+# 標準インストール（既定モデル Cymbidium-v1.2-xsmall + 読み辞書・解析器を自動取得）
 irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
 
 # 変換モデルを切り替える例（Bletilla-v0.1-small）
@@ -99,7 +99,8 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 | モデル | サイズ | 1 位一致（wiki_fresh_v4 / AJIMEE v2-fix2 / probe_v6） | 上位 5 位一致（同） | 速度（1 スレッド・中央値） | 用途 |
 |---|---:|---:|---:|---:|---|
-| [**Cymbidium-v1.1-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)（既定） | 約 23 MB | 82.3% / 79.1% / 85.1% | 88.4% / 87.4% / 88.7% | 2.4〜2.6 ms | 高速・高精度の標準モデル |
+| [**Cymbidium-v1.2-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.2-xsmall)（既定） | 約 23 MB | 83.2% / 79.1% / 84.8% | 88.9% / 88.1% / 88.7% | 2.3〜2.4 ms | 高速・高精度の標準モデル |
+| [**Cymbidium-v1.1-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall) | 約 23 MB | 82.3% / 79.1% / 85.1% | 88.4% / 87.4% / 88.7% | 2.4 ms | 前の既定 |
 | [**Cymbidium-v1.0-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) | 約 14 MB | — | — | — | より軽量な旧版（このセットでは未計測） |
 | [**Bletilla-v0.1-small**](https://huggingface.co/esehe/Bletilla-v0.1-small) | 約 130 MB | 81.1% / 78.0% / 84.1% | 89.3% / 92.5% / 89.6% | 7.6〜8.4 ms | 上位 5 候補のカバー率重視 |
 | 参考: [zenz-v3.2-small](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)（Q5_K_M） | — | 74.0% / 76.6% / 81.6% | 78.6% / 83.9% / 86.7% | 約 990 ms（AJIMEE 1 件） | 自己回帰モデルとの比較用 |
@@ -107,7 +108,7 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 - 評価セットは 2026-11-12 時点の標準のもの: wiki_fresh_v4（変換モデルの学習データより後に作られた Wikipedia 日本語版の記事の文 4,998 件。正解の表記の揺れを許す）、AJIMEE-Bench JWTD v2 の v2-fix2（628 件。読みの誤りを直したもの）、probe_v6（数字・人名・技術用語・同音異義語などの分野別 309 件）。
 - 数値は変換エンジン単体（ビーム幅 20）の完全一致率。IME ではこれに読み辞書が候補を足します。Bletilla は並べ替えの表（`pairs.bin` / `words.tsv`）を使ったときの値です。
 - 速度は AJIMEE の 200 文を 1 スレッドで変換したときの中央値（2 回の計測の幅）。
-- zenz-v3.2-small は llama.cpp で 1 スレッド、ビーム幅 5、前の文脈 40 文字までで動かした値で、速度は AJIMEE の 1 件あたりの中央値（計測の仕方が上の 3 つとは違います）。
+- zenz-v3.2-small は llama.cpp で 1 スレッド、ビーム幅 5、前の文脈 40 文字までで動かした値で、速度は AJIMEE の 1 件あたりの中央値（計測の仕方が上のモデルとは違います）。
 
 ### 辞書・解析器（CC BY-SA 4.0 / [esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）
 

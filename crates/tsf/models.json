@@ -1,37 +1,69 @@
 {
   "schema": "setsuna-model-download-v1",
-  "name": "Cymbidium-v1.1-xsmall",
-  "repository": "esehe/Cymbidium-v1.1-xsmall",
-  "revision": "4f506001a580364b99a1db6c6d3b91409eeb3ef9",
+  "name": "Cymbidium-v1.2-xsmall",
+  "repository": "esehe/Cymbidium-v1.2-xsmall",
+  "revision": "58ca8608ffee3104374464d0f10c8f935444abbc",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
-      "manifest": "Cymbidium-v1.1-xsmall.manifest.json",
+      "manifest": "Cymbidium-v1.2-xsmall.manifest.json",
       "files": [
         {
-          "path": "Cymbidium-v1.1-xsmall.manifest.json",
+          "path": "Cymbidium-v1.2-xsmall.manifest.json",
           "size": 563,
-          "sha256": "d7cfb0d9270da3a4d16b93078f81460a5ed5e81e71bdd3f49303a2902fce77b8"
+          "sha256": "7558aa675d9c9c915d4f67d8660c731efd1f1edd10cf5a761007c5d5a4ca9df8"
         },
         {
-          "path": "Cymbidium-v1.1-xsmall.onnx",
+          "path": "Cymbidium-v1.2-xsmall.onnx",
           "size": 22987122,
-          "sha256": "77dd51fd4fa13011bead0cc49c6be15291da53ffd4b641a0a23f2d7bb1ee008b"
+          "sha256": "e41ddc9c9c5312664a1c97fe49cf79b7faff33e6ddee1dde1055abaff740e360"
         },
         {
-          "path": "Cymbidium-v1.1-xsmall.vocab.hex.tsv",
+          "path": "Cymbidium-v1.2-xsmall.vocab.hex.tsv",
           "size": 95166,
           "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
         },
         {
           "path": "config.json",
           "size": 113,
-          "sha256": "9a772096081de5c536124551d9d7cf9e105fe94e084f4d9c3c914109aabe1f6d"
+          "sha256": "ab81637a64c1f26c3e928c520b3bca06eedbd96bb810de975a63cd0ec59909b7"
         }
       ]
     }
   },
   "models": {
+    "Cymbidium-v1.1-xsmall": {
+      "repository": "esehe/Cymbidium-v1.1-xsmall",
+      "revision": "4f506001a580364b99a1db6c6d3b91409eeb3ef9",
+      "license": "Apache-2.0",
+      "variants": {
+        "int8": {
+          "manifest": "Cymbidium-v1.1-xsmall.manifest.json",
+          "files": [
+            {
+              "path": "Cymbidium-v1.1-xsmall.manifest.json",
+              "size": 563,
+              "sha256": "d7cfb0d9270da3a4d16b93078f81460a5ed5e81e71bdd3f49303a2902fce77b8"
+            },
+            {
+              "path": "Cymbidium-v1.1-xsmall.onnx",
+              "size": 22987122,
+              "sha256": "77dd51fd4fa13011bead0cc49c6be15291da53ffd4b641a0a23f2d7bb1ee008b"
+            },
+            {
+              "path": "Cymbidium-v1.1-xsmall.vocab.hex.tsv",
+              "size": 95166,
+              "sha256": "5a15c688b99120c68e72d7cb47f056ca0a82081a1a25ff0649d8bf873f895072"
+            },
+            {
+              "path": "config.json",
+              "size": 113,
+              "sha256": "9a772096081de5c536124551d9d7cf9e105fe94e084f4d9c3c914109aabe1f6d"
+            }
+          ]
+        }
+      }
+    },
     "Cymbidium-v1.0-xsmall": {
       "repository": "esehe/Cymbidium-v1.0-xsmall",
       "revision": "0701d2c33f3c5a583019a3204db76e6985e7e15b",
