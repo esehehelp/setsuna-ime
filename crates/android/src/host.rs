@@ -135,6 +135,14 @@ pub struct Host {
     /// The engine daemon started with the service, off the main thread, for
     /// the first `configure` to take.
     started: Arc<Mutex<Started>>,
+    /// The `[engine]` settings the running daemon was started with (as
+    /// `engine_key` writes them): another daemon starts when they change.
+    engine_key: Option<String>,
+}
+
+/// `[engine]` as compared for a restart of the daemon (the Linux addon's way).
+fn engine_key(cfg: &Config) -> String {
+    format!("{:?}", cfg.engine)
 }
 
 /// The daemon the warm-up thread starts: not yet, there to take, or taken
@@ -142,7 +150,8 @@ pub struct Host {
 /// thread, coming later, none.
 enum Started {
     Pending,
-    Ready(child_daemon::ChildDaemonClient),
+    /// The daemon, and the `engine_key` of the settings it was started with.
+    Ready(child_daemon::ChildDaemonClient, String),
     Taken,
 }
 
@@ -170,7 +179,7 @@ impl Host {
                             Some(&warm.data),
                             notify,
                         ) {
-                            Some(c) => Started::Ready(c),
+                            Some(c) => Started::Ready(c, engine_key(&cfg)),
                             None => Started::Taken,
                         };
                     }
@@ -182,6 +191,7 @@ impl Host {
             dirs,
             wake,
             started,
+            engine_key: None,
         }
     }
 
@@ -192,25 +202,31 @@ impl Host {
 
     /// Take up config.toml for the app `package` (its `[[apps]]` settings
     /// over the rest, and its start state), dropping any composition, and
-    /// start the engine when there is none or its daemon exited. Called when
+    /// start the engine when there is none, its daemon exited, or `[engine]`
+    /// changed (the settings page's corrector threshold): the new daemon
+    /// replaces the old one, which ends with its client; when it does not
+    /// start, the old one stays and the next field tries again. Called when
     /// a field is focused, as the TSF DLL reloads on ActivateEx.
     pub fn configure(&mut self, package: &str) {
         let (cfg, app) = with_app_defaults(Config::load_default(), &self.dirs).for_app(package);
-        let client = if self.session.has_client() {
+        let key = engine_key(&cfg);
+        let client = if self.session.has_client() && self.engine_key.as_ref() == Some(&key) {
             None
         } else {
-            // the one started with the service, else one now (none was, or its daemon exited)
+            // the one started with the service when it was started so, else one now (none was,
+            // its daemon exited, or the settings changed)
             let ahead = std::mem::replace(
                 &mut *self.started.lock().unwrap_or_else(|e| e.into_inner()),
                 Started::Taken,
             );
             match ahead {
-                Started::Ready(c) => Some(Box::new(c) as Box<dyn EngineClient>),
+                Started::Ready(c, k) if k == key => Some(Box::new(c) as Box<dyn EngineClient>),
                 _ => child_daemon::spawn_with_config(&cfg, Some(&self.dirs.data), self.notify()),
             }
         };
         if client.is_some() {
             setsuna_core::diagnostics::log("android engine started");
+            self.engine_key = Some(key);
         }
         self.session.configure_with(&cfg, client);
         match app.map(|a| a.start) {
@@ -374,6 +390,7 @@ mod tests {
             },
             wake: Arc::new(|| {}),
             started: Arc::new(Mutex::new(Started::Taken)),
+            engine_key: None,
         };
         assert!(host.key('a' as u32, 0, FIELD_NORMAL, None));
         host.session.flush();
