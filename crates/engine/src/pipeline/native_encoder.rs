@@ -18,6 +18,12 @@
 //! Outputs: "ctc", the NAT decoder's frames through the CTC head, as logits (T, V); "ar_cross", the AR layers'
 //! cross-attention keys and values, each (layers, 1, heads, T, head_dim) as the encoder graph gives them.
 
+// the x86 kernels and what only they read are unused elsewhere
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

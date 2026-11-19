@@ -13,6 +13,12 @@
 //! a constant shift within a frame, so the ranking of a frame's tokens never
 //! changes; only hypotheses whose scores are that close can swap.
 
+// the x86 kernels and what only they read are unused elsewhere
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 const LANES: usize = 16;
 
 /// e^x (the Cephes scheme above), branch-free so a loop of it vectorizes; also the AR decoder's softmaxes and the

@@ -18,6 +18,12 @@
 //! K best tokens `forbidden` allows, best first, by one pass that keeps the best K so far and skips a 16-wide chunk
 //! with nothing above the K-th.
 
+// the x86 kernels and what only they read are unused elsewhere
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 use std::collections::HashMap;
 use std::path::Path;
 

@@ -7,6 +7,12 @@
 //! router's fp32 logits, the top-`k` experts with their softmax renormalised over the `k`, the weighted outputs
 //! summed), the experts' Linears being `group_q`'s.
 
+// the x86 kernels and what only they read are unused elsewhere
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 /// An int8 matrix (out, in) prepacked for the u8 x i8 dot products: 16 output rows x 4 inputs a 64-byte block (lane j
 /// = row 16 * b + j), blocks along the inputs; `colsum` the sum of each row (for the activations' zero point). Only
 /// one layout is kept:
@@ -117,12 +123,18 @@ pub(crate) enum Isa {
     Vnni256,
     Avx2,
     Avx,
+    /// ARMv8.2 SDOT (`arm`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    Dot,
     Plain,
 }
 
 /// The kernel for the engine's level (`crate::cpu`; SETSUNA_CPU_LEVEL caps it).
 pub(crate) fn detect_isa() -> Isa {
     use crate::cpu::Level;
+    if crate::cpu::dotprod() {
+        return Isa::Dot;
+    }
     match crate::cpu::level() {
         Level::Avx512 => Isa::Vnni512,
         Level::AvxVnni => Isa::Vnni256,
@@ -151,6 +163,9 @@ pub(crate) fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [
         // AVX (128-bit integers): the 16-bit copy's kernel (a matrix packed at the AVX level has it)
         #[cfg(target_arch = "x86_64")]
         Isa::Avx if !w.wide.is_empty() => unsafe { x86::gemm_avxw(q, rows, w, acc) },
+        // SAFETY: the CPU has the dot products (`detect_isa`)
+        #[cfg(target_arch = "aarch64")]
+        Isa::Dot => unsafe { arm::gemm_dot(q, rows, w, acc) },
         _ => gemm_plain(q, rows, w, acc),
     }
 }
@@ -241,6 +256,133 @@ pub(crate) fn gemm_u8i8_f32(
                 v += b[o];
             }
             yr[o] = v;
+        }
+    }
+}
+
+/// The blocked int8 GEMM with ARM's SDOT (signed i8 x i8 dot products of four into each i32 lane): a block's 64 bytes
+/// are four vectors, outputs 0-3, 4-7, 8-11 and 12-15, each lane an output's four inputs, so the layout of the VNNI
+/// paths serves as it is. The u8 codes go in as i8 with their top bit flipped (code - 128), and the 128 * row sum of
+/// the weights this takes off is put back after, so the sums are the plain path's.
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::Packed;
+    use std::arch::aarch64::*;
+
+    /// SDOT: each lane of `acc` plus the dot product of its four i8 of `w` and of `x` (the intrinsic is not stable).
+    #[inline(always)]
+    unsafe fn sdot(acc: int32x4_t, w: int8x16_t, x: int8x16_t) -> int32x4_t {
+        let mut r = acc;
+        std::arch::asm!(
+            "sdot {r:v}.4s, {w:v}.16b, {x:v}.16b",
+            r = inout(vreg) r,
+            w = in(vreg) w,
+            x = in(vreg) x,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        r
+    }
+
+    /// Row r's four codes at input 4 kg, top bits flipped, in every lane.
+    #[inline(always)]
+    unsafe fn codes(q: *const u8, at: usize) -> int8x16_t {
+        let v = vreinterpretq_u8_u32(vdupq_n_u32((q.add(at) as *const u32).read_unaligned()));
+        vreinterpretq_s8_u8(veorq_u8(v, vdupq_n_u8(0x80)))
+    }
+
+    /// RT rows x C output blocks (block c `bstride` bytes after block 0).
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn tile<const RT: usize, const C: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i8,
+        bstride: usize,
+        acc: *mut i32,
+        n: usize,
+    ) {
+        let mut a = [[[vdupq_n_s32(0); 4]; C]; RT];
+        for kg in 0..k / 4 {
+            let mut x = [vdupq_n_s8(0); RT];
+            for (r, xr) in x.iter_mut().enumerate() {
+                *xr = codes(q, r * k + kg * 4);
+            }
+            for c in 0..C {
+                let p = wb.add(c * bstride + kg * 64);
+                let w = [
+                    vld1q_s8(p),
+                    vld1q_s8(p.add(16)),
+                    vld1q_s8(p.add(32)),
+                    vld1q_s8(p.add(48)),
+                ];
+                for (ar, xr) in a.iter_mut().zip(&x) {
+                    for (av, wv) in ar[c].iter_mut().zip(&w) {
+                        *av = sdot(*av, *wv, *xr);
+                    }
+                }
+            }
+        }
+        for (r, ar) in a.iter().enumerate() {
+            for (c, ac) in ar.iter().enumerate() {
+                for (v, av) in ac.iter().enumerate() {
+                    vst1q_s32(acc.add(r * n + c * 16 + v * 4), *av);
+                }
+            }
+        }
+    }
+
+    /// `tile::<rt, c>` for a row count known at run time: 1 row on 4 blocks, 2 on 2 (16 sums each), else up to 4
+    /// rows on one block.
+    macro_rules! by_rows {
+        ($rt:expr, $c:expr, $($arg:expr),*) => {
+            match ($rt, $c) {
+                (1, 4) => tile::<1, 4>($($arg),*),
+                (2, 2) => tile::<2, 2>($($arg),*),
+                (1, _) => tile::<1, 1>($($arg),*),
+                (2, _) => tile::<2, 1>($($arg),*),
+                (3, _) => tile::<3, 1>($($arg),*),
+                _ => tile::<4, 1>($($arg),*),
+            }
+        };
+    }
+
+    /// The integer sums of `super::gemm_u8i8` on a blocked matrix.
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn gemm_dot(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+        let (n, k) = (w.out, w.inp);
+        let bstride = k * 16;
+        let (qp, ap, wp) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr());
+        // few rows: more blocks at once, so the sums do not wait on each other
+        let c = match rows {
+            1 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        let blocks = n / 16;
+        let mut ob = 0;
+        while ob < blocks {
+            let cb = if ob + c <= blocks { c } else { 1 };
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                by_rows!(
+                    rt,
+                    cb,
+                    qp.add(r0 * k),
+                    k,
+                    wp.add(ob * bstride),
+                    bstride,
+                    ap.add(r0 * n + ob * 16),
+                    n
+                );
+                r0 += rt;
+            }
+            ob += cb;
+        }
+        // the codes went in as code - 128: put back what that took off
+        for r in 0..rows {
+            for (a, &cs) in acc[r * n..(r + 1) * n].iter_mut().zip(&w.colsum) {
+                *a += 128 * cs;
+            }
         }
     }
 }
@@ -1345,9 +1487,10 @@ mod tests {
             let mut got = vec![0i32; rows * out];
             gemm_plain(&q, rows, &p, &mut got);
             assert_eq!(got, want, "plain on blocked, rows {rows}");
-            for isa in [Isa::Vnni512, Isa::Vnni256, Isa::Avx2] {
+            for isa in [Isa::Vnni512, Isa::Vnni256, Isa::Avx2, Isa::Dot] {
                 if detect_isa() == Isa::Plain
                     || (isa == Isa::Vnni512 && detect_isa() != Isa::Vnni512)
+                    || (isa == Isa::Dot) != (detect_isa() == Isa::Dot)
                 {
                     continue;
                 }

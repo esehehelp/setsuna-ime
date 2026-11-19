@@ -9,6 +9,12 @@
 //! Attribute `epsilon`. Outputs: the norm, f32 shaped as `x`; the sum `x + skip`, optional (a pre-norm residual
 //! stream reads it on). The research export writes it in place of both ORT norms.
 
+// the x86 kernels and what only they read are unused elsewhere
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Isa {
     Avx512,

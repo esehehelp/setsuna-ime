@@ -2,7 +2,7 @@
 //! with AVX2 and FMA), AVX-VNNI (AVX2, FMA and the 256-bit VNNI of Intel's cores from the 12th generation), AVX2
 //! (with FMA: Intel from Haswell, every AMD Zen), AVX (Intel's Sandy and Ivy Bridge: 256-bit floats, 128-bit
 //! integers with SSSE3 and SSE4.1, no FMA), or none of them (the plain paths, correct and slow): AVX-512 is not
-//! every CPU's, so every level down to AVX has its kernels.
+//! every CPU's, so every level down to AVX has its kernels. On aarch64, ARMv8.2's dot products (`dotprod`).
 //!
 //! SETSUNA_CPU_LEVEL caps the level for research and tests (`avx512`, `avx-vnni`, `avx2`, `avx`, `plain`): the
 //! integer kernels give the same values on every level (their tests compare the paths' bits), so a capped run shows
@@ -46,6 +46,23 @@ pub fn avx2() -> bool {
 /// AVX with SSSE3 and SSE4.1 (every level from `Avx` up).
 pub fn avx() -> bool {
     level() >= Level::Avx
+}
+
+/// ARMv8.2's dot products (SDOT / UDOT: aarch64 phones since about 2018), unless SETSUNA_CPU_LEVEL is `plain`.
+pub fn dotprod() -> bool {
+    static DOT: OnceLock<bool> = OnceLock::new();
+    *DOT.get_or_init(|| {
+        let plain = std::env::var("SETSUNA_CPU_LEVEL").is_ok_and(|v| v.trim() == "plain");
+        #[cfg(target_arch = "aarch64")]
+        {
+            !plain && std::arch::is_aarch64_feature_detected!("dotprod")
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = plain;
+            false
+        }
+    })
 }
 
 fn detected() -> Level {

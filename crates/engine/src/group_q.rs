@@ -20,6 +20,12 @@
 //! scaled its sums from memory: the 4M's 43 Linears 0.47 ms slower than ONNX Runtime's dynamic int8 MatMuls on a
 //! conversion; ONNX Runtime 1.28's MatMulNBits 1.9 ms slower.)
 
+// the x86 kernels and what only they read are unused elsewhere
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 use crate::moe_op::{add_routed, gelu, quantize_row, route};
 
 /// A `GroupMoe` on the experts' nibble codes `w1` (E, d / g, f, g / 2) and `w2` (E, f / g, d, g / 2) with their
@@ -289,6 +295,9 @@ enum Path {
     Vnni256,
     Avx2,
     Avx,
+    /// ARMv8.2 UDOT (`arm`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    Dot,
     Plain,
 }
 
@@ -502,8 +511,15 @@ impl GroupWeights {
             Path::Vnni256 => return unsafe { x86::inner_vnni256(self, q, a, xs, bias, rows, y) },
             Path::Avx2 => return unsafe { x86::inner_avx2(self, q, a, xs, bias, rows, y) },
             Path::Avx => return unsafe { x86::inner_avx(self, q, a, xs, bias, rows, y) },
-            Path::Plain => {}
+            Path::Dot | Path::Plain => {}
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.path == Path::Dot {
+            unsafe { arm::inner(self, q, a, rows, y) }
+        } else {
+            self.inner_plain(q, a, rows, y);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.inner_plain(q, a, rows, y);
         for r in 0..rows {
             let (sx, zx) = xs[r];
@@ -583,7 +599,102 @@ fn detect() -> Path {
             Level::Plain => {}
         }
     }
+    if crate::cpu::dotprod() {
+        return Path::Dot;
+    }
     Path::Plain
+}
+
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::GroupWeights;
+    use std::arch::aarch64::*;
+
+    /// UDOT: each lane of `acc` plus the dot product of its four u8 of `w` and of `x` (the intrinsic is not stable).
+    #[inline(always)]
+    unsafe fn udot(acc: uint32x4_t, w: uint8x16_t, x: uint8x16_t) -> uint32x4_t {
+        let mut r = acc;
+        std::arch::asm!(
+            "udot {r:v}.4s, {w:v}.16b, {x:v}.16b",
+            r = inout(vreg) r,
+            w = in(vreg) w,
+            x = in(vreg) x,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        r
+    }
+
+    /// RT rows x one output block, as the x86 tiles: every group's sums in registers (16 of the 32 with 4 rows), then
+    /// per output the running sum plus s_g acc_g, plus -s_g z_g A_g: a multiply and an add each, as the plain path
+    /// orders them (no fused multiply-add), so the bits are its.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn tile<const RT: usize>(
+        w: &GroupWeights,
+        q: *const u8,
+        a: *const f32,
+        ob: usize,
+        y: *mut f32,
+    ) {
+        let (n, k, g) = (w.n, w.k, w.g);
+        let (groups, steps, gstride) = (k / g, g / 4, n * g);
+        let codes = w.unpacked.as_ptr() as *const u8;
+        let (sc, sz) = (w.scale.as_ptr(), w.scale_zero.as_ptr());
+        for gi in 0..groups {
+            let mut acc = [[vdupq_n_u32(0); 4]; RT];
+            let wg = codes.add(gi * gstride + ob * steps * 64);
+            for s in 0..steps {
+                let p = wg.add(s * 64);
+                let wv = [
+                    vld1q_u8(p),
+                    vld1q_u8(p.add(16)),
+                    vld1q_u8(p.add(32)),
+                    vld1q_u8(p.add(48)),
+                ];
+                for (r, ar) in acc.iter_mut().enumerate() {
+                    let at = q.add(r * k + gi * g + s * 4) as *const u32;
+                    let x = vreinterpretq_u8_u32(vdupq_n_u32(at.read_unaligned()));
+                    for (av, wc) in ar.iter_mut().zip(&wv) {
+                        *av = udot(*av, *wc, x);
+                    }
+                }
+            }
+            for v in 0..4 {
+                let s1 = vld1q_f32(sc.add(gi * n + ob * 16 + v * 4));
+                let s2 = vld1q_f32(sz.add(gi * n + ob * 16 + v * 4));
+                for (r, ar) in acc.iter().enumerate() {
+                    let av = vdupq_n_f32(*a.add(r * groups + gi));
+                    let yp = y.add(r * n + ob * 16 + v * 4);
+                    let f = vaddq_f32(vmulq_f32(vcvtq_f32_u32(ar[v]), s1), vld1q_f32(yp));
+                    vst1q_f32(yp, vaddq_f32(vmulq_f32(s2, av), f));
+                }
+            }
+        }
+    }
+
+    /// `GroupWeights::inner_plain` with UDOT: tiles of up to 4 rows, block by block.
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn inner(w: &GroupWeights, q: &[u8], a: &[f32], rows: usize, y: &mut [f32]) {
+        let (n, k, groups) = (w.n, w.k, w.k / w.g);
+        y[..rows * n].fill(0.0);
+        for ob in 0..n / 16 {
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                let (qp, ap, yp) = (
+                    q.as_ptr().add(r0 * k),
+                    a.as_ptr().add(r0 * groups),
+                    y.as_mut_ptr().add(r0 * n),
+                );
+                match rt {
+                    1 => tile::<1>(w, qp, ap, ob, yp),
+                    2 => tile::<2>(w, qp, ap, ob, yp),
+                    3 => tile::<3>(w, qp, ap, ob, yp),
+                    _ => tile::<4>(w, qp, ap, ob, yp),
+                }
+                r0 += rt;
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1272,7 +1383,7 @@ mod tests {
                     }
                 }
                 // the 256- and 128-bit kernels (CPUs without AVX-512) where this CPU has their instructions: the same bits
-                for path in [Path::Avx, Path::Avx2, Path::Vnni256] {
+                for path in [Path::Avx, Path::Avx2, Path::Vnni256, Path::Dot] {
                     if !has_path(path) {
                         continue;
                     }
@@ -1313,12 +1424,13 @@ mod tests {
                 }
                 Path::Vnni256 => avx2 && is_x86_feature_detected!("avxvnni"),
                 Path::Vnni512 => crate::cpu::avx512(),
+                Path::Dot => false,
                 Path::Plain => true,
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            path == Path::Plain
+            path == Path::Plain || (path == Path::Dot && crate::cpu::dotprod())
         }
     }
 
@@ -1397,6 +1509,7 @@ mod tests {
             Path::Avx2,
             Path::Vnni256,
             Path::Vnni512,
+            Path::Dot,
         ] {
             if !has_path(path) {
                 continue;
