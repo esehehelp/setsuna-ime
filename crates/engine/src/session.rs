@@ -423,9 +423,15 @@ impl EngineSession {
             Some(Self::load_corrector(&m, path, threshold, env)?)
         } else if let Some(b) = &manifest.corrector {
             let threshold = env.corrector_threshold.unwrap_or(b.threshold);
+            // named by its graph, or by its native weights when the manifest has no graph
+            let source = b
+                .manifest
+                .proposal_path
+                .as_ref()
+                .or(b.manifest.proposal_native_path.as_ref());
             Some(Self::load_corrector(
                 &b.manifest,
-                &b.manifest.proposal_path,
+                source.context("the bundled corrector has neither a graph nor native weights")?,
                 threshold,
                 env,
             )?)

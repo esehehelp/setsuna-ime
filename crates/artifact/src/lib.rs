@@ -35,7 +35,10 @@ pub fn read_manifest(path: &Path) -> Result<(Envelope, serde_json::Value)> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposalArtifact {
-    pub path: PathBuf,
+    /// The ONNX graph. Absent when `native` holds the weights for the engine's own implementation (the published
+    /// packages without their graphs); one of the two is required.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     /// One of fp32 / fp16 / int8 / int4. One manifest names exactly one
     /// proposal graph; another precision is another manifest.
     pub precision: String,
@@ -226,7 +229,9 @@ fn check_logit_ids(ids: &[u32], path: &Path, what: &str) -> Result<()> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArDecoderArtifact {
-    pub step: ProposalArtifact,
+    /// The step graph; absent when `native` holds the step's weights (one of the two is required).
+    #[serde(default)]
+    pub step: Option<ProposalArtifact>,
     #[serde(default)]
     pub native: Option<NativeStepArtifact>,
     pub layers: usize,
@@ -269,7 +274,8 @@ pub struct NativeStepArtifact {
 /// resolved.
 #[derive(Debug, Clone)]
 pub struct ArDecoder {
-    pub step_path: PathBuf,
+    /// The step graph, when the manifest names one (else `native_path`).
+    pub step_path: Option<PathBuf>,
     pub native_path: Option<PathBuf>,
     pub layers: usize,
     pub heads: usize,
@@ -287,7 +293,8 @@ pub struct ArDecoder {
 #[derive(Debug, Clone)]
 pub struct CtcNatManifest {
     pub manifest_path: PathBuf,
-    pub proposal_path: PathBuf,
+    /// The proposal graph, when the manifest names one (else `proposal_native_path`).
+    pub proposal_path: Option<PathBuf>,
     pub precision: String,
     /// See `ProposalArtifact::logit_ids` (checked ascending and distinct).
     pub logit_ids: Option<Vec<u32>>,
@@ -362,10 +369,33 @@ impl CtcNatManifest {
         for extra in &file.proposal.external_data {
             resolve(extra, "external data")?;
         }
+        // a graph or the weights for the engine's own implementation: the proposal, a corrector's, the AR step
+        anyhow::ensure!(
+            file.proposal.path.is_some() || file.proposal.native.is_some(),
+            "manifest {}: proposal needs its graph (path) or its native weights (native)",
+            path.display()
+        );
+        anyhow::ensure!(
+            file.proposal.path.is_some() || file.proposal.external_data.is_empty(),
+            "manifest {}: proposal.external_data without the graph (path)",
+            path.display()
+        );
+        if let Some(c) = &file.corrector {
+            anyhow::ensure!(
+                c.proposal.path.is_some() || c.proposal.native.is_some(),
+                "manifest {}: corrector.proposal needs its graph (path) or its native weights (native)",
+                path.display()
+            );
+        }
         let ar_decoder = match &file.ar_decoder {
             None => None,
             Some(a) => {
-                for extra in &a.step.external_data {
+                anyhow::ensure!(
+                    a.step.as_ref().is_some_and(|s| s.path.is_some()) || a.native.is_some(),
+                    "manifest {}: ar_decoder needs its step graph (step.path) or its native step (native)",
+                    path.display()
+                );
+                for extra in a.step.iter().flat_map(|s| &s.external_data) {
                     resolve(extra, "AR step external data")?;
                 }
                 anyhow::ensure!(
@@ -393,7 +423,12 @@ impl CtcNatManifest {
                     );
                 }
                 Some(ArDecoder {
-                    step_path: resolve(&a.step.path, "AR step graph")?,
+                    step_path: a
+                        .step
+                        .as_ref()
+                        .and_then(|s| s.path.as_ref())
+                        .map(|p| resolve(p, "AR step graph"))
+                        .transpose()?,
                     native_path: a
                         .native
                         .as_ref()
@@ -467,7 +502,12 @@ impl CtcNatManifest {
                 Some(Box::new(BundledCorrector {
                     manifest: CtcNatManifest {
                         manifest_path: path.to_path_buf(),
-                        proposal_path: resolve(&c.proposal.path, "corrector proposal")?,
+                        proposal_path: c
+                            .proposal
+                            .path
+                            .as_ref()
+                            .map(|p| resolve(p, "corrector proposal"))
+                            .transpose()?,
                         precision: c.proposal.precision.clone(),
                         logit_ids: c.proposal.logit_ids.clone(),
                         proposal_native_path: native(&c.proposal, "corrector's native encoder")?,
@@ -488,7 +528,12 @@ impl CtcNatManifest {
         };
         Ok(Self {
             manifest_path: path.to_path_buf(),
-            proposal_path: resolve(&file.proposal.path, "proposal")?,
+            proposal_path: file
+                .proposal
+                .path
+                .as_ref()
+                .map(|p| resolve(p, "proposal"))
+                .transpose()?,
             precision: file.proposal.precision,
             logit_ids: file.proposal.logit_ids,
             proposal_native_path,
@@ -862,8 +907,8 @@ mod tests {
         );
         let m = CtcNatManifest::load(&manifest).unwrap();
         let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
-        assert_eq!(m.proposal_path, canon(dir.join("m.fp32.onnx")));
-        assert!(m.proposal_path.is_absolute());
+        assert_eq!(m.proposal_path, Some(canon(dir.join("m.fp32.onnx"))));
+        assert!(m.proposal_path.as_ref().unwrap().is_absolute());
         assert_eq!(m.special_ids.blank, 4);
         assert_eq!(m.decode_defaults.beam_width, Some(20));
         assert_eq!(m.decode_defaults.top_k, None);
@@ -937,6 +982,52 @@ mod tests {
         );
     }
 
+    /// A package without its ONNX graphs: the proposal by its native weights alone, the AR step by its native step
+    /// alone; neither a graph nor native weights refused.
+    #[test]
+    fn loads_without_the_graphs() {
+        let dir = temp_dir("no-graphs");
+        write(&dir, "m.vocab.hex.tsv", "");
+        write(&dir, "m.encoder.safetensors", "");
+        write(&dir, "m.ar_step.safetensors", "");
+        let with = |proposal: &str, extra: &str| {
+            let body = manifest_body("unused.onnx", "m.vocab.hex.tsv", extra).replace(
+                r#""proposal":{"path":"unused.onnx","precision":"fp32"}"#,
+                proposal,
+            );
+            CtcNatManifest::load(&write(&dir, "m.int8.manifest.json", &body))
+        };
+        let native = r#""proposal":{"precision":"int8","native":{"path":"m.encoder.safetensors","precision":"int8"}}"#;
+        let m = with(native, "").unwrap();
+        assert_eq!(
+            (m.proposal_path.is_none(), m.proposal_native_path.is_some()),
+            (true, true)
+        );
+        assert!(with(r#""proposal":{"precision":"int8"}"#, "").is_err());
+        let ar = |step: &str, native: &str| {
+            format!(
+                r#","ar_decoder":{{{step}{native}"layers":1,"heads":6,"head_dim":32,"max_positions":128,"bos_id":3,
+                "eos_id":2,"top_k":32}}"#
+            )
+        };
+        let a = with(
+            native,
+            &ar(
+                "",
+                r#""native":{"path":"m.ar_step.safetensors","precision":"int8"},"#,
+            ),
+        )
+        .unwrap()
+        .ar_decoder
+        .unwrap();
+        assert_eq!(
+            (a.step_path.is_none(), a.native_path.is_some()),
+            (true, true)
+        );
+        assert!(with(native, &ar("", "")).is_err());
+        assert!(with(native, &ar(r#""step":{"precision":"int8"},"#, "")).is_err());
+    }
+
     /// A reading corrector's own manifest: its threshold in decode_defaults.corrector_threshold, absent by default.
     #[test]
     fn loads_the_corrector_threshold() {
@@ -992,7 +1083,7 @@ mod tests {
         let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
         assert_eq!(
             c.manifest.proposal_path,
-            canon(dir.join("m.corrector.int8head.onnx"))
+            Some(canon(dir.join("m.corrector.int8head.onnx")))
         );
         assert_eq!(c.manifest.vocab_path, m.vocab_path);
         assert_eq!(c.manifest.special_ids, m.special_ids);
@@ -1063,7 +1154,7 @@ mod tests {
         let ar = m.ar_decoder.expect("ar_decoder");
         assert_eq!(
             ar.step_path,
-            std::fs::canonicalize(dir.join("m.ar_step.fp32.onnx")).unwrap()
+            Some(std::fs::canonicalize(dir.join("m.ar_step.fp32.onnx")).unwrap())
         );
         assert_eq!(
             (
@@ -1183,7 +1274,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ctc_nat_manifest");
         let m = CtcNatManifest::load(&dir.join("model.int4.manifest.json")).unwrap();
         let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
-        assert_eq!(m.proposal_path, canon(dir.join("model.int4.onnx")));
+        assert_eq!(m.proposal_path, Some(canon(dir.join("model.int4.onnx"))));
         assert_eq!(m.precision, "int4");
         assert_eq!(
             m.vocab_path,

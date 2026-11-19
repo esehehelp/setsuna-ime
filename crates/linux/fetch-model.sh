@@ -148,7 +148,7 @@ if ! jq -e --arg p "$precision" \
 fi
 # All names remain relative to the manifest, including nested artifact paths.
 manifest_dir=$(dirname "$manifest_rel")
-list=$(jq -r '[.proposal.path, .vocab] + ([.proposal.external_data // empty] | flatten) + [.input_vocab // empty, .crf.path // empty, .rescore.pairs // empty, .rescore.words // empty]
+list=$(jq -r '[.proposal.path // empty, .vocab] + ([.proposal.external_data // empty] | flatten) + [.input_vocab // empty, .crf.path // empty, .rescore.pairs // empty, .rescore.words // empty]
     + [.proposal.native.path // empty, .ar_decoder.step.path // empty] + ([.ar_decoder.step.external_data // empty] | flatten)
     + [.ar_decoder.native.path // empty, .corrector.proposal.path // empty, .corrector.proposal.native.path // empty]
     | unique

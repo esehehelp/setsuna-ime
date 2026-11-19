@@ -2,7 +2,7 @@
   "schema": "setsuna-model-download-v1",
   "name": "Cymbidium-v1.2-xsmall",
   "repository": "esehe/Cymbidium-v1.2-xsmall",
-  "revision": "7fe22dfd7c803fa913d44125fe7f92b28f0122ed",
+  "revision": "67465654ddda4ad069974e66f49b4b1a4d304f45",
   "license": "Apache-2.0",
   "variants": {
     "int8": {
@@ -10,13 +10,8 @@
       "files": [
         {
           "path": "Cymbidium-v1.2-xsmall.manifest.json",
-          "size": 675,
-          "sha256": "454b72369a52ff1aca9fad13fd7b84dd1ed37c8d747741e266b0d1cb8b4a62b5"
-        },
-        {
-          "path": "Cymbidium-v1.2-xsmall.onnx",
-          "size": 22987122,
-          "sha256": "e41ddc9c9c5312664a1c97fe49cf79b7faff33e6ddee1dde1055abaff740e360"
+          "size": 632,
+          "sha256": "dcc2f0bf79d0831a6c75a3b411e984d216b9a8996271cf99b0b8b40cecbee14f"
         },
         {
           "path": "Cymbidium-v1.2-xsmall.encoder.safetensors",
@@ -39,7 +34,7 @@
   "models": {
     "Diphylleia-v1.0-flash": {
       "repository": "esehe/Diphylleia-v1.0-flash",
-      "revision": "058599ec5cd95677cb3131670d26bf52745e1d70",
+      "revision": "cd178d6c02283fb0c308cdfb41d698311de77761",
       "license": "Apache-2.0",
       "variants": {
         "int8": {
@@ -47,23 +42,13 @@
           "files": [
             {
               "path": "Diphylleia-v1.0-flash.manifest.json",
-              "size": 1207,
-              "sha256": "5feac1c23176d93de48769254e70e34fa320980769973dcdf4de8369d98d1698"
-            },
-            {
-              "path": "Diphylleia-v1.0-flash.onnx",
-              "size": 22575623,
-              "sha256": "1a228b6168c5baedc4c0f9e8495216f5495e091fd41f9ee50148e07e6939ad1b"
+              "size": 1061,
+              "sha256": "1d5f3d81c5cc3adb42e955c629c9f8ecd818e15ab8919eaac23981d68d190bca"
             },
             {
               "path": "Diphylleia-v1.0-flash.encoder.safetensors",
               "size": 22264649,
               "sha256": "c04bc91a5a89a256d8255677a170f92d48c9419db74954ef8f4840c4c31fc1e7"
-            },
-            {
-              "path": "Diphylleia-v1.0-flash.ar_step.onnx",
-              "size": 3841808,
-              "sha256": "2f5612680045e429b8ece143f909735504fbd69a77b1699cfbf2378dfa59d32d"
             },
             {
               "path": "Diphylleia-v1.0-flash.ar_step.safetensors",
@@ -132,19 +117,14 @@
     },
     "corrector": {
       "repository": "esehe/Nandina-v1.0-tiny",
-      "revision": "db3907f055e901309125620bc6cada9b020a126d",
+      "revision": "9d72bb674e085846caa8123b4f0073c2050b843b",
       "license": "Apache-2.0",
       "entry": "Nandina-v1.0-tiny.manifest.json",
       "files": [
         {
           "path": "Nandina-v1.0-tiny.manifest.json",
-          "size": 3720,
-          "sha256": "4182ff31ec272d716d2b528f3447943bd97eaffb5a09308f2016210fe333ffa0"
-        },
-        {
-          "path": "Nandina-v1.0-tiny.onnx",
-          "size": 4277749,
-          "sha256": "58af51274dfc58f188fefdd0c229206badf74185ef1f3e589c5c7c6b40f72bbc"
+          "size": 3681,
+          "sha256": "1d6ab5d2e4b8e305a3492449d244d2891db00b9a2970363b5e1b0e9e8dda4b4f"
         },
         {
           "path": "Nandina-v1.0-tiny.encoder.safetensors",

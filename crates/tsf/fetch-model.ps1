@@ -197,7 +197,8 @@ if ($manifest.corrector) {
     $artifacts += @($manifest.corrector.proposal.path)
     if ($manifest.corrector.proposal.native) { $artifacts += @($manifest.corrector.proposal.native.path) }
 }
-$artifacts = @($artifacts | Select-Object -Unique)
+# a graph the package leaves out (its native weights alone) is no file
+$artifacts = @($artifacts | Where-Object { $_ } | Select-Object -Unique)
 $relativeFiles = @($artifacts | ForEach-Object {
     Assert-ArtifactPath $_
     if ($manifestDir) { "$($manifestDir.Replace('\', '/'))/$_" } else { $_ }

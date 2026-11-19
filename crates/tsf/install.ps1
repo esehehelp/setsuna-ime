@@ -492,9 +492,10 @@ function Get-ManifestFiles {
     } catch {
         return @()
     }
-    @($j.proposal.path, $j.proposal.external_data, $j.vocab, $j.input_vocab, $j.crf.path,
-      $j.rescore.pairs, $j.rescore.words, $j.weights.path, $j.tokenizer.path,
-      $j.dictionary.path, $j.alternates) |
+    @($j.proposal.path, $j.proposal.external_data, $j.proposal.native.path, $j.vocab, $j.input_vocab, $j.crf.path,
+      $j.rescore.pairs, $j.rescore.words, $j.ar_decoder.step.path, $j.ar_decoder.step.external_data,
+      $j.ar_decoder.native.path, $j.corrector.proposal.path, $j.corrector.proposal.native.path,
+      $j.weights.path, $j.tokenizer.path, $j.dictionary.path, $j.alternates) |
         ForEach-Object { $_ } | Where-Object { $_ -is [string] -and $_ }
 }
 
@@ -796,7 +797,8 @@ if ($ManifestJson.corrector) {
     $ArtifactFiles += @($ManifestJson.corrector.proposal.path)
     if ($ManifestJson.corrector.proposal.native) { $ArtifactFiles += @($ManifestJson.corrector.proposal.native.path) }
 }
-$ArtifactFiles = @($ArtifactFiles | Select-Object -Unique)
+# a graph the package leaves out (its native weights alone) is no file
+$ArtifactFiles = @($ArtifactFiles | Where-Object { $_ } | Select-Object -Unique)
 foreach ($rel in $ArtifactFiles) {
     Assert-InsideDir -Rel $rel -Dir $ManifestItem.Directory.FullName -What 'manifest'
     $src = Join-Path $ManifestItem.Directory.FullName $rel
@@ -887,7 +889,7 @@ if ($Corrector) {
     if ($CorrectorJson.proposal.external_data) { $CorrectorFiles += @($CorrectorJson.proposal.external_data) }
     if ($CorrectorJson.proposal.native) { $CorrectorFiles += @($CorrectorJson.proposal.native.path) }
     if ($CorrectorJson.input_vocab) { $CorrectorFiles += @($CorrectorJson.input_vocab) }
-    $CorrectorFiles = @($CorrectorFiles | Select-Object -Unique)
+    $CorrectorFiles = @($CorrectorFiles | Where-Object { $_ } | Select-Object -Unique)
     foreach ($f in $CorrectorFiles) {
         Assert-InsideDir -Rel $f -Dir (Split-Path -Parent $Corrector) -What 'reading corrector manifest'
         if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Corrector) $f))) {
