@@ -886,11 +886,13 @@ fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
         "corrector",
         corrector_of(c).map(|p| p.display().to_string()),
     );
-    // not a number: left to the corrector's own, rather than an engine that does not start
+    // the IME's default where config.toml sets none (or not a number, rather than an engine that
+    // does not start), given whenever a corrector is configured
     flag(
         "corrector-threshold",
         c.corrector_threshold
             .filter(|t| !t.is_nan())
+            .or_else(|| corrector_of(c).map(|_| crate::config::DEFAULT_CORRECTOR_THRESHOLD))
             .map(|t| t.to_string()),
     );
     match &c.vocab_blacklist {
@@ -979,12 +981,17 @@ mod tests {
             corrector_manifest: Some(PathBuf::from("c/corrector.manifest.json")),
             ..EngineCfg::default()
         };
+        // with it, the IME's default threshold where config.toml sets none
+        let args = args_of(&corrector);
         assert_eq!(
-            args_of(&corrector).last().unwrap(),
-            &format!(
-                "--corrector={}",
-                Path::new("c/corrector.manifest.json").display()
-            )
+            args[args.len() - 2..],
+            [
+                format!(
+                    "--corrector={}",
+                    Path::new("c/corrector.manifest.json").display()
+                ),
+                "--corrector-threshold=4".to_string()
+            ]
         );
         let none = EngineCfg {
             corrector_manifest: Some(PathBuf::new()),

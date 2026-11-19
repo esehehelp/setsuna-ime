@@ -473,7 +473,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
       <div class="desc">補正モデルが、打ったままの読みより補正した読みをこの値を超えて確かだと見たとき、補正した読みの変換を先頭にします（それ以下では 2 番目）。小さいほど打ち間違いが直って出やすくなり、正しく打った読みが書き換わることも増えます。目安は 4〜5。「既定」はモデルの値です</div>
     </div>
     <div class="control">
-      <input type="range" id="corrector_threshold" min="0" max="15" step="0.5">
+      <input type="range" id="corrector_threshold" min="0" max="15" step="0.5" data-default="4">
       <span class="value" id="corrector_threshold_value"></span>
       <button id="corrector_threshold_reset">既定に戻す</button>
     </div>
@@ -912,8 +912,8 @@ function render() {
 
   $("strength").value = cfg.learning.strength;
   $("similarity_threshold").value = cfg.learning.similarity_threshold;
-  // unset (the corrector's own): the thumb at the end, "既定" beside it
-  $("corrector_threshold").value = cfg.engine.corrector_threshold ?? $("corrector_threshold").max;
+  // unset (the IME's default, config::DEFAULT_CORRECTOR_THRESHOLD): the thumb there, "既定" beside it
+  $("corrector_threshold").value = cfg.engine.corrector_threshold ?? $("corrector_threshold").dataset.default;
   renderReplacements();
   renderRewriter();
   renderKeyboard();
@@ -1119,7 +1119,7 @@ $("corrector_threshold").addEventListener("input", (e) => {
 // Unset again: the key leaves the config, and saving takes its line out of config.toml.
 $("corrector_threshold_reset").addEventListener("click", () => {
   delete cfg.engine.corrector_threshold;
-  $("corrector_threshold").value = $("corrector_threshold").max;
+  $("corrector_threshold").value = $("corrector_threshold").dataset.default;
   changed();
 });
 $("add_rep").addEventListener("click", () => {

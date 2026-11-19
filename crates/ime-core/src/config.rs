@@ -298,11 +298,18 @@ pub struct EngineCfg {
     /// corrector must be for its reading to be converted first
     /// (`--corrector-threshold`: log P(corrected) - log P(as typed), in
     /// nats). Lower, and more slips come out corrected, and more readings
-    /// typed right are rewritten too. Unset: the corrector's own (its
-    /// manifest's `decode_defaults.corrector_threshold`).
+    /// typed right are rewritten too. Unset: [`DEFAULT_CORRECTOR_THRESHOLD`]
+    /// whenever a corrector is configured (not its manifest's own
+    /// `decode_defaults.corrector_threshold`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrector_threshold: Option<f32>,
 }
+
+/// The reading corrector's threshold where config.toml sets none: 4 nats, by
+/// a sweep of Cymbidium-v1.2-class models with their corrector (top 1 of
+/// typed slips up 9 to 13 points against the corrector's own 11.6, at most 2
+/// of a set typed right lost).
+pub const DEFAULT_CORRECTOR_THRESHOLD: f32 = 4.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
