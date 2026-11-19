@@ -52,7 +52,9 @@ typedef struct {
 
 /* Load config.toml and spawn the daemons it asks for (the engine; the
  * reranker and rewriter when set up). `module_dir` (may be NULL) is searched
- * last for them and the models. Never returns NULL. */
+ * last for them and the models. A failure there leaves the defaults; NULL
+ * only when not even they could be set up (every call then does nothing and
+ * setsuna_session_view returns NULL). */
 SetsunaSession *setsuna_session_new(const char *module_dir, SetsunaNotify notify,
                                   void *user);
 /* Stop the daemons; no notify follows once this returns. */

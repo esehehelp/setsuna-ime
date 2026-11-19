@@ -344,7 +344,9 @@ fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
 /// Start a session: load `config.toml` and spawn the daemons it asks for.
 /// `module_dir` (may be null) is where the engine and models are looked for
 /// last, and the mixed input model (`mixed`, installed with the addon) when
-/// `[frontend] mixed_model` is not set. Never returns null.
+/// `[frontend] mixed_model` is not set. A panic loading `config.toml` or
+/// starting the daemons leaves the session on its defaults; null only when
+/// not even that session could be made.
 ///
 /// # Safety
 /// `module_dir` is null or a NUL-terminated string. `notify` may be called
@@ -361,7 +363,9 @@ pub unsafe extern "C" fn setsuna_session_new(
             .then(|| PathBuf::from(CStr::from_ptr(module_dir).to_string_lossy().into_owned()));
         let config_path = Config::appdata_config_path();
         let mut s = Box::new(SetsunaSession::empty(module_dir, config_path, notify, user));
-        s.sync_config("", true);
+        guard((), || {
+            s.sync_config("", true);
+        });
         s.refresh();
         Box::into_raw(s)
     })

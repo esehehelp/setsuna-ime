@@ -458,6 +458,9 @@ private:
 
     void render(InputContext *ic, bool commit = true) {
         const SetsunaView *v = setsuna_session_view(session_);
+        if (!v) {
+            return;
+        }
         for (size_t i = 0; commit && i < v->n_commits; i++) {
             ic->commitString(v->commits[i]);
         }
