@@ -1,5 +1,5 @@
 # Build what the runs of this project execute into the run's output directory
-# (bin/: the engine, the bench, ONNX Runtime) with build.txt saying from what.
+# (bin/: the engine and the bench) with build.txt saying from what.
 # Declared `regenerable` in kairo.toml: its output is temporal data, made
 # again from the same snapshot when a reader needs it and it was evicted.
 # cargo's target and home stay in the project's cache on this node

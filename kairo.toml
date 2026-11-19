@@ -71,7 +71,7 @@ min_free_after_bytes = 10737418240
 
 # --- temporal: made again from the snapshot when evicted --------------------
 
-# The engine, the bench and ONNX Runtime (kairo/build.ps1).
+# The engine and the bench (kairo/build.ps1).
 [[tasks]]
 name = "build-20261116"
 queue = "build"
