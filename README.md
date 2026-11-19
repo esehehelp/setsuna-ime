@@ -1,578 +1,254 @@
-# Setsuna IME
+# Setsuna IME（刹那）
 
-Setsuna (刹那) is a Japanese input method built around a non-autoregressive
-neural kana-kanji converter (CTC-NAT). This repository holds the inference engine, the IME
-frontends for Windows (TSF), Linux (fcitx5) and Android (in development), an optional LM reranker and a
-settings GUI. **Research stage**: a public conversion model
-is available, and the Windows installer downloads it automatically (see
-[Status](#状態)).
+Setsuna (刹那) is a Japanese input method built around a non-autoregressive neural kana-kanji converter (CTC-NAT). It provides fast CPU live conversion with frontends for **Windows (TSF)**, **Linux (fcitx5)**, and **Android** (in development), plus an optional LM reranker, LLM rewriter, and settings GUI.
 
-Setsuna（刹那）は、非自己回帰のニューラルかな漢字変換（CTC-NAT）を中心にした
-日本語入力メソッド。推論エンジン、
-Windows（TSF）と Linux（fcitx5）の IME（Android 版は開発中）、言語モデルによるリランカ、設定 GUI
-を含む。
+**Setsuna（刹那）** は、非自己回帰ニューラルかな漢字変換（CTC-NAT）を中心とした日本語入力メソッド（IME）です。CPU 上で 1 文あたり数ミリ秒の高速なライブ変換を実現します。
 
-## 状態
+> **ステータス**: 研究・開発段階のプロジェクトです。公開変換モデル（Apache-2.0）と辞書（CC BY-SA 4.0）はインストーラーから自動取得してそのまま試用できます。
 
-研究段階のプロジェクト。変換モデル
-[Cymbidium-v1.1-xsmall](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)（約 23 MB）、
-[Cymbidium-v1.0-xsmall](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall)（約 14 MB）と
-[Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（約 130 MB）
-（どれも Apache-2.0）を公開しており、Windows・Linux のインストーラーは既定で
-Cymbidium-v1.1-xsmall を自動取得する（ほかは `-Model Cymbidium-v1.0-xsmall`・
-`-Model Bletilla-v0.1-small`、Linux は `--model` で同じ名前）。Cymbidium は Bletilla から
-切り出して学習し直した小さいモデルで、v1.1 の 1 位の正解率は wiki_fresh_v4 で Bletilla より
-高く（82.3 対 81.1）、AJIMEE では同程度（79.1 対 78.0）、変換は約 3 倍速い（1 スレッド・
-AJIMEE の 1 文の中央値 2.4〜2.6 ms 対 7.6〜8.4 ms）。上位 5 位までに正解が入る率は
-Bletilla が高い（wiki_fresh_v4 88.4 対 89.3、AJIMEE 87.4 対 92.5）。
+---
 
-- エンジンと IME はこの変換モデルを前提に調整している（記号分割、
-  前の文脈 64 トークン、読みは 80 文字までなら文をまたいで一度に変換し、それより長い
-  読みは文末（。！？）と読点で区切って前の区切りの変換結果を文脈に順に変換する）。
-- 辞書データは、生成元は公開せず辞書ファイルとして配布し、エンジンと IME は
-  それを読んで使う予定。今読むのは記号辞書（`[frontend] symbol_dictionary_file`）
-  と英字の名前の辞書（`name_dictionary_file`）、読みの辞書（`[lexicon] file`）。
+## インストール
 
-モデルが無くてもビルドとテストは通り、日付・時間候補のようにモデルを使わない
-部分は動く。
+### Windows（TSF / x64 Windows 10・11）
 
-## 特徴
+Windows PowerShell 5.1 または PowerShell 7 (`pwsh`) で実行します（`regsvr32` 登録時に UAC が表示されます）。
 
-- **推論専用エンジン** — CTC-NAT の proposal（ONNX）→ CTC beam search →
-  候補。モデルは manifest 経由でのみ読み、推奨 decode 設定も manifest に載る。
-  stdio の JSONL protocol で動く daemon として IME から使う。Windows では
-  ログイン中の全アプリが 1 つのエンジン（`setsuna-engine serve`、名前付きパイプ）を
-  共有し、モデルはメモリに 1 つだけ載る。最後のアプリが離れて 10 分で終了する。
-  管理者権限のアプリは、自分専用の子プロセスを使う。AppContainer のアプリ
-  （スタートメニューの検索、ストアアプリ）は、ほかのアプリが起動した共有エンジンに
-  つなぐだけで、自分では起動しない（サンドボックスごとにモデルを載せない）。
-- **文節編集** — CTC アラインメント（候補の各文字の読み位置）から文節を作り、
-  変換中に ← / → / Shift+← / Shift+→ で文節ごとに編集できる。英日混在入力で
-  英語と読んだ文節には、その英字をローマ字として読んだひらがな・カタカナと、
-  その読みの変換も出る（`yoro` → よろ・ヨロ・…）。文節編集中の F6–F10
-  （Ctrl+U / I / O / P / T）は選んでいる文節だけを変える。
-- **Esc** — 変換（ライブ変換の表示、候補の窓、F6–F10）を表示しているときの Esc は
-  打ったかなに戻し、もう一度の Esc で入力を消す（MS-IME と同じ）。かなに戻した
-  ところで Enter はかなを確定し、Space で変換し直し、続けて打てばまた変換する。
-  `escape_to_kana = false` で、候補の窓からはライブ変換の表示に戻り、そこからの
-  Esc で消す動きに戻す。
-- **ライブ変換の Backspace** — 表示している変換の最後の 1 文字を、その下の読みと
-  一緒に消し、残りは表示のまま（東京に行く → 東京に行 → 東京に）。打ちかけの
-  ローマ字、まだ変換されていないかな、1 文字では読めない字（今日の日）は、
-  読みのかなを 1 文字ずつ消す。`backspace_deletes_shown =
-  false` で、読みの最後のかなを消して残りを変換し直す動きに戻す。
-- **リランク（任意）** — 入力が止まったときに causal LM（llama.cpp、GGUF）で
-  上位候補の対数尤度を足して並べ替える。`[rerank] defer_ms` を設定すると、
-  ライブ変換の表示を並べ替えの結果まで待たせて、先頭が二度入れ替わらないように
-  する（Mozkey の deferred display と同じ考え方）。Windows ではログイン中の
-  全アプリが 1 つのリランカ（`setsuna-rerank serve`、名前付きパイプ）を共有し、
-  60 秒使われなければ LM のキャッシュを手放し、最後のアプリが離れて 10 分で終了する。
-  Linux では最初の並べ替えで起動し、5 分使われなければ終了する。
-- **文字 n-gram（任意）** — 学習データの文字 bigram / trigram の数から、
-  偶然より珍しい文字の並びを含む候補（はくし → 博士と白紙が混ざった「博紙」）を
-  下げる。engine のスコアに足してから並べ替え、リランカはその後に足す
-  （`[ngram] table`）。
-- **学習** — 選んだ候補を覚えて並べ替える。読みの文字 bigram のコサイン
-  類似度で似た読みにも適用し、変えた単語単位でも学習する。文節を直すときの
-  文節ごとの候補にも、その候補にしたときの文として適用する（学習で上がる候補は
-  選んでいる候補のすぐ次に置き、表示は変えない。長さを変えた文節は先頭にして選ぶ）。
-  確定した変換を覚えて、読みの始めを打って Tab を押すと予測として候補の窓に
-  出す（打っている間に窓は出さない。直前に確定した語のあとによく打ったものを
-  上げる。一度だけ確定したものは 3 文字打ってから。読みが 16 文字を超える文は
-  覚えない。`prediction`）。
-  変換中に Ctrl+Delete で、選んでいる候補の学習を取り消す（学習で上がった
-  候補でなければ、その読みでは表示しないようにする。設定 GUI で戻せる。
-  読みのかなとカタカナ、候補が 1 つだけのときのその候補は窓に残す）。Tab で
-  開いた予測の上での Ctrl+Delete は、その予測を消して以後出さない（学習は
-  そのまま）。
-  学習履歴（`learning.jsonl`）は追記していくので、同じ選択の繰り返しや取り消した
-  選択の行がたまる：読み込むときに、行が 500 を超えて有効な選択の 2 倍より多ければ、
-  有効な選択だけを回数つきで書き直す（ほかのプロセスが書き足している最中なら
-  書き直さない）。書き直した履歴を以前の版で読むと、回数は 1 回として扱われる。
-- **候補の後処理** — 記号の全角半角、句読点の種類、中黒の統一、任意置換、
-  読みに無い記号を含む候補の除外。記号キーで入力する記号（`[frontend.symbols]`）は
-  設定 GUI の「入力する記号」で全角（！（）＃）・半角（! ( ) #）を選ぶか記号ごとに
-  選べる（、。・「」 にしているキーはそのまま）。モデルは候補を 1 文字ずつ出すので、どの辞書にも
-  無い候補（ぞくとう → 続頭、きょう → き今日）が混じる：かなの 1 文字だけ文字種が
-  違う候補（決まッた、よろ → よロ・ヨろ）と、リランカの点が最良より大きく低い候補を外す。
-  かなを数字にした候補（がっこうにいったときに → 学校に行ったとき2・学校に1たときに、
-  よろ → 4路）も外す：打っていない数字は、その数の読み（にがつ → 2月、さんぜんにん →
-  3千人）か、助数詞の前の形（いっかい → 1回、よにん → 4人、ひとつ → 1つ、ついたち →
-  1日）で読めるときだけ残す。読みの辞書
-  （`[lexicon] file`。表記・読み・コスト・品詞の文脈 ID の表と接続コストの表を
-  `examples/lexicon.rs build` で変換したもの）があれば、候補を辞書の語・打ったかな・
-  数字・記号の並びとして読んだ最小のコスト（語のつながりのコストを含む）を点から引き
-  （よく使われる語でできた表記ほど上がる）、最小よりずっと高い候補を外す。辞書だけで
-  変換した候補のうち、モデルの最も安い候補より 8 までしか高くないもの（研修担当者に
-  対する検収担当者のような語の同音異義）も候補に足す。読みが 1 語（と後ろの助詞・
-  送り仮名 3 文字まで）のときは、その読みの辞書の語のうちモデルが出さなかったものを
-  上位 3 つとかなの後に並べる（文節編集の文節の候補にも。英日混在入力がオンでも、
-  読みに英字がなければ）。読みがかな 1〜2 文字なら、その読みの 1 文字の漢字を
-  辞書からよく使われる順に 50 まで、候補の 1 ページ目（9 個）の後に並べる
-  （あ → 亜 亞 啞 痾 在 婀 有 合 吾 唖 我 阿 …）。
-- **候補の窓** — テーマ（自動は Windows のアプリのモードに合わせてライト・
-  ダーク）、大きさ、文字の大きさと太さ、角の丸み、不透明度（`[ui.candidate_window]`、
-  設定 GUI の「候補の窓」）。窓はカーソルの下に出し、画面の下端（タスクバー）に
-  かかるときはカーソルの上に出す。左右もカーソルのあるモニターの作業領域に収める
-  （ページを送って大きさが変わったときも）。
-- **アプリ別の設定** — 実行ファイル名ごとに、開始時のオン・オフ、ライブ変換、
-  学習、書き直し、英日混在、予測を変える（`[[apps]]`、設定 GUI の「アプリ別の
-  設定」）。
-- **入力方式** — ローマ字表を選べる（`romaji_table`）：標準、AZIK、かな入力
-  （JIS 配列）、Mozc 形式の表のファイル。設定 GUI の「入力方式」でも変えられる。
-  ローマ字として読めない文字があると、隣のキー・余計なキー・入れ替えを直した
-  読みの候補も出す（kaisga → 会社。`typo_correction`）。ずとづの取り違えも、
-  英日混在入力のかなのモデルで直す：直した読みの方がずっと読みらしければその
-  読みで変換し（tuzuku → 続く、katazukeru → 片付ける、midu → 水）、打った読みの
-  候補も上位の後に出す（kizuitara → 気づいたら、築いたら。打った読みが語として
-  まずない tuzuku などでは出さない）。どちらも使う読み（きずく：築く・気づく）は打ったとおり
-  変換し、もう一方の候補を上位の後に出す。じとぢは直さない（まぢか → 間近）。
-- **英日混在入力（任意）** — ローマ字の中の英単語を打ったまま残す
-  （kana / Latin の n-gram モデルによる分割。モデルは IME に同梱：
-  `crates/ime-core/data/mixed`、インストールで有効になり、`mixed_model = ""`
-  でオフ）。小文字で打った知らない語はローマ字の打ち間違いとして日本語に読む
-  （`kaisga` は かいsが。英単語として残すなら Shift で大文字を混ぜて打つ）。英単語の後ろの助詞
-  （`Ollamade` → Ollamaで）から日本語に戻る。小文字で打ったまれな語や名前が
-  「よくある英単語＋する」とも読めるときは文を取る（`dlsite` → dlして、助詞が
-  続けば `dlsitede` → DLsiteで。名前の表記どおり Shift で打てばそのまま）。
-  英単語が 2 語以上の英文は文頭を大文字にする。英単語の直後の `.` `,` `!` `?`
-  は、その文に日本語がなければ英文のまま（`this is a pen.`、英文を確定した後の
-  `.`）、日本語の文の中なら `、。`（`korehagoogle.` → これはgoogle。）
-  （`sentence_case`）。小文字で
-  打った英語の表記は `name_case` で選ぶ：`proper` は英字の名前の辞書
-  （`name_dictionary_file`）の固有名詞をその表記に（`github` → GitHub、
-  `iphone` → iPhone）、`acronyms`（既定）はさらに、英単語として読めない
-  つづりの略語を大文字に（`pc` → PC、`usb` → USB、`ok` → OK）。`word` や
-  `apple` のように普通の語でもある名前はどちらでもそのまま。設定 GUI の
-  「英日混在入力」でも変えられる。
-  URL（`https://…`）、メールアドレス、パス（`C:\…`、`~/…`）、@メンションは
-  途中で切らず打ったまま残す。`pass_through_commands` をオンにすると、行の先頭や
-  空白の後の `/コマンド`・`$スキル`・`@ファイル` を変換せずにアプリへ送る（AI
-  エージェントの補完が使える。アプリの文章を読めるとき）。
-- **ユーザー辞書** — 設定 GUI で語を登録する（`user_dictionary.txt`、Google
-  日本語入力 / Mozc と同じ形式）。読み全体のほか、長い読みの一部に一致しても
-  その部分を登録した語にした候補を出す。品詞「短縮よみ」は読み全体だけで、
-  ライブ変換ではその読みちょうどのときだけ表示する（続けて打つと消える）。
-  「抑制単語」はその語を出さない。ローマ字として読めない英字・記号だけの読み
-  （`w` → (笑)、全角は半角に、大文字は小文字にそろえる）も登録でき、そのとおり
-  打って Space で登録した語と打ったままの文字の候補を出す（英日混在入力で英語と
-  読んだ語でも、空白を打たずに出す。長い読みの一部には当てない）。英日混在入力が
-  英語と読んだ語の、ローマ字として読んだ読み（`yoro` の よろ）の登録した語は、
-  すべて候補に出す。Google 日本語入力 / Mozc、Microsoft IME、
-  ATOK、Gboard の書き出したファイルを読み込める。
-- **日付・時間候補**、**数字の候補**（数字だけを Space で変換すると、打った数字の
-  すぐ後に日付になる候補：1001 → 10月1日・10/1・10/01・10:01、20261001 →
-  2026/10/01。エンジンの答えを待たずに出る。1234 → 1,234・千二百三十四・
-  壱阡弐百参拾四・12:34、じゅうに → 12、2025ねん → 令和7年、れいわ7ねん → 2025年、`1+2=` → 3、
-  `U+3042` → あ。`number_candidates`）、**絵文字・顔文字**（にこにこ → 😊、
-  えもじ / かおもじ で一覧。`emoji_candidates`）、**記号辞書**（`やじるし` → `→`、
-  ギリシャ文字 `あるふぁ` → `α` `Α` など）。
-- **書き直し（任意、Windows）** — Space で変換すると、OpenAI のモデルが入力を
-  自然な日本語に書き直した候補を先頭に出す。
-  ChatGPT プラン（Sign in with ChatGPT）、OpenAI の API キー、OpenAI 互換 API
-  のどれでも使える（[書き直し](#書き直し)）。
+```powershell
+# 標準インストール（既定モデル Cymbidium-v1.1-xsmall + 読み辞書・解析器を自動取得）
+irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
 
-## 構成
+# 変換モデルを切り替える例（Bletilla-v0.1-small）
+& ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -Model Bletilla-v0.1-small
 
-依存は一方向: artifact → runtime → platform。
+# 辞書・解析器を取得せずモデルのみ入れる場合
+& ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -NoDictionaries
+```
 
-| crate | 層 | 内容 |
+- リリース zip（`setsuna-ime-<version>-windows-x64.zip`）を展開して `install.cmd` を実行しても同じです。Visual C++ ランタイム（14.44 以上）が無い場合は自動導入します。
+- **設定 GUI**: タスクバーの「あ / A」アイコンを右クリック →「設定...」から開けます。変更は次の入力から反映されます。
+- **起動中アプリへの更新反映**: TSF に登録した軽量シム（`setsuna_tsf_shim.dll`）が新バージョンの本体 DLL をホットスワップし、旧エンジンプロセスも自動停止するため、アプリを再起動せずに更新が届きます。
+- **アンインストール**: `%LOCALAPPDATA%\setsuna-ime\uninstall.ps1` を実行します。
+
+### Linux（fcitx5 / x86_64）
+
+fcitx5 5.1 以上・glibc 2.39 以上（Arch Linux、Fedora 40+、Ubuntu 24.04+ など）に対応しています。
+
+```sh
+# 標準インストール（既定モデル + 読み辞書・解析器を自動取得し fcitx5 へ登録・再起動）
+curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
+
+# 変換モデルを切り替える例
+curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash -s -- --model Bletilla-v0.1-small
+
+# 辞書・解析器なし / fcitx5 への登録を行わない例
+curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash -s -- --no-dictionaries --no-register
+```
+
+- アドオンは fcitx5 のアドオンディレクトリへ、エンジン・モデル・辞書は `/usr/lib/setsuna-ime` へ入ります（WebKitGTK 4.1 がある環境では `/usr/bin/setsuna-settings` も配置されます）。
+- **設定 GUI**: fcitx5 の設定画面・状態表示メニュー・アプリメニューの「Setsuna の設定」から開けます。
+- **アンインストール**: `sudo /usr/lib/setsuna-ime/uninstall.sh` を実行します。
+
+### Android（開発中 / arm64・Android 8 以降）
+
+Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキスト編集・クリップボード履歴を備えた Android IME です。アプリ内の設定画面（「この端末」）から変換モデルや辞書を Hugging Face 経由でダウンロードできます。現在はソースからのビルドで導入します（[Android のビルド](#android) を参照）。
+
+---
+
+## 主な機能
+
+### 変換・編集
+- **ライブ変換**: 入力と並行してリアルタイムに変換を表示します。表示中の文字をそのまま 1 文字ずつ消す Backspace（`backspace_deletes_shown`）や、`Esc` 1 回でかなに戻し 2 回目で入力を消す MS-IME 互換挙動（`escape_to_kana`）に対応しています。
+- **文節編集**: CTC アラインメントと形態素解析器（`--analyzer`）で文節に区切り、`←` / `→` で文節移動、`Shift+←` / `Shift+→` で文節伸縮ができます。選択文節のみの字種変換（`F6`–`F10`）も可能です。
+- **読み辞書による候補補完・フィルタ**: 読み辞書（`[lexicon]`）がある場合、語の連接コストで不自然な文字単位の誤変換を除外しつつ、モデルが出さなかった同音異義語や単漢字候補（1〜2 文字のかな入力時）を補完します。
+
+### 英日混在入力・誤入力補正
+- **英日混在入力**: 同梱のかな / 英字 n-gram モデルにより、日本語入力のまま英単語・URL・メールアドレス・パス・`@` メンションを自動で切り分けて保持します。固有名詞・略語の大文字化（例: `github` → `GitHub`、`pc` → `PC`、`name_case`）や英文の文頭大文字化にも対応します。
+- **AI ツール向けコマンド透過**: `pass_through_commands = true` にすると、行頭や空白直後の `/コマンド`・`$スキル`・`@ファイル` を変換せずアプリへ直接送ります。
+- **入力方式・ローマ字表**: 標準・AZIK・JIS かな入力・Mozc 形式のカスタム表（`romaji_table`）を選べます。
+- **誤入力補正（`typo_correction`）**:
+  - かなとして読めない打ち間違い（隣接キー・余計なキー・2 文字入れ替え、例: `kaisga` → 会社）の補正候補を提示します。
+  - `ず` / `づ` の取り違えをかなモデルで補正します（例: `tuzuku` → 続く、両方使われる `きずく` は両候補を提示）。
+  - 英大文字の直後に Shift を離し遅れた入力（例: `IMENo`、`IMEDemo`、`PCWokatta`）に対し、元の英語読みと並行して `IMEの`・`IMEでも`・`PCをかった` などの別読み候補を提示します。
+
+### 学習・予測・ユーザー辞書
+- **学習**: 選択した候補を `learning.jsonl` に記録し、全アプリ間で共有します。文全体だけでなく単語単位・文節編集時の候補リストにも適用されます。変換中に `Ctrl+Delete` で学習取り消し・候補の非表示化ができます。
+- **予測変換（`prediction`）**: 確定した変換を記憶し、読みの途中から `Tab` で予測候補を展開します（入力中に自動で窓は出しません）。
+- **ユーザー辞書**: `user_dictionary.txt`（Google 日本語入力 / Mozc 互換形式）を設定 GUI から編集でき、Mozc・MS-IME・ATOK・Gboard のエクスポート形式をインポートできます。部分一致、品詞「短縮よみ」「抑制単語」、`w` → `(笑)` のような英字・記号読みにも対応します。
+
+### ユーティリティ変換
+- **日付・時刻（`date_time_candidates`）**: `きょう`、`あした`、`いま`、`にちじ`、`らいしゅうのすいようび`、`らいげつ`、`30ぷんまえ`、`2しゅうかんご` などをモデル未起動でも展開します。
+- **数字・計算・文字コード（`number_candidates`）**: `1001` → `10月1日` / `10:01`、`1234` → `1,234` / 漢数字、`2025ねん` ⇔ `令和7年`、`1+2=` → `3`、`U+3042` → `あ`。
+- **絵文字・顔文字・記号**: `にこにこ` → `😊`、`えもじ` / `かおもじ` で一覧表示、記号辞書（`やじるし` → `→`、`あるふぁ` → `α`）に対応します。
+
+### 拡張機能（任意）
+- **LLM 書き直し（Windows / Linux）**: `[rewriter]` を有効にすると、変換時に OpenAI（Sign in with ChatGPT / API キー）または OpenAI 互換 API へ読み・変換結果・直前文脈を送り、自然な日本語に書き直した候補を先頭へ表示します。
+  - **プライバシー保護**: URL・メール・パス・API キー/トークン・長い数字・「パスワード」等の語を含む文脈や入力、およびパスワード/機密入力欄（InputScope / fcitx5 Sensitive）の内容は送信しません。資格情報は Windows では DPAPI 保護の `credentials.bin`、Linux / macOS では権限 `0600` の `credentials.json` に保存され、`config.toml` には書きません。
+- **LM リランカ（任意）**: llama.cpp（GGUF）による causal LM（`setsuna-rerank`）で上位候補の対数尤度を加算して並べ替えます。`[rerank] defer_ms` でライブ変換表示をリランク結果まで待たせることも可能です。
+- **文字 n-gram（任意）**: `[ngram] table` を指定すると珍しい文字連結（例: `博紙`）のスコアを下げます。
+- **設定 GUI・アプリ別設定**: `setsuna-settings` から変換挙動・記号の全角半角・候補ウィンドウ外観（Windows）・アプリごとのオン/オフや機能切替（`[[apps]]`）を設定できます。
+
+---
+
+## 公開モデル・辞書
+
+すべての公開ファイルは [crates/tsf/models.json](crates/tsf/models.json) に Hugging Face のリビジョン・サイズ・SHA-256 を固定しており、ログイン不要で検証つき取得が行われます。既定のインストールではダウンロード用キャッシュからハードリンクで配置した後にキャッシュを削除し、再実行時は既存の検証済みファイルをオフラインでも再利用します。
+
+### 変換モデル（Apache-2.0）
+
+| モデル | サイズ | Top-1 (wiki_fresh_v4 / AJIMEE) | Top-5 (wiki_fresh_v4 / AJIMEE) | 速度目安（1 スレッド中央値） | 用途 |
+|---|---:|---:|---:|---:|---|
+| [**Cymbidium-v1.1-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)（既定） | 約 23 MB | 82.3% / 79.1% | 88.4% / 87.4% | 2.4〜2.6 ms | 高速・高精度の標準モデル |
+| [**Cymbidium-v1.0-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) | 約 14 MB | — | — | — | より軽量な旧版（約 3 ms） |
+| [**Bletilla-v0.1-small**](https://huggingface.co/esehe/Bletilla-v0.1-small) | 約 130 MB | 81.1% / 78.0% | 89.3% / 92.5% | 7.6〜8.4 ms | 上位 5 候補カバー率重視 |
+
+### 辞書・解析器（CC BY-SA 4.0 / [esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）
+
+| コンポーネント | サイズ | 用途 |
+|---|---:|---|
+| `lexicon` (`lexicon-v1.lexicon`) | 約 222 MB | 読み辞書（候補スコア補正・フィルタ・単漢字展開） |
+| `lexicon-small` (`lexicon-v1-small.lexicon`) | 約 4 MB | モバイル向け軽量読み辞書（よく使う語＋全単漢字の補完のみ） |
+| `analyzer` (`nid-ma-v2-600k-tb`) | 約 288 MB | 形態素解析器（文節編集の境界判定） |
+
+---
+
+## 基本操作・設定ファイル
+
+### 主なキー操作
+
+| 操作 | キー（既定） |
+|---|---|
+| IME オン / オフ（Windows） | `半角/全角`、`Alt+半角/全角`、`` Alt+` ``、`IME オン` / `IME オフ`（`toggle_keys` / `on_keys` / `off_keys` で変更可） |
+| 変換・次候補 | `Space` / `↓` / `↑` / `PageUp` / `PageDown` / 数字キー |
+| 文節移動・伸縮 | `←` / `→`（移動）、`Shift+←` / `Shift+→`（伸縮） |
+| 字種変換（全体 / 選択文節） | `F6` ひらがな、`F7` カタカナ、`F8` 半角カタカナ、`F9` 全角英数、`F10` 半角英数（`Ctrl+U/I/O/P/T`） |
+| かなに戻す / 入力キャンセル | `Esc`（1 回目でかな戻し、2 回目でキャンセル） |
+| 予測候補を開く | `Tab` |
+| 候補の学習取消 / 非表示 | 変換中に `Ctrl+Delete` |
+
+### 設定・ログの保存先
+
+| OS | 設定ファイル | ログ |
 |---|---|---|
-| `crates/artifact` | artifact | manifest reader |
-| `crates/engine` | runtime | 推論エンジン（`setsuna-engine`、library / CLI / daemon） |
-| `crates/rerank` | runtime | LM リランカ（`setsuna-rerank`、llama.cpp） |
-| `crates/analyzer` | runtime | 形態素解析（vibrato の辞書と CRF のコスト。文 → 語と読み。`setsuna-engine --analyzer` が持つ） |
-| `crates/pipe` | runtime | 共有エンジン・共有リランカの名前付きパイプ（名前、Win32 の呼び出し、サーバのループ。Windows） |
-| `crates/ime-core` | platform | 各 frontend 共通の IME ロジック（ローマ字合成、状態遷移、後処理、学習、設定、daemon client） |
-| `crates/tsf` | platform | Windows TSF IME（DLL） |
-| `crates/linux` | platform | fcitx5 addon（Rust 部分 + `fcitx5/` の C++ shim） |
-| `crates/android` | platform | Android の入力メソッド（Rust 部分 + `app/` の Kotlin のサービスとキーボード。開発中） |
-| `crates/rewrite` | platform | 書き直し（`setsuna-rewrite`、Sign in with ChatGPT、OpenAI / 互換 API の client） |
-| `crates/settings` | platform | 設定 GUI `setsuna-settings`（システムの WebView に出す HTML 画面。Windows / macOS / Linux） |
+| **Windows** | `%APPDATA%\setsuna-ime\config.toml` | `%APPDATA%\setsuna-ime\tsf.log` |
+| **Linux** | `~/.config/setsuna-ime/config.toml` | `~/.local/state/setsuna-ime/fcitx5.log`（`$XDG_STATE_HOME` 優先） |
+| **Android** | `<app files>/config/setsuna-ime/config.toml` | `<app files>/state/setsuna-ime/` |
 
-frontend はエンジンをリンクせず、`setsuna-engine daemon` / `setsuna-rerank
-daemon` / `setsuna-rewrite daemon` を子プロセスとして起動し stdio で話す。
-Windows のエンジンとリランカは、ログインで 1 つずつの `setsuna-engine serve` /
-`setsuna-rerank serve` に名前付きパイプでつなぐ（管理者権限のアプリは子プロセス）。
+> **ログのプライバシー**: ログ（4 MB で `.1` にローテーション）には既定で打鍵文字や変換文字列を残さず、文字数のみを記録します。手元で不具合を調査したい場合のみ `config.toml` に `[diagnostics]` と `log_typed_text = true` を設定してください（パスワード欄は常に変換対象外のため記録されません）。
 
-## ビルド
+---
 
-Rust（stable）が要る。`crates/rerank` は llama.cpp をソースから build するので
-CMake と C/C++ コンパイラも要る。
+## アーキテクチャ・構成
+
+依存は **artifact → runtime → platform** の一方向です。各フロントエンドは推論エンジンを直接リンクせず、子プロセス（stdio JSONL）または共有サーバー経由で通信します。
+
+| Crate | 層 | 役割 |
+|---|---|---|
+| `crates/artifact` | artifact | 各モデルマニフェスト（`*-export-v1`）の読み込み・検証 |
+| `crates/engine` | runtime | CTC-NAT 推論エンジン `setsuna-engine`（library / CLI / daemon / Windows serve） |
+| `crates/rerank` | runtime | llama.cpp による LM リランカ `setsuna-rerank` |
+| `crates/analyzer` | runtime | vibrato / vibrato-packed 形態素解析器（`setsuna-engine --analyzer` が保持） |
+| `crates/pipe` | runtime | Windows 共有エンジン・リランカ用の名前付きパイプ実装 |
+| `crates/ime-core` | platform | 各フロントエンド共通の IME ロジック（ローマ字・状態機械・英日混在・学習・辞書・後処理・クライアント） |
+| `crates/tsf` / `tsf-shim` / `tsf-reg` | platform | Windows TSF IME DLL、ホットスワップ用シム、登録補助 |
+| `crates/linux` | platform | fcitx5 アドオン（Rust ライブラリ + `fcitx5/` の C++ shim） |
+| `crates/android` | platform | Android IME（Rust ライブラリ + `app/` の Kotlin キーボード・サービス） |
+| `crates/rewrite` | platform | LLM 書き直しデーモン `setsuna-rewrite`（Sign in with ChatGPT / OpenAI / 互換 API） |
+| `crates/settings` | platform | WebView 設定 GUI `setsuna-settings`（デスクトップ・Android 共用ページ） |
+
+### 実行モデルとマニフェスト
+
+- **プロセス共有（Windows）**: 通常アプリはログインごとに 1 つの共有サーバー（`setsuna-engine serve` / `setsuna-rerank serve`）へ名前付きパイプで接続し、モデルや解析器辞書のメモリを共有します（無接続 10 分で終了、リランカの KV キャッシュは 60 秒で解放）。AppContainer（スタートメニュー検索・ストアアプリ）は既存共有エンジンへ接続のみ行い、管理者権限アプリは専用子プロセスを使用します。
+- **マニフェスト駆動ロード**: モデルは必ず `*.manifest.json` 経由で読み込みます（例は `tests/fixtures/`）。
+  - **変換モデル**（`neo-ime-ctc-nat-export-v1`）: ONNX proposal グラフ・語彙・special token ID・`decode_defaults`・任意の CTC-CRF 遷移表 (`crf`) や rescore 表 (`rescore`)。カスタム op（`neo_ime` ドメインの `TokenMoE` / `AddLayerNorm` / `LinearQ4G` / `TokenMoEQ4G`）は AVX-512 VNNI・AVX-VNNI・AVX2・ARM dotprod（および汎用 Rust フォールバック）で実行されます。
+  - **リランカ**（`neo-ime-lm-scorer-export-v1`）: GGUF 重み、`score_defaults`、任意の SentencePiece トークナイザ。
+  - **解析器**（`neo-ime-analyzer-export-v1`）: `vibrato-zstd`（通常の vibrato 辞書 + 任意の別読み表 `alternates`）または省メモリな `vibrato-packed-zstd`（`vendor/vibrato-packed` + 符号表 `packed`、`examples/analyzer.rs build` / `usage` で生成）。
+
+---
+
+## ソースからのビルド
+
+### 共通要件
+
+- Rust（stable）
+- CMake・C/C++ コンパイラ（`crates/rerank` が llama.cpp をソースビルドするため必要）
+- ONNX Runtime **1.28.0**（エンジンは実行時に共有ライブラリを動的ロードします。探索順: `--ort-dylib` → 環境変数 `SETSUNA_ORT_DYLIB` → エンジンと同一ディレクトリ）
 
 ```sh
 cargo build --release
 cargo test
 ```
 
-エンジンは ONNX Runtime をリンクせず、実行時に共有ライブラリを読む
-（`--ort-dylib` > 環境変数 `SETSUNA_ORT_DYLIB` > エンジンと同じディレクトリ）。
-Windows では公式 build を取ってくるスクリプトがある:
+> モデルファイルが無くてもビルドとユニットテストは通ります。なお ONNX Runtime のバージョン変更は int8 演算の数値に影響するため、既定版の変更はベンチマーク再計測とセットで行います。
+
+### Windows
 
 ```powershell
-pwsh crates/engine/fetch-onnxruntime.ps1   # ONNX Runtime 1.28.0 を target/release へ
-```
-
-Linux では `crates/engine/fetch-onnxruntime.sh` が同じことをする（x64 / aarch64）。
-macOS では `libonnxruntime.dylib` をエンジンの隣に置くか
-`SETSUNA_ORT_DYLIB` で指す。ORT の版が変わると int8 の数値が変わり候補も
-変わるので、既定版（1.28.0）の変更は bench の取り直しとセットで行う。
-
-### Windows（TSF）
-
-x64 の Windows 10 / 11 なら release から入れられる（Windows PowerShell 5.1 でも pwsh でも動く）:
-
-```powershell
-irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
-# 変換モデルを Bletilla にする場合（オプションは install.ps1 と同じ）:
-& ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -Model Bletilla-v0.1-small
-```
-
-`setup.ps1` は自分と組になった release の zip（SHA-256 固定）を取ってきて、その中の
-`install.ps1` を動かす。zip（`setsuna-ime-<version>-windows-x64.zip`）を展開して
-`install.cmd` をダブルクリックしても同じ（オプションは `install.ps1` と同じ）。zip には
-DLL・エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・設定 GUI・ONNX Runtime
-1.28.0・英日混在のモデルが入り、変換モデルはインストール時に取得する。読みの辞書
-（lexicon-v1、222 MB）と解析器（nid-ma v2-600k-tb、288 MB）も
-[esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)（CC BY-SA 4.0）の
-固定した revision から取得して入れる（`models.json` の `components`。取得できなければ
-それなしで入れる。要らなければ `-NoDictionaries`）。バイナリが使う
-Visual C++ ランタイム（14.44 以上）が無ければ Microsoft から取得して入れる。
-
-release は `crates/tsf/package.ps1` が作る:
-
-```powershell
-pwsh crates/tsf/package.ps1      # target\dist\ に zip、setup.ps1、SHA256SUMS
-pwsh target/dist/setup.ps1 -Archive target/dist/setsuna-ime-<version>-windows-x64.zip   # 手元で試す
-```
-
-一つの release に Linux の分（下の `crates/linux/package.sh`）と合わせて上げる
-（`releases/latest/download/` の `setup.ps1` と `install.sh` が両方そろうように）。
-
-ソースから入れる場合:
-
-```powershell
+# ビルドと ONNX Runtime 取得
 cargo build --release
 pwsh crates/engine/fetch-onnxruntime.ps1
-pwsh crates/tsf/install.ps1                  # 公開モデルと辞書を自動取得してインストール
-# Bletilla で入れる場合: -Model Bletilla-v0.1-small
-# 取得済み・独自のモデル（ネット接続不要）:
-# pwsh crates/tsf/install.ps1 -Manifest <path to *.manifest.json>
-# リランカも入れる場合: -RerankManifest <path to LM scorer manifest>
-# 英日混在入力の名前の辞書も入れる場合: -NameDictionary <names tsv>
-# 手元の読みの辞書・解析器を使う場合: -Lexicon <file.lexicon> / -Analyzer <analyzer manifest>
-```
 
-`%LOCALAPPDATA%\setsuna-ime` に DLL・エンジン・モデルを置き、`regsvr32` で登録する
-（UAC が出る）。設定は `%APPDATA%\setsuna-ime\config.toml` で、タスクバーの
-「あ / A」アイコンの右クリックメニュー「設定...」から設定 GUI を開ける。保存した設定は
-次の入力から反映される（IME は入力を始めるときとフォーカスが移ったときに
-`config.toml` の更新を見て読み直す。変換中は読み直さない。エンジンの設定が
-変わったときだけエンジンにつなぎ直す）。アンインストールは
-`%LOCALAPPDATA%\setsuna-ime\uninstall.ps1`。
+# 公開モデル・辞書を自動取得してインストール（手元のモデルは -Manifest <path> 等を指定）
+pwsh crates/tsf/install.ps1
 
-**更新は起動中のアプリにも届く** — IME として登録されるのは本体ではなく、本体を
-読み込んで呼び出す小さな DLL（`setsuna_tsf_shim.dll`）。本体は中身のハッシュを名前に
-して置かれ（`setsuna_tsf_<hash>.dll`）、どれを使うかは `core.txt` が示す。
-インストーラーは新しい本体を別のプロセスでいったん起動して確かめ
-（`setsuna-tsf-check.exe`）、起動できたときだけ `core.txt` を書き換える（できなければ
-終了コード 70 で、`core.txt` は前の本体のまま）。起動中のアプリはその変更に気付き、
-変換中でなければすぐ（変換中なら確定してから）新しい本体に切り替わる。オン・オフの
-状態はそのまま引き継ぐ。この仕組みが入る前の版から更新したときだけは、それまで
-開いていたアプリは古い版のままで、再起動すると新しい版になる。変換エンジン
-（`setsuna-engine`）も、各アプリの IME が次のキーかフォーカスの移動で新しい設定を
-読み、新しいエンジンを使い始める。前のエンジン・モデル・解析器のままのエンジンの
-プロセスは、インストーラーが止める（アプリは止めない。止めたエンジンを使っていた
-アプリは、次に変換するまでに新しいエンジンを起こす）。
+# リリース用 zip・setup.ps1 の作成（リランカも同梱する場合は -WithRerank）
+pwsh crates/tsf/package.ps1
 
-スタートメニューの検索やストアアプリは AppContainer（サンドボックス）で動くので、
-インストーラーは `%LOCALAPPDATA%\setsuna-ime`（DLL・エンジン・モデル）と
-`config.toml` の 1 ファイルにだけ、AppContainer からの読み取りを許す
-（`ALL APPLICATION PACKAGES` と `ALL RESTRICTED APPLICATION PACKAGES`。設定 GUI が
-保存しても保つ）。`%APPDATA%\setsuna-ime` のディレクトリ（学習・予測の履歴、
-`credentials.bin`）は許さない。AppContainer の中の IME は、ほかのアプリが起動した
-共有エンジンにつないで変換する。共有エンジンが動いていない（AppContainer のアプリ
-しか使っていない）ときは変換せずにひらがなを入力し、タスクバーの「あ」の
-ツールチップと、オン・オフの切り替えの表示に「変換エンジンなし」と出る（入力を
-始めるときに、30 秒おきにつなぎ直す）。アンインストールは許可を取り消す。
-
-**オン・オフのキー** — 既定は 半角/全角（Alt+半角/全角）と Alt+`、それに
-オン専用・オフ専用のキー（VK_IME_ON / VK_IME_OFF を送るキーボード）。
-`[frontend] toggle_keys` / `on_keys` / `off_keys`（設定 GUI の「入力方式」）で、
-`Henkan`、`Muhenkan`、`Eisu`、`Kana`、`Space`、英字、`F1`〜`F24` に `Ctrl+` /
-`Shift+` / `Alt+` を付けて変えられる（例: `on_keys = ["Henkan"]`、
-`off_keys = ["Muhenkan"]`）。Ctrl+Space は VS Code・Excel・Emacs などの
-ショートカットなので既定には入れていない。
-
-**入力欄の種類（InputScope）** — URL・メール・数値・電話番号・時刻・半角英数の欄に
-フォーカスが移ると IME をオフにする（Mozc と同じ。切り替えの表示は出さない）。そこで
-オンにすればそのまま変換でき（Firefox のアドレスバーなど）、その欄の文章は読まず、
-書き直さず、学習もしない。テキストの欄に移ると、その間に切り替えていなければオンに
-戻る。パスワード・暗証番号の欄は、オンにしても IME を通さず直接入力になる。
-
-IME の処理で想定外のエラー（panic）が起きても、アプリを巻き込んで落とさず、
-入力中の文字をそのまま確定して次のキーからやり直す（`tsf.log` に場所を残す）。
-
-ログ（`%APPDATA%\setsuna-ime\tsf.log` など。4 MB で `.1` に回す）には、打った内容を
-残さない（読み・変換中の文字列・候補・文脈は長さだけ、文字キーはコードなし）。
-自分の PC で不具合を追うときは、`config.toml` に `[diagnostics]` と
-`log_typed_text = true` を書くと、エンジンに渡した読み、カーソル前の文脈の末尾、
-変換中の表示と確定した文字列、リランカーの 1 位をそのまま残す。文字キーのコードは
-それでも残さず、パスワードの欄では変換しないので、そこで打ったものは残らない。
-
-モデルはログイン不要で Hugging Face から取得する。取得元・commit・各ファイルの
-サイズと SHA-256 は `crates/tsf/models.json` に固定し、manifest と参照先の ONNX・語彙・
-並べ直しの表を検証してから配置する。キャッシュは `%LOCALAPPDATA%\setsuna-ime\cache\models`。
-再実行では検証済みファイルを再利用するので、取得完了後はオフラインでも使える。
-通信・検証に失敗するとインストールを中止する（終了コード 30）。`-Manifest` と
-`-ModelPrecision`・`-Model` は併用できない。既定のモデルは `models.json` の最上位、
-`-Model` で選べるほかのモデルは `models` に固定する。前のインストールのモデル
-（既定が変わったときの前のモデル）は、`config.toml` が名指ししていなければ消える。ビルドと ONNX Runtime の取得は上記の手順が別途必要。
-
-モデルだけ取得する場合（標準出力にローカル manifest のパスを返す）:
-
-```powershell
-pwsh crates/tsf/fetch-model.ps1 -Precision int8 -CacheDir local/models/downloads
-pwsh crates/tsf/fetch-model.ps1 -Model Bletilla-v0.1-small
-# ダウンローダーの回帰テスト（ネット接続不要）:
+# ダウンローダー回帰テスト（オフライン実行可）
 pwsh tests/model-download.ps1
 ```
 
+主な `install.ps1` オプション: `-Model <name>`、`-Manifest <path>`、`-RerankManifest <path>`、`-Lexicon <path>`、`-Analyzer <path>`、`-NameDictionary <tsv>`、`-NoDictionaries`。モデル単体取得は `pwsh crates/tsf/fetch-model.ps1`。
+
 ### Linux（fcitx5）
 
-fcitx5（5.1 以上）が入った x86_64 の環境（glibc 2.39 以上: Arch、Fedora 40、Ubuntu 24.04 以降）なら:
+追加要件: fcitx5 開発パッケージ、WebKitGTK 4.1 開発パッケージ（設定 GUI 用）、OpenMP 対応 C/C++ コンパイラ、`curl`、`jq`。
 
 ```sh
-curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
-# リランカの LM も入れる場合: ... | sudo bash -s -- --rerank-manifest <LM scorer manifest>
-# 英日混在入力の名前の辞書も入れる場合: ... | sudo bash -s -- --name-dictionary <names tsv>
-# 手元の読みの辞書・解析器を使う場合: ... | sudo bash -s -- --lexicon <file.lexicon> --analyzer <analyzer manifest>
-# 読みの辞書と解析器を取得しない場合: ... | sudo bash -s -- --no-dictionaries
-# 変換モデルを Bletilla にする場合: ... | sudo bash -s -- --model Bletilla-v0.1-small
-# アンインストール: sudo /usr/lib/setsuna-ime/uninstall.sh
-```
-
-`install.sh`（`crates/linux/install.sh`）は root で動く前提で、中で権限昇格はしない。
-自分と組になった release アーカイブ（SHA-256 固定）と、そのアーカイブが固定する
-変換モデル・読みの辞書（lexicon-v1、222 MB）・解析器（nid-ma v2-600k-tb、288 MB）
-（`crates/tsf/models.json` の `variants`（`--model` なら `models` のそれ）と
-`components` と同じ）を取ってきて入れる。前のモデルのファイルは消す。
-どのファイルも 1 部だけ持つ: `/var/cache/setsuna-ime/models` に取得・検証したものを
-入れる場所へハードリンクで置き（リンクできないファイルシステムならコピー）、入れ終わったら
-キャッシュを消す。次のインストールでは、入っているファイルが固定したものと一致すればそのまま
-使うので、固定が同じなら何も取得しない（オフラインでも入れ直せる）。前のインストールが
-キャッシュに残したもの（0.2.1 までは取得したものを `/var/cache` にも持っていた）も消える。読みの辞書と解析器は
-取得できなければ警告を出してそれなしで入れる（前に入れたものがあれば残る。もう一度
-実行すれば取り直す）。addon は fcitx5 の addon
-ディレクトリに、エンジン・リランカ（llama.cpp 込み）・書き直しの daemon・ONNX Runtime
-1.28.0・モデル・英日混在のモデルは `/usr/lib/setsuna-ime`（addon に埋め込んだ場所なので
-`config.toml` は要らない）に、設定 GUI は WebKitGTK 4.1 があれば
-`/usr/bin/setsuna-settings` に入る。`--rerank-manifest` の LM は
-`/usr/lib/setsuna-ime/models/rerank`、`--name-dictionary` の辞書は
-`/usr/lib/setsuna-ime/names/latin-names.tsv`、読みの辞書は
-`/usr/lib/setsuna-ime/lexicon/words.lexicon`、解析器（manifest と、それが指す辞書と別の読みの表）は
-`/usr/lib/setsuna-ime/analyzer` に入り、`config.toml` が `[rerank] manifest` /
-`name_dictionary_file` / `[lexicon] file` / `[engine] analyzer_manifest` を決めていなければ
-それを使う（次の更新でオプションを付けなくても残る。`analyzer_manifest = ""` なら解析器を使わない）。
-最後に sudo（または pkexec）した利用者の fcitx5 の入力メソッドに Setsuna を足し、fcitx5 を
-再起動して読み込ませる（KDE Plasma の Wayland では `fcitx5-wayland-launcher` も
-起動し直させる）。`--no-register` ならファイルを置くだけ。
-
-fcitx5 版は有効にするたびに `config.toml` を読み直し（Windows TSF 版は次の入力から）、エンジン・
-リランカ（`[rerank]`）・書き直し（`[rewriter]`）の daemon を必要なら起動する（書き直しが
-オンなら変換キーで書き直しを頼み、状態表示は「直」、進み具合は候補の位置の後ろに出る）。
-アプリが周りの文字列を教えるならカーソルの前の文章を文脈に使い、URL・メール・数値・
-電話番号・日時・英数字・パスワードの欄は直接入力、Sensitive の欄（プライベートウィンドウ
-など）は文脈も学習も使わない。設定 GUI は fcitx5 の設定の「Setsuna の設定」、状態表示の
-「設定」、アプリメニューの「Setsuna の設定」から開く。候補ウィンドウの見た目は fcitx5 の
-テーマ（同梱の `setsuna` / `setsuna-dark`）で、`[ui.candidate_window]` は Windows だけ。
-
-release は `crates/linux/package.sh` が作る（build に要るもの: CMake、fcitx5 と
-WebKitGTK 4.1 の開発パッケージ、OpenMP 付きの C/C++ コンパイラ（llama.cpp）、curl、jq）:
-
-```sh
-crates/linux/package.sh        # target/dist/ に tar.gz、install.sh、SHA256SUMS
-sudo bash target/dist/install.sh --archive target/dist/setsuna-ime-*.tar.gz   # 手元で試す
-gh release create v<version> target/dist/*                                     # 公開
-```
-
-```sh
-# 開発中に手で build する場合（モデルも入れるなら -DSETSUNA_MODEL_MANIFEST=<manifest>、
-# ONNX Runtime は crates/engine/fetch-onnxruntime.sh、モデルは crates/linux/fetch-model.sh で取る）:
+# ONNX Runtime 取得と開発ビルド
+crates/engine/fetch-onnxruntime.sh
 cmake -B target/fcitx5 -DCMAKE_INSTALL_PREFIX=/usr crates/linux/fcitx5
 cmake --build target/fcitx5 && sudo cmake --install target/fcitx5
-# ダウンローダーの回帰テスト（ネット接続不要）:
+
+# リリース用 tar.gz・install.sh の作成
+crates/linux/package.sh
+sudo bash target/dist/install.sh --archive target/dist/setsuna-ime-*.tar.gz
+
+# ダウンローダー回帰テスト（オフライン実行可）
 bash tests/model-download.sh
 ```
 
-エンジンとモデルは `config.toml`（`~/.config/setsuna-ime/`）、環境変数
-`SETSUNA_ENGINE_EXE` / `SETSUNA_MANIFEST` / `SETSUNA_MODEL_DIR`、最後に
-`SETSUNA_MODULE_DIR`（既定 `<libdir>/setsuna-ime`）の順に探す。開発中は
-`-DSETSUNA_MODULE_DIR=<repo>/target/release` とすると `target/release` の
-エンジンと `<repo>/local/models/onnx` のモデルを使う。
+開発中は `-DSETSUNA_MODULE_DIR=<repo>/target/release` を渡すと `target/release` のエンジンと `local/models/onnx` のモデルを参照します。モデル単体取得は `crates/linux/fetch-model.sh`。
 
-### Android（開発中）
+### Android
 
-arm64 の Android 8 以降が対象。キーボードは Gboard の日本語 QWERTY（数字行つき）と
-同じ配列（見た目は Setsuna のもの: アイコンのグラデーションの Enter キーと上端の線、
-スペースキーの「Setsuna」）で、あa1 キーで あ（ローマ字かな変換）／ a（英字そのまま）／ 1（数字パッド。
-フリックで記号。数字は あ と同じく変換でき、⎵ が「変換」になる：1001 → 10月1日。記号は
-そのまま入る）を切り替え、a の ?123 から電卓配列と記号 2 ページに行く。Shift で数字の行は
-JIS 配列の記号（! " # $ % & ' ( ) と、0 は ~）になり、変換中は地球儀キーが ? になる。ライブ変換・
-候補バー・確定のほか、ツールバーからテキスト編集（カーソル移動、選択、すべて選択、
-切り取り・コピー・貼り付け）とクリップボード（コピーした文字の一覧。1 時間、メモリだけに
-置き、パスワードなど機密の印のついたものは残さない）が使える。アプリの画面は設定画面ひとつで
-（アプリのアイコン、ツールバーの歯車、Android の入力方法の設定のどこからでも同じ画面）、PC 版の設定 GUI と同じ
-ページ（`crates/settings/web/index.html`）を WebView で開く。先頭の「この端末」に、入力方法として有効か・
-今の入力方法か、入っているモデルと辞書、ダウンロードのボタン、入力方法の切り替えと試し書きの欄がある。キーボードの振動（タップと長押しを別々に）・
-キーの吹き出し・高さはここで、書き直し・候補の窓・PC のキーボードのキーなど Android にないものは出さない。
-変換モデル（`models.json` の既定のもの、今は Cymbidium-v1.1-xsmall、約 23 MB）と読みの辞書・
-解析器（約 510 MB）は、「この端末」のボタンで Hugging Face から取得する（PC 版と同じ固定した revision、
-サイズと SHA-256 を確かめてから置き、前に入っていたものと入れ替える。そのためアプリはインターネットの
-権限を持つが、通信するのはこのダウンロードだけ）。配布用の鍵での署名はまだ（release の APK は debug の
-鍵で署名している）。`models.json` が `lexicon-small`（よく使う語と、すべての一文字の漢字とその読み、
-約 4 MB）を固定していれば、変換モデルのボタンでそれも入る。この辞書は候補を並べ替えず、落としもしない。
-候補に語を足すだけ。読みの辞書をすでに入れていれば、そちらを残す。IME の
-ロジックは fcitx5 版と同じ `session`（ime-core）で、キーは X の keysym として渡す。
-エンジンは APK に `libsetsuna_engine.so` として入れた実行ファイルを子プロセスで動かし、
-ONNX Runtime は Microsoft の onnxruntime-android（1.28.0）のものを使う。エンジンの MoE
-（`neo_ime` の op）は ARMv8.2 の SDOT で計算する（Snapdragon SM8850 で 1 文 3〜12 ms。
-SDOT のない CPU は素の Rust で、その 20 倍ほどかかる）。
-
-build に要るもの: Android SDK（platform 35 と NDK。`ANDROID_HOME`、既定は
-`%LOCALAPPDATA%\Android\Sdk`）、JDK 17 以降（`JAVA_HOME`）、
-`rustup target add aarch64-linux-android`、`cargo install cargo-ndk`。
+追加要件: Android SDK（platform 35 + NDK、`ANDROID_HOME`）、JDK 17+（`JAVA_HOME`）、`rustup target add aarch64-linux-android`、`cargo install cargo-ndk`。
 
 ```powershell
-pwsh crates/android/build.ps1 -Install   # Rust 部分とエンジンを arm64 で build、APK を作って adb で入れる
-pwsh crates/android/push-models.ps1      # この PC の Windows 版が使うモデル・読みの辞書・解析器・名前の辞書をアプリへ
+# arm64 ネイティブライブラリと APK をビルドし adb でインストール（-Release でリリースビルド）
+pwsh crates/android/build.ps1 -Install
+
+# （任意・debug ビルド時）PC 側のモデル・辞書を端末へ転送
+pwsh crates/android/push-models.ps1
 ```
 
-モデルはアプリの `files/models`（`onnx/`、`lexicon/`、`analyzer/<名前>/`、`names/latin-names.tsv`）から読む。
-アプリでのダウンロードはそこへ入れ、`push-models.ps1` は
-`/data/local/tmp` を経由して `run-as` でそこへ写すので、debug build（`-Release` なし）のときだけ使える。入れたあと、「この端末」の「入力方法の設定」で
-Setsuna を有効にし、キーボードの地球儀キーの長押し（入力方法の選択）で切り替える。
-`config.toml` とログはアプリの `files/config/setsuna-ime`、`files/state/setsuna-ime`。
+インストール後、アプリの「この端末」画面からモデルをダウンロードし、「入力方法の設定」で Setsuna を有効化してキーボードを切り替えます（リリース APK も現在は debug 鍵で署名されています）。
 
-### 設定 GUI
+### 設定 GUI の単体起動
 
 ```sh
 cargo run --release -p setsuna-settings
 ```
 
-## モデルと manifest
+---
 
-エンジンは manifest（`*.manifest.json`）だけを入口にモデルを読む。
+## ライセンス
 
-- 変換モデル: schema `neo-ime-ctc-nat-export-v1`。proposal の ONNX、語彙、
-  special token id、`decode_defaults`（beam 幅、記号の扱いなど）を持つ。
-  CTC-CRF で学習したモデルは遷移表（`crf`、低ランクの ψ）も持ち、beam search が
-  隣り合う文字の遷移のスコアを足す。
-  MoE のモデルは専門家の重みを int8 か int4 で持ち、エンジン自身のカーネル（op
-  domain `neo_ime` の `TokenMoE*`、`AddLayerNorm`）で動く。
-  候補を並べ直す表（`rescore`: `pairs` は 2 文字の共起、`words` は読みと語の
-  頻度）を持つモデルでは、`decode_defaults` の `pair_weight` / `word_weight` の
-  重みで beam の候補のスコアに足して並べ直す（0 か未指定ならその項は使わない）。
-  公開モデル Bletilla-v0.1-small は int8 版（MoE の専門家は int4、約 116 MB）と
-  並べ直しの表（約 28 MB）。Cymbidium（v1.0-xsmall・v1.1-xsmall）は、Linear と専門家を群ごとの
-  スケールと零点つきの低ビット符号で持ち（`LinearQ4G`、`TokenMoEQ4G`、専門家は
-  3 bit・ほかは 4 bit）、v1.0 は約 13.6 MB、v1.1 は約 23.0 MB。並べ直しの表は持たない。この 2 つの op は
-  AVX-512 VNNI・AVX-VNNI・AVX2・ARM の dotprod のカーネルで計算し（どれも同じ結果）、
-  そのどれもない CPU では素の Rust で計算する（Ryzen 9 9950X3D で v1.0 の 1 文の中央値
-  2.9 / 3.1 / 3.5 / 33 ms）。
-- リランカ: schema `neo-ime-lm-scorer-export-v1`。GGUF の重みと
-  `score_defaults`、任意で LM 自身のトークナイザ（`tokenizer`、SentencePiece の
-  `tokenizer.model`）を持つ。書いてあればリランカはそれで区切る（sarashina2.2 は
-  Unigram のモデルで、llama.cpp は GGUF の語彙を別の方式として読み、日本語の
-  区切りが変わる）。書いていなければ GGUF の語彙で区切る。
-- 解析器: schema `neo-ime-analyzer-export-v1`。vibrato の辞書（`dictionary`、
-  zstd 圧縮）、素性の列の名前（`features`、`reading` は必須）、任意で別の読みの表
-  （`alternates`、読みが複数ある語の項目と連接コスト。`examples/analyzer.rs
-  alternates` が学習済みの `lex.csv` と `matrix.def` から作る）と
-  `analyze_defaults` を持つ。辞書の `format` が `vibrato-packed-zstd` のものは、
-  同じ解析をより少ないメモリで行う形式で、`vendor/vibrato-packed`（vibrato の
-  辞書の持ち方を変えたもの）で読む。`features` の代わりに語の品詞と読みの符号表
-  （`packed`）を持ち、別の読みの表は持たない。`examples/analyzer.rs build` が
-  学習済みの語と連接コストから作り、`usage` で数えた使われる回数で語を絞れる。
-  `setsuna-engine daemon|serve --analyzer <manifest>`
-  で読み込み（ready の後に裏で読む）、`{"id":1,"analyze":["今日は晴れ"]}` に
-  各文の語（表層、文字の範囲、読み、品詞、別の読みとそれで経路が何コスト高くなるか）
-  を返す。辞書はメモリに展開するので、ログインで 1 つのエンジンのプロセスが持つ。
-  IME は `[engine] analyzer_manifest`（`install.ps1 -Analyzer <manifest>`。Linux は
-  `/usr/lib/setsuna-ime/analyzer` に入れたもの）で
-  使い、文節編集（← / →）で変換をその語で区切る（`crates/ime-core/src/bunsetsu.rs`。
-  KWDLC の文節境界の F1 は test で 83.4 → 94.4）。
-
-例は `tests/fixtures/` にある（中身は空の placeholder）。
-
-## 日付・時間候補
-
-`crates/ime-core/src/date_time.rs` が端末のローカル日時から候補を生成する。
-Windows TSF / Linux fcitx5 共通で、モデル未起動でも Space で利用できる。
-通常の変換候補・かな候補は残し、その後に日付・時間候補を追加する。
-
-- `きのう` / `きょう` / `あした` / `あさって` / `おととい`：日付。
-  `YYYY/MM/DD`、`YYYY-MM-DD`、`YYYY年M月D日`、曜日付きなど。
-- `いま` / `じこく` / `にちじ`：現在時刻、日時、タイムゾーン付きの日時。
-- `すいようび` など：今日を含む次の該当曜日。
-  `らいしゅうのすいようび` / `こんしゅうのげつようび` も指定できる。
-- `らいしゅう` / `こんしゅう` / `せんしゅう` / `さらいしゅう`：月曜〜日曜の
-  日付範囲と開始日。`らいげつ` などは月の範囲、`らいねん` などは年。
-- `1じかんご` / `いちじかんご` / `30ぷんまえ` / `2しゅうかんご` など：相対指定。
-  秒・分・時間は経過時間、日・週・月・年はカレンダー上の日付として計算する。
-  月・年の加減算で存在しない日は月末に合わせる。
-
-読み全体、または編集中の文節全体が一致した場合だけ生成する。
-Space ごとに時計を読み直し、開いている候補の日時は後から届くモデル結果や
-リランク結果で変わらない。既定で有効。設定 GUI、または
-`[frontend]` の `date_time_candidates = false` で無効にできる。
-
-## 書き直し
-
-書き直しがオンなら、Space で変換すると、読み・変換結果（と、設定でオンなら
-カーソルの前の文章）をモデルに送り、自然な日本語に書き直した文を候補の先頭に
-出す（変換候補の窓の上に「書き直し中…」と出て、届くと先頭が入れ替わる）。
-Enter で確定、↓ でいつもの変換候補を選べる。変換のたびに送るので、そのぶん
-使用量や料金がかかる。
-
-- **有効にする** — 設定 GUI の「書き直し」をオンにし、接続先とモデルを選んで
-  保存する（`[rewriter]`）。次の入力から使える（タスクバーの表示が
-  「直」になる）。Windows のみ。
-- **ChatGPT プラン** — 「Continue with ChatGPT」でブラウザからサインインし、
-  ChatGPT プランの使用量で書き直す（OpenAI の Sign in with ChatGPT。ローカルで
-  動くオープンソースのアプリとして登録する）。使用量は ChatGPT の設定で管理する。
-- **API キー / 互換 API** — OpenAI の API キー、または OpenAI 互換 API（ローカルの
-  LLM サーバーなど）のベース URL と、必要ならその API キー。互換 API は
-  Chat Completions と Responses のどちらでも話せる。
-- **送らないもの** — カーソルの前の文章に URL、メールアドレス、パス、API キーや
-  トークン、長い数字（カード番号や電話番号）、「パスワード」「暗証番号」のような
-  語があれば、文章は送らない。読みや変換結果がそういうものなら書き直さない。
-  URL・メール・数字などの入力欄（Windows の InputScope）では IME はオフで始まり、
-  オンにしても文章を読まず、書き直さず、学習もしない。パスワードの欄は IME を通さず
-  直接入力になる。非公開の入力欄（InputScope の private、fcitx5 の
-  Password / Sensitive）でも文章を読まず、書き直さず、学習もしない。変換モデルは
-  文章のうち最後に見つかった箇所より後ろだけを読む。
-- **資格情報** — サインインのトークンと API キーは設定と同じディレクトリの
-  `credentials.bin` に、Windows の DPAPI でこのユーザーだけが読める形で保存する
-  （Linux / macOS では権限 0600 の `credentials.json`）。`config.toml` には入らない。
-
-## License
-
-MIT（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）から流用して
-おり、その著作権表示は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にある。
-
-実行時に読む / build 時に取り込む外部コンポーネントはそれぞれのライセンスに従う:
-[ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、
-[llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）、
-[vibrato](https://github.com/daac-tools/vibrato)（MIT または Apache-2.0。
-`vendor/vibrato-packed` に変更を加えて同梱、THIRD_PARTY_NOTICES.md）、
-その他の Rust crate は `Cargo.lock` を参照。英日混在入力のモデル
-（`crates/ime-core/data/mixed`）は FineWeb2-edu-japanese と FineWeb から数えた
-出現回数で、ODC-By 1.0（出典は同じディレクトリの README.md と
-THIRD_PARTY_NOTICES.md）。かな漢字変換モデルは
-[Cymbidium-v1.1-xsmall](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)、
-[Cymbidium-v1.0-xsmall](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) と
-[Bletilla-v0.1-small](https://huggingface.co/esehe/Bletilla-v0.1-small)（Apache-2.0）。
-辞書データとかな漢字変換モデルの重みはこのリポジトリに含まない。
-配布する辞書ファイルのライセンスと出典表示は、
-それぞれの辞書ファイルに同梱する。
+- **Setsuna IME 本体**: MIT License（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）を基にしています（[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）。
+- **外部コンポーネント**:
+  - [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）
+  - [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）
+  - [vibrato](https://github.com/daac-tools/vibrato)（MIT / Apache-2.0、`vendor/vibrato-packed` に辞書レイアウト変更を加えて同梱。詳細は [vendor/vibrato-packed/VENDORED.md](vendor/vibrato-packed/VENDORED.md)）
+  - 英日混在入力モデル（[crates/ime-core/data/mixed/README.md](crates/ime-core/data/mixed/README.md)）: FineWeb2-edu-japanese / FineWeb 由来、ODC-By 1.0
+  - その他の Rust クレートは `Cargo.lock` および [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
+- **モデル・辞書**: 公開変換モデル（Cymbidium / Bletilla）は Apache-2.0、配布辞書（[esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）は CC BY-SA 4.0 です。モデルの重みおよび辞書ファイル本体はこのリポジトリには含みません。
