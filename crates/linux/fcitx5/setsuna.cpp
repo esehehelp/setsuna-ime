@@ -27,6 +27,8 @@
 #include <fcitx/candidatelist.h>
 #include <fcitx/event.h>
 #include <fcitx/inputcontext.h>
+#include <fcitx/inputcontextmanager.h>
+#include <fcitx/inputcontextproperty.h>
 #include <fcitx/inputmethodengine.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
@@ -129,6 +131,14 @@ private:
     SetsunaEngine *engine_;
 };
 
+/* Per-InputContext mode state so [[apps]] start = "on" / "off" does not bleed
+ * across apps and manual toggles inside an app survive focus changes. */
+struct SetsunaState : public InputContextProperty {
+    bool initialized = false;
+    int appStart = SETSUNA_APP_START_KEEP;
+    bool enabled = true;
+};
+
 /* What fcitx5's settings show for Setsuna: a button opening its own
  * settings GUI (setSubConfig), which edits config.toml. */
 FCITX_CONFIGURATION(SetsunaConfig,
@@ -140,8 +150,11 @@ void openSettings() { startProcess({SETSUNA_SETTINGS_EXE}); }
 class SetsunaEngine final : public InputMethodEngineV2 {
 public:
     explicit SetsunaEngine(Instance *instance)
-        : instance_(instance), modeAction_(this) {
+        : instance_(instance),
+          modeAction_(this),
+          factory_([](InputContext &) { return new SetsunaState(); }) {
         dispatcher_.attach(&instance->eventLoop());
+        instance->inputContextManager().registerProperty("setsunaState", &factory_);
         session_ = setsuna_session_new(SETSUNA_MODULE_DIR, &SetsunaEngine::notify, this);
         instance->userInterfaceManager().registerAction("setsuna-mode", &modeAction_);
         settingsAction_.setShortText("設定");
@@ -153,6 +166,7 @@ public:
     ~SetsunaEngine() override {
         instance_->userInterfaceManager().unregisterAction(&settingsAction_);
         instance_->userInterfaceManager().unregisterAction(&modeAction_);
+        factory_.unregister();
         // Joins the engine client's threads: no notify follows, so nothing
         // is scheduled on the dispatcher after this.
         setsuna_session_free(session_);
@@ -160,15 +174,26 @@ public:
 
     void activate(const InputMethodEntry &, InputContextEvent &event) override {
         auto *ic = event.inputContext();
+        auto *state = ic->propertyFor(&factory_);
         // the settings of this application ([[apps]])
-        bool enabled = setsuna_session_enabled(session_);
-        setsuna_session_configure_app(session_, ic->program().c_str());
-        if (enabled != setsuna_session_enabled(session_)) {
-            modeChanged(ic);
+        int start = setsuna_session_configure_app(session_, ic->program().c_str());
+        if (!state->initialized || state->appStart != start) {
+            if (start == SETSUNA_APP_START_ON) {
+                state->enabled = true;
+            } else if (start == SETSUNA_APP_START_OFF) {
+                state->enabled = false;
+            } else if (!state->initialized) {
+                state->enabled = defaultEnabled_;
+            }
+            state->appStart = start;
+            state->initialized = true;
         }
+        setsuna_session_set_enabled(session_, state->enabled);
         ic_ = ic->watch();
         ic->statusArea().addAction(StatusGroup::InputMethod, &modeAction_);
         ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
+        modeAction_.update(ic);
+        ic->updateUserInterface(UserInterfaceComponent::StatusArea);
     }
 
     const Configuration *getConfig() const override { return &config_; }
@@ -205,7 +230,8 @@ public:
         // Unnormalized: normalize() drops Shift from printable keys, and
         // Shift+letter is the temporary alphabet mode.
         const Key &key = event.rawKey();
-        bool enabled = setsuna_session_enabled(session_);
+        bool wasEnabled = setsuna_session_enabled(session_);
+        bool wasRewrite = setsuna_session_rewrite_mode(session_);
         std::string before;
         bool known = beforeCaret(ic, before);
         if (setsuna_session_key(session_, key.sym(), key.code(), mods(key.states()), field(ic),
@@ -213,33 +239,47 @@ public:
             event.filterAndAccept();
             render(ic);
         }
-        if (enabled != setsuna_session_enabled(session_)) {
+        bool nowEnabled = setsuna_session_enabled(session_);
+        if (wasEnabled != nowEnabled) {
+            recordEnabled(ic, nowEnabled);
             modeChanged(ic);
+        } else if (wasRewrite != setsuna_session_rewrite_mode(session_)) {
+            modeAction_.update(ic);
+            ic->updateUserInterface(UserInterfaceComponent::StatusArea);
         }
     }
 
-    bool enabled() const { return setsuna_session_enabled(session_); }
+    bool enabled(InputContext *ic = nullptr) const {
+        if (ic) {
+            const auto *state = ic->propertyFor(&factory_);
+            if (state->initialized) {
+                return state->enabled;
+            }
+        }
+        return setsuna_session_enabled(session_);
+    }
 
     /* あ on, 直 on and rewriting, A off: the TSF language bar's glyph. */
-    std::string modeLabel() const {
-        if (!enabled()) {
+    std::string modeLabel(InputContext *ic = nullptr) const {
+        if (!enabled(ic)) {
             return "A";
         }
         return setsuna_session_rewrite_mode(session_) ? "直" : "あ";
     }
 
     /* The tray icon: あ on, A off (icons/). */
-    std::string subModeIconImpl(const InputMethodEntry &, InputContext &) override {
-        return modeIcon();
+    std::string subModeIconImpl(const InputMethodEntry &, InputContext &ic) override {
+        return modeIcon(&ic);
     }
-    std::string modeIcon() const {
-        return enabled() ? "setsuna-hiragana" : "setsuna-direct";
+    std::string modeIcon(InputContext *ic = nullptr) const {
+        return enabled(ic) ? "setsuna-hiragana" : "setsuna-direct";
     }
 
     /* The mode button was clicked. */
     void toggle(InputContext *ic) {
         setsuna_session_toggle(session_);
         render(ic);
+        recordEnabled(ic, setsuna_session_enabled(session_));
         modeChanged(ic);
     }
 
@@ -255,12 +295,12 @@ public:
         });
     }
 
-    /* あ while on (直 rewriting), A while ` / Zenkaku_Hankaku has turned it off. */
-    std::string subModeLabelImpl(const InputMethodEntry &, InputContext &) override {
-        return modeLabel();
+    /* あ while on (直 rewriting), A while off. */
+    std::string subModeLabelImpl(const InputMethodEntry &, InputContext &ic) override {
+        return modeLabel(&ic);
     }
-    std::string subMode(const InputMethodEntry &, InputContext &) override {
-        return setsuna_session_enabled(session_) ? "" : "Direct";
+    std::string subMode(const InputMethodEntry &, InputContext &ic) override {
+        return enabled(&ic) ? "" : "Direct";
     }
 
     /* A click on a candidate: pick and commit it, as its digit would. */
@@ -272,6 +312,15 @@ public:
     }
 
 private:
+    void recordEnabled(InputContext *ic, bool on) {
+        auto *state = ic->propertyFor(&factory_);
+        state->enabled = on;
+        state->initialized = true;
+        if (state->appStart == SETSUNA_APP_START_KEEP) {
+            defaultEnabled_ = on;
+        }
+    }
+
     void modeChanged(InputContext *ic) {
         modeAction_.update(ic);
         ic->updateUserInterface(UserInterfaceComponent::StatusArea);
@@ -280,7 +329,7 @@ private:
         if (panel.clientPreedit().empty() && panel.preedit().empty() &&
             !panel.candidateList()) {
             instance_->showCustomInputMethodInformation(
-                ic, !enabled()                          ? "A  直接入力"
+                ic, !enabled(ic)                          ? "A  直接入力"
                     : setsuna_session_rewrite_mode(session_) ? "直  書き直し"
                                                              : "あ  ひらがな");
         }
@@ -439,6 +488,8 @@ private:
     SetsunaModeAction modeAction_;
     SimpleAction settingsAction_;
     SetsunaConfig config_;
+    FactoryFor<SetsunaState> factory_;
+    bool defaultEnabled_ = true;
     EventDispatcher dispatcher_;
     std::unique_ptr<EventSourceTime> deferredTimer_;
     SetsunaSession *session_ = nullptr;
@@ -452,13 +503,13 @@ void SetsunaCandidateList::next() { engine_->deferKey(FcitxKey_Page_Down); }
 void SetsunaCandidateList::prevCandidate() { engine_->deferKey(FcitxKey_Up); }
 void SetsunaCandidateList::nextCandidate() { engine_->deferKey(FcitxKey_Down); }
 
-std::string SetsunaModeAction::shortText(InputContext *) const {
-    return engine_->modeLabel();
+std::string SetsunaModeAction::shortText(InputContext *ic) const {
+    return engine_->modeLabel(ic);
 }
-std::string SetsunaModeAction::longText(InputContext *) const {
-    return engine_->enabled() ? "ひらがな (` で直接入力)" : "直接入力 (` でひらがな)";
+std::string SetsunaModeAction::longText(InputContext *ic) const {
+    return engine_->enabled(ic) ? "ひらがな" : "直接入力";
 }
-std::string SetsunaModeAction::icon(InputContext *) const { return engine_->modeIcon(); }
+std::string SetsunaModeAction::icon(InputContext *ic) const { return engine_->modeIcon(ic); }
 void SetsunaModeAction::activate(InputContext *ic) { engine_->toggle(ic); }
 
 class SetsunaFactory : public AddonFactory {

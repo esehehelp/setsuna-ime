@@ -187,7 +187,27 @@ if [[ -n $analyzer ]]; then
 fi
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+kwinrc_orig=
+kwinrc_backup=
+kwinrc_user=
+kwinrc_uid=
+kwinrc_bus=
+kwinrc_im=
+cleanup() {
+    if [[ -n $kwinrc_backup && -f $kwinrc_backup ]]; then
+        if [[ -n $kwinrc_im ]]; then
+            runuser -u "$kwinrc_user" -- env XDG_RUNTIME_DIR="/run/user/$kwinrc_uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=$kwinrc_bus" \
+                kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "$kwinrc_im" \
+                >/dev/null 2>&1 || true
+        fi
+        runuser -u "$kwinrc_user" -- mv -f "$kwinrc_backup" "$kwinrc_orig" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 file_size() { wc -c <"$1" | tr -d ' '; }
 file_sha256() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -500,6 +520,40 @@ if [[ -z $root ]] && command -v gtk-update-icon-cache >/dev/null && [[ -f /usr/s
 fi
 log "installed Setsuna $VERSION ($precision model) into ${root:-/}"
 
+# Extract every double-quoted string from a busctl reply line (handling spaces
+# inside quotes and \" / \\ escapes) into the `busctl_strings` array.
+parse_busctl_strings() {
+    local s=$1 i=0 len=${#1} in_q=0 cur="" c
+    busctl_strings=()
+    while ((i < len)); do
+        c=${s:i:1}
+        if ((!in_q)); then
+            if [[ $c == '"' ]]; then
+                in_q=1
+                cur=""
+            fi
+        else
+            if [[ $c == '\' && $((i + 1)) -lt $len ]]; then
+                i=$((i + 1))
+                c=${s:i:1}
+                case $c in
+                    n) cur+=$'\n' ;;
+                    t) cur+=$'\t' ;;
+                    r) cur+=$'\r' ;;
+                    *) cur+=$c ;;
+                esac
+            elif [[ $c == '"' ]]; then
+                busctl_strings+=("$cur")
+                in_q=0
+            else
+                cur+=$c
+            fi
+        fi
+        i=$((i + 1))
+    done
+    ((!in_q))
+}
+
 # ---- add Setsuna to the user's fcitx5 ----
 register_user() {
     local user=$1 uid home bus pid env_file
@@ -517,12 +571,21 @@ register_user() {
     pid=$(pgrep -u "$uid" -x fcitx5 | head -1 || true)
     if [[ -z $pid ]]; then
         # Not running: the profile is safe to edit; fcitx5 reads it when it starts.
-        local profile=$home/.config/fcitx5/profile n
-        if [[ -f $profile ]] && ! grep -qx 'Name=setsuna' "$profile"; then
-            n=$(grep -o '^\[Groups/0/Items/[0-9]*\]' "$profile" | tr -dc '0-9\n' | sort -n | tail -1)
-            printf '\n[Groups/0/Items/%s]\n# Name\nName=setsuna\n# Layout\nLayout=\n' "$((${n:--1} + 1))" |
-                as_user tee -a "$profile" >/dev/null
-            log "added Setsuna to $user's fcitx5 input methods"
+        local profile=$home/.config/fcitx5/profile n next
+        if [[ -f $profile ]]; then
+            if grep -qx 'Name=setsuna' "$profile"; then
+                log "Setsuna is already in $user's fcitx5 input methods"
+            else
+                n=$(sed -n 's/^\[Groups\/0\/Items\/\([0-9][0-9]*\)\]$/\1/p' "$profile" | sort -n | tail -1)
+                if [[ -n $n ]]; then
+                    next=$((10#$n + 1))
+                else
+                    next=0
+                fi
+                printf '\n[Groups/0/Items/%s]\n# Name\nName=setsuna\n# Layout\nLayout=\n' "$next" |
+                    as_user tee -a "$profile" >/dev/null
+                log "added Setsuna to $user's fcitx5 input methods"
+            fi
         else
             log "fcitx5 is not running: add Setsuna in fcitx5-configtool once it is"
         fi
@@ -549,13 +612,39 @@ register_user() {
         sleep 0.25
     done
     if [[ -n $kwin_im ]]; then
-        local kwinrc=$home/.config/kwinrc
-        as_user cp -p "$kwinrc" "$kwinrc.setsuna-install"
-        as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify ""
+        local kwinrc=$home/.config/kwinrc orig_line= tmp_rc=
+        if [[ -f $kwinrc ]]; then
+            orig_line=$(awk '/^\[/{g=$0; next} g=="[Wayland]" && /^InputMethod(\[[^]]*\])?=/{print; exit}' "$kwinrc" || true)
+            kwinrc_backup=$(as_user mktemp "$kwinrc.setsuna-install.XXXXXX")
+            as_user cp -p "$kwinrc" "$kwinrc_backup"
+            kwinrc_orig=$kwinrc
+            kwinrc_user=$user
+            kwinrc_uid=$uid
+            kwinrc_bus=$bus
+            kwinrc_im=$kwin_im
+        fi
+        as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "" || true
         sleep 1
-        as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "$kwin_im"
-        # the file exactly as it was (kwriteconfig6 rewrites the key's flags)
-        as_user mv -f "$kwinrc.setsuna-install" "$kwinrc"
+        as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "$kwin_im" || true
+        # Restore the key's original flags (e.g. InputMethod[$e]=...) without
+        # overwriting unrelated keys KWin may have written meanwhile.
+        if [[ -n $orig_line && -f $kwinrc && $orig_line == InputMethod\[* ]]; then
+            tmp_rc=$(as_user mktemp "$kwinrc.setsuna-fix.XXXXXX")
+            if SETSUNA_LINE=$orig_line awk '
+                /^\[/ { in_w = ($0 == "[Wayland]") }
+                in_w && !done && /^InputMethod(\[[^]]*\])?=/ { print ENVIRON["SETSUNA_LINE"]; done = 1; next }
+                { print }
+            ' "$kwinrc" >"$tmp_rc"; then
+                chmod --reference="$kwinrc" "$tmp_rc" 2>/dev/null || true
+                as_user mv -f "$tmp_rc" "$kwinrc" || rm -f -- "$tmp_rc"
+            else
+                rm -f -- "$tmp_rc"
+            fi
+        fi
+        if [[ -n $kwinrc_backup ]]; then
+            rm -f -- "$kwinrc_backup"
+            kwinrc_backup=
+        fi
     elif [[ ! -f /usr/share/dbus-1/services/org.fcitx.Fcitx5.service ]]; then
         local -a vars
         mapfile -d '' vars <"$env_file"
@@ -572,15 +661,20 @@ register_user() {
 
     # Append Setsuna to the current input method group.
     local group info layout count i
-    local -a tok entries
-    group=$(fcitx CurrentInputMethodGroup | cut -d'"' -f2)
-    info=$(fcitx InputMethodGroupInfo s "$group")
-    # sa(ss) "<layout>" <count> "<name>" "<layout>" ...
-    read -ra tok <<<"$info"
-    tok=("${tok[@]//\"/}")
-    layout=${tok[1]}
-    count=${tok[2]}
-    entries=("${tok[@]:3}")
+    local -a busctl_strings entries
+    if ! info=$(fcitx CurrentInputMethodGroup) || ! parse_busctl_strings "$info" || ((${#busctl_strings[@]} < 1)); then
+        log "could not read $user's current fcitx5 group: add Setsuna in fcitx5-configtool"
+        return
+    fi
+    group=${busctl_strings[0]}
+    if ! info=$(fcitx InputMethodGroupInfo s "$group") || ! parse_busctl_strings "$info" ||
+        ((${#busctl_strings[@]} < 1 || (${#busctl_strings[@]} - 1) % 2 != 0)); then
+        log "could not read $user's fcitx5 group $group: add Setsuna in fcitx5-configtool"
+        return
+    fi
+    layout=${busctl_strings[0]}
+    entries=("${busctl_strings[@]:1}")
+    count=$((${#entries[@]} / 2))
     for ((i = 0; i < count; i++)); do
         if [[ ${entries[2 * i]} == setsuna ]]; then
             log "Setsuna is already in $user's input methods"

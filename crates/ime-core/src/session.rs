@@ -135,10 +135,19 @@ impl View {
 pub struct Session {
     bridge: EngineBridge,
     symbols: BTreeMap<String, String>,
-    /// Off: every key but the toggle goes to the app (\` / 半角/全角).
+    on_off: keys::OnOffKeys,
+    /// Off: every key but the on / off keys goes to the app.
     enabled: bool,
     page_size: usize,
     view: View,
+}
+
+fn on_off_keys(cfg: &Config) -> keys::OnOffKeys {
+    let (keys, bad) = keys::OnOffKeys::from_config(&cfg.frontend);
+    if !bad.is_empty() {
+        crate::diagnostics::log(format!("unknown on/off keys ignored: {bad:?}"));
+    }
+    keys
 }
 
 /// Candidates per page of the panel (`[ui.candidate_window] page_size`,
@@ -169,6 +178,7 @@ impl Session {
         Self {
             bridge,
             symbols: cfg.frontend.symbols.clone(),
+            on_off: on_off_keys(cfg),
             enabled: true,
             page_size: page_size(cfg),
             view: View {
@@ -203,6 +213,7 @@ impl Session {
         self.bridge.set_candidate_paging(self.page_size, true);
         self.bridge.set_live_conversion(live_conversion(cfg));
         self.symbols = cfg.frontend.symbols.clone();
+        self.on_off = on_off_keys(cfg);
         self.view = View {
             cursor_at_start: cfg.frontend.preedit_cursor_at_start,
             ..View::default()
@@ -276,6 +287,10 @@ impl Session {
         self.enabled
     }
 
+    pub fn is_active(&self) -> bool {
+        self.bridge.is_active()
+    }
+
     pub fn page_size(&self) -> usize {
         self.page_size
     }
@@ -293,8 +308,15 @@ impl Session {
     /// text before the caret is the left context.
     pub fn key_in(&mut self, key: &Key, field: Field, before_caret: Option<&str>) -> bool {
         self.view.commits.clear();
-        if keys::is_toggle(key) {
-            self.toggle();
+        if let Some(role) = self.on_off.role(key) {
+            let want = match role {
+                keys::OnOff::Toggle => !self.enabled,
+                keys::OnOff::On => true,
+                keys::OnOff::Off => false,
+            };
+            if want != self.enabled {
+                self.toggle();
+            }
             return true;
         }
         if !self.enabled {
@@ -649,19 +671,49 @@ mod tests {
     }
 
     #[test]
-    fn backquote_commits_and_turns_the_ime_off_and_on() {
+    fn on_off_keys_commit_and_switch_while_bare_backquote_stays_typable() {
         let (mut s, _) = session();
         type_str(&mut s, "kana");
-        assert!(press(&mut s, '`' as u32, 0));
+        // Default toggle is Alt+` (or Zenkaku), not bare `
+        assert!(press(&mut s, '`' as u32, MOD_ALT));
         assert!(!s.enabled());
         assert_eq!(s.view().commits, vec!["かな"]);
         assert!(s.view().preedit.is_empty());
-        // off: keys go to the app
+        // Off: bare ` and JIS Shift+@ (GRAVE + MOD_SHIFT) pass straight to the app
         assert!(!press(&mut s, 'a' as u32, 0));
+        assert!(!press(&mut s, '`' as u32, 0));
+        assert!(!press(&mut s, '`' as u32, MOD_SHIFT));
+        assert!(!s.enabled());
         assert!(press(&mut s, '`' as u32, MOD_ALT));
         assert!(s.enabled());
+        // On: bare ` types a symbol into preedit rather than toggling off
+        assert!(press(&mut s, '`' as u32, 0));
+        assert!(s.enabled());
+        assert!(!s.view().preedit.is_empty());
+        assert!(press(&mut s, RETURN, 0));
         type_str(&mut s, "a");
         assert_eq!(s.view().preedit, vec!["あ"]);
+
+        // Custom dedicated on/off keys (Henkan / Muhenkan)
+        let (mut s, _) = session_with(|c| {
+            c.frontend.on_keys = vec!["Henkan".into()];
+            c.frontend.off_keys = vec!["Muhenkan".into()];
+        });
+        type_str(&mut s, "kana");
+        // Henkan while already on keeps composing
+        assert!(press(&mut s, 0xff23, 0));
+        assert!(s.enabled());
+        assert_eq!(s.view().preedit, vec!["かな"]);
+        // Muhenkan commits and turns off
+        assert!(press(&mut s, 0xff22, 0));
+        assert!(!s.enabled());
+        assert_eq!(s.view().commits, vec!["かな"]);
+        // Muhenkan again stays off
+        assert!(press(&mut s, 0xff22, 0));
+        assert!(!s.enabled());
+        // Henkan turns back on
+        assert!(press(&mut s, 0xff23, 0));
+        assert!(s.enabled());
     }
 
     #[test]

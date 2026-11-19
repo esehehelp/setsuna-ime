@@ -5,18 +5,50 @@
 //! never cross the boundary: each entry point catches them and returns its
 //! "nothing happened" value.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use setsuna_core::child_daemon;
-use setsuna_core::config::{Config, RewriterCfg};
+use setsuna_core::config::{AppStart, Config, RerankCfg, RewriterCfg};
 use setsuna_core::engine_client::Notify;
 use setsuna_core::rerank_client;
 use setsuna_core::rewrite_client::{self, RewriteClient};
 
 use crate::keys::Key;
 use crate::session::{Field, Session};
+
+/// App-specific initial mode from `[[apps]]` (`setsuna_session_configure_app`).
+pub const SETSUNA_APP_START_KEEP: c_int = 0;
+pub const SETSUNA_APP_START_ON: c_int = 1;
+pub const SETSUNA_APP_START_OFF: c_int = 2;
+
+/// Minimum interval between `stat(config.toml)` checks on idle key presses.
+const CONFIG_CHECK_EVERY: Duration = Duration::from_secs(1);
+/// Cooldown before retrying an engine spawn that failed (no model, bad path).
+const ENGINE_RETRY_EVERY: Duration = Duration::from_secs(30);
+
+fn config_stamp(path: Option<&Path>) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path?).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn rerank_launch_key(c: &RerankCfg) -> Option<String> {
+    c.manifest.as_ref()?;
+    Some(format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        c.manifest, c.exe, c.threads, c.max_candidates
+    ))
+}
+
+fn app_start_code(start: AppStart) -> c_int {
+    match start {
+        AppStart::Keep => SETSUNA_APP_START_KEEP,
+        AppStart::On => SETSUNA_APP_START_ON,
+        AppStart::Off => SETSUNA_APP_START_OFF,
+    }
+}
 
 /// Wakes the addon's event loop; called from a backend thread with the
 /// `user` pointer given to `setsuna_session_new`.
@@ -71,13 +103,28 @@ impl CList {
 
 pub struct SetsunaSession {
     session: Session,
-    /// Where the engine and models are looked for last (see `load_config`).
+    /// Where the engine and models are looked for last (see `with_module_defaults`).
     module_dir: Option<PathBuf>,
     /// What the daemons wake the addon with.
     notify: SetsunaNotify,
     user: UserPtr,
-    /// The settings the running rewriter was started with.
-    rewriter_started: Option<RewriterCfg>,
+    /// Path to `config.toml` watched for changes (`mtime`, `len`).
+    config_path: Option<PathBuf>,
+    config_stamp: Option<(SystemTime, u64)>,
+    config_checked: Option<Instant>,
+    /// Last successfully loaded `config.toml` (with `module_dir` defaults).
+    base_config: Config,
+    /// Last active application program name (for idle key-time reloads).
+    last_program: String,
+    /// Effective `Config` debug key last applied to `session`.
+    applied_key: Option<String>,
+    /// `(engine config key, spawn succeeded)` of the last engine launch attempt.
+    engine_started: Option<(String, bool)>,
+    engine_retry_at: Option<Instant>,
+    /// `(reranker launch key, spawn succeeded)` of the last reranker attempt.
+    reranker_started: Option<(String, bool)>,
+    /// `(rewriter cfg, spawn succeeded)` of the last rewriter attempt.
+    rewriter_started: Option<(RewriterCfg, bool)>,
     commits: CList,
     preedit: CList,
     candidates: CList,
@@ -137,46 +184,147 @@ impl SetsunaSession {
         })
     }
 
-    /// Take up `cfg` and start the daemons it asks for, as the TSF DLL does
-    /// on ActivateEx: an engine when there is none or its daemon exited
-    /// (with a new bridge, so a new reranker and rewriter too), a reranker
-    /// when there is none, the rewriter when it is on and was not started
-    /// with these settings; then rewrite mode on (only with a rewriter).
-    fn configure(&mut self, cfg: &Config) {
+    /// Re-read `config.toml` when its `(mtime, size)` changed (throttled when
+    /// `!force`). Keeps the previous `base_config` on parse errors so a half-
+    /// written or broken file never wipes live settings.
+    fn reload_base_config(&mut self, force: bool) -> bool {
+        let now = Instant::now();
+        if !force
+            && self
+                .config_checked
+                .is_some_and(|t| now.duration_since(t) < CONFIG_CHECK_EVERY)
+        {
+            return false;
+        }
+        self.config_checked = Some(now);
+        let stamp = config_stamp(self.config_path.as_deref());
+        if stamp == self.config_stamp && self.applied_key.is_some() {
+            return false;
+        }
+        self.config_stamp = stamp;
+        let loaded = match self.config_path.as_deref() {
+            Some(p) if p.exists() => match Config::load_from_path(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    setsuna_core::diagnostics::log(format!(
+                        "fcitx5 config.toml not applied: {e:#}"
+                    ));
+                    return false;
+                }
+            },
+            _ => Config::default(),
+        };
+        self.base_config = with_module_defaults(loaded, self.module_dir.as_deref());
+        self.engine_retry_at = None;
+        true
+    }
+
+    /// Apply `base_config` + `[[apps]]` for `program` only when the config
+    /// file, effective app settings, or daemon liveness changed. Returns the
+    /// app's configured `AppStart` without overwriting `session.enabled()`.
+    fn sync_config(&mut self, program: &str, force: bool) -> AppStart {
+        let file_changed = self.reload_base_config(force);
+        let (cfg, app) = self.base_config.for_app(program);
+        let start = app.as_ref().map_or(AppStart::Keep, |a| a.start);
+        let effective_key = format!("{cfg:?}");
+        let engine_key = format!("{:?}", cfg.engine);
+        let rerank_key = rerank_launch_key(&cfg.rerank);
+        let now = Instant::now();
+
+        let engine_changed = self
+            .engine_started
+            .as_ref()
+            .is_none_or(|(k, _)| k != &engine_key);
+        let engine_died =
+            self.engine_started.as_ref().is_some_and(|(_, ok)| *ok) && !self.session.has_client();
+        let engine_retry =
+            !self.session.has_client() && self.engine_retry_at.is_none_or(|t| now >= t);
+        let needs_engine = engine_changed || engine_died || engine_retry;
+
+        let needs_reranker = needs_engine
+            || match (&rerank_key, &self.reranker_started) {
+                (None, Some(_)) => true,
+                (None, None) => self.session.has_reranker(),
+                (Some(k), Some((prev, ok))) => {
+                    k != prev || ((*ok || file_changed) && !self.session.has_reranker())
+                }
+                (Some(_), None) => true,
+            };
+
+        let needs_rewriter = needs_engine
+            || if cfg.rewriter.enabled {
+                match &self.rewriter_started {
+                    Some((prev, ok)) => {
+                        prev != &cfg.rewriter
+                            || ((*ok || file_changed) && !self.session.has_rewriter())
+                    }
+                    None => true,
+                }
+            } else {
+                self.session.has_rewriter() || self.rewriter_started.is_some()
+            };
+
+        let cfg_changed = file_changed || self.applied_key.as_ref() != Some(&effective_key);
+        self.last_program = program.to_string();
+        if !cfg_changed && !needs_engine && !needs_reranker && !needs_rewriter {
+            return start;
+        }
+
         let module_dir = self.module_dir.clone();
         let module_dir = module_dir.as_deref();
-        let client = (!self.session.has_client())
-            .then(|| child_daemon::spawn_with_config(cfg, module_dir, self.wake()))
-            .flatten();
-        let new_bridge = client.is_some();
-        if new_bridge {
-            setsuna_core::diagnostics::log("fcitx5 engine started");
+        if needs_engine {
+            let client = child_daemon::spawn_with_config(&cfg, module_dir, self.wake());
+            let ok = client.is_some();
+            if ok {
+                setsuna_core::diagnostics::log("fcitx5 engine started");
+                self.engine_retry_at = None;
+            } else {
+                self.engine_retry_at = Some(now + ENGINE_RETRY_EVERY);
+            }
+            self.engine_started = Some((engine_key, ok));
+            let was_enabled = self.session.enabled();
+            self.session = Session::new(&cfg, client);
+            self.session.set_enabled(was_enabled);
+            self.reranker_started = None;
+            self.rewriter_started = None;
+        } else if cfg_changed {
+            self.session.configure(&cfg);
         }
-        self.session.configure_with(cfg, client);
-        if new_bridge || !self.session.has_reranker() {
-            let reranker = rerank_client::spawn_with_config(cfg, module_dir, self.wake());
-            self.session.set_reranker(reranker, cfg);
-        } else {
-            self.session.set_rerank_config(cfg);
+
+        if needs_reranker {
+            if let Some(key) = rerank_key {
+                let reranker = rerank_client::spawn_with_config(&cfg, module_dir, self.wake());
+                self.reranker_started = Some((key, reranker.is_some()));
+                self.session.set_reranker(reranker, &cfg);
+            } else {
+                self.reranker_started = None;
+                self.session.set_reranker(None, &cfg);
+            }
+        } else if cfg_changed {
+            self.session.set_rerank_config(&cfg);
         }
-        let needs_rewriter = cfg.rewriter.enabled
-            && (!self.session.has_rewriter()
-                || self.rewriter_started.as_ref() != Some(&cfg.rewriter));
-        if needs_rewriter || !cfg.rewriter.enabled {
-            let rewriter = needs_rewriter
-                .then(|| rewrite_client::spawn_with_config(cfg, module_dir, self.wake()))
-                .flatten();
-            self.rewriter_started = rewriter.as_ref().map(|_| cfg.rewriter.clone());
-            self.session
-                .set_rewriter(rewriter.map(|c| Box::new(c) as Box<dyn RewriteClient>));
+
+        if needs_rewriter {
+            if cfg.rewriter.enabled {
+                let rewriter = rewrite_client::spawn_with_config(&cfg, module_dir, self.wake());
+                self.rewriter_started = Some((cfg.rewriter.clone(), rewriter.is_some()));
+                self.session
+                    .set_rewriter(rewriter.map(|c| Box::new(c) as Box<dyn RewriteClient>));
+            } else {
+                self.rewriter_started = None;
+                self.session.set_rewriter(None);
+            }
         }
         self.session.set_rewrite_mode(true);
+        self.applied_key = Some(effective_key);
         setsuna_core::diagnostics::log(format!(
-            "fcitx5 daemons engine={} reranker={} rewriter={}",
+            "fcitx5 configure program={program:?} app={} engine={} reranker={} rewriter={}",
+            app.is_some(),
             self.session.has_client(),
             self.session.has_reranker(),
             self.session.rewrite_mode()
         ));
+        start
     }
 }
 
@@ -207,48 +355,69 @@ pub unsafe extern "C" fn setsuna_session_new(
     notify: SetsunaNotify,
     user: *mut c_void,
 ) -> *mut SetsunaSession {
-    setsuna_core::diagnostics::init("fcitx5.log");
-    let module_dir = (!module_dir.is_null())
-        .then(|| PathBuf::from(CStr::from_ptr(module_dir).to_string_lossy().into_owned()));
-    let mut s = Box::new(SetsunaSession {
-        session: Session::new(&Config::default(), None),
-        module_dir,
-        notify,
-        user: UserPtr(user),
-        rewriter_started: None,
-        commits: CList::default(),
-        preedit: CList::default(),
-        candidates: CList::default(),
-        comments: CList::default(),
-        texts: CList::default(),
-        suggestions: CList::default(),
-        suggestion_comments: CList::default(),
-        view: SetsunaView {
-            commits: std::ptr::null(),
-            n_commits: 0,
-            preedit: std::ptr::null(),
-            n_preedit: 0,
-            focus: -1,
-            cursor: 0,
-            candidates: std::ptr::null(),
-            comments: std::ptr::null(),
-            n_candidates: 0,
-            selected: 0,
-            reading: std::ptr::null(),
-            form: std::ptr::null(),
-            form_key: std::ptr::null(),
-            suggestions: std::ptr::null(),
-            suggestion_comments: std::ptr::null(),
-            n_suggestions: 0,
-            status: std::ptr::null(),
-        },
-    });
-    guard((), || {
-        let cfg = load_config(s.module_dir.as_deref());
-        s.configure(&cfg);
-    });
-    s.refresh();
-    Box::into_raw(s)
+    guard(std::ptr::null_mut(), || {
+        setsuna_core::diagnostics::init("fcitx5.log");
+        let module_dir = (!module_dir.is_null())
+            .then(|| PathBuf::from(CStr::from_ptr(module_dir).to_string_lossy().into_owned()));
+        let config_path = Config::appdata_config_path();
+        let mut s = Box::new(SetsunaSession::empty(module_dir, config_path, notify, user));
+        s.sync_config("", true);
+        s.refresh();
+        Box::into_raw(s)
+    })
+}
+
+impl SetsunaSession {
+    fn empty(
+        module_dir: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        notify: SetsunaNotify,
+        user: *mut c_void,
+    ) -> Self {
+        let base_config = with_module_defaults(Config::default(), module_dir.as_deref());
+        Self {
+            session: Session::new(&base_config, None),
+            module_dir,
+            notify,
+            user: UserPtr(user),
+            config_path,
+            config_stamp: None,
+            config_checked: None,
+            base_config,
+            last_program: String::new(),
+            applied_key: None,
+            engine_started: None,
+            engine_retry_at: None,
+            reranker_started: None,
+            rewriter_started: None,
+            commits: CList::default(),
+            preedit: CList::default(),
+            candidates: CList::default(),
+            comments: CList::default(),
+            texts: CList::default(),
+            suggestions: CList::default(),
+            suggestion_comments: CList::default(),
+            view: SetsunaView {
+                commits: std::ptr::null(),
+                n_commits: 0,
+                preedit: std::ptr::null(),
+                n_preedit: 0,
+                focus: -1,
+                cursor: 0,
+                candidates: std::ptr::null(),
+                comments: std::ptr::null(),
+                n_candidates: 0,
+                selected: 0,
+                reading: std::ptr::null(),
+                form: std::ptr::null(),
+                form_key: std::ptr::null(),
+                suggestions: std::ptr::null(),
+                suggestion_comments: std::ptr::null(),
+                n_suggestions: 0,
+                status: std::ptr::null(),
+            },
+        }
+    }
 }
 
 /// Stop the daemons and free the session. No notify follows.
@@ -267,30 +436,39 @@ unsafe fn with<R>(s: *mut SetsunaSession, fallback: R, f: impl FnOnce(&mut Sessi
     let Some(s) = s.as_mut() else {
         return fallback;
     };
-    let r = guard(fallback, || f(&mut s.session));
-    s.refresh();
-    r
+    guard(fallback, || {
+        let r = f(&mut s.session);
+        s.refresh();
+        r
+    })
 }
 
-/// Reload `config.toml` (the input method was activated again), dropping
-/// any composition. The engine daemon is kept.
+/// `with` for what needs the whole session (its config and daemons).
+unsafe fn with_outer<R>(
+    s: *mut SetsunaSession,
+    fallback: R,
+    f: impl FnOnce(&mut SetsunaSession) -> R,
+) -> R {
+    let Some(s) = s.as_mut() else {
+        return fallback;
+    };
+    guard(fallback, || {
+        let r = f(s);
+        s.refresh();
+        r
+    })
+}
+
+/// Reload `config.toml` if it changed (and restart daemons whose settings
+/// changed or that exited).
 ///
 /// # Safety
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_configure(s: *mut SetsunaSession) {
-    setsuna_core::diagnostics::log("fcitx5 configure");
-    let cfg = load_config(module_dir_of(s));
-    with_outer(s, |s| s.configure(&cfg));
-}
-
-/// `with` for what needs the whole session (its daemons).
-unsafe fn with_outer(s: *mut SetsunaSession, f: impl FnOnce(&mut SetsunaSession)) {
-    let Some(s) = s.as_mut() else {
-        return;
-    };
-    guard((), || f(s));
-    s.refresh();
+    with_outer(s, (), |s| {
+        s.sync_config("", true);
+    });
 }
 
 /// `config.toml` over what the addon's install supplies, each where
@@ -301,10 +479,6 @@ unsafe fn with_outer(s: *mut SetsunaSession, f: impl FnOnce(&mut SetsunaSession)
 /// `*manifest.json` of `<module_dir>/analyzer`) and the reranker's model (the
 /// one `*manifest.json` of `<module_dir>/models/rerank`). Every (re)load goes
 /// through here, so a reload on activation or focus keeps them.
-fn load_config(module_dir: Option<&Path>) -> Config {
-    with_module_defaults(Config::load_default(), module_dir)
-}
-
 fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
     let Some(dir) = module_dir else {
         return cfg;
@@ -347,17 +521,10 @@ fn the_manifest_in(dir: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(first)
 }
 
-/// The session's module dir.
-///
-/// # Safety
-/// `s` is null or a live session.
-unsafe fn module_dir_of<'a>(s: *mut SetsunaSession) -> Option<&'a Path> {
-    s.as_ref().and_then(|s| s.module_dir.as_deref())
-}
-
-/// `setsuna_session_configure` for the application `program` (the input
-/// context's program, empty when unknown): its `[[apps]]` settings over the
-/// rest, and its start state.
+/// Apply `config.toml` and `[[apps]]` settings for `program` (empty when
+/// unknown), reloading only when the config file, effective app settings or
+/// daemon liveness changed. Returns `SETSUNA_APP_START_*` without changing
+/// `session.enabled()` (the addon owns per-context on/off state).
 ///
 /// # Safety
 /// `s` is a live session; `program` is null or a NUL-terminated string.
@@ -365,23 +532,13 @@ unsafe fn module_dir_of<'a>(s: *mut SetsunaSession) -> Option<&'a Path> {
 pub unsafe extern "C" fn setsuna_session_configure_app(
     s: *mut SetsunaSession,
     program: *const c_char,
-) {
-    let program = (!program.is_null())
-        .then(|| CStr::from_ptr(program).to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let (cfg, app) = load_config(module_dir_of(s)).for_app(&program);
-    setsuna_core::diagnostics::log(format!(
-        "fcitx5 configure for {program:?} app settings={}",
-        app.is_some()
-    ));
-    with_outer(s, |s| {
-        s.configure(&cfg);
-        match app.map(|a| a.start) {
-            Some(setsuna_core::config::AppStart::On) => s.session.set_enabled(true),
-            Some(setsuna_core::config::AppStart::Off) => s.session.set_enabled(false),
-            _ => {}
-        }
-    });
+) -> c_int {
+    with_outer(s, SETSUNA_APP_START_KEEP, |s| {
+        let program = (!program.is_null())
+            .then(|| CStr::from_ptr(program).to_string_lossy().into_owned())
+            .unwrap_or_default();
+        app_start_code(s.sync_config(&program, true))
+    })
 }
 
 /// `setsuna_session_key`'s `field`: what the field typed into is.
@@ -406,15 +563,20 @@ pub unsafe extern "C" fn setsuna_session_key(
     field: u32,
     before_caret: *const c_char,
 ) -> bool {
-    let field = match field {
-        SETSUNA_FIELD_PRIVATE => Field::Private,
-        SETSUNA_FIELD_DIRECT => Field::Direct,
-        _ => Field::Normal,
-    };
-    let before = (!before_caret.is_null())
-        .then(|| CStr::from_ptr(before_caret).to_string_lossy().into_owned());
-    with(s, false, |sess| {
-        sess.key_in(&Key { sym, code, mods }, field, before.as_deref())
+    with_outer(s, false, |s| {
+        if !s.session.is_active() {
+            let program = s.last_program.clone();
+            s.sync_config(&program, false);
+        }
+        let field = match field {
+            SETSUNA_FIELD_PRIVATE => Field::Private,
+            SETSUNA_FIELD_DIRECT => Field::Direct,
+            _ => Field::Normal,
+        };
+        let before = (!before_caret.is_null())
+            .then(|| CStr::from_ptr(before_caret).to_string_lossy().into_owned());
+        s.session
+            .key_in(&Key { sym, code, mods }, field, before.as_deref())
     })
 }
 
@@ -424,7 +586,9 @@ pub unsafe extern "C" fn setsuna_session_key(
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_rewrite_mode(s: *const SetsunaSession) -> bool {
-    s.as_ref().is_some_and(|s| s.session.rewrite_mode())
+    guard(false, || {
+        s.as_ref().is_some_and(|s| s.session.rewrite_mode())
+    })
 }
 
 /// How long (ms) until a deferred preedit is shown anyway (0: none waits);
@@ -433,8 +597,8 @@ pub unsafe extern "C" fn setsuna_session_rewrite_mode(s: *const SetsunaSession) 
 /// # Safety
 /// `s` is a live session.
 #[no_mangle]
-pub unsafe extern "C" fn setsuna_session_deferred_ms(s: *mut SetsunaSession) -> u32 {
-    with(s, 0, |sess| sess.deferred_ms())
+pub unsafe extern "C" fn setsuna_session_deferred_ms(s: *const SetsunaSession) -> u32 {
+    guard(0, || s.as_ref().map_or(0, |s| s.session.deferred_ms()))
 }
 
 /// The deferred preedit's deadline passed; true when the view changed.
@@ -471,8 +635,10 @@ pub unsafe extern "C" fn setsuna_session_select(s: *mut SetsunaSession, index: u
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_flush(s: *mut SetsunaSession) {
-    setsuna_core::diagnostics::log("fcitx5 flush");
-    with(s, (), |sess| sess.flush())
+    with(s, (), |sess| {
+        setsuna_core::diagnostics::log("fcitx5 flush");
+        sess.flush()
+    })
 }
 
 /// Drop the composition (the app reset the input context).
@@ -481,8 +647,10 @@ pub unsafe extern "C" fn setsuna_session_flush(s: *mut SetsunaSession) {
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_reset(s: *mut SetsunaSession) {
-    setsuna_core::diagnostics::log("fcitx5 reset");
-    with(s, (), |sess| sess.reset())
+    with(s, (), |sess| {
+        setsuna_core::diagnostics::log("fcitx5 reset");
+        sess.reset()
+    })
 }
 
 /// The current view; valid until the next call on `s`.
@@ -491,7 +659,9 @@ pub unsafe extern "C" fn setsuna_session_reset(s: *mut SetsunaSession) {
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_view(s: *const SetsunaSession) -> *const SetsunaView {
-    s.as_ref().map_or(std::ptr::null(), |s| &s.view)
+    guard(std::ptr::null(), || {
+        s.as_ref().map_or(std::ptr::null(), |s| &s.view)
+    })
 }
 
 /// Candidates per page of the panel (`[ui.candidate_window] page_size`,
@@ -501,16 +671,16 @@ pub unsafe extern "C" fn setsuna_session_view(s: *const SetsunaSession) -> *cons
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_page_size(s: *const SetsunaSession) -> usize {
-    s.as_ref().map_or(10, |s| s.session.page_size())
+    guard(10, || s.as_ref().map_or(10, |s| s.session.page_size()))
 }
 
-/// Whether the IME is on (\` / 半角/全角 turn it off: keys go to the app).
+/// Whether the IME is on (keys go to the app while off).
 ///
 /// # Safety
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_enabled(s: *const SetsunaSession) -> bool {
-    s.as_ref().is_some_and(|s| s.session.enabled())
+    guard(false, || s.as_ref().is_some_and(|s| s.session.enabled()))
 }
 
 /// Turn the IME on or off (the status area's mode action), committing
@@ -523,23 +693,45 @@ pub unsafe extern "C" fn setsuna_session_toggle(s: *mut SetsunaSession) {
     with(s, (), |sess| sess.toggle())
 }
 
+/// Set the IME on or off without committing (per-context state restore).
+///
+/// # Safety
+/// `s` is a live session.
+#[no_mangle]
+pub unsafe extern "C" fn setsuna_session_set_enabled(s: *mut SetsunaSession, on: bool) {
+    with(s, (), |sess| sess.set_enabled(on))
+}
+
 /// Whether the engine daemon was started (else raw hiragana only).
 ///
 /// # Safety
 /// `s` is a live session.
 #[no_mangle]
 pub unsafe extern "C" fn setsuna_session_has_engine(s: *const SetsunaSession) -> bool {
-    s.as_ref().is_some_and(|s| s.session.has_client())
+    guard(false, || s.as_ref().is_some_and(|s| s.session.has_client()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use setsuna_core::rerank_client::{RerankClient, RerankInfo, RerankResult};
 
     unsafe fn strings(ptrs: *const *const c_char, n: usize) -> Vec<String> {
         (0..n)
             .map(|i| CStr::from_ptr(*ptrs.add(i)).to_string_lossy().into_owned())
             .collect()
+    }
+
+    struct DummyReranker;
+    impl RerankClient for DummyReranker {
+        fn dispatch(&self, _: u64, _: &str, _: &[String], _: Instant) {}
+        fn cancel(&self) {}
+        fn take_latest(&self) -> Option<RerankResult> {
+            None
+        }
+        fn info(&self) -> Option<RerankInfo> {
+            None
+        }
     }
 
     #[test]
@@ -622,21 +814,8 @@ mod tests {
 
     #[test]
     fn the_c_view_mirrors_the_session() {
-        let mut s = SetsunaSession {
-            session: Session::new(&Config::default(), None),
-            module_dir: None,
-            notify: no_wake,
-            user: UserPtr(std::ptr::null_mut()),
-            rewriter_started: None,
-            commits: CList::default(),
-            preedit: CList::default(),
-            candidates: CList::default(),
-            comments: CList::default(),
-            texts: CList::default(),
-            suggestions: CList::default(),
-            suggestion_comments: CList::default(),
-            view: unsafe { std::mem::zeroed() },
-        };
+        let mut s = SetsunaSession::empty(None, None, no_wake, std::ptr::null_mut());
+        s.sync_config("", true);
         s.refresh();
         let p = &mut s as *mut SetsunaSession;
         unsafe {
@@ -655,5 +834,105 @@ mod tests {
             assert_eq!(v.n_preedit, 0);
             assert!(!setsuna_session_has_engine(p));
         }
+    }
+
+    #[test]
+    fn configure_app_skips_unchanged_reloads_and_returns_app_start_without_clobbering_enabled() {
+        let dir = std::env::temp_dir().join(format!("setsuna-ffi-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "[ui.candidate_window]\npage_size = 7\n\n[[apps]]\nprocess = \"konsole\"\nstart = \"off\"\n",
+        )
+        .unwrap();
+
+        let mut s =
+            SetsunaSession::empty(None, Some(cfg_path.clone()), no_wake, std::ptr::null_mut());
+        s.sync_config("", true);
+        s.refresh();
+        let p = &mut s as *mut SetsunaSession;
+        let konsole = CString::new("konsole").unwrap();
+        let firefox = CString::new("firefox").unwrap();
+        let dolphin = CString::new("dolphin").unwrap();
+        unsafe {
+            assert_eq!(setsuna_session_page_size(p), 7);
+            assert!(setsuna_session_enabled(p));
+            // konsole returns OFF without clobbering enabled itself
+            assert_eq!(
+                setsuna_session_configure_app(p, konsole.as_ptr()),
+                SETSUNA_APP_START_OFF
+            );
+            assert!(setsuna_session_enabled(p));
+            setsuna_session_set_enabled(p, false);
+            assert!(!setsuna_session_enabled(p));
+
+            // Switching between unrelated apps hits the fast path (keeps preedit/state)
+            assert_eq!(
+                setsuna_session_configure_app(p, firefox.as_ptr()),
+                SETSUNA_APP_START_KEEP
+            );
+            setsuna_session_set_enabled(p, true);
+            assert!(setsuna_session_key(
+                p,
+                'a' as u32,
+                0,
+                0,
+                0,
+                std::ptr::null()
+            ));
+            assert_eq!(
+                setsuna_session_configure_app(p, dolphin.as_ptr()),
+                SETSUNA_APP_START_KEEP
+            );
+            // Fast path did not tear down the session
+            let v = &*setsuna_session_view(p);
+            assert_eq!(strings(v.preedit, v.n_preedit), vec!["あ"]);
+
+            // Editing config.toml (different length -> new stamp) reloads settings
+            std::fs::write(
+                &cfg_path,
+                "[ui.candidate_window]\npage_size = 5\n\n[[apps]]\nprocess = \"konsole\"\nstart = \"on\"\n",
+            )
+            .unwrap();
+            assert_eq!(
+                setsuna_session_configure_app(p, konsole.as_ptr()),
+                SETSUNA_APP_START_ON
+            );
+            assert_eq!(setsuna_session_page_size(p), 5);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_rerank_manifest_stops_running_reranker_and_engine_change_tracks_key() {
+        let dir = std::env::temp_dir().join(format!("setsuna-ffi-rrstop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, "[engine]\nbeam_width = 10\n").unwrap();
+
+        let mut s =
+            SetsunaSession::empty(None, Some(cfg_path.clone()), no_wake, std::ptr::null_mut());
+        s.sync_config("", true);
+        let first_engine_key = s.engine_started.clone().unwrap().0;
+        // Simulate a running reranker attached under a previous config
+        s.session
+            .set_reranker(Some(Box::new(DummyReranker)), &Config::default());
+        s.reranker_started = Some(("old-manifest".into(), true));
+        assert!(s.session.has_reranker());
+
+        // Reloading with no [rerank] manifest stops the reranker
+        s.sync_config("", true);
+        assert!(!s.session.has_reranker());
+        assert!(s.reranker_started.is_none());
+
+        // Changing [engine] beam_width updates engine_started key (triggers restart path)
+        std::fs::write(&cfg_path, "[engine]\nbeam_width = 25\n").unwrap();
+        s.sync_config("", true);
+        let second_engine_key = s.engine_started.clone().unwrap().0;
+        assert_ne!(first_engine_key, second_engine_key);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

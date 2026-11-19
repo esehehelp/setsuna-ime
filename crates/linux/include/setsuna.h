@@ -58,12 +58,21 @@ SetsunaSession *setsuna_session_new(const char *module_dir, SetsunaNotify notify
 /* Stop the daemons; no notify follows once this returns. */
 void setsuna_session_free(SetsunaSession *s);
 
-/* Reload config.toml, dropping any composition, and start the daemons it
- * asks for that are not running (as the TSF DLL does on activation). */
+/* Reload config.toml if it changed (and restart daemons whose settings
+ * changed or that exited). */
 void setsuna_session_configure(SetsunaSession *s);
-/* setsuna_session_configure for the application `program` (its [[apps]]
- * settings and start state); null or empty when unknown. */
-void setsuna_session_configure_app(SetsunaSession *s, const char *program);
+
+/* App-specific initial mode from [[apps]] (setsuna_session_configure_app). */
+#define SETSUNA_APP_START_KEEP 0
+#define SETSUNA_APP_START_ON 1
+#define SETSUNA_APP_START_OFF 2
+
+/* Apply config.toml and [[apps]] settings for `program` (null or empty when
+ * unknown), reloading only when the config file, effective app settings or
+ * daemon liveness changed. Returns SETSUNA_APP_START_* without changing
+ * the session's enabled flag (the frontend owns per-context on/off state via
+ * setsuna_session_set_enabled). */
+int setsuna_session_configure_app(SetsunaSession *s, const char *program);
 /* What the field typed into is (setsuna_session_key's `field`). */
 #define SETSUNA_FIELD_NORMAL 0u
 #define SETSUNA_FIELD_PRIVATE 1u /* no context, no rewrite, nothing learned */
@@ -71,8 +80,8 @@ void setsuna_session_configure_app(SetsunaSession *s, const char *program);
 
 /* A key press (X keysym, X keycode, SETSUNA_MOD_*) typed into `field`, with
  * `before_caret` the app's text before the caret (NULL when unknown): a key
- * starting a composition takes both up. True when taken. ` and
- * Zenkaku_Hankaku turn the IME on or off. */
+ * starting a composition takes both up. True when taken. Keys in
+ * [frontend] toggle_keys / on_keys / off_keys switch the IME on or off. */
 bool setsuna_session_key(SetsunaSession *s, uint32_t sym, uint32_t code,
                         uint32_t mods, uint32_t field, const char *before_caret);
 /* Apply the latest conversion result; true when the view changed. */
@@ -88,10 +97,12 @@ const SetsunaView *setsuna_session_view(const SetsunaSession *s);
 size_t setsuna_session_page_size(const SetsunaSession *s);
 /* How long (ms) until a deferred preedit is shown anyway (0: none waits);
  * then call setsuna_session_tick (true when the view changed). */
-uint32_t setsuna_session_deferred_ms(SetsunaSession *s);
+uint32_t setsuna_session_deferred_ms(const SetsunaSession *s);
 bool setsuna_session_tick(SetsunaSession *s);
 /* Turn the IME on or off, committing what is composed. */
 void setsuna_session_toggle(SetsunaSession *s);
+/* Set the IME on or off without committing (per-context state restore). */
+void setsuna_session_set_enabled(SetsunaSession *s, bool on);
 /* Whether the IME is on; off, every key goes to the app. */
 bool setsuna_session_enabled(const SetsunaSession *s);
 bool setsuna_session_has_engine(const SetsunaSession *s);

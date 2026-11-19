@@ -54,29 +54,145 @@ const END: u32 = 0xff57;
 const INSERT: u32 = 0xff63;
 const KP_ENTER: u32 = 0xff8d;
 const ISO_LEFT_TAB: u32 = 0xfe20;
+const F1: u32 = 0xffbe;
 const F6: u32 = 0xffc3;
 const F7: u32 = 0xffc4;
 const F8: u32 = 0xffc5;
 const F9: u32 = 0xffc6;
 const F10: u32 = 0xffc7;
+const CAPS_LOCK: u32 = 0xffe5;
 const DELETE: u32 = 0xffff;
 const SPACE: u32 = 0x20;
 const GRAVE: u32 = 0x60;
 const YEN: u32 = 0xa5;
 const KANJI: u32 = 0xff21;
+const MUHENKAN: u32 = 0xff22;
+const HENKAN: u32 = 0xff23;
+const HIRAGANA: u32 = 0xff25;
+const KATAKANA: u32 = 0xff26;
+const HIRAGANA_KATAKANA: u32 = 0xff27;
+const ZENKAKU: u32 = 0xff28;
+const HANKAKU: u32 = 0xff29;
 const ZENKAKU_HANKAKU: u32 = 0xff2a;
+const KANA_SHIFT: u32 = 0xff2e;
+const EISU_SHIFT: u32 = 0xff2f;
+const EISU_TOGGLE: u32 = 0xff30;
 
 /// X keycode of the JIS ろ key (evdev `KEY_RO` 89 + 8).
 const KEYCODE_RO: u32 = 97;
 
-/// Whether `key` turns the IME on or off: \` (with or without Alt), the key
-/// in the JIS 半角/全角 position on other keyboards, and 半角/全角 itself
-/// (`Zenkaku_Hankaku`, or `Kanji` under some layouts). \` therefore never
-/// types; Shift+\` is still `~`. fcitx5's default trigger keys already take
-/// `Zenkaku_Hankaku` to switch input methods; it only reaches the addon
-/// when they don't.
-pub fn is_toggle(key: &Key) -> bool {
-    matches!(key.sym, GRAVE | KANJI | ZENKAKU_HANKAKU) && key.mods & (MOD_CTRL | MOD_SUPER) == 0
+/// What a key of `[frontend] toggle_keys` / `on_keys` / `off_keys` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnOff {
+    Toggle,
+    On,
+    Off,
+}
+
+/// A key of the config: its X keysyms with exact `MOD_*` modifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySpec {
+    pub syms: Vec<u32>,
+    pub mods: u32,
+}
+
+/// Read a key spec (`Zenkaku`, `Alt+\``, `Ctrl+Space`, `Henkan`, `Muhenkan`,
+/// `F12`, `0xff23`), mirroring `crates/tsf/src/keymap.rs`. Names ignore case;
+/// `None` for one this does not know.
+pub fn parse_key(spec: &str) -> Option<KeySpec> {
+    let parts: Vec<String> = spec.split('+').map(|p| p.trim().to_lowercase()).collect();
+    let (key, modifiers) = parts.split_last()?;
+    let mut mods = 0u32;
+    for m in modifiers {
+        match m.as_str() {
+            "ctrl" | "control" => mods |= MOD_CTRL,
+            "shift" => mods |= MOD_SHIFT,
+            "alt" => mods |= MOD_ALT,
+            "win" | "windows" | "super" | "meta" => mods |= MOD_SUPER,
+            _ => return None,
+        }
+    }
+    let syms = match key.as_str() {
+        "zenkaku" | "hankaku" | "hankaku/zenkaku" | "kanji" | "半角/全角" | "半角" | "全角" =>
+        {
+            vec![ZENKAKU_HANKAKU, KANJI, ZENKAKU, HANKAKU]
+        }
+        "henkan" | "convert" | "変換" => vec![HENKAN],
+        "muhenkan" | "nonconvert" | "無変換" => vec![MUHENKAN],
+        "eisu" | "英数" => vec![EISU_TOGGLE, EISU_SHIFT],
+        "kana" | "hiragana" | "katakana" | "かな" | "カタカナ/ひらがな" => {
+            vec![HIRAGANA_KATAKANA, HIRAGANA, KATAKANA, KANA_SHIFT]
+        }
+        // Windows-only VK_IME_ON / VK_IME_OFF (in the default config): accept
+        // without warning, matching no X keysym.
+        "imeon" | "ime_on" | "imeoff" | "ime_off" => Vec::new(),
+        "capslock" => vec![CAPS_LOCK],
+        "space" => vec![SPACE],
+        "enter" | "return" => vec![RETURN, KP_ENTER],
+        "tab" => vec![TAB, ISO_LEFT_TAB],
+        "esc" | "escape" => vec![ESCAPE],
+        "backspace" => vec![BACKSPACE],
+        "`" | "backquote" | "grave" => vec![GRAVE],
+        k if k.starts_with("0x") => vec![u32::from_str_radix(&k[2..], 16).ok()?],
+        k if k.starts_with('f') && k.len() > 1 => {
+            let n: u32 = k[1..].parse().ok()?;
+            if !(1..=24).contains(&n) {
+                return None;
+            }
+            vec![F1 + n - 1]
+        }
+        k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphabetic()) => {
+            let b = k.as_bytes()[0];
+            vec![
+                u32::from(b.to_ascii_lowercase()),
+                u32::from(b.to_ascii_uppercase()),
+            ]
+        }
+        k if k.len() == 1 && k.chars().all(|c| c.is_ascii_digit()) => {
+            vec![u32::from(k.as_bytes()[0])]
+        }
+        _ => return None,
+    };
+    Some(KeySpec { syms, mods })
+}
+
+/// The keys that turn the IME on and off, as `[frontend] toggle_keys` /
+/// `on_keys` / `off_keys` name them.
+#[derive(Debug, Clone, Default)]
+pub struct OnOffKeys {
+    keys: Vec<(KeySpec, OnOff)>,
+}
+
+impl OnOffKeys {
+    /// Parse `[frontend] toggle_keys`, `on_keys`, `off_keys`; unrecognized
+    /// specs are left out and returned for the log.
+    pub fn from_config(f: &crate::config::FrontendCfg) -> (Self, Vec<String>) {
+        let mut keys = Vec::new();
+        let mut bad = Vec::new();
+        for (specs, role) in [
+            (&f.toggle_keys, OnOff::Toggle),
+            (&f.on_keys, OnOff::On),
+            (&f.off_keys, OnOff::Off),
+        ] {
+            for spec in specs {
+                match parse_key(spec) {
+                    Some(k) if !k.syms.is_empty() => keys.push((k, role)),
+                    Some(_) => {}
+                    None => bad.push(spec.clone()),
+                }
+            }
+        }
+        (Self { keys }, bad)
+    }
+
+    /// What `key` does, if it matches one of the configured keys with exact
+    /// modifiers.
+    pub fn role(&self, key: &Key) -> Option<OnOff> {
+        self.keys
+            .iter()
+            .find(|(k, _)| k.mods == key.mods && k.syms.contains(&key.sym))
+            .map(|(_, role)| *role)
+    }
 }
 
 /// The form F6–F10, or their MS-IME aliases Ctrl+U / I / O / P / T,
@@ -294,16 +410,49 @@ mod tests {
     }
 
     #[test]
-    fn backquote_and_zenkaku_hankaku_toggle() {
-        assert!(is_toggle(&key(GRAVE, 0)));
-        assert!(is_toggle(&key(GRAVE, MOD_ALT)));
-        assert!(is_toggle(&key(ZENKAKU_HANKAKU, 0)));
-        assert!(is_toggle(&key(KANJI, 0)));
-        // Shift+` types ～
-        assert!(!is_toggle(&key('~' as u32, MOD_SHIFT)));
+    fn default_on_off_keys_do_not_capture_bare_or_shifted_grave() {
+        let (keys, bad) = OnOffKeys::from_config(&crate::config::FrontendCfg::default());
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(keys.role(&key(ZENKAKU_HANKAKU, 0)), Some(OnOff::Toggle));
+        assert_eq!(keys.role(&key(KANJI, 0)), Some(OnOff::Toggle));
+        assert_eq!(
+            keys.role(&key(ZENKAKU_HANKAKU, MOD_ALT)),
+            Some(OnOff::Toggle)
+        );
+        assert_eq!(keys.role(&key(GRAVE, MOD_ALT)), Some(OnOff::Toggle));
+        // Bare ` (US backquote) and Shift+@ (JIS backquote) stay free to type.
+        assert_eq!(keys.role(&key(GRAVE, 0)), None);
+        assert_eq!(keys.role(&key(GRAVE, MOD_SHIFT)), None);
+        // Shift+` on US types ～
+        assert_eq!(keys.role(&key('~' as u32, MOD_SHIFT)), None);
         assert_eq!(classify_default('~' as u32, MOD_SHIFT), p("～"));
-        assert!(!is_toggle(&key(GRAVE, MOD_CTRL)));
-        assert!(!is_toggle(&key(ZENKAKU_HANKAKU, MOD_SUPER)));
+        assert_eq!(keys.role(&key(GRAVE, MOD_CTRL)), None);
+        assert_eq!(keys.role(&key(ZENKAKU_HANKAKU, MOD_SUPER)), None);
+    }
+
+    #[test]
+    fn custom_toggle_on_and_off_keys_parse() {
+        let mut f = crate::config::FrontendCfg::default();
+        f.toggle_keys = vec![
+            "Ctrl+Space".into(),
+            "`".into(),
+            "Ctrl+A".into(),
+            "NotAKey".into(),
+        ];
+        f.on_keys = vec!["Henkan".into(), "Kana".into()];
+        f.off_keys = vec!["Muhenkan".into(), "Eisu".into()];
+        let (keys, bad) = OnOffKeys::from_config(&f);
+        assert_eq!(bad, vec!["NotAKey"]);
+        assert_eq!(keys.role(&key(SPACE, MOD_CTRL)), Some(OnOff::Toggle));
+        assert_eq!(keys.role(&key(SPACE, 0)), None);
+        assert_eq!(keys.role(&key(GRAVE, 0)), Some(OnOff::Toggle));
+        assert_eq!(keys.role(&key(GRAVE, MOD_SHIFT)), None);
+        assert_eq!(keys.role(&key('a' as u32, MOD_CTRL)), Some(OnOff::Toggle));
+        assert_eq!(keys.role(&key('A' as u32, MOD_CTRL)), Some(OnOff::Toggle));
+        assert_eq!(keys.role(&key(HENKAN, 0)), Some(OnOff::On));
+        assert_eq!(keys.role(&key(HIRAGANA_KATAKANA, 0)), Some(OnOff::On));
+        assert_eq!(keys.role(&key(MUHENKAN, 0)), Some(OnOff::Off));
+        assert_eq!(keys.role(&key(EISU_TOGGLE, 0)), Some(OnOff::Off));
     }
 
     #[test]
