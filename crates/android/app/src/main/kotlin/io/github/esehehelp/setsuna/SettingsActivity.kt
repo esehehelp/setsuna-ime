@@ -88,7 +88,9 @@ class SettingsActivity : Activity() {
                     WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout() or WindowInsets.Type.ime(),
                 )
                 v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-                insets
+                // taken here: a WebView given the keyboard's inset too shrinks
+                // its page by it again (the action bar stood far above the keyboard)
+                WindowInsets.CONSUMED
             }
         }
         setContentView(frame)
@@ -159,6 +161,9 @@ class SettingsActivity : Activity() {
         val analyzer = File(models, "analyzer").listFiles()?.firstOrNull {
             File(it, "analyzer.manifest.json").isFile
         }
+        val corrector = File(models, "corrector").listFiles()?.firstOrNull {
+            File(it, "${it.name}.manifest.json").isFile
+        }
         val j = JSONObject()
             .put("type", "app")
             .put("enabled", enabled)
@@ -166,11 +171,13 @@ class SettingsActivity : Activity() {
             .put("model", manifest?.name?.removeSuffix(".manifest.json") ?: JSONObject.NULL)
             .put("lexicon", lexicon?.name ?: JSONObject.NULL)
             .put("analyzer", analyzer?.name ?: JSONObject.NULL)
+            .put("corrector", corrector?.name ?: JSONObject.NULL)
             .put("download", Downloads.state)
             .put("running", Downloads.running)
+        // what each download would get; none when all of it is in place
         for ((key, what) in listOf("get_model" to Downloads.What.MODEL, "get_dicts" to Downloads.What.DICTIONARIES)) {
-            runCatching { Downloads.describe(this, what) }.onSuccess { (label, size) ->
-                j.put(key, JSONObject().put("label", label).put("mb", Math.round(size / 1048576.0)))
+            runCatching { Downloads.describe(this, what) }.getOrNull()?.let { (label, size) ->
+                j.put(key, JSONObject().put("label", label).put("mb", Math.max(1L, Math.round(size / 1048576.0))))
             }
         }
         return j.toString()

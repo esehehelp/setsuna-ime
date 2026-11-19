@@ -13,14 +13,12 @@ import java.security.MessageDigest
 
 /**
  * What the app downloads from Hugging Face (user 2026-11-10: the model the
- * APK carried did not come out of it on the phone): the conversion model,
- * the reading lexicon and the analyzer that crates/tsf/models.json pins
- * (assets/models.json, build.ps1 puts it there), and with the model the
- * partial lexicon the catalog pins as `lexicon-small` (the commoner words and
- * every one-char kanji, a few MB: user 2026-11-10 "辞書でかいしインストール
- * できなくない？", "単語辞書だけ作るか") unless the full lexicon is in
- * lexicon/ already, and the reading corrector the catalog pins as
- * `corrector` (models/corrector/<name>/), each file checked by its
+ * APK carried did not come out of it on the phone): the conversion model
+ * with the reading corrector the catalog pins as `corrector`
+ * (models/corrector/<name>/), and the reading lexicon with the analyzer, that
+ * crates/tsf/models.json pins (assets/models.json, build.ps1 puts it there):
+ * one lexicon, the full one (28 MB packed; the partial one the model brought
+ * before went: two downloads offered a lexicon each). Each file is checked by its
  * size and SHA-256 and put where setsuna-core looks for it, the app's
  * files/models: onnx/, lexicon/, analyzer/<name>/. The files arrive as
  * `.part` beside their place; once all of them are in, what each directory
@@ -58,15 +56,22 @@ object Downloads {
         onChange?.invoke()
     }
 
-    /** What [start] would download for [what] as things are: its label and its size in bytes. */
-    fun describe(context: Context, what: What): Pair<String, Long> {
-        val parts = parts(context, what)
-        val label = when {
-            what == What.DICTIONARIES -> "読みの辞書と解析器"
-            parts.size > 1 -> "変換モデルと小さい読みの辞書"
-            else -> "変換モデル"
-        }
-        return label to parts.sumOf { p -> p.pins.sumOf { it.size } }
+    /** [what]'s label: what its download brings. */
+    fun label(context: Context, what: What): String = when {
+        what == What.DICTIONARIES -> "読みの辞書と解析器"
+        parts(context, what).size > 1 -> "変換モデルと読みの補正"
+        else -> "変換モデル"
+    }
+
+    /**
+     * What [start] would download for [what] as things are: its label and the
+     * bytes of the files not in place yet, by their size (the download checks
+     * their SHA-256); null when every file is in place, nothing to download.
+     */
+    fun describe(context: Context, what: What): Pair<String, Long>? {
+        val missing = parts(context, what).flatMap { it.pins }.filter { !(it.to.isFile && it.to.length() == it.size) }
+        if (missing.isEmpty()) return null
+        return label(context, what) to missing.sumOf { it.size }
     }
 
     /** Download [what] unless a download is going on. */
@@ -80,7 +85,7 @@ object Downloads {
         set("$label を確認中…")
         Thread {
             try {
-                label = describe(app, what).first
+                label = Downloads.label(app, what)
                 fetch(app, what, label)
                 set("✓ $label を入れました（キーボードを開き直すと使います）")
             } catch (e: Exception) {
@@ -102,17 +107,7 @@ object Downloads {
                 val onnx = File(models, "onnx")
                 val files = catalog.getJSONObject("variants").getJSONObject("int8").getJSONArray("files")
                 val model = part(catalog, files, onnx) { File(onnx, it) }
-                val small = catalog.optJSONObject("components")?.optJSONObject("lexicon-small")
-                val lexiconDir = File(models, "lexicon")
-                // the full lexicon, downloaded with the analyzer, stays (the session takes the only lexicon)
-                val name = small?.getString("entry")?.substringAfterLast('/')
-                val full = lexiconDir.listFiles()?.any { it.isFile && it.name.endsWith(".lexicon") && it.name != name } == true
                 val parts = mutableListOf(model)
-                if (small != null && !full) {
-                    parts.add(part(small, small.getJSONArray("files"), lexiconDir) {
-                        File(lexiconDir, it.substringAfterLast('/'))
-                    })
-                }
                 // the reading corrector, a few MB: its files under models/corrector/<its manifest's name>/
                 val corrector = catalog.optJSONObject("components")?.optJSONObject("corrector")
                 if (corrector != null) {

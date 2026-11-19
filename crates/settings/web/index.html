@@ -1276,17 +1276,26 @@ function renderApp(a) {
     ? "無効です。「入力方法の設定」で Setsuna をオンにしてください"
     : a.current ? "有効、今の入力方法です" : "有効ですが、今の入力方法ではありません（「切り替える」で選べます）";
   const get = (g) => g ? `\nダウンロード: ${g.label}（約 ${g.mb} MB）` : "";
-  $("app_model").textContent = (a.model ? `${a.model}` : "ありません。ダウンロードしてください") + get(a.get_model);
+  $("app_model").textContent = (a.model ? `${a.model}` : "ありません。ダウンロードしてください") +
+    `\n読みの補正: ${a.corrector ?? "なし"}` + get(a.get_model);
   $("app_dicts").textContent = `読みの辞書: ${a.lexicon ?? "なし"}\n解析器: ${a.analyzer ?? "なし"}` + get(a.get_dicts);
-  $("app_get_model").disabled = a.running || !a.get_model;
-  $("app_get_dicts").disabled = a.running || !a.get_dicts;
+  // one download at a time; nothing to get when all of it is in place
+  for (const [id, g] of [["app_get_model", a.get_model], ["app_get_dicts", a.get_dicts]]) {
+    $(id).disabled = a.running || !g;
+    $(id).textContent = g ? "ダウンロード" : "入っています";
+  }
   $("app_download").hidden = !a.download;
   $("app_download").textContent = a.download;
 }
 $("app_open_ime").addEventListener("click", () => send({ type: "app_open_ime" }));
 $("app_pick_ime").addEventListener("click", () => send({ type: "app_pick_ime" }));
-$("app_get_model").addEventListener("click", () => send({ type: "app_download", what: "model" }));
-$("app_get_dicts").addEventListener("click", () => send({ type: "app_download", what: "dictionaries" }));
+// both buttons off at once, before the app's answer comes back
+function startDownload(what) {
+  $("app_get_model").disabled = $("app_get_dicts").disabled = true;
+  send({ type: "app_download", what });
+}
+$("app_get_model").addEventListener("click", () => startDownload("model"));
+$("app_get_dicts").addEventListener("click", () => startDownload("dictionaries"));
 
 window.setsuna = {
   receive(msg) {
