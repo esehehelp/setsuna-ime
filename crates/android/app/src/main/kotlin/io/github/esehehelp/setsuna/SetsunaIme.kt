@@ -14,6 +14,7 @@ import android.text.Spanned
 import android.text.style.BackgroundColorSpan
 import android.text.style.StyleSpan
 import android.text.style.UnderlineSpan
+import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -36,6 +37,15 @@ import org.json.JSONObject
 class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener {
     private var h = 0L
     private val main = Handler(Looper.getMainLooper())
+
+    /** [block], said in logcat when it holds the main thread over 50 ms (keys wait for it). */
+    private inline fun <T> timed(what: String, block: () -> T): T {
+        val t0 = SystemClock.elapsedRealtime()
+        val out = block()
+        val ms = SystemClock.elapsedRealtime() - t0
+        if (ms > 50) Log.w("SetsunaIme", "$what took $ms ms")
+        return out
+    }
     private var keyboard: KeyboardView? = null
     private var bar: CandidateBar? = null
     private var palette: Palette? = null
@@ -50,6 +60,21 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     /** Where it starts in the app's text, as the app last reported. */
     private var composeStart = -1
     private var selStart = 0
+
+    /**
+     * The text before the caret (up to [BEFORE] chars) as last known and the
+     * caret it is for (-1: none), the left context a composition starts with.
+     * Never read on the main thread when a key comes: an app may take its 2 s
+     * to answer (a WebView did, and every first key waited for it). It is the
+     * field's initial text, what the IME commits after it, and a read on
+     * [reader] when the caret goes elsewhere.
+     */
+    private var before: String? = null
+    private var beforeAt = -1
+    private var beforeAsked = -1
+    private val reader = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "setsuna-before").apply { isDaemon = true }
+    }
 
     /** Hardware keys whose down the IME took: their ups are its too. */
     private val heldKeys = HashSet<Int>()
@@ -76,10 +101,10 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
 
     override fun onCreate() {
         super.onCreate()
-        Assets.unpack(this)
+        timed("unpack") { Assets.unpack(this) }
         // the models are in files/models too: the one the APK carries,
         // unpacked, and those push-models.ps1 copies
-        h = Native.create(filesDir.path, applicationInfo.nativeLibraryDir, filesDir.path, this)
+        h = timed("create") { Native.create(filesDir.path, applicationInfo.nativeLibraryDir, filesDir.path, this) }
         clips = ClipHistory(this)
         clips.onChange = {
             if (open == CandidateBar.Tool.CLIPBOARD) clipPanel?.show(clips.list())
@@ -91,16 +116,19 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
         clips.stop()
+        reader.shutdownNow()
         if (h != 0L) Native.destroy(h)
         h = 0L
         super.onDestroy()
     }
 
     override fun onEngineNotify() {
-        main.post { if (h != 0L && Native.applyAsync(h)) render() }
+        main.post { if (h != 0L && timed("applyAsync") { Native.applyAsync(h) }) timed("render") { render() } }
     }
 
-    override fun onCreateInputView(): View {
+    override fun onCreateInputView(): View = timed("inputView") { createInputView() }
+
+    private fun createInputView(): View {
         palette = Palette(this)
         val density = resources.displayMetrics.density
         val root = LinearLayout(this).apply {
@@ -154,12 +182,20 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         composing = false
         composeStart = -1
         selStart = attribute.initialSelStart.coerceAtLeast(0)
+        // the field's text before the caret comes with it (API 30): nothing to ask the app
+        before = if (Build.VERSION.SDK_INT >= 30) attribute.getInitialTextBeforeCursor(BEFORE, 0)?.toString() else null
+        beforeAt = if (before != null) selStart else -1
+        beforeAsked = -1
         editorInfo = attribute
         field = fieldOf(attribute)
-        if (h != 0L) Native.configure(h, attribute.packageName ?: "")
+        if (h != 0L) timed("configure") { Native.configure(h, attribute.packageName ?: "") }
     }
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
+        timed("startInputView") { startInputView(info, restarting) }
+    }
+
+    private fun startInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         val cls = info.inputType and InputType.TYPE_MASK_CLASS
         keyboard?.reset(
@@ -300,6 +336,8 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
         selStart = newSelStart
         if (candidatesStart >= 0) composeStart = candidatesStart
+        // the caret went where the text before it is not known: read it, off the main thread
+        if (!composing && candidatesStart < 0 && newSelStart == newSelEnd && newSelStart != beforeAt) readBefore()
         // the user put the caret elsewhere: what is composed is committed
         // (a report of the time before the composition, without one, is not
         // taken for that: the app reports edits late)
@@ -395,14 +433,14 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     /** Hand the key to setsuna-core; true when it took it. */
     private fun take(sym: Int, mods: Int): Boolean {
         if (h == 0L) return false
-        // the left context, read when a composition may start
-        val before = if (!composing && field == Native.FIELD_NORMAL) {
-            currentInputConnection?.getTextBeforeCursor(64, 0)?.toString()
+        // the left context of a composition that may start: the text known before this caret, else none
+        val left = if (!composing && field == Native.FIELD_NORMAL) {
+            if (beforeAt == selStart) before else null.also { readBefore() }
         } else {
             null
         }
-        val took = Native.key(h, sym, mods, field, before)
-        if (took) render()
+        val took = timed("key") { Native.key(h, sym, mods, field, left) }
+        if (took) timed("render") { render() }
         return took
     }
 
@@ -443,6 +481,24 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     private fun strings(a: JSONArray?): List<String> =
         if (a == null) emptyList() else List(a.length()) { a.getString(it) }
 
+    /** Read the text before the caret on [reader]; kept when the caret is still there. */
+    private fun readBefore() {
+        val ic = currentInputConnection ?: return
+        val at = selStart
+        if (beforeAsked == at) return
+        beforeAsked = at
+        reader.execute {
+            val text = runCatching { ic.getTextBeforeCursor(BEFORE, 0)?.toString() }.getOrNull()
+            main.post {
+                if (beforeAsked == at) beforeAsked = -1
+                if (text != null && selStart == at && !composing) {
+                    before = text
+                    beforeAt = at
+                }
+            }
+        }
+    }
+
     /** Write the session's view into the app and onto the keyboard. */
     private fun render() {
         if (h == 0L) return
@@ -453,9 +509,15 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         if (ic != null) {
             ic.beginBatchEdit()
             var start = if (composing && composeStart >= 0) composeStart else selStart
+            // what the IME commits extends the text known before the caret
+            val known = if (beforeAt == start) before else null
             for (c in commits) {
                 ic.commitText(c, 1)
                 start += c.length
+            }
+            if (commits.isNotEmpty()) {
+                before = known?.let { (it + commits.joinToString("")).takeLast(BEFORE) }
+                beforeAt = if (known != null) start else -1
             }
             if (segments.isNotEmpty()) {
                 val text = segments.joinToString("")
@@ -528,6 +590,9 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     }
 
     companion object {
+        /** The chars of left context kept before the caret. */
+        private const val BEFORE = 64
+
         /**
          * What a field is to the IME: a password, a URL, an e-mail address
          * or a number takes keys as they are (as the input scopes do on
