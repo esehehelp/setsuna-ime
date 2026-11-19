@@ -1561,9 +1561,7 @@ impl EngineBridge {
         // reading's chosen before (IMEの for IMENo) comes first as one of
         // the mixed reading's would, which `finish_list` reranked alone
         let reading = self.composing.hiragana().to_string();
-        if let Some(learning) = self.learning.as_mut() {
-            list = learning.rerank(&reading, list);
-        }
+        list = self.rerank_learned(&reading, list);
         // what Backspace left of the conversion shown stays first
         if let Some((_, text, _)) = self.kept.as_ref().filter(|(r, _, _)| *r == reading) {
             if let Some(i) = list.iter().position(|c| c == text) {
@@ -3275,9 +3273,7 @@ impl EngineBridge {
             list = dict.apply(reading, list);
         }
         if rerank {
-            if let Some(learning) = self.learning.as_mut() {
-                list = learning.rerank(reading, list);
-            }
+            list = self.rerank_learned(reading, list);
         }
         if let Some(hidden) = self.hidden.as_mut() {
             list = hidden.filter(reading, list);
@@ -4169,6 +4165,23 @@ impl EngineBridge {
         crate::date_time::candidates(reading, &self.date_time_now.unwrap_or_else(Local::now))
     }
 
+    /// `list` reranked by the learned choices, except that they never move a
+    /// date or a time the reading generates first: those read as another one
+    /// each day (a date chosen once for きょう then came first as soon as
+    /// きょう was typed), and they are not learned (`commit_converting`).
+    fn rerank_learned(&mut self, reading: &str, list: Vec<String>) -> Vec<String> {
+        let dates = self.date_time_candidates(reading);
+        let Some(learning) = self.learning.as_mut() else {
+            return list;
+        };
+        let out = learning.rerank(reading, list.clone());
+        if out.first() != list.first() && out.first().is_some_and(|t| dates.contains(t)) {
+            list
+        } else {
+            out
+        }
+    }
+
     /// A provisional whole reading, never a stale candidate for a different
     /// reading. Only a matching converted prefix may replace its raw kana.
     fn provisional_conversion(&self) -> String {
@@ -4341,7 +4354,12 @@ impl EngineBridge {
                 .unwrap_or_default();
             (reading, text.clone())
         });
-        let learn = learn.filter(|_| !self.private_field && prediction.is_none());
+        // nor a date or a time the reading generated, another one each day
+        let learn = learn.filter(|(reading, _)| {
+            !self.private_field
+                && prediction.is_none()
+                && !self.date_time_candidates(reading).contains(&text)
+        });
         if let (Some((reading, rejected)), Some(learning)) = (learn, self.learning.as_mut()) {
             if let Err(e) = learning.record(&reading, &text, &rejected) {
                 tracing::warn!("learning record failed: {e}");
@@ -7156,7 +7174,7 @@ mod tests {
         bridge.set_learning(Some(learned("帰社の記者", "fresh")));
         bridge.handle_move_cursor(1);
         bridge.handle_resize(-1);
-        mock.answer_last(&["汽車", "記者", "帰社"]);
+        mock.answer_last(&["汽車", "帰社", "記者"]);
         let out = bridge.apply_async_result();
         assert_eq!(segments_shown(&out).0, v(&["帰社", "のきしゃ"]));
         let _ = std::fs::remove_dir_all(&dir);
@@ -8040,6 +8058,57 @@ mod tests {
         assert_eq!(segments_shown(&out.actions), (v(&["ありがとう"]), 0));
         let (list, selected, _) = segment_list(&out.actions);
         assert_eq!(list[selected], "ありがとう");
+    }
+
+    #[test]
+    fn a_date_is_never_learned_nor_put_first_by_learning() {
+        let path = std::env::temp_dir().join(format!(
+            "setsuna-bridge-date-learning-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let cfg = crate::config::LearningCfg::default();
+        // chosen from the list: not learned
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_learning(Some(Learning::at(path.clone(), &cfg)));
+        type_str(&mut bridge, "kyou");
+        answer_scored(&mock, &["今日", "京"], &[-0.1, -2.0]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        let date =
+            crate::date_time::candidates("きょう", &bridge.date_time_now.unwrap())[0].clone();
+        bridge.handle_select(list.iter().position(|c| *c == date).unwrap());
+        assert_eq!(commits(&bridge.handle_enter().actions), vec![date.clone()]);
+        assert_eq!(bridge.learning.as_mut().unwrap().len(), 0);
+        // learned before (the phone's case): きょう still converts to 今日
+        Learning::at(path.clone(), &cfg)
+            .record("きょう", &date, "今日")
+            .unwrap();
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_learning(Some(Learning::at(path.clone(), &cfg)));
+        type_str(&mut bridge, "kyou");
+        answer_scored(&mock, &["今日", "京"], &[-0.1, -2.0]);
+        assert_eq!(
+            preedit(&bridge.apply_async_result()).as_deref(),
+            Some("今日")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_date_reading_converts_live_to_its_word_not_to_the_date() {
+        for engine in [
+            &["今日", "京", "教"][..],
+            &["今日"][..],
+            &["きょう", "今日"][..],
+        ] {
+            let (mut bridge, mock) = bridge_with_mock();
+            type_str(&mut bridge, "kyou");
+            let scores: Vec<f32> = (0..engine.len()).map(|i| -(i as f32)).collect();
+            answer_scored(&mock, engine, &scores);
+            let shown = preedit(&bridge.apply_async_result());
+            assert_eq!(shown.as_deref(), Some(engine[0]), "{engine:?}");
+        }
     }
 
     #[test]

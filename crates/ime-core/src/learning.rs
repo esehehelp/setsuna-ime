@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! bonus(c) = Σ sim(R, r_i) · w_i · (cos(c, chosen_i) − cos(c, rejected_i)) / span_i
-//! score(c) = −rank(c) / n + strength · bonus(c)
+//! score(c) = −rank(c) / n + strength · SCALE · bonus(c)
 //! ```
 //!
 //! `sim` and `cos` are cosine similarities of character-bigram count
@@ -21,8 +21,12 @@
 //! top; every other candidate keeps the engine's order. (Sorting the whole
 //! list by score let misconversions that merely share the chosen characters,
 //! 意志をつ伝えたい / 医志を伝えたい, jump over the engine's real
-//! alternatives.) With the default strength 1.0 a choice learned for the
-//! same reading moves to the top.
+//! alternatives.) `SCALE` (0.3) keeps learning from overriding the model
+//! elsewhere: with the default strength 1.0 a choice learned for the same
+//! reading still moves its candidate to the top (its sentence and its words
+//! both count), but a word choice in another sentence moves a candidate only
+//! from the first 60% of the list until it is chosen again (w grows), and a
+//! choice learned on a similar reading only one near the top.
 //!
 //! Each choice also yields word-level choices (`words`): the words the two
 //! surfaces differ in, with their reading and up to two reading chars on
@@ -70,6 +74,10 @@ mod words;
 /// Sparse character-bigram vector: (bigram key, weight) sorted by key, with
 /// unit L2 norm.
 type Vector = Vec<(u64, f32)>;
+
+/// What every learned bonus counts for against the model's order (the
+/// module doc): 0.3 of what it was, for all strengths alike.
+const SCALE: f32 = 0.3;
 
 const BOS: char = '\u{2}';
 const EOS: char = '\u{3}';
@@ -579,7 +587,7 @@ impl Learning {
         }
         let word_bonus = word_bonuses(&reading_chars, &candidates, &word_hits);
         let n = candidates.len() as f32;
-        let scores: Vec<f32> = candidates
+        let learned: Vec<f32> = candidates
             .iter()
             .enumerate()
             .map(|(rank, c)| {
@@ -592,11 +600,17 @@ impl Learning {
                         sim * w * (cosine(&cv, &e.chosen) - cosine(&cv, &e.rejected)) / e.span
                     })
                     .sum();
-                -(rank as f32) / n + self.strength * (bonus + word_bonus[rank])
+                bonus + word_bonus[rank]
             })
             .collect();
-        // First index of the highest score: ties keep the engine's order.
-        let best = (1..scores.len()).fold(0, |b, i| if scores[i] > scores[b] { i } else { b });
+        let score = |rank: usize| -(rank as f32) / n + self.strength * SCALE * learned[rank];
+        // First index of the highest score: ties keep the engine's order. Only
+        // a candidate the choices favour moves: the rejected form's penalty
+        // alone is no reason to put up what lies below it (赤い神を刻む over
+        // 赤い髪を刻む once 紙 was chosen over 髪).
+        let best = (1..learned.len())
+            .filter(|&i| learned[i] > 0.0)
+            .fold(0, |b, i| if score(i) > score(b) { i } else { b });
         let mut candidates = candidates;
         if best > 0 {
             let c = candidates.remove(best);
@@ -794,6 +808,40 @@ mod tests {
     }
 
     #[test]
+    fn a_word_chosen_once_moves_a_candidate_of_another_sentence_from_near_the_top_only() {
+        // 紙 over 髪 before をき: in another sentence (no whole-sentence
+        // choice reaches it) it moves 赤い紙を刻む from the first 60% of the
+        // list, and from further down only once chosen again
+        let t = TempFile::new("word-weak");
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        l.record("かみをきる", "紙を切る", "髪を切る").unwrap();
+        let reading = "あかいかみをきざむ";
+        let near = list(&[
+            "赤い髪を刻む",
+            "赤い紙を刻む",
+            "赤い神を刻む",
+            "赤い上を刻む",
+            "赤い髪を着ざむ",
+        ]);
+        assert_eq!(l.rerank(reading, near)[0], "赤い紙を刻む");
+        let far = list(&[
+            "赤い髪を刻む",
+            "赤い神を刻む",
+            "赤い上を刻む",
+            "赤い髪を着ざむ",
+            "紅い髪を刻む",
+            "赤い髪をきざむ",
+            "赤井髪を刻む",
+            "赤い加味を刻む",
+            "赤い紙を刻む",
+            "あかい髪を刻む",
+        ]);
+        assert_eq!(l.rerank(reading, far.clone())[0], "赤い髪を刻む");
+        l.record("かみをきる", "紙を切る", "髪を切る").unwrap();
+        assert_eq!(l.rerank(reading, far)[0], "赤い紙を刻む");
+    }
+
+    #[test]
     fn a_word_chosen_in_kana_does_not_turn_a_sentence_into_kana() {
         // までは over 迄は learns まで over 迄 before は, which recurs in
         // いまでは; the reading itself writes まで there, 今では does not.
@@ -816,10 +864,18 @@ mod tests {
         );
         assert_eq!(got[0], "今日までは");
         // the reading itself, punctuation and all, gets nothing for writing
-        // まで: what writes it of the conversions goes up
+        // まで: what writes it of the conversions goes up (a word choice
+        // learned once reaches the first 60% of a list, as long as the IME's)
         let got = l.rerank(
             "きょうまでは。",
-            list(&["今日迄は。", "きょうまでは。", "今日までは。"]),
+            list(&[
+                "今日迄は。",
+                "きょうまでは。",
+                "今日までは。",
+                "京迄は。",
+                "強迄は。",
+                "キョウマデハ。",
+            ]),
         );
         assert_eq!(got[0], "今日までは。");
     }

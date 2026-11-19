@@ -618,7 +618,9 @@ pub struct LearningCfg {
     /// Record which candidate the user picks and rerank by it.
     pub enabled: bool,
     /// Weight of a learned choice against the model's order. At 1.0 a choice
-    /// learned for the exact same reading moves to the top.
+    /// learned for the exact same reading moves its candidate to the top; a
+    /// word choice in another sentence moves one from the first 60% of the
+    /// list until chosen again (`learning`'s SCALE).
     pub strength: f32,
     /// Minimum cosine similarity (reading character bigrams) for a choice
     /// learned on another reading to apply as a whole sentence. 1.0 = exact
