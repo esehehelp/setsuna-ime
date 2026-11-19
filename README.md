@@ -18,8 +18,8 @@ Windows PowerShell 5.1 または PowerShell 7 (`pwsh`) で実行します（`reg
 # 標準インストール（既定モデル Cymbidium-v1.2-xsmall + 読み辞書・解析器を自動取得）
 irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1 | iex
 
-# 変換モデルを切り替える例（Bletilla-v0.1-small）
-& ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -Model Bletilla-v0.1-small
+# 変換モデルを切り替える例（Diphylleia-v1.0-flash）
+& ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -Model Diphylleia-v1.0-flash
 
 # 辞書・解析器を取得せずモデルのみ入れる場合
 & ([scriptblock]::Create((irm https://github.com/esehehelp/setsuna-ime/releases/latest/download/setup.ps1))) -NoDictionaries
@@ -40,7 +40,7 @@ fcitx5 5.1 以上・glibc 2.39 以上（Arch Linux、Fedora 40+、Ubuntu 24.04+ 
 curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash
 
 # 変換モデルを切り替える例
-curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash -s -- --model Bletilla-v0.1-small
+curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash -s -- --model Diphylleia-v1.0-flash
 
 # 辞書・解析器なし / fcitx5 への登録を行わない例
 curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/install.sh | sudo bash -s -- --no-dictionaries --no-register
@@ -99,16 +99,21 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 | モデル | サイズ | 1 位一致（wiki_fresh_v4 / AJIMEE v2-fix2 / probe_v6） | 上位 5 位一致（同） | 速度（1 スレッド・中央値） | 用途 |
 |---|---:|---:|---:|---:|---|
-| [**Cymbidium-v1.2-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.2-xsmall)（既定） | 約 23 MB | 83.2% / 79.1% / 84.8% | 88.9% / 88.1% / 88.7% | 2.3〜2.4 ms | 高速・高精度の標準モデル |
-| [**Cymbidium-v1.1-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall) | 約 23 MB | 82.3% / 79.1% / 85.1% | 88.4% / 87.4% / 88.7% | 2.4 ms | 前の既定 |
-| [**Cymbidium-v1.0-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) | 約 14 MB | — | — | — | より軽量な旧版（このセットでは未計測） |
-| [**Bletilla-v0.1-small**](https://huggingface.co/esehe/Bletilla-v0.1-small) | 約 130 MB | 81.1% / 78.0% / 84.1% | 89.3% / 92.5% / 89.6% | 7.6〜8.4 ms | 上位 5 候補のカバー率重視 |
+| [**Cymbidium-v1.2-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.2-xsmall)（既定） | 約 23 MB | 83.3% / 79.5% / 84.8% | 88.9% / 88.4% / 88.7% | 1.1 ms | 高速・高精度の標準モデル |
+| [**Diphylleia-v1.0-flash**](https://huggingface.co/esehe/Diphylleia-v1.0-flash) | 約 25 MB | 83.1% / 77.5% / 85.8% | 92.7% / 92.5% / 93.5% | 2.7〜2.8 ms | 上位 5 候補のカバー率重視（浅い自己回帰デコーダ付き） |
 | 参考: [zenz-v3.2-small](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)（Q5_K_M） | — | 74.0% / 76.6% / 81.6% | 78.6% / 83.9% / 86.7% | 約 990 ms（AJIMEE 1 件） | 自己回帰モデルとの比較用 |
 
 - 評価セットは 2026-11-12 時点の標準のもの: wiki_fresh_v4（変換モデルの学習データより後に作られた Wikipedia 日本語版の記事の文 4,998 件。正解の表記の揺れを許す）、AJIMEE-Bench JWTD v2 の v2-fix2（628 件。読みの誤りを直したもの）、probe_v6（数字・人名・技術用語・同音異義語などの分野別 309 件）。
-- 数値は変換エンジン単体（ビーム幅 20）の完全一致率。IME ではこれに読み辞書が候補を足します。Bletilla は並べ替えの表（`pairs.bin` / `words.tsv`）を使ったときの値です。
+- 数値は変換エンジン単体（ビーム幅 20、エンジン自身の推論）の完全一致率。IME ではこれに読み辞書が候補を足します。Diphylleia は自己回帰デコーダの探索の打ち切り幅 8（エンジンの既定）での値です。
+- サイズはエンジンが読む重みの大きさです。モデルのパッケージには同じ重みの ONNX グラフも入っています（エンジンは読みません）。
 - 速度は AJIMEE の 200 文を 1 スレッドで変換したときの中央値（2 回の計測の幅）。
 - zenz-v3.2-small は llama.cpp で 1 スレッド、ビーム幅 5、前の文脈 40 文字までで動かした値で、速度は AJIMEE の 1 件あたりの中央値（計測の仕方が上のモデルとは違います）。
+
+### 読みの補正（Apache-2.0）
+
+| モデル | サイズ | 用途 |
+|---|---:|---|
+| [**Nandina-v1.0-tiny**](https://huggingface.co/esehe/Nandina-v1.0-tiny) | 約 4 MB | 打ち間違いを含む読みを、補正してから変換します（補正の確からしさが閾値を超えたとき。打ったままの読みの候補も出します）。Windows のインストーラが既定で入れます（`-NoCorrector` で入れない、`[engine] corrector_manifest` を空にすると使わない） |
 
 ### 辞書・解析器（CC BY-SA 4.0 / [esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）
 
@@ -255,4 +260,4 @@ cargo run --release -p setsuna-settings
   - [vibrato](https://github.com/daac-tools/vibrato)（MIT / Apache-2.0、`vendor/vibrato-packed` に辞書レイアウト変更を加えて同梱。詳細は [vendor/vibrato-packed/VENDORED.md](vendor/vibrato-packed/VENDORED.md)）
   - 英日混在入力モデル（[crates/ime-core/data/mixed/README.md](crates/ime-core/data/mixed/README.md)）: FineWeb2-edu-japanese / FineWeb 由来、ODC-By 1.0
   - その他の Rust クレートは `Cargo.lock` および [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
-- **モデル・辞書**: 公開変換モデル（Cymbidium / Bletilla）は Apache-2.0、配布辞書（[esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）は CC BY-SA 4.0 です。モデルの重みおよび辞書ファイル本体はこのリポジトリには含みません。
+- **モデル・辞書**: 公開変換モデル（Cymbidium / Diphylleia）と読みの補正（Nandina）は Apache-2.0、配布辞書（[esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）は CC BY-SA 4.0 です。モデルの重みおよび辞書ファイル本体はこのリポジトリには含みません。
