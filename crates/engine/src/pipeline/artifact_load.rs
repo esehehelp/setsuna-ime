@@ -33,7 +33,8 @@ pub fn load(manifest: &CtcNatManifest) -> Result<(SharedCharTokenizer, Model)> {
 
     let path = manifest.proposal_native_path.as_ref().with_context(|| {
         format!(
-            "manifest {} names no weights for the engine's own encoder (proposal.native): this engine runs no ONNX              graph, the model's package must carry them",
+            "manifest {} names no weights for the engine's own encoder (proposal.native): this engine runs no ONNX \
+             graph, the model's package must carry them",
             manifest.manifest_path.display()
         )
     })?;
@@ -45,7 +46,8 @@ pub fn load(manifest: &CtcNatManifest) -> Result<(SharedCharTokenizer, Model)> {
         .map(|a| (a.layers, a.heads, a.head_dim));
     anyhow::ensure!(
         c.vocab == tokenizer.vocab_size() && c.sep_id == tokenizer.sep_id && encoder.ar_shape() == ar,
-        "native encoder {} has {} tokens, [SEP] {} and AR layers {:?}; the vocabulary {} tokens, [SEP] {},          the manifest's AR layers {ar:?}",
+        "native encoder {} has {} tokens, [SEP] {} and AR layers {:?}; the vocabulary {} tokens, [SEP] {}, \
+         the manifest's AR layers {ar:?}",
         path.display(),
         c.vocab,
         c.sep_id,
@@ -54,10 +56,14 @@ pub fn load(manifest: &CtcNatManifest) -> Result<(SharedCharTokenizer, Model)> {
         tokenizer.sep_id
     );
     // the logits: every token's, or the manifest's columns (a reading corrector's cut head)
-    let columns = manifest.logit_ids.as_ref().map_or(tokenizer.vocab_size(), Vec::len);
+    let columns = manifest
+        .logit_ids
+        .as_ref()
+        .map_or(tokenizer.vocab_size(), Vec::len);
     anyhow::ensure!(
         encoder.ar_shape().is_some() || encoder.logit_width() == columns,
-        "native encoder {} gives {} logits a frame, the manifest {columns} (its proposal.logit_ids, or the          vocabulary)",
+        "native encoder {} gives {} logits a frame, the manifest {columns} (its proposal.logit_ids, or the \
+         vocabulary)",
         path.display(),
         encoder.logit_width()
     );

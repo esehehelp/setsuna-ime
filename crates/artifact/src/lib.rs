@@ -323,7 +323,9 @@ impl CtcNatManifest {
             .collect();
         anyhow::ensure!(
             removed.is_empty(),
-            "manifest {} sets {removed:?}: dictionary / n-gram fusion is not part of the              engine any more; re-export the model (or run it with the engine at tag              engine-v1-final)",
+            "manifest {} sets {removed:?}: dictionary / n-gram fusion is not part of the \
+             engine any more; re-export the model (or run it with the engine at tag \
+             engine-v1-final)",
             path.display()
         );
         let file: CtcNatManifestFile = serde_json::from_value(value)

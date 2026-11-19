@@ -349,7 +349,8 @@ impl ProposalRunner {
         );
         anyhow::ensure!(
             enc.logit_width() == width,
-            "native encoder logits of {} columns, {width} expected (the vocabulary's {}, or the manifest's              proposal.logit_ids)",
+            "native encoder logits of {} columns, {width} expected (the vocabulary's {}, or the manifest's \
+             proposal.logit_ids)",
             enc.logit_width(),
             tokenizer.vocab_size()
         );
