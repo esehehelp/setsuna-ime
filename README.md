@@ -97,19 +97,25 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 ### 変換モデル（Apache-2.0）
 
-| モデル | サイズ | Top-1 (wiki_fresh_v4 / AJIMEE) | Top-5 (wiki_fresh_v4 / AJIMEE) | 速度目安（1 スレッド中央値） | 用途 |
+| モデル | サイズ | 1 位一致（wiki_fresh_v4 / AJIMEE v2-fix2 / probe_v6） | 上位 5 位一致（同） | 速度（1 スレッド・中央値） | 用途 |
 |---|---:|---:|---:|---:|---|
-| [**Cymbidium-v1.1-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)（既定） | 約 23 MB | 82.3% / 79.1% | 88.4% / 87.4% | 2.4〜2.6 ms | 高速・高精度の標準モデル |
-| [**Cymbidium-v1.0-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) | 約 14 MB | — | — | — | より軽量な旧版（約 3 ms） |
-| [**Bletilla-v0.1-small**](https://huggingface.co/esehe/Bletilla-v0.1-small) | 約 130 MB | 81.1% / 78.0% | 89.3% / 92.5% | 7.6〜8.4 ms | 上位 5 候補カバー率重視 |
+| [**Cymbidium-v1.1-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.1-xsmall)（既定） | 約 23 MB | 82.3% / 79.1% / 85.1% | 88.4% / 87.4% / 88.7% | 2.4〜2.6 ms | 高速・高精度の標準モデル |
+| [**Cymbidium-v1.0-xsmall**](https://huggingface.co/esehe/Cymbidium-v1.0-xsmall) | 約 14 MB | — | — | — | より軽量な旧版（このセットでは未計測） |
+| [**Bletilla-v0.1-small**](https://huggingface.co/esehe/Bletilla-v0.1-small) | 約 130 MB | 81.1% / 78.0% / 84.1% | 89.3% / 92.5% / 89.6% | 7.6〜8.4 ms | 上位 5 候補のカバー率重視 |
+| 参考: [zenz-v3.2-small](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf)（Q5_K_M） | — | 74.0% / 76.6% / 81.6% | 78.6% / 83.9% / 86.7% | 約 990 ms（AJIMEE 1 件） | 自己回帰モデルとの比較用 |
+
+- 評価セットは 2026-11-12 時点の標準のもの: wiki_fresh_v4（変換モデルの学習データより後に作られた Wikipedia 日本語版の記事の文 4,998 件。正解の表記の揺れを許す）、AJIMEE-Bench JWTD v2 の v2-fix2（628 件。読みの誤りを直したもの）、probe_v6（数字・人名・技術用語・同音異義語などの分野別 309 件）。
+- 数値は変換エンジン単体（ビーム幅 20）の完全一致率。IME ではこれに読み辞書が候補を足します。Bletilla は並べ替えの表（`pairs.bin` / `words.tsv`）を使ったときの値です。
+- 速度は AJIMEE の 200 文を 1 スレッドで変換したときの中央値（2 回の計測の幅）。
+- zenz-v3.2-small は llama.cpp で 1 スレッド、ビーム幅 5、前の文脈 40 文字までで動かした値で、速度は AJIMEE の 1 件あたりの中央値（計測の仕方が上の 3 つとは違います）。
 
 ### 辞書・解析器（CC BY-SA 4.0 / [esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）
 
 | コンポーネント | サイズ | 用途 |
 |---|---:|---|
-| `lexicon` (`lexicon-v1.lexicon`) | 約 222 MB | 読み辞書（候補スコア補正・フィルタ・単漢字展開） |
-| `lexicon-small` (`lexicon-v1-small.lexicon`) | 約 4 MB | モバイル向け軽量読み辞書（よく使う語＋全単漢字の補完のみ） |
-| `analyzer` (`nid-ma-v2-600k-tb`) | 約 288 MB | 形態素解析器（文節編集の境界判定） |
+| `lexicon` (`lexicon-v2.lexicon`) | 約 28 MB | 読み辞書（変換モデルの 1 位はそのままに、2 位以下の並べ替え、モデルが出さない語・単漢字の候補の追加、漢字の並びの区切り） |
+| `lexicon-small` (`lexicon-v1-small.lexicon`) | 約 3.6 MB | Android 向けの軽量読み辞書（よく使う語とすべての単漢字の読み。候補を足すだけで並べ替えない） |
+| `analyzer` (`nid-ma-v2-600k-tb-packed`) | 約 7 MB | 形態素解析器（文節編集の区切り） |
 
 ---
 
