@@ -7564,7 +7564,15 @@ mod tests {
             mock.dispatched_readings().last().unwrap(),
             "IMENおつかいかた"
         );
-        mock.set_result("IMENおつかいかた", &["IMENお使い方"]);
+        mock.set_result(
+            "IMENおつかいかた",
+            &[
+                "IMENお使い方",
+                "IMENお使いかた",
+                "IMEN御使い方",
+                "IMENおつかいかた",
+            ],
+        );
         bridge.apply_async_result();
         let (list, _) = shown(&bridge.handle_space().actions).unwrap();
         assert_eq!(list[0], "IMENお使い方");
@@ -7572,10 +7580,11 @@ mod tests {
             mock.dispatched_readings().last().unwrap(),
             "IMEのつかいかた"
         );
-        mock.set_result("IMEのつかいかた", &["IMEの使い方"]);
+        mock.set_result("IMEのつかいかた", &["IMEの使い方", "IMEの使いかた"]);
+        // its first right after the first three as typed, which stays chosen
         let (list, selected) = shown(&bridge.apply_async_result()).unwrap();
         assert_eq!((list[0].as_str(), selected), ("IMENお使い方", 0));
-        assert!(list.contains(&"IMEの使い方".to_string()), "{list:?}");
+        assert_eq!(list[3], "IMEの使い方", "{list:?}");
 
         // ending in English: Space types a space, Space again converts,
         // the reading put right before every letter as romaji (いめの)
@@ -7583,9 +7592,14 @@ mod tests {
         type_str(&mut bridge, "IMENo");
         bridge.handle_space();
         bridge.handle_space();
-        mock.answer_last(&["IMENo"]);
+        mock.answer_last(&["IMENo", "IMENO"]);
         bridge.apply_async_result();
         assert_eq!(mock.dispatched_readings().last().unwrap(), "IMEの");
+        // second, after the English with a space, which stays chosen
+        mock.answer_last(&["IMEの", "IMEノ"]);
+        let (list, selected) = shown(&bridge.apply_async_result()).unwrap();
+        assert_eq!((list[0].as_str(), selected), ("IMENo ", 0));
+        assert_eq!(list[1], "IMEの", "{list:?}");
 
         // off with typo correction: every letter as romaji, as before
         let (mut bridge, mock) = voicing_bridge();
