@@ -94,6 +94,11 @@ pub struct FrameView {
     pub top: Vec<(String, f32)>,
 }
 
+/// The AR search's default beam threshold in nats: on the standard sets of 2026-11-12 the AR model's top 1 and
+/// top 5 were those of the search without one, in half the time (one thread, AJIMEE, p50 2.7 ms against 5.6); what
+/// it drops lies e^8 below the best.
+const AR_MARGIN: f32 = 8.0;
+
 /// The environment variables the engine honours. Everything else comes from
 /// the caller and the manifest.
 #[derive(Debug, Clone)]
@@ -101,8 +106,8 @@ struct RuntimeEnv {
     /// `SETSUNA_TOP_K_PER_STEP` (default 16): beam expansion breadth when
     /// neither the caller nor the manifest sets one.
     top_k_per_step: usize,
-    /// `SETSUNA_AR_MARGIN` (unset: none): the AR search's beam threshold in nats (`ar::ArSearch::margin`), a
-    /// research knob until it is measured.
+    /// `SETSUNA_AR_MARGIN` (default `AR_MARGIN`; `off`: none): the AR search's beam threshold in nats
+    /// (`ar::ArSearch::margin`).
     ar_margin: Option<f32>,
     /// `SETSUNA_SCRIPT_BIAS` (unset: none): four numbers, `other,kanji,hiragana,katakana`, added to the prior's
     /// logits of those classes by a model with the script latent (`ar::ArSearch::script_bias`; e.g. `0,0,4,0`
@@ -160,9 +165,15 @@ impl RuntimeEnv {
         };
         Ok(Self {
             top_k_per_step: env_usize("SETSUNA_TOP_K_PER_STEP", 16),
-            ar_margin: std::env::var("SETSUNA_AR_MARGIN")
-                .ok()
-                .and_then(|s| s.parse().ok()),
+            ar_margin: match std::env::var("SETSUNA_AR_MARGIN") {
+                Err(_) => Some(AR_MARGIN),
+                Ok(s) if matches!(s.trim(), "off" | "none") => None,
+                Ok(s) => Some(
+                    s.trim()
+                        .parse()
+                        .with_context(|| format!("SETSUNA_AR_MARGIN={s}: nats, or off"))?,
+                ),
+            },
             script_bias,
             fusion_manifest: std::env::var_os("SETSUNA_FUSION_MANIFEST")
                 .filter(|p| !p.is_empty())
