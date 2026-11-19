@@ -13,7 +13,7 @@ model_manifest = "${KAIRO_INPUT_MODEL}/Cymbidium-v1.1-xsmall.manifest.json"
 mixed_model = "crates/ime-core/data/mixed"
 
 [lexicon]
-file = "${KAIRO_INPUT_LEXICON}/lexicon-v1.lexicon"
+file = "${KAIRO_INPUT_LEXICON}/lexicon-v2.lexicon"
 
 [learning]
 enabled = false

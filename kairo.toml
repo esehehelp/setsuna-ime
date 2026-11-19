@@ -101,6 +101,14 @@ argv = ["pwsh", "-NoProfile", "-File", "kairo/fetch.ps1", "-Component", "lexicon
 regenerable = true
 confine = false
 
+# models.json pins lexicon-v2 (packed, 28 MB) from 2026-11-19.
+[[tasks]]
+name = "lexicon-v2"
+queue = "fetch"
+[tasks.execution]
+argv = ["pwsh", "-NoProfile", "-File", "kairo/fetch.ps1", "-Component", "lexicon"]
+regenerable = true
+
 # --- durable: results ---------------------------------------------------------
 
 # The bench's sets typed into the IME session as the installer sets it up
@@ -120,3 +128,19 @@ task = "model-cymbidium-v1.1-xsmall"
 [[tasks.execution.inputs]]
 name = "LEXICON"
 task = "lexicon-v1"
+
+# The same bench with lexicon-v2, which models.json pins from 2026-11-19.
+[[tasks]]
+name = "bench-harness-20261119-lexicon-v2"
+depends_on = ["build-20261116", "model-cymbidium-v1.1-xsmall", "lexicon-v2"]
+[tasks.execution]
+argv = ["pwsh", "-NoProfile", "-File", "kairo/bench.ps1"]
+[[tasks.execution.inputs]]
+name = "BUILD"
+task = "build-20261116"
+[[tasks.execution.inputs]]
+name = "MODEL"
+task = "model-cymbidium-v1.1-xsmall"
+[[tasks.execution.inputs]]
+name = "LEXICON"
+task = "lexicon-v2"
