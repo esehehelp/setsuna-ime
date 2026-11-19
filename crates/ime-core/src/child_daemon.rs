@@ -613,35 +613,7 @@ pub fn spawn_with_config(
     module_dir: Option<&Path>,
     notify: Notify,
 ) -> Option<Box<dyn EngineClient>> {
-    let manifest =
-        match resolve_manifest(&cfg.engine, module_dir, |key| crate::config::env_path(key)) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                tracing::warn!("no model manifest found; engine disabled");
-                crate::diagnostics::log("engine disabled: no model manifest");
-                return None;
-            }
-            Err(e) => {
-                tracing::warn!("model discovery failed: {e}; engine disabled");
-                crate::diagnostics::log(format!("engine disabled: {e}"));
-                return None;
-            }
-        };
-    let engine_exe = cfg
-        .engine
-        .engine_exe
-        .as_ref()
-        .filter(|p| p.is_file())
-        .cloned()
-        .or_else(|| find_engine_exe(module_dir));
-    let engine_exe = match engine_exe {
-        Some(p) => p,
-        None => {
-            tracing::warn!("{ENGINE_EXE} not found; engine disabled");
-            crate::diagnostics::log(format!("engine disabled: {ENGINE_EXE} not found"));
-            return None;
-        }
-    };
+    let (manifest, engine_exe) = daemon_files(cfg, module_dir)?;
     #[cfg(windows)]
     let notify = {
         use setsuna_pipe::win;
@@ -678,14 +650,76 @@ pub fn spawn_with_config(
             }
         }
     };
-    match ChildDaemonClient::spawn(&manifest, &engine_exe, notify, &cfg.engine) {
+    spawn_child(&manifest, &engine_exe, notify, &cfg.engine)
+        .map(|c| Box::new(c) as Box<dyn EngineClient>)
+}
+
+/// A daemon of this process's own for `cfg`, never the shared server: the
+/// concrete client, which one thread may start and another use (Android
+/// starts it with the service, off the main thread, where the fork of the
+/// app's process held the first field's focus). `None` as in
+/// [`spawn_with_config`].
+pub fn spawn_child_with_config(
+    cfg: &crate::config::Config,
+    module_dir: Option<&Path>,
+    notify: Notify,
+) -> Option<ChildDaemonClient> {
+    let (manifest, engine_exe) = daemon_files(cfg, module_dir)?;
+    spawn_child(&manifest, &engine_exe, notify, &cfg.engine)
+}
+
+/// The model manifest and the engine binary `cfg` names or finds (`None`,
+/// logged, when either is missing).
+fn daemon_files(
+    cfg: &crate::config::Config,
+    module_dir: Option<&Path>,
+) -> Option<(PathBuf, PathBuf)> {
+    let manifest =
+        match resolve_manifest(&cfg.engine, module_dir, |key| crate::config::env_path(key)) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::warn!("no model manifest found; engine disabled");
+                crate::diagnostics::log("engine disabled: no model manifest");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("model discovery failed: {e}; engine disabled");
+                crate::diagnostics::log(format!("engine disabled: {e}"));
+                return None;
+            }
+        };
+    let engine_exe = cfg
+        .engine
+        .engine_exe
+        .as_ref()
+        .filter(|p| p.is_file())
+        .cloned()
+        .or_else(|| find_engine_exe(module_dir));
+    let engine_exe = match engine_exe {
+        Some(p) => p,
+        None => {
+            tracing::warn!("{ENGINE_EXE} not found; engine disabled");
+            crate::diagnostics::log(format!("engine disabled: {ENGINE_EXE} not found"));
+            return None;
+        }
+    };
+    Some((manifest, engine_exe))
+}
+
+fn spawn_child(
+    manifest: &Path,
+    engine_exe: &Path,
+    notify: Notify,
+    engine_cfg: &crate::config::EngineCfg,
+) -> Option<ChildDaemonClient> {
+    match ChildDaemonClient::spawn(manifest, engine_exe, notify, engine_cfg) {
         Ok(c) => {
             tracing::info!(
                 "engine daemon spawned: {} (manifest {})",
                 engine_exe.display(),
                 manifest.display(),
             );
-            Some(Box::new(c))
+            Some(c)
         }
         Err(e) => {
             tracing::warn!("engine daemon spawn failed: {}", e);

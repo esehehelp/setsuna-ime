@@ -1,11 +1,11 @@
 //! The session the input method service keeps, and where its files are.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use setsuna_core::child_daemon;
 use setsuna_core::config::{AppStart, Config};
-use setsuna_core::engine_client::Notify;
+use setsuna_core::engine_client::{EngineClient, Notify};
 use setsuna_core::keysym::Key;
 use setsuna_core::session::{Field, Session};
 
@@ -132,16 +132,56 @@ pub struct Host {
     /// Wakes the service's main thread, from the engine client's reader
     /// thread; the service then takes the result (`apply_async`).
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// The engine daemon started with the service, off the main thread, for
+    /// the first `configure` to take.
+    started: Arc<Mutex<Started>>,
+}
+
+/// The daemon the warm-up thread starts: not yet, there to take, or taken
+/// (or none started) — then `configure` starts one itself, and the warm-up
+/// thread, coming later, none.
+enum Started {
+    Pending,
+    Ready(child_daemon::ChildDaemonClient),
+    Taken,
 }
 
 impl Host {
     pub fn new(dirs: Dirs, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         dirs.export();
         setsuna_core::diagnostics::init("android.log");
+        // what the first field's `configure` would do on the main thread
+        // (start the engine, whose fork of this process took ~96 ms on the
+        // phone, and load the mixed input model's tables: 250 ms on a PC)
+        // happens now, off it: the daemon for `configure` to take, the tables
+        // in the caches every session shares
+        let started = Arc::new(Mutex::new(Started::Pending));
+        let (warm, ahead, waker) = (dirs.clone(), started.clone(), wake.clone());
+        let _ = std::thread::Builder::new()
+            .name("setsuna-warm".into())
+            .spawn(move || {
+                let cfg = with_app_defaults(Config::load_default(), &warm);
+                {
+                    let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(*state, Started::Pending) {
+                        let notify: Notify = Box::new(move |_req_id| waker());
+                        *state = match child_daemon::spawn_child_with_config(
+                            &cfg,
+                            Some(&warm.data),
+                            notify,
+                        ) {
+                            Some(c) => Started::Ready(c),
+                            None => Started::Taken,
+                        };
+                    }
+                }
+                Session::new(&Config::default(), None).configure_with(&cfg, None);
+            });
         Self {
             session: Session::new(&Config::default(), None),
             dirs,
             wake,
+            started,
         }
     }
 
@@ -156,9 +196,19 @@ impl Host {
     /// a field is focused, as the TSF DLL reloads on ActivateEx.
     pub fn configure(&mut self, package: &str) {
         let (cfg, app) = with_app_defaults(Config::load_default(), &self.dirs).for_app(package);
-        let client = (!self.session.has_client())
-            .then(|| child_daemon::spawn_with_config(&cfg, Some(&self.dirs.data), self.notify()))
-            .flatten();
+        let client = if self.session.has_client() {
+            None
+        } else {
+            // the one started with the service, else one now (none was, or its daemon exited)
+            let ahead = std::mem::replace(
+                &mut *self.started.lock().unwrap_or_else(|e| e.into_inner()),
+                Started::Taken,
+            );
+            match ahead {
+                Started::Ready(c) => Some(Box::new(c) as Box<dyn EngineClient>),
+                _ => child_daemon::spawn_with_config(&cfg, Some(&self.dirs.data), self.notify()),
+            }
+        };
         if client.is_some() {
             setsuna_core::diagnostics::log("android engine started");
         }
@@ -323,6 +373,7 @@ mod tests {
                 data: PathBuf::new(),
             },
             wake: Arc::new(|| {}),
+            started: Arc::new(Mutex::new(Started::Taken)),
         };
         assert!(host.key('a' as u32, 0, FIELD_NORMAL, None));
         host.session.flush();
