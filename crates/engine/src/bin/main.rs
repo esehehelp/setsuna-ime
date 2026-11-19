@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use setsuna_analyzer::{Analyzer, Token};
 use setsuna_artifact::{CtcNatManifest, DecodeDefaults};
 use setsuna_engine::candidate::identity_pos;
+use setsuna_engine::pipeline::correct::Correction;
 use setsuna_engine::session::{ConvertPerf, FrameView};
 use setsuna_engine::{Candidate, CandidateSource, ConversionRequest, EngineSession};
 
@@ -244,6 +245,8 @@ struct Decoded {
     /// The reading corrector's reading, when it changed the one requested
     /// (both were converted, their candidates merged).
     corrected_reading: Option<String>,
+    /// What the reading corrector made of the reading, when there is one.
+    correction: Option<Correction>,
 }
 
 fn decode_one(
@@ -265,6 +268,7 @@ fn decode_one(
             perf: None,
             frames: None,
             corrected_reading: None,
+            correction: None,
         });
     }
     let set = session.convert(ConversionRequest {
@@ -289,7 +293,12 @@ fn decode_one(
         cands,
         perf: Some(set.perf),
         frames: set.frames,
-        corrected_reading: set.correction.filter(|c| c.changed).map(|c| c.reading),
+        corrected_reading: set
+            .correction
+            .as_ref()
+            .filter(|c| c.changed)
+            .map(|c| c.reading.clone()),
+        correction: set.correction,
     })
 }
 
@@ -425,22 +434,51 @@ struct PerfResponse {
     beam_ms: f64,
     post_ms: f64,
     rescore_ms: f64,
+    /// The reading corrector's pass, and the other reading's conversion when it changed the reading (0 without it).
+    corrector_ms: f64,
+    other_reading_ms: f64,
     total_ms: f64,
     hyp_count: usize,
     candidate_count: usize,
+    /// With a reading corrector: what it made of the reading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correction: Option<CorrectionJson>,
 }
 
-impl From<ConvertPerf> for PerfResponse {
-    fn from(p: ConvertPerf) -> Self {
+/// `pipeline::correct::Correction` as the response gives it: the log probabilities null when -inf (no alignment
+/// fits) or when the corrector did not run (a reading too long for one pass).
+#[derive(Serialize, Debug)]
+struct CorrectionJson {
+    reading: String,
+    changed: bool,
+    applied: bool,
+    score_fix: Option<f32>,
+    score_typed: Option<f32>,
+    margin: Option<f32>,
+}
+
+impl PerfResponse {
+    fn new(p: ConvertPerf, correction: Option<&Correction>) -> Self {
+        let finite = |x: f32| x.is_finite().then_some(x);
         Self {
             input_len: p.input_len,
             proposal_ms: p.proposal_ms,
             beam_ms: p.beam_ms,
             post_ms: p.post_ms,
             rescore_ms: p.rescore_ms,
+            corrector_ms: p.corrector_ms,
+            other_reading_ms: p.other_reading_ms,
             total_ms: p.total_ms,
             hyp_count: p.hyp_count,
             candidate_count: p.candidate_count,
+            correction: correction.map(|c| CorrectionJson {
+                reading: c.reading.clone(),
+                changed: c.changed,
+                applied: c.applied,
+                score_fix: finite(c.score_fix),
+                score_typed: finite(c.score_typed),
+                margin: c.margin(),
+            }),
         }
     }
 }
@@ -729,7 +767,10 @@ impl Daemon {
         let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(d) => {
-                let perf = d.perf.filter(|_| self.perf_enabled).map(PerfResponse::from);
+                let perf = d
+                    .perf
+                    .filter(|_| self.perf_enabled)
+                    .map(|p| PerfResponse::new(p, d.correction.as_ref()));
                 to_line(&Response::ok(
                     req.id,
                     d.cands,
@@ -854,7 +895,10 @@ fn run_convert(
     let t0 = Instant::now();
     let d = decode_one(&mut session, &context, &reading, continue_beam)?;
     let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let perf = d.perf.filter(|_| perf_enabled).map(PerfResponse::from);
+    let perf = d
+        .perf
+        .filter(|_| perf_enabled)
+        .map(|p| PerfResponse::new(p, d.correction.as_ref()));
     println!(
         "{}",
         serde_json::to_string(&Response::ok(
