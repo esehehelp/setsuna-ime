@@ -134,6 +134,50 @@ pub fn correct(typed: &str, lm: Option<&crate::mixed::MixedModel>) -> Option<Str
     fine.then_some(kana)
 }
 
+/// `typed` with the capitals a Shift released a key late left in lowercase
+/// (`IMENo` for IME + の, `PCWokatta` for PC + をかった), `None` for none:
+/// a capital right after two or more, the lowercase letters after it, with
+/// it, reading wholly as kana from a particle on and no Latin word the
+/// model knows (`IMENote`, `DOMNode`, `AIToken` stay), unless the particle
+/// itself (`No`). Mixed input reads a capital as English, and the reading
+/// as typed keeps it so; this is the other reading, converted next to it
+/// (issue #6, user 2026-11-19: typoのdomainとして扱う).
+pub fn shift_slips(typed: &str, lm: &MixedModel) -> Option<String> {
+    let mut chars: Vec<char> = typed.chars().collect();
+    // the particles alone (ら before one is for a word ending in r: Judd + らは)
+    let particles = || {
+        crate::mixed::PARTICLES
+            .iter()
+            .filter(|p| !p.starts_with("ra"))
+    };
+    let mut found = false;
+    for at in 2..chars.len() {
+        if !chars[at - 2..=at].iter().all(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        let end = (at + 1..chars.len())
+            .find(|&k| !chars[k].is_ascii_lowercase())
+            .unwrap_or(chars.len());
+        if end == at + 1 {
+            continue;
+        }
+        let word: Vec<char> = chars[at..end]
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let word_str: String = word.iter().collect();
+        let particle = particles().any(|p| word_str == *p);
+        if particles().any(|p| word_str.starts_with(p))
+            && reads(&word).is_some()
+            && (particle || !lm.knows(&word_str))
+        {
+            chars[at] = word[0];
+            found = true;
+        }
+    }
+    found.then(|| chars.into_iter().collect())
+}
+
 /// `kana` with each ず and づ swapped where the other reads better by the
 /// kana model, by `margin` or more; `None` when none is. Only ず/づ: じ/ぢ
 /// would make 間近's まぢか まじか, as the kana model has it.
@@ -203,6 +247,41 @@ mod tests {
         assert_eq!(correct("arigatuo", Some(&m)), None);
         assert_eq!(correct("", Some(&m)), None);
         assert_eq!(correct("Kaisga", Some(&m)).as_deref(), Some("かいしゃ"));
+    }
+
+    #[test]
+    fn a_shift_released_a_key_late_after_capitals_is_put_right() {
+        // issue #6
+        let m = lm();
+        for (typed, meant) in [
+            ("IMENo", "IMEno"),
+            ("PCWokatta", "PCwokatta"),
+            ("IMENotsukaikata", "IMEnotsukaikata"),
+            ("kyouhaIMENotsukaikatawo", "kyouhaIMEnotsukaikatawo"),
+            ("AIGa", "AIga"),
+            ("OKDesu", "OKdesu"),
+            ("JRNishinihon", "JRnishinihon"),
+            ("PCWokattaIMENo", "PCwokattaIMEno"),
+        ] {
+            assert_eq!(shift_slips(typed, &m).as_deref(), Some(meant), "{typed}");
+        }
+        for typed in [
+            // typed as meant
+            "IMEno",
+            "IMENO",
+            "kaisha",
+            // a word after the capitals, read as kana or not
+            "GPTWorks",
+            "NSNotification",
+            "IMENote",
+            "DOMNode",
+            "AIToken",
+            "CSSMode",
+            // one capital before: a word's (Wo), not an acronym's
+            "AWokatta",
+        ] {
+            assert_eq!(shift_slips(typed, &m), None, "{typed}");
+        }
     }
 
     #[test]

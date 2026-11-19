@@ -319,7 +319,9 @@ pub struct FrontendCfg {
     /// reading one edit away (a neighbouring key, a key too many, two keys
     /// swapped) is converted too, its candidates after the first ones; ず
     /// and づ as the mixed model's kana model reads them (つずく is
-    /// converted as つづく, the reading typed too).
+    /// converted as つづく, the reading typed too); with mixed input, a
+    /// Shift released a key late after capitals (IMENo) read as romaji, the
+    /// reading converted next to the one typed (IMEの).
     pub typo_correction: bool,
     /// `/`, `$` or `@` typed at a line's start or after a space, and the
     /// name after it, go to the app as typed (an AI agent's `/command`,

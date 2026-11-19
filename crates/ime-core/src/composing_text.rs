@@ -434,6 +434,18 @@ impl ComposingText {
         crate::typo::voicing(&typed, &mixed.model, crate::typo::VOICING_OFFER)
     }
 
+    /// The reading with the capitals a Shift released a key late left read
+    /// as romaji (`typo::shift_slips`: IMENo, read IMEの), to convert next
+    /// to the one typed; `None` for none, or without mixed input (which
+    /// alone reads a capital as English).
+    pub fn shift_slip_alt(&self) -> Option<String> {
+        let mixed = self.mixed.as_ref()?;
+        let fixed = crate::typo::shift_slips(&self.raw, &mixed.model)?;
+        let converted = self.convert(&fixed, true);
+        let reading = converted.text + &converted.pending;
+        (reading != self.full_reading()).then_some(reading)
+    }
+
     /// `text` with ず and づ as the kana model reads them, when it does.
     fn voiced(&self, text: String) -> String {
         match self.mixed.as_ref().filter(|_| self.voicing) {

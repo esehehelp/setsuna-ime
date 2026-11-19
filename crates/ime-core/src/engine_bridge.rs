@@ -1369,8 +1369,10 @@ impl EngineBridge {
     }
 
     /// Space: the other reading to offer, or `None`: with English in the
-    /// composition, every letter as romaji; a typo's correction; ず and づ
-    /// the other way (`ComposingText::voicing_alt`).
+    /// composition, a Shift released a key late put right
+    /// (`ComposingText::shift_slip_alt`), or else every letter as romaji; a
+    /// typo's correction; ず and づ the other way
+    /// (`ComposingText::voicing_alt`).
     fn alt_for_space(&self) -> Option<AltList> {
         // a typo: the reading one edit away, when a letter reads as no kana
         // and nothing was read as English
@@ -1403,11 +1405,18 @@ impl EngineBridge {
                 user_words: Vec::new(),
             });
         }
+        // a Shift released a key late (IMENo for IMEの): the capitals before
+        // it were English, so it goes before every letter as romaji (いめの)
+        let slip = || {
+            self.typo_correction
+                .then(|| self.composing.shift_slip_alt())
+                .flatten()
+        };
         let reading = self.composing.kana_reading();
         let mixed = self.composing.full_reading();
         let other = reading != mixed && !reading.chars().any(|c| c.is_ascii_alphabetic());
         Some(AltList {
-            reading: if other { Some(reading) } else { typo() },
+            reading: slip().or_else(|| if other { Some(reading) } else { typo() }),
             req_id: None,
             candidates: Vec::new(),
             main: Vec::new(),
@@ -7543,6 +7552,50 @@ mod tests {
         bridge.composing.set_voicing(false);
         type_str(&mut bridge, "tuzuku");
         assert_eq!(mock.dispatched_readings().last().unwrap(), "つずく");
+    }
+
+    #[test]
+    fn a_shift_released_a_key_late_offers_the_reading_put_right() {
+        // issue #6: IMENo stays English as typed (capitals are), and the
+        // reading with the N as romaji is converted next to it
+        let (mut bridge, mock) = voicing_bridge();
+        type_str(&mut bridge, "IMENotsukaikata");
+        assert_eq!(
+            mock.dispatched_readings().last().unwrap(),
+            "IMENおつかいかた"
+        );
+        mock.set_result("IMENおつかいかた", &["IMENお使い方"]);
+        bridge.apply_async_result();
+        let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+        assert_eq!(list[0], "IMENお使い方");
+        assert_eq!(
+            mock.dispatched_readings().last().unwrap(),
+            "IMEのつかいかた"
+        );
+        mock.set_result("IMEのつかいかた", &["IMEの使い方"]);
+        let (list, selected) = shown(&bridge.apply_async_result()).unwrap();
+        assert_eq!((list[0].as_str(), selected), ("IMENお使い方", 0));
+        assert!(list.contains(&"IMEの使い方".to_string()), "{list:?}");
+
+        // ending in English: Space types a space, Space again converts,
+        // the reading put right before every letter as romaji (いめの)
+        let (mut bridge, mock) = voicing_bridge();
+        type_str(&mut bridge, "IMENo");
+        bridge.handle_space();
+        bridge.handle_space();
+        mock.answer_last(&["IMENo"]);
+        bridge.apply_async_result();
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "IMEの");
+
+        // off with typo correction: every letter as romaji, as before
+        let (mut bridge, mock) = voicing_bridge();
+        bridge.typo_correction = false;
+        type_str(&mut bridge, "IMENo");
+        bridge.handle_space();
+        bridge.handle_space();
+        mock.answer_last(&["IMENo"]);
+        bridge.apply_async_result();
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "いめの");
     }
 
     #[test]
