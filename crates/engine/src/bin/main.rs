@@ -167,6 +167,13 @@ struct EngineArgs {
     /// with an error. Default none.
     #[arg(long)]
     analyzer: Option<PathBuf>,
+
+    /// A reading corrector's manifest, run before each conversion (as
+    /// SETSUNA_CORRECTOR_MANIFEST): a reading with a slip is converted as it
+    /// reads it, the reading as typed offered too. Default: the model's own
+    /// corrector, if its manifest carries one.
+    #[arg(long)]
+    corrector: Option<PathBuf>,
 }
 
 impl EngineArgs {
@@ -190,8 +197,12 @@ impl EngineArgs {
 fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
     let manifest = CtcNatManifest::load(&args.manifest)
         .with_context(|| format!("load manifest {}", args.manifest.display()))?;
-    let mut session = EngineSession::from_manifest(&manifest, &args.explicit_knobs())
-        .with_context(|| format!("load engine from {}", args.manifest.display()))?;
+    let mut session = EngineSession::from_manifest_with_corrector(
+        &manifest,
+        &args.explicit_knobs(),
+        args.corrector.as_deref(),
+    )
+    .with_context(|| format!("load engine from {}", args.manifest.display()))?;
     session.inspect = args.emit_frames;
     // One line with every resolved decode setting, so a run can be compared
     // against another by what the engine actually used, not by its argv.
@@ -200,6 +211,7 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
         "manifest": manifest.manifest_path,
         "encoder": manifest.proposal_native_path,
         "ar_step": manifest.ar_decoder.as_ref().and_then(|a| a.native_path.as_ref()),
+        "corrector": session.corrector().map(|c| c.0),
         "precision": manifest.precision,
         "vocab": manifest.vocab_path,
         "beam_width": cfg.beam_width,

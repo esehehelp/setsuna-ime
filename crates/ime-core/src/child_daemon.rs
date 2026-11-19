@@ -816,6 +816,13 @@ fn analyzer_of(cfg: &crate::config::EngineCfg) -> Option<&Path> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// The reading corrector's manifest (`[engine] corrector_manifest`), when one is set.
+fn corrector_of(cfg: &crate::config::EngineCfg) -> Option<&Path> {
+    cfg.corrector_manifest
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// The flags after the manifest, `daemon`'s and `serve`'s: what changes the
 /// engine's answers, and so what a shared server is named by.
 fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
@@ -841,6 +848,10 @@ fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
     flag("digit-split", c.digit_split.map(|v| v.to_string()));
     flag("emit-frames", c.emit_frames.map(|v| v.to_string()));
     flag("analyzer", analyzer_of(c).map(|p| p.display().to_string()));
+    flag(
+        "corrector",
+        corrector_of(c).map(|p| p.display().to_string()),
+    );
     match &c.vocab_blacklist {
         // The bare flag clears a manifest blacklist.
         Some(ids) if ids.is_empty() => args.push("--vocab-blacklist".to_string()),
@@ -922,6 +933,23 @@ mod tests {
                 Path::new("a/analyzer.manifest.json").display()
             )
         );
+        // a reading corrector of its own; an empty path none
+        let corrector = EngineCfg {
+            corrector_manifest: Some(PathBuf::from("c/corrector.manifest.json")),
+            ..EngineCfg::default()
+        };
+        assert_eq!(
+            args_of(&corrector).last().unwrap(),
+            &format!(
+                "--corrector={}",
+                Path::new("c/corrector.manifest.json").display()
+            )
+        );
+        let none = EngineCfg {
+            corrector_manifest: Some(PathBuf::new()),
+            ..EngineCfg::default()
+        };
+        assert!(!args_of(&none).iter().any(|a| a.starts_with("--corrector")));
         let empty = EngineCfg {
             analyzer_manifest: Some(PathBuf::new()),
             ..EngineCfg::default()

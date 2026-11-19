@@ -199,6 +199,7 @@ impl Config {
         e.model_dir = i.model_dir.clone();
         e.engine_exe = i.engine_exe.clone();
         on(&mut e.analyzer_manifest, &i.analyzer_manifest, never);
+        on(&mut e.corrector_manifest, &i.corrector_manifest, never);
         let (f, i) = (&mut self.frontend, &installed.frontend);
         on(
             &mut f.symbol_dictionary_file,
@@ -288,6 +289,11 @@ pub struct EngineCfg {
     /// cuts a conversion by its words (`bunsetsu`). Empty = none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analyzer_manifest: Option<PathBuf>,
+    /// A reading corrector's manifest the engine runs before each
+    /// conversion (`--corrector`): a reading with a slip is converted as the
+    /// corrector reads it, the reading as typed offered too. Empty = none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrector_manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

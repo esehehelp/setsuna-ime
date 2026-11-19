@@ -333,7 +333,20 @@ impl EngineSession {
     /// knob as: `explicit` value > the manifest's `decode_defaults` > engine
     /// default.
     pub fn from_manifest(manifest: &CtcNatManifest, explicit: &DecodeDefaults) -> Result<Self> {
-        let env = RuntimeEnv::read()?;
+        Self::from_manifest_with_corrector(manifest, explicit, None)
+    }
+
+    /// `from_manifest` with a reading corrector's manifest of its own (the daemon's `--corrector`), taken as
+    /// SETSUNA_CORRECTOR_MANIFEST is.
+    pub fn from_manifest_with_corrector(
+        manifest: &CtcNatManifest,
+        explicit: &DecodeDefaults,
+        corrector: Option<&Path>,
+    ) -> Result<Self> {
+        let mut env = RuntimeEnv::read()?;
+        if let Some(p) = corrector {
+            env.corrector_manifest = Some(p.to_path_buf());
+        }
         Self::build(manifest, explicit, &env)
     }
 
