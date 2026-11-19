@@ -8096,6 +8096,25 @@ mod tests {
     }
 
     #[test]
+    fn space_before_the_engine_answers_does_not_convert_to_the_date() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "kyou");
+        let out = bridge.handle_space();
+        let shown_first = shown(&out.actions).map(|(l, _)| l[0].clone());
+        let pre = preedit(&out.actions);
+        let date =
+            crate::date_time::candidates("きょう", &bridge.date_time_now.unwrap())[0].clone();
+        assert_ne!(
+            shown_first.as_deref(),
+            Some(date.as_str()),
+            "{:?}",
+            out.actions
+        );
+        assert_ne!(pre.as_deref(), Some(date.as_str()), "{:?}", out.actions);
+        let _ = mock;
+    }
+
+    #[test]
     fn a_date_reading_converts_live_to_its_word_not_to_the_date() {
         for engine in [
             &["今日", "京", "教"][..],
