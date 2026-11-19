@@ -1,4 +1,4 @@
-//! setsuna-engine: ONNX CTC-NAT inference daemon / one-shot CLI.
+//! setsuna-engine: CTC-NAT inference daemon / one-shot CLI (the engine's own implementation, no ONNX Runtime).
 //!
 //! Drives a `setsuna_engine::EngineSession` from JSONL stdio (daemon mode),
 //! a named pipe shared by every app of a Windows login (serve mode, the same
@@ -26,7 +26,7 @@ use setsuna_engine::{Candidate, CandidateSource, ConversionRequest, EngineSessio
 #[command(
     name = "setsuna-engine",
     version,
-    about = "Setsuna ONNX CTC-NAT inference engine: daemon or one-shot convert."
+    about = "Setsuna CTC-NAT inference engine: daemon or one-shot convert."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -83,15 +83,10 @@ enum Command {
 /// manifest's `decode_defaults`, then the engine default.
 #[derive(Parser, Debug, Clone)]
 struct EngineArgs {
-    /// CTC-NAT artifact manifest. The proposal graph and vocab are read from
-    /// it; nothing is inferred from file names.
+    /// CTC-NAT artifact manifest. The weights and vocab are read from it;
+    /// nothing is inferred from file names.
     #[arg(long)]
     manifest: PathBuf,
-
-    /// ONNX Runtime library to load (Microsoft's official build). Default:
-    /// SETSUNA_ORT_DYLIB, else onnxruntime.dll next to this executable.
-    #[arg(long)]
-    ort_dylib: Option<PathBuf>,
 
     /// Beam width (1 = greedy). Default 1.
     #[arg(long)]
@@ -193,7 +188,6 @@ impl EngineArgs {
 }
 
 fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
-    let ort_path = setsuna_engine::runtime::init(args.ort_dylib.as_deref())?;
     let manifest = CtcNatManifest::load(&args.manifest)
         .with_context(|| format!("load manifest {}", args.manifest.display()))?;
     let mut session = EngineSession::from_manifest(&manifest, &args.explicit_knobs())
@@ -203,10 +197,9 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
     // against another by what the engine actually used, not by its argv.
     let cfg = &session.config;
     let effective = serde_json::json!({
-        "onnxruntime": ort_path,
-        "onnxruntime_build": setsuna_engine::runtime::build_info(),
         "manifest": manifest.manifest_path,
-        "onnx": manifest.proposal_path,
+        "encoder": manifest.proposal_native_path,
+        "ar_step": manifest.ar_decoder.as_ref().and_then(|a| a.native_path.as_ref()),
         "precision": manifest.precision,
         "vocab": manifest.vocab_path,
         "beam_width": cfg.beam_width,
@@ -224,13 +217,8 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
         "rescore_words": manifest.rescore_words,
     });
     eprintln!("[engine] effective {effective}");
-    let artifact_format = match manifest.precision.as_str() {
-        "fp16" => "onnx-fp16",
-        "int8" => "onnx-int8",
-        "int4" => "onnx-int4",
-        _ => "onnx-fp32",
-    };
-    Ok((session, artifact_format))
+    // the manifest's load refuses a package without the native weights, and those are int8
+    Ok((session, "native-int8"))
 }
 
 /// Candidates of one request and the conversion timings.
@@ -246,6 +234,7 @@ fn decode_one(
             score: 0.0,
             source: CandidateSource::Fallback,
             reading_pos: Vec::new(),
+            parts: None,
         };
         return Ok((vec![empty], None, None));
     }
@@ -261,13 +250,22 @@ fn decode_one(
             score: 0.0,
             source: CandidateSource::Fallback,
             reading_pos: identity_pos(reading),
+            parts: None,
         });
     }
-    // Greedy decoding has exactly one answer.
     if session.config.beam_width <= 1 && continue_beam == 0 {
-        cands.truncate(1);
+        cands.truncate(greedy_answers(&cands));
     }
     Ok((cands, Some(set.perf), set.frames))
+}
+
+/// Greedy decoding has one answer for each reading converted: the first
+/// candidate, and with a reading corrector's two readings the other's too,
+/// which `correct::merge` puts second.
+fn greedy_answers(cands: &[Candidate]) -> usize {
+    let other = |c: &Candidate| c.source == CandidateSource::OtherReading;
+    let other_second = cands.first().is_some_and(|c| !other(c)) && cands.get(1).is_some_and(other);
+    1 + usize::from(other_second)
 }
 
 #[derive(Deserialize, Debug)]
@@ -471,7 +469,7 @@ fn backend_manifest() -> BackendManifest {
             request: r#"{"id":1,"context":"...","reading":"..."}"#,
             response: r#"{"id":1,"candidates":["..."],"candidate_scores":[0.0],"engine_ms":1.0}"#,
         }],
-        artifact_formats: vec!["onnx-fp32", "onnx-fp16", "onnx-int8", "onnx-int4"],
+        artifact_formats: vec!["native-int8"],
         optional_features: vec![
             "ctc-prefix-beam",
             "symbol-split",
@@ -750,8 +748,8 @@ fn run_daemon(args: EngineArgs) -> Result<()> {
         out.flush()?;
     }
     // stdin closed: the client is gone. Leave without running exit's
-    // handlers: ONNX Runtime's static destructors then race its pool's
-    // threads (on Android, bionic aborts on the mutex they destroyed).
+    // handlers: nothing needs them (they once raced an inference runtime's
+    // threads, and bionic aborted on the mutex they destroyed).
     #[cfg(unix)]
     unsafe {
         libc::_exit(0)
@@ -797,7 +795,7 @@ fn run_serve(
 /// The daemon's threads on one L3 (`setsuna_engine::cpu`, with SETSUNA_CPU_AFFINITY=1), before the session starts
 /// any.
 fn pin_cpus() {
-    if let Some(cpus) = setsuna_engine::cpu::pin_to_one_l3() {
+    if let Some(cpus) = setsuna_engine::affinity::pin_to_one_l3() {
         eprintln!("[engine] pinned to CPUs {cpus:?} (one L3)");
     }
 }
@@ -905,6 +903,7 @@ mod tests {
             score: -0.5,
             source: CandidateSource::Beam,
             reading_pos: vec![0, 2],
+            parts: None,
         }];
         let resp = Response::ok(7, cands.clone(), 1.0, None, true, false, None);
         let json = serde_json::to_value(&resp).unwrap();

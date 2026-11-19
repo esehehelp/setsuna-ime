@@ -574,14 +574,11 @@ mod tests {
     /// Two clients of one server convert as a child daemon does, their
     /// requests interleaved; a killed server is started again.
     #[test]
-    #[ignore = "needs the engine and a model: SETSUNA_ENGINE_EXE, SETSUNA_MANIFEST, SETSUNA_ORT_DYLIB"]
+    #[ignore = "needs the engine and a model: SETSUNA_ENGINE_EXE, SETSUNA_MANIFEST"]
     fn two_clients_share_one_server() {
         let env = |k: &str| PathBuf::from(std::env::var_os(k).unwrap_or_else(|| panic!("{k}")));
         let (exe, manifest) = (env("SETSUNA_ENGINE_EXE"), env("SETSUNA_MANIFEST"));
-        let cfg = crate::config::EngineCfg {
-            ort_dylib: Some(env("SETSUNA_ORT_DYLIB")),
-            ..Default::default()
-        };
+        let cfg = crate::config::EngineCfg::default();
         let pipe = |n: Notify| -> Box<dyn EngineClient> {
             Box::new(
                 PipeEngineClient::start(&manifest, &exe, n, &cfg)

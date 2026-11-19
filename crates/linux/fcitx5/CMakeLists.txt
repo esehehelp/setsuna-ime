@@ -9,9 +9,9 @@
 # point it at the cargo target dir: -DSETSUNA_MODULE_DIR=<repo>/target/release
 # finds target/release/setsuna-engine and <repo>/local/models/onnx.
 #
-# The install puts the engine and rewriter daemons, the ONNX Runtime the engine
-# loads (SETSUNA_ORT_LIBRARY) and the model (SETSUNA_MODEL_MANIFEST) into
-# SETSUNA_MODULE_DIR, where they are found with no config.toml.
+# The install puts the engine and rewriter daemons and the model
+# (SETSUNA_MODEL_MANIFEST) into SETSUNA_MODULE_DIR, where they are found with no
+# config.toml.
 # crates/linux/package.sh builds the release archive (crates/linux/install.sh
 # installs it) with these.
 cmake_minimum_required(VERSION 3.19)
@@ -117,16 +117,6 @@ if(SETSUNA_BUILD_RERANK)
     install(CODE "
         file(GLOB backends \"${CARGO_OUT}/libggml-cpu-*.so\")
         file(INSTALL \${backends} DESTINATION \"${SETSUNA_MODULE_DIR}\" USE_SOURCE_PERMISSIONS)")
-endif()
-
-set(SETSUNA_ORT_LIBRARY "${CARGO_OUT}/libonnxruntime.so" CACHE FILEPATH
-    "ONNX Runtime library installed next to the engine (crates/engine/fetch-onnxruntime.sh)")
-if(EXISTS "${SETSUNA_ORT_LIBRARY}")
-    get_filename_component(ort_file "${SETSUNA_ORT_LIBRARY}" REALPATH)
-    install(PROGRAMS "${ort_file}" DESTINATION "${SETSUNA_MODULE_DIR}" RENAME libonnxruntime.so)
-else()
-    message(WARNING "${SETSUNA_ORT_LIBRARY} does not exist: the engine needs ONNX Runtime "
-        "next to it (crates/engine/fetch-onnxruntime.sh), SETSUNA_ORT_DYLIB or [engine] ort_dylib")
 endif()
 
 # The manifest and every file it names, at the same paths relative to it, so

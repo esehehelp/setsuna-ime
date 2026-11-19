@@ -6,15 +6,18 @@
 //! when a session is created.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use setsuna_artifact::{CtcNatManifest, DecodeDefaults};
 
-use crate::candidate::Candidate;
-use crate::pipeline::proposal::{FrameReduce, ProposalRunner};
+use crate::candidate::{Candidate, CandidateSource, ScoreParts};
+use crate::pipeline::artifact_load::Model;
+use crate::pipeline::proposal::FrameReduce;
 use crate::pipeline::{
-    artifact_load, chunk, decode, digitsplit, pool, proposal, rescore, symsplit, symtoken,
+    ar, artifact_load, chunk, correct, ctc_score, decode, digitsplit, pool, proposal, rescore,
+    symsplit, symtoken,
 };
 use crate::tokenizer::SharedCharTokenizer;
 
@@ -22,10 +25,26 @@ use crate::tokenizer::SharedCharTokenizer;
 pub struct ConvertPerf {
     pub input_len: usize,
     pub proposal_ms: f64,
+    /// The proposal's parts: the encoder (its logits; `ort_ms`, the name the
+    /// daemon's perf has always given it) and the logits reduced to the
+    /// frames' top-k (0 when the proposal came from the cache of the last
+    /// conversion).
+    pub ort_ms: f64,
+    pub reduce_ms: f64,
     pub beam_ms: f64,
     pub post_ms: f64,
     /// The rescoring of the candidates (`pipeline::rescore`).
     pub rescore_ms: f64,
+    /// The fusion's scoring of the AR candidates by the CTC model: all of it,
+    /// and its encoder alone; 0 without the fusion.
+    pub fusion_ms: f64,
+    pub fusion_ort_ms: f64,
+    /// The reading corrector (`pipeline::correct`): its pass, and its encoder
+    /// alone; then the conversion of the other reading when it changed the
+    /// reading (the rest of the perf is the first reading's). 0 without it.
+    pub corrector_ms: f64,
+    pub corrector_ort_ms: f64,
+    pub other_reading_ms: f64,
     pub total_ms: f64,
     pub hyp_count: usize,
     pub candidate_count: usize,
@@ -55,6 +74,8 @@ pub struct CandidateSet {
     /// asks for it (and the reading was converted in one pass, not split
     /// at symbols).
     pub frames: Option<Vec<FrameView>>,
+    /// What the reading corrector made of the reading, when there is one.
+    pub correction: Option<correct::Correction>,
 }
 
 /// One output frame of the model, for inspection: the input token it sits
@@ -77,21 +98,104 @@ pub struct FrameView {
 /// the caller and the manifest.
 #[derive(Debug, Clone)]
 struct RuntimeEnv {
-    /// `SETSUNA_ORT_INTRA_THREADS` (default 1: an IME's conversion runs on
-    /// one core; more cores are for other work, not to make one faster).
-    ort_intra_threads: usize,
     /// `SETSUNA_TOP_K_PER_STEP` (default 16): beam expansion breadth when
     /// neither the caller nor the manifest sets one.
     top_k_per_step: usize,
+    /// `SETSUNA_AR_MARGIN` (unset: none): the AR search's beam threshold in nats (`ar::ArSearch::margin`), a
+    /// research knob until it is measured.
+    ar_margin: Option<f32>,
+    /// `SETSUNA_SCRIPT_BIAS` (unset: none): four numbers, `other,kanji,hiragana,katakana`, added to the prior's
+    /// logits of those classes by a model with the script latent (`ar::ArSearch::script_bias`; e.g. `0,0,4,0`
+    /// leans to hiragana where the model may choose); a research knob, the IME's setting in setsuna-ime.
+    script_bias: [f32; 4],
+    /// `SETSUNA_FUSION_MANIFEST` (unset: no fusion): a CTC model's manifest whose model scores an AR model's
+    /// candidates ([`Fusion`]), a research knob until the fusion is measured (and has a place in the manifest).
+    fusion_manifest: Option<PathBuf>,
+    /// `SETSUNA_FUSION_WEIGHT` (default 1): the CTC log-likelihood's weight in a fused candidate's score.
+    fusion_weight: f32,
+    /// `SETSUNA_CORRECTOR_MANIFEST` (unset: the manifest's own `corrector`, if any): a reading corrector's manifest
+    /// ([`Corrector`], `pipeline::correct`) run in place of the manifest's, a research knob.
+    corrector_manifest: Option<PathBuf>,
+    /// `SETSUNA_CORRECTOR_THRESHOLD` (unset: the manifest's corrector's threshold, or +inf for a
+    /// `SETSUNA_CORRECTOR_MANIFEST` one: the corrected reading never converted first, only offered): the margin
+    /// log P(corrected) - log P(as typed) above which the corrected reading is converted first.
+    corrector_threshold: Option<f32>,
+    /// `SETSUNA_CORRECTOR=0` (or `off`): no reading corrector, not even the manifest's (the conversion alone, a
+    /// research comparison).
+    corrector_off: bool,
 }
 
 impl RuntimeEnv {
-    fn read() -> Self {
-        Self {
-            ort_intra_threads: env_usize("SETSUNA_ORT_INTRA_THREADS", 1),
+    fn read() -> Result<Self> {
+        let fusion_weight = match std::env::var("SETSUNA_FUSION_WEIGHT") {
+            Ok(s) => s
+                .parse::<f32>()
+                .ok()
+                .filter(|w| w.is_finite())
+                .with_context(|| format!("SETSUNA_FUSION_WEIGHT={s} is not a number"))?,
+            Err(_) => 1.0,
+        };
+        let corrector_threshold = match std::env::var("SETSUNA_CORRECTOR_THRESHOLD") {
+            Ok(s) => Some(
+                s.parse::<f32>()
+                    .ok()
+                    .filter(|t| !t.is_nan())
+                    .with_context(|| format!("SETSUNA_CORRECTOR_THRESHOLD={s} is not a number"))?,
+            ),
+            Err(_) => None,
+        };
+        let script_bias = match std::env::var("SETSUNA_SCRIPT_BIAS") {
+            Ok(s) if !s.trim().is_empty() => parse_script_bias(&s).with_context(|| {
+                format!("SETSUNA_SCRIPT_BIAS={s}: four numbers, other,kanji,hiragana,katakana")
+            })?,
+            _ => [0.0; 4],
+        };
+        let corrector_off = match std::env::var("SETSUNA_CORRECTOR") {
+            Ok(s) if s == "0" || s.eq_ignore_ascii_case("off") => true,
+            Ok(s) if s.is_empty() || s == "1" || s.eq_ignore_ascii_case("on") => false,
+            Ok(s) => bail!(
+                "SETSUNA_CORRECTOR={s}: 0 / off turns the reading corrector off, 1 / on leaves it"
+            ),
+            Err(_) => false,
+        };
+        Ok(Self {
             top_k_per_step: env_usize("SETSUNA_TOP_K_PER_STEP", 16),
-        }
+            ar_margin: std::env::var("SETSUNA_AR_MARGIN")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            script_bias,
+            fusion_manifest: std::env::var_os("SETSUNA_FUSION_MANIFEST")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+            fusion_weight,
+            corrector_manifest: std::env::var_os("SETSUNA_CORRECTOR_MANIFEST")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+            corrector_threshold,
+            corrector_off,
+        })
     }
+}
+
+/// A reading corrector (`pipeline::correct`): a CTC model over the conversion model's vocabulary, read greedily
+/// over the reading and its context before the conversion, with the last reading's correction kept (a request for
+/// more candidates of it, or the same request again, does not run it again).
+struct Corrector {
+    /// The corrector's own session (its manifest's decode settings: context length, blacklist, symbol token).
+    session: Box<EngineSession>,
+    manifest: PathBuf,
+    threshold: f32,
+    last: Option<(String, String, correct::Correction)>,
+}
+
+/// An AR model's candidates scored by a CTC model too: each hypothesis' tokens get the CTC model's log-likelihood
+/// over every alignment to its frames for the same context and reading (`pipeline::ctc_score`), and the candidates
+/// are ordered by `ar + weight * ctc` (both in [`Candidate::parts`]). The two models share one vocabulary.
+struct Fusion {
+    /// The CTC model's own session (its manifest's decode settings: its context length and blacklist).
+    scorer: Box<EngineSession>,
+    manifest: PathBuf,
+    weight: f32,
 }
 
 /// Resolved decode settings of a session.
@@ -102,8 +206,7 @@ pub struct DecodeConfig {
     pub top_k_per_step: usize,
     /// Maximum returned candidates.
     pub max_candidates: usize,
-    /// Maximum left-context tokens fed to the model (a char the vocabulary
-    /// lacks takes one a byte).
+    /// Maximum left-context characters fed to the model.
     pub max_context: usize,
     /// Token ids whose log-prob is forced to -inf before decoding.
     pub vocab_blacklist: Vec<u32>,
@@ -169,7 +272,8 @@ impl DecodeConfig {
 
 pub struct EngineSession {
     pub tokenizer: SharedCharTokenizer,
-    proposal: ProposalRunner,
+    /// The proposal graph (CTC) or the AR decoder's graphs.
+    model: Model,
     /// Positional-table size of the model (manifest `max_seq_len`).
     pub seq_len: usize,
     pub config: DecodeConfig,
@@ -188,6 +292,15 @@ pub struct EngineSession {
     crf: Option<crate::pipeline::crf::CrfTables>,
     /// The candidates' rescoring (manifest `rescore`), when a weight is set.
     rescorer: Option<rescore::Rescorer>,
+    /// The AR search's beam threshold (`RuntimeEnv::ar_margin`).
+    ar_margin: Option<f32>,
+    /// The AR search's preference among the scripts of a model with the script latent
+    /// (`RuntimeEnv::script_bias`, `ar::ArSearch::script_bias`).
+    script_bias: [f32; 4],
+    /// A CTC model scoring the AR candidates (`RuntimeEnv::fusion_manifest`).
+    fusion: Option<Fusion>,
+    /// A reading corrector run before the conversion (`RuntimeEnv::corrector_manifest`).
+    corrector: Option<Corrector>,
 }
 
 /// A proposal with what it was computed for.
@@ -209,8 +322,30 @@ impl EngineSession {
     /// knob as: `explicit` value > the manifest's `decode_defaults` > engine
     /// default.
     pub fn from_manifest(manifest: &CtcNatManifest, explicit: &DecodeDefaults) -> Result<Self> {
-        let env = RuntimeEnv::read();
-        let (tokenizer, proposal) = artifact_load::load(manifest, env.ort_intra_threads)?;
+        let env = RuntimeEnv::read()?;
+        Self::build(manifest, explicit, &env)
+    }
+
+    /// The fusion's CTC manifest and weight, when there is one.
+    pub fn fusion(&self) -> Option<(&Path, f32)> {
+        self.fusion
+            .as_ref()
+            .map(|f| (f.manifest.as_path(), f.weight))
+    }
+
+    /// The reading corrector's source (its manifest, or the bundled corrector's graph) and threshold, when there is one.
+    pub fn corrector(&self) -> Option<(&Path, f32)> {
+        self.corrector
+            .as_ref()
+            .map(|c| (c.manifest.as_path(), c.threshold))
+    }
+
+    fn build(
+        manifest: &CtcNatManifest,
+        explicit: &DecodeDefaults,
+        env: &RuntimeEnv,
+    ) -> Result<Self> {
+        let (tokenizer, model) = artifact_load::load(manifest)?;
         let config = DecodeConfig::resolve(explicit, &manifest.decode_defaults, &env);
         if config.symbol_token {
             let mut buf = [0u8; 4];
@@ -243,9 +378,34 @@ impl EngineSession {
             manifest.rescore_words.as_deref(),
             config.word_weight,
         )?;
+        let fusion = match &env.fusion_manifest {
+            None => None,
+            Some(path) => Some(Self::load_fusion(path, env, &tokenizer, &model, manifest)?),
+        };
+        // SETSUNA_CORRECTOR=0: none; SETSUNA_CORRECTOR_MANIFEST: that one (threshold from the environment, else +inf);
+        // else the manifest's own (its threshold unless the environment gives one)
+        let corrector = if env.corrector_off {
+            None
+        } else if let Some(path) = &env.corrector_manifest {
+            let m = CtcNatManifest::load(path).with_context(|| {
+                format!("load the reading corrector's manifest {}", path.display())
+            })?;
+            let threshold = env.corrector_threshold.unwrap_or(f32::INFINITY);
+            Some(Self::load_corrector(&m, path, threshold, env)?)
+        } else if let Some(b) = &manifest.corrector {
+            let threshold = env.corrector_threshold.unwrap_or(b.threshold);
+            Some(Self::load_corrector(
+                &b.manifest,
+                &b.manifest.proposal_path,
+                threshold,
+                env,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             tokenizer,
-            proposal,
+            model,
             seq_len: manifest.max_seq_len,
             config,
             reduce: FrameReduce::default(),
@@ -254,20 +414,285 @@ impl EngineSession {
             last_proposal: None,
             crf,
             rescorer,
+            ar_margin: env.ar_margin,
+            script_bias: env.script_bias,
+            fusion,
+            corrector,
         })
+    }
+
+    /// The reading corrector's session from its manifest (its own decode defaults; no fusion or corrector of its
+    /// own): a CTC model. Its vocabulary need not be the conversion model's: what it gives is a reading. `source`
+    /// names it (its manifest, or a bundled corrector's graph).
+    fn load_corrector(
+        corrector_manifest: &CtcNatManifest,
+        source: &Path,
+        threshold: f32,
+        env: &RuntimeEnv,
+    ) -> Result<Corrector> {
+        let path = source;
+        let corrector_env = RuntimeEnv {
+            fusion_manifest: None,
+            corrector_manifest: None,
+            corrector_off: true,
+            ..env.clone()
+        };
+        let session = Self::build(
+            corrector_manifest,
+            &DecodeDefaults::default(),
+            &corrector_env,
+        )
+        .with_context(|| format!("load the reading corrector from {}", path.display()))?;
+        if !matches!(session.model, Model::Ctc(_)) {
+            bail!(
+                "the reading corrector {} is not a CTC model (it has an AR decoder)",
+                path.display()
+            );
+        }
+        Ok(Corrector {
+            session: Box::new(session),
+            manifest: path.to_path_buf(),
+            threshold,
+            last: None,
+        })
+    }
+
+    /// As a reading corrector: the greedy output for `reading` after `context` (each run of symbols one token and
+    /// put back, with symbol token on), log P(output) and log P(`reading`) under this model over the same frames
+    /// less one constant (`proposal::greedy_scores`, `ctc_score`; -inf where no alignment fits), and the graph's time
+    /// in ms. `None` for a reading the model does not take in one pass, or with a token its logits leave out (a head
+    /// cut to the tokens of readings, manifest `proposal.logit_ids`: it could not give that reading back).
+    fn correct_reading(
+        &mut self,
+        context: &str,
+        reading: &str,
+    ) -> Result<Option<(String, f32, f32, f64)>> {
+        let cfg = &self.config;
+        let tokenized = cfg.symbol_token.then(|| symtoken::tokenize(reading));
+        let text = tokenized.as_ref().map_or(reading, |t| t.text.as_str());
+        let Ok(encoded) = proposal::encode(
+            &self.tokenizer,
+            self.seq_len,
+            cfg.max_context,
+            context,
+            text,
+        ) else {
+            return Ok(None);
+        };
+        // the reading's tokens: what follows [SEP]
+        let (ids, actual) = (&encoded.0, encoded.2);
+        let sep = ids[1..actual]
+            .iter()
+            .position(|&id| id == self.tokenizer.sep_id as i64)
+            .map_or(actual, |i| i + 2);
+        let typed: Vec<u32> = ids[sep..actual].iter().map(|&id| id as u32).collect();
+        let Model::Ctc(runner) = &mut self.model else {
+            bail!("a reading corrector is a CTC model");
+        };
+        if let Some(columns) = runner.logit_ids() {
+            if typed.iter().any(|id| columns.binary_search(id).is_err()) {
+                return Ok(None);
+            }
+        }
+        let (path, scores) =
+            runner.greedy_log_probs(&self.tokenizer, encoded, &cfg.vocab_blacklist, &typed)?;
+        let forward = ctc_score::Forward::new(&scores);
+        let (score_fix, score_typed) = (
+            forward.log_likelihood(&path),
+            forward.log_likelihood(&typed),
+        );
+        let raw = self.tokenizer.decode(&path);
+        let corrected = tokenized.map_or(raw.clone(), |t| t.restore(&raw));
+        Ok(Some((
+            corrected,
+            score_fix,
+            score_typed,
+            runner.last_ort_ms,
+        )))
+    }
+
+    /// The fusion's CTC session from its manifest (its own decode defaults, no fusion of its own), checked against
+    /// the AR model it scores: a CTC model, over the same vocabulary.
+    fn load_fusion(
+        path: &Path,
+        env: &RuntimeEnv,
+        tokenizer: &SharedCharTokenizer,
+        model: &Model,
+        manifest: &CtcNatManifest,
+    ) -> Result<Fusion> {
+        if !matches!(model, Model::Ar(_)) {
+            bail!(
+                "SETSUNA_FUSION_MANIFEST scores an AR model's candidates, but {} has no AR decoder",
+                manifest.manifest_path.display()
+            );
+        }
+        let scorer_manifest = CtcNatManifest::load(path)
+            .with_context(|| format!("load the fusion's manifest {}", path.display()))?;
+        let scorer_env = RuntimeEnv {
+            fusion_manifest: None,
+            corrector_manifest: None,
+            corrector_off: true,
+            ..env.clone()
+        };
+        let scorer = Self::build(&scorer_manifest, &DecodeDefaults::default(), &scorer_env)
+            .with_context(|| format!("load the fusion's model from {}", path.display()))?;
+        if !matches!(scorer.model, Model::Ctc(_)) {
+            bail!(
+                "the fusion's model {} is not a CTC model (it has an AR decoder)",
+                path.display()
+            );
+        }
+        let (a, b) = (tokenizer, &scorer.tokenizer);
+        anyhow::ensure!(
+            a.id_to_token == b.id_to_token
+                && (a.pad_id, a.unk_id, a.cls_id, a.sep_id, a.blank_id, a.mask_id)
+                    == (b.pad_id, b.unk_id, b.cls_id, b.sep_id, b.blank_id, b.mask_id),
+            "the fusion's model {} has another vocabulary than {} (a candidate's token ids must mean the same to both)",
+            path.display(),
+            manifest.manifest_path.display()
+        );
+        Ok(Fusion {
+            scorer: Box::new(scorer),
+            manifest: path.to_path_buf(),
+            weight: env.fusion_weight,
+        })
+    }
+
+    /// The CTC log-likelihood of each token sequence for `reading` after `context`, over the frames a conversion of
+    /// them reads (`ctc_score`): -inf for a sequence no alignment fits. The fusion's scorer side; a CTC model only.
+    /// Returns the scores and the graph's time in ms.
+    fn ctc_log_likelihoods(
+        &mut self,
+        context: &str,
+        reading: &str,
+        sequences: &[&[u32]],
+    ) -> Result<(Vec<f32>, f64)> {
+        let cfg = &self.config;
+        let encoded = proposal::encode(
+            &self.tokenizer,
+            self.seq_len,
+            cfg.max_context,
+            context,
+            reading,
+        )?;
+        let Model::Ctc(runner) = &mut self.model else {
+            bail!("only a CTC model scores token sequences by their alignments");
+        };
+        let mut ids: Vec<u32> = sequences.iter().flat_map(|s| s.iter().copied()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let lp = runner.token_log_probs(
+            &self.tokenizer,
+            encoded,
+            &cfg.vocab_blacklist,
+            &ids,
+            self.reduce,
+        )?;
+        let forward = ctc_score::Forward::new(&lp);
+        Ok((
+            sequences
+                .iter()
+                .map(|s| forward.log_likelihood(s))
+                .collect(),
+            runner.last_ort_ms,
+        ))
     }
 
     /// Convert one request: the pipeline's candidates, cut to the display
     /// limit. A reading longer than a chunk (`chunk::MAX_CHUNK`, or what the
-    /// model's sequence holds) is converted chunk by chunk, a sentence after
-    /// another. A reading
+    /// model's sequence holds less [CLS] and [SEP]) is converted chunk by
+    /// chunk, a sentence after another. A reading
     /// carrying bracket / annotation symbols, or chars the vocabulary has no
     /// token for, goes through symbol split when it is enabled; with symbol
     /// token, every run of symbols is read as one token instead. With digit
     /// split, the runs of digits are cut out first and spliced back. A
     /// `continue_beam` request decodes with a wider beam and returns more
     /// candidates; which of them are new is the caller's to tell.
+    ///
+    /// With a reading corrector, the reading goes through it first: when it
+    /// changes the reading, both readings are converted, the one it picks
+    /// first (`pipeline::correct`), and their candidates merged, every
+    /// candidate's reading positions on the reading requested; the perf is
+    /// the first reading's with the corrector's and the other reading's time
+    /// added.
     pub fn convert(&mut self, request: ConversionRequest<'_>) -> Result<CandidateSet> {
+        if self.corrector.is_none() {
+            return self.convert_reading(request);
+        }
+        let t0 = Instant::now();
+        let (correction, ort_ms) = self.correction(request.context, request.reading)?;
+        let corrector_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut set = if correction.changed {
+            let (first, other) = if correction.applied {
+                (correction.reading.as_str(), request.reading)
+            } else {
+                (request.reading, correction.reading.as_str())
+            };
+            let limit = self.config.max_candidates + CONTINUE_STEP * request.continue_beam;
+            let mut set = self.convert_reading(ConversionRequest {
+                reading: first,
+                ..request
+            })?;
+            let mut other_set = self.convert_reading(ConversionRequest {
+                reading: other,
+                ..request
+            })?;
+            // positions on the reading as requested, the frontend's
+            let corrected = if correction.applied {
+                &mut set.candidates
+            } else {
+                &mut other_set.candidates
+            };
+            correct::to_typed_positions(
+                corrected,
+                &correct::typed_positions(request.reading, &correction.reading),
+            );
+            set.candidates = correct::merge(set.candidates, other_set.candidates, limit);
+            set.perf.candidate_count = set.candidates.len();
+            set.perf.other_reading_ms = other_set.perf.total_ms;
+            set.perf.total_ms += other_set.perf.total_ms;
+            set
+        } else {
+            self.convert_reading(request)?
+        };
+        set.perf.corrector_ms = corrector_ms;
+        set.perf.corrector_ort_ms = ort_ms;
+        set.perf.total_ms += corrector_ms;
+        set.correction = Some(correction);
+        Ok(set)
+    }
+
+    /// The reading corrector's verdict on `reading` after `context` (the last one again when asked for once more)
+    /// and its graph's time in ms (0 when kept). A session with a corrector only.
+    fn correction(&mut self, context: &str, reading: &str) -> Result<(correct::Correction, f64)> {
+        let c = self
+            .corrector
+            .as_mut()
+            .expect("a session with a reading corrector");
+        if let Some((ctx, rd, kept)) = &c.last {
+            if ctx == context && rd == reading {
+                return Ok((kept.clone(), 0.0));
+            }
+        }
+        let (correction, ort_ms) = match c.session.correct_reading(context, reading)? {
+            None => (correct::Correction::unchanged(reading), 0.0),
+            Some((corrected, score_fix, score_typed, ort_ms)) => (
+                correct::Correction::judged(
+                    reading,
+                    corrected,
+                    score_fix,
+                    score_typed,
+                    c.threshold,
+                ),
+                ort_ms,
+            ),
+        };
+        c.last = Some((context.to_string(), reading.to_string(), correction.clone()));
+        Ok((correction, ort_ms))
+    }
+
+    /// [`Self::convert`] of the reading as given.
+    fn convert_reading(&mut self, request: ConversionRequest<'_>) -> Result<CandidateSet> {
         if request.continue_beam == 0 {
             return self.convert_at(request);
         }
@@ -335,6 +760,7 @@ impl EngineSession {
             candidates,
             perf,
             frames,
+            correction: None,
         })
     }
 
@@ -403,7 +829,7 @@ impl EngineSession {
             .filter(|&c| !self.tokenizer.has_char(c))
             .collect();
         // Only [UNK] chars leave the context: one the vocabulary spells with
-        // byte-fallback tokens is still read (Aster-v1.2-small spells ~ that
+        // byte-fallback tokens is still read (a model with the byte tokens spells ~ that
         // way, and dropping it turned 東京~大阪間 into 東京~大阪館).
         let dropped_from_context: HashSet<char> = out_of_vocab
             .iter()
@@ -418,7 +844,7 @@ impl EngineSession {
                 symsplit::convert_split(context, reading, pool_limit, is_split, |c, r| {
                     // A spliced char the vocabulary lacks would reach the
                     // model as [UNK] through the running context: with
-                    // Aster-v1.2-small minus `.`, 2ぱーせんと after `6.`
+                    // a model with the byte tokens minus `.`, 2ぱーせんと after `6.`
                     // gave 2ーセン%, after `6` 2パーセント.
                     let c: String = c
                         .chars()
@@ -479,6 +905,9 @@ impl EngineSession {
         if reading.is_empty() {
             return Ok((Vec::new(), ConvertPerf::default(), None));
         }
+        if matches!(self.model, Model::Ar(_)) {
+            return self.convert_span_ar(context, reading, total_t0);
+        }
         let cfg = &self.config;
         let greedy = cfg.beam_width <= 1;
         // Inspection needs probabilities even when decoding is greedy.
@@ -502,7 +931,10 @@ impl EngineSession {
             let frame_reading =
                 proposal::frame_reading(&self.tokenizer, &encoded.0, encoded.2, reading);
             let inputs: Vec<i64> = encoded.0[..encoded.2].to_vec();
-            let proposal = self.proposal.run(
+            let Model::Ctc(runner) = &mut self.model else {
+                unreachable!("an AR model returned above")
+            };
+            let proposal = runner.run(
                 &self.tokenizer,
                 encoded,
                 &cfg.vocab_blacklist,
@@ -520,6 +952,10 @@ impl EngineSession {
                 inputs,
             });
         }
+        let (ort_ms, reduce_ms) = match (&self.model, hit) {
+            (Model::Ctc(runner), false) => (runner.last_ort_ms, runner.last_reduce_ms),
+            _ => (0.0, 0.0),
+        };
         let last = self.last_proposal.as_ref().expect("stored above");
         let (proposal, frame_reading, inputs) = (&last.proposal, &last.frame_reading, &last.inputs);
         let proposal_ms = proposal_t0.elapsed().as_secs_f64() * 1000.0;
@@ -549,9 +985,16 @@ impl EngineSession {
         let perf = ConvertPerf {
             input_len: proposal.input_len,
             proposal_ms,
+            ort_ms,
+            reduce_ms,
             beam_ms,
             post_ms: post_t0.elapsed().as_secs_f64() * 1000.0,
             rescore_ms: 0.0,
+            fusion_ms: 0.0,
+            fusion_ort_ms: 0.0,
+            corrector_ms: 0.0,
+            corrector_ort_ms: 0.0,
+            other_reading_ms: 0.0,
             total_ms: total_t0.elapsed().as_secs_f64() * 1000.0,
             hyp_count,
             candidate_count: candidates.len(),
@@ -559,6 +1002,118 @@ impl EngineSession {
         let frames =
             (self.inspect > 0).then(|| self.frame_views(&proposal.steps, inputs, frame_reading));
         Ok((candidates, perf, frames))
+    }
+
+    /// [`Self::convert_span`] for a model with an AR decoder (`pipeline::ar`): the encoder graph once, then the
+    /// beam over the step graph (`beam_width` live hypotheses, `top_k_per_step` next tokens each, until the pool's
+    /// worth closed), the hypotheses decoded best first (empty and duplicate texts dropped; the reading and its
+    /// katakana when nothing is left). The special ids but the end and the blacklist are never written. No frames to
+    /// inspect, no reading positions; the perf's proposal is the encoder, its beam the search.
+    fn convert_span_ar(
+        &mut self,
+        context: &str,
+        reading: &str,
+        total_t0: Instant,
+    ) -> Result<(Vec<Candidate>, ConvertPerf, Option<Vec<FrameView>>)> {
+        let cfg = &self.config;
+        let tok = &self.tokenizer;
+        let encoded = proposal::encode(tok, self.seq_len, cfg.max_context, context, reading)?;
+        let input_len = encoded.2;
+        let Model::Ar(runner) = &mut self.model else {
+            unreachable!("called for AR models")
+        };
+        let mut forbidden: Vec<u32> = vec![
+            tok.pad_id,
+            tok.unk_id,
+            tok.cls_id,
+            tok.blank_id,
+            tok.mask_id,
+        ];
+        forbidden.extend(cfg.vocab_blacklist.iter().copied());
+        let search = ar::ArSearch {
+            bos: runner.spec.bos,
+            eos: runner.spec.eos,
+            beam: cfg.beam_width,
+            top_k: cfg.top_k_per_step,
+            // as the model's own greedy decode (ar_generate): at most the input's length
+            max_len: input_len,
+            want: cfg.pool_limit(),
+            forbidden,
+            margin: self.ar_margin,
+            script_bias: self.script_bias,
+        };
+        let mut hyps = runner.run(encoded, &search)?;
+        let (encoder_ms, search_ms) = (runner.last_encoder_ms, runner.last_search_ms);
+        // the fusion: each hypothesis scored by the CTC model too, the hypotheses ordered by the sum (a stable sort:
+        // equal sums keep the AR order)
+        let (mut fusion_ms, mut fusion_ort_ms) = (0.0, 0.0);
+        let mut parts: Vec<Option<ScoreParts>> = vec![None; hyps.len()];
+        if let Some(f) = self.fusion.as_mut() {
+            let t0 = Instant::now();
+            let sequences: Vec<&[u32]> = hyps.iter().map(|h| h.ids.as_slice()).collect();
+            let (ctc, ort_ms) = f.scorer.ctc_log_likelihoods(context, reading, &sequences)?;
+            let mut fused: Vec<(ar::ArHypothesis, ScoreParts)> = hyps
+                .into_iter()
+                .zip(ctc)
+                .map(|(mut h, ctc)| {
+                    let p = ScoreParts { ar: h.score, ctc };
+                    // weight 0: the AR order (0 * -inf would be NaN)
+                    if f.weight != 0.0 {
+                        h.score += f.weight * ctc;
+                    }
+                    (h, p)
+                })
+                .collect();
+            fused.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+            parts = fused.iter().map(|x| Some(x.1)).collect();
+            hyps = fused.into_iter().map(|x| x.0).collect();
+            fusion_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            fusion_ort_ms = ort_ms;
+        }
+        let post_t0 = Instant::now();
+        let source = if cfg.beam_width <= 1 {
+            CandidateSource::Greedy
+        } else {
+            CandidateSource::Beam
+        };
+        let hyp_count = hyps.len();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut candidates: Vec<Candidate> = hyps
+            .into_iter()
+            .zip(parts)
+            .filter_map(|(h, parts)| {
+                let text = pool::ar_text(tok, &h.ids, cfg.normalize_candidates);
+                (!text.is_empty() && seen.insert(text.clone())).then(|| Candidate {
+                    text,
+                    score: h.score,
+                    source,
+                    reading_pos: Vec::new(),
+                    parts,
+                })
+            })
+            .collect();
+        if candidates.is_empty() {
+            candidates = pool::fallback(reading);
+        }
+        candidates.truncate(cfg.pool_limit());
+        let perf = ConvertPerf {
+            input_len,
+            proposal_ms: encoder_ms,
+            ort_ms: encoder_ms,
+            reduce_ms: 0.0,
+            beam_ms: search_ms,
+            post_ms: post_t0.elapsed().as_secs_f64() * 1000.0,
+            rescore_ms: 0.0,
+            fusion_ms,
+            fusion_ort_ms,
+            corrector_ms: 0.0,
+            corrector_ort_ms: 0.0,
+            other_reading_ms: 0.0,
+            total_ms: total_t0.elapsed().as_secs_f64() * 1000.0,
+            hyp_count,
+            candidate_count: candidates.len(),
+        };
+        Ok((candidates, perf, None))
     }
 
     /// The proposal's frames as [`FrameView`]s; `inputs` are the encoded
@@ -611,14 +1166,45 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Four finite numbers separated by commas (`RuntimeEnv::script_bias`).
+fn parse_script_bias(s: &str) -> Result<[f32; 4]> {
+    let v: Vec<f32> = s
+        .split(',')
+        .map(|x| x.trim().parse::<f32>().ok().filter(|x| x.is_finite()))
+        .collect::<Option<_>>()
+        .context("not numbers")?;
+    v.try_into()
+        .map_err(|v: Vec<f32>| anyhow::anyhow!("{} numbers, not 4", v.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn env() -> RuntimeEnv {
         RuntimeEnv {
-            ort_intra_threads: 1,
             top_k_per_step: 16,
+            ar_margin: None,
+            script_bias: [0.0; 4],
+            fusion_manifest: None,
+            fusion_weight: 1.0,
+            corrector_manifest: None,
+            corrector_threshold: None,
+            corrector_off: false,
+        }
+    }
+
+    /// SETSUNA_SCRIPT_BIAS: four numbers in class order, spaces allowed; other counts, words and non-finite
+    /// numbers refused.
+    #[test]
+    fn script_bias_is_four_numbers() {
+        assert_eq!(parse_script_bias("0,0,4,0").unwrap(), [0.0, 0.0, 4.0, 0.0]);
+        assert_eq!(
+            parse_script_bias(" -1, 2.5 ,0,0 ").unwrap(),
+            [-1.0, 2.5, 0.0, 0.0]
+        );
+        for bad in ["0,0,4", "0,0,4,0,0", "hiragana=4", "0,0,inf,0", ""] {
+            assert!(parse_script_bias(bad).is_err(), "{bad}");
         }
     }
 

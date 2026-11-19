@@ -1,5 +1,5 @@
 //! Rescoring of a conversion's candidates with outside statistics, after the
-//! pipeline (the research side, 2026-10-23: on Shiran-v2's beam-20 candidates the two
+//! pipeline (the research side, 2026-10-23: on an int4 MoE model's beam-20 candidates the two
 //! terms together gave wiki-fresh EM1 +1.8pt and raw dev +1.2pt; most of it
 //! undoes the beam's garbles, such as two words run into one). Each
 //! candidate's score gains
@@ -212,7 +212,7 @@ const TWO_BYTE: usize = 15 * 256;
 /// counts: the 240 most frequent chars one byte (0x00-0xEF), the next 3840
 /// two (0xF0-0xFE, then one), any other 0xFF then its UTF-8. A prefix code,
 /// so a coded text's byte prefixes are its char prefixes and equal codes are
-/// equal texts (Shiran's readings at about one byte a char, against three).
+/// equal texts (the readings at about one byte a char, against three).
 struct Code {
     rank: HashMap<char, u16>,
 }
@@ -896,6 +896,7 @@ mod tests {
             score,
             source,
             reading_pos: Vec::new(),
+            parts: None,
         };
         let mut c = vec![
             cand("藍は", -1.0, CandidateSource::Beam),

@@ -154,6 +154,7 @@ impl Tokenized {
             score: c.score,
             source: c.source,
             reading_pos: if aligned { pos } else { Vec::new() },
+            parts: c.parts,
         }
     }
 
@@ -250,6 +251,7 @@ mod tests {
             score,
             source: CandidateSource::Beam,
             reading_pos: pos.to_vec(),
+            parts: None,
         }
     }
 

@@ -6,7 +6,6 @@
 
 [engine]
 engine_exe = "${KAIRO_INPUT_BUILD}/bin/setsuna-engine.exe"
-ort_dylib = "${KAIRO_INPUT_BUILD}/bin/onnxruntime.dll"
 model_manifest = "${KAIRO_INPUT_MODEL}/Cymbidium-v1.1-xsmall.manifest.json"
 
 [frontend]

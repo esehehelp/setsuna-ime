@@ -198,7 +198,6 @@ impl Config {
         e.model_manifest = i.model_manifest.clone();
         e.model_dir = i.model_dir.clone();
         e.engine_exe = i.engine_exe.clone();
-        e.ort_dylib = i.ort_dylib.clone();
         on(&mut e.analyzer_manifest, &i.analyzer_manifest, never);
         let (f, i) = (&mut self.frontend, &installed.frontend);
         on(
@@ -257,8 +256,9 @@ pub struct EngineCfg {
     pub model_dir: Option<PathBuf>,
     /// Optional explicit `setsuna-engine.exe` path. Empty = next to the DLL.
     pub engine_exe: Option<PathBuf>,
-    /// ONNX Runtime library the engine loads (`--ort-dylib`). Empty = the
-    /// engine's default, `onnxruntime.dll` next to it.
+    /// Ignored: the ONNX Runtime library an engine before 0.3 loaded. Still
+    /// read, as an earlier install wrote it into config.toml.
+    #[serde(skip_serializing)]
     pub ort_dylib: Option<PathBuf>,
     /// Prefix-beam width (1 = greedy).
     pub beam_width: Option<usize>,
@@ -1082,8 +1082,6 @@ impl Config {
              # model_dir = \"models/onnx\"\n\
              # Optional explicit engine daemon executable.\n\
              # engine_exe = \"setsuna-engine.exe\"\n\
-             # ONNX Runtime the engine loads (default: onnxruntime.dll next to it).\n\
-             # ort_dylib = \"onnxruntime.dll\"\n\
              # Decode knobs. An unset knob falls back to the manifest's\n\
              # `decode_defaults`, then to the engine default.\n\
              # beam_width = 20\n\

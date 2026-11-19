@@ -7,8 +7,8 @@
 #   pwsh -File target\dist\setup.ps1 -Archive target\dist\setsuna-ime-<version>-windows-x64.zip   # try it
 #   gh release create v<version> target\dist\*                                                    # publish
 #
-# The zip holds the TSF DLL, the engine and rewriter daemons, ONNX Runtime
-# (crates\engine\fetch-onnxruntime.ps1), the settings GUI, the mixed input
+# The zip holds the TSF DLL, the engine and rewriter daemons, the settings
+# GUI, the mixed input
 # model (mixed\), the licenses and install.ps1, uninstall.ps1, fetch-model.ps1
 # and models.json: install.ps1 downloads the model pinned there. Its scripts
 # get a UTF-8 BOM, which Windows PowerShell 5.1 needs to read non-ASCII text,
@@ -42,7 +42,6 @@ if (-not $SkipBuild) {
     cargo build --release -p setsuna-tsf -p setsuna-engine -p setsuna-settings -p setsuna-rewrite -p setsuna-rerank
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 }
-& (Join-Path $Repo 'crates\engine\fetch-onnxruntime.ps1') -Dest $Release
 
 $Out = Join-Path $Dist $Name
 $Zip = Join-Path $Dist "$Name.zip"
@@ -54,7 +53,7 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 # binaries
 $binaries = @('setsuna_tsf.dll', 'setsuna_tsf_shim.dll', 'setsuna-tsf-check.exe', 'setsuna-engine.exe',
-              'onnxruntime.dll', 'setsuna-settings.exe', 'setsuna-rewrite.exe')
+              'setsuna-settings.exe', 'setsuna-rewrite.exe')
 if ($WithRerank) {
     $binaries += @('setsuna-rerank.exe') +
                  @(Get-ChildItem -LiteralPath $Release -File -Filter '*.dll' |
@@ -113,26 +112,9 @@ foreach ($f in @('kana.tsv', 'latin.tsv', 'params.txt', 'README.md')) {
 
 # licenses
 $licenses = Join-Path $Out 'licenses'
-New-Item -ItemType Directory -Force -Path (Join-Path $licenses 'onnxruntime') | Out-Null
+New-Item -ItemType Directory -Force -Path $licenses | Out-Null
 Copy-Item -LiteralPath (Join-Path $Repo 'LICENSE'), (Join-Path $Repo 'THIRD_PARTY_NOTICES.md') -Destination $licenses
-# ONNX Runtime's, from the zip fetch-onnxruntime.ps1 checked
-$ortDll = (Get-Item -LiteralPath (Join-Path $Release 'onnxruntime.dll')).VersionInfo.ProductVersion
-# "1.28.0.<date>.<build>.<commit>"
-$ortDll = if ($ortDll -match '^\d+\.\d+\.\d+') { $Matches[0] }
-$ortZip = Get-ChildItem -LiteralPath (Join-Path $Repo 'local\onnxruntime') -Filter 'onnxruntime-win-x64-*.zip' |
-    Where-Object { $ortDll -and $_.BaseName -eq "onnxruntime-win-x64-$ortDll" } | Select-Object -First 1
-if (-not $ortZip) { throw "no ONNX Runtime zip in local\onnxruntime for onnxruntime.dll $ortDll" }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$archive = [IO.Compression.ZipFile]::OpenRead($ortZip.FullName)
-try {
-    foreach ($f in @('LICENSE', 'ThirdPartyNotices.txt')) {
-        $entry = $archive.Entries | Where-Object { $_.FullName -eq "$($ortZip.BaseName)/$f" }
-        if (-not $entry) { throw "$($ortZip.Name) has no $f" }
-        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $licenses "onnxruntime\$f"), $true)
-    }
-} finally {
-    $archive.Dispose()
-}
 # llama.cpp (MIT), built into the reranker from the llama-cpp-sys-2 crate
 if ($WithRerank) {
     $lock = Get-Content -LiteralPath (Join-Path $Repo 'Cargo.lock') -Raw

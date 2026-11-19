@@ -23,7 +23,6 @@ $bin = New-Item -ItemType Directory -Force -Path (Join-Path $out 'bin')
 foreach ($p in $Packages) {
     Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "release/$p.exe") -Destination $bin
 }
-& (Join-Path $PSScriptRoot '../crates/engine/fetch-onnxruntime.ps1') -Dest $bin -CacheDir (Join-Path $cache 'onnxruntime')
 
 $info = @(
     "source $env:KAIRO_SOURCE_ID",

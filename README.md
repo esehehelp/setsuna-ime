@@ -168,7 +168,7 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 - **プロセス共有（Windows）**: 通常アプリはログインごとに 1 つの共有サーバー（`setsuna-engine serve` / `setsuna-rerank serve`）へ名前付きパイプで接続し、モデルや解析器辞書のメモリを共有します（無接続 10 分で終了、リランカの KV キャッシュは 60 秒で解放）。AppContainer（スタートメニュー検索・ストアアプリ）は既存共有エンジンへ接続のみ行い、管理者権限アプリは専用子プロセスを使用します。
 - **マニフェスト駆動ロード**: モデルは必ず `*.manifest.json` 経由で読み込みます（例は `tests/fixtures/`）。
-  - **変換モデル**（`neo-ime-ctc-nat-export-v1`）: ONNX proposal グラフ・語彙・special token ID・`decode_defaults`・任意の CTC-CRF 遷移表 (`crf`) や rescore 表 (`rescore`)。カスタム op（`neo_ime` ドメインの `TokenMoE` / `AddLayerNorm` / `LinearQ4G` / `TokenMoEQ4G`）は AVX-512 VNNI・AVX-VNNI・AVX2・ARM dotprod（および汎用 Rust フォールバック）で実行されます。
+  - **変換モデル**（`neo-ime-ctc-nat-export-v1`）: エンジン自身の推論で読む重み（エンコーダの `proposal.native`、AR デコーダを持つモデルはそのステップの `ar_decoder.native`）・語彙・special token ID・`decode_defaults`・任意の CTC-CRF 遷移表 (`crf`) や rescore 表 (`rescore`)。推論は Rust の自前実装で、ONNX Runtime は使いません。行列演算は AVX-512 VNNI・AVX-VNNI・AVX2・AVX（および汎用 Rust フォールバック）で、どの経路でも同じ整数演算結果になります。マニフェストが名指す ONNX グラフは読まず、自前の推論用の重みを持たないパッケージは読み込みません。
   - **リランカ**（`neo-ime-lm-scorer-export-v1`）: GGUF 重み、`score_defaults`、任意の SentencePiece トークナイザ。
   - **解析器**（`neo-ime-analyzer-export-v1`）: `vibrato-zstd`（通常の vibrato 辞書 + 任意の別読み表 `alternates`）または省メモリな `vibrato-packed-zstd`（`vendor/vibrato-packed` + 符号表 `packed`、`examples/analyzer.rs build` / `usage` で生成）。
 
@@ -180,21 +180,19 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 - Rust（stable）
 - CMake・C/C++ コンパイラ（`crates/rerank` が llama.cpp をソースビルドするため必要）
-- ONNX Runtime **1.28.0**（エンジンは実行時に共有ライブラリを動的ロードします。探索順: `--ort-dylib` → 環境変数 `SETSUNA_ORT_DYLIB` → エンジンと同一ディレクトリ）
 
 ```sh
 cargo build --release
 cargo test
 ```
 
-> モデルファイルが無くてもビルドとユニットテストは通ります。なお ONNX Runtime のバージョン変更は int8 演算の数値に影響するため、既定版の変更はベンチマーク再計測とセットで行います。
+> モデルファイルが無くてもビルドとユニットテストは通ります。
 
 ### Windows
 
 ```powershell
-# ビルドと ONNX Runtime 取得
+# ビルド
 cargo build --release
-pwsh crates/engine/fetch-onnxruntime.ps1
 
 # 公開モデル・辞書を自動取得してインストール（手元のモデルは -Manifest <path> 等を指定）
 pwsh crates/tsf/install.ps1
@@ -213,8 +211,7 @@ pwsh tests/model-download.ps1
 追加要件: fcitx5 開発パッケージ、WebKitGTK 4.1 開発パッケージ（設定 GUI 用）、OpenMP 対応 C/C++ コンパイラ、`curl`、`jq`。
 
 ```sh
-# ONNX Runtime 取得と開発ビルド
-crates/engine/fetch-onnxruntime.sh
+# 開発ビルド
 cmake -B target/fcitx5 -DCMAKE_INSTALL_PREFIX=/usr crates/linux/fcitx5
 cmake --build target/fcitx5 && sudo cmake --install target/fcitx5
 
@@ -254,7 +251,6 @@ cargo run --release -p setsuna-settings
 
 - **Setsuna IME 本体**: MIT License（[LICENSE](LICENSE)）。`crates/tsf` の一部は karukan-tsf（MIT）を基にしています（[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）。
 - **外部コンポーネント**:
-  - [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）
   - [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）
   - [vibrato](https://github.com/daac-tools/vibrato)（MIT / Apache-2.0、`vendor/vibrato-packed` に辞書レイアウト変更を加えて同梱。詳細は [vendor/vibrato-packed/VENDORED.md](vendor/vibrato-packed/VENDORED.md)）
   - 英日混在入力モデル（[crates/ime-core/data/mixed/README.md](crates/ime-core/data/mixed/README.md)）: FineWeb2-edu-japanese / FineWeb 由来、ODC-By 1.0

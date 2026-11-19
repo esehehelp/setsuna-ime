@@ -4,7 +4,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 version = "0.3.0"
-description = "Inference-only kana-kanji conversion engine: a CTC-NAT model (ONNX), loaded through a manifest, run as proposal -> CTC beam -> candidates, as a library or a stdio daemon."
+description = "Inference-only kana-kanji conversion engine: a CTC-NAT model (its weights for the engine's own implementation), loaded through a manifest, run as proposal -> CTC beam (or AR decoder) -> candidates, as a library or a stdio daemon."
 
 [lib]
 name = "setsuna_engine"
@@ -20,10 +20,6 @@ setsuna-artifact = { path = "../artifact" }
 setsuna-analyzer = { path = "../analyzer" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-# The runtime is loaded at run time (`runtime.rs`): Microsoft's official
-# build, not the one `download-binaries` bundles, which was measurably slower.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
-rayon = "1"
 ndarray = "0.16"
 serde.workspace = true
 serde_json.workspace = true

@@ -35,7 +35,27 @@ fn logsumexp(a: f32, b: f32) -> f32 {
         return a;
     }
     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-    hi + (lo - hi).exp().ln_1p()
+    let d = lo - hi;
+    if d < negligible_below(hi) {
+        return hi;
+    }
+    hi + d.exp().ln_1p()
+}
+
+/// A gap `d` below which `hi + ln_1p(exp(d))` rounds back to `hi`: with `hi`
+/// normal, 2^e <= |hi| < 2^(e+1), `exp(d) < 2^(e-27)` keeps the added term
+/// (`ln_1p(x) <= x`, exp within an ulp) under 2^(e-26), less than half the
+/// spacing of the floats next to `hi` on either side (2^(e-24) toward zero
+/// when |hi| is a power of two, 2^(e-23) else). -inf (no early return) for a
+/// zero, subnormal, infinite or NaN `hi`. The beam took two transcendental
+/// calls a merge (about half of its time).
+#[inline(always)]
+fn negligible_below(hi: f32) -> f32 {
+    let biased = (hi.to_bits() >> 23) & 0xff;
+    if biased == 0 || biased == 0xff {
+        return NEG_INF;
+    }
+    (biased as i32 - 127 - 27) as f32 * std::f32::consts::LN_2
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +139,9 @@ struct State {
     pnb: f32,
     frames: u32,
     frames_logp: f32,
+    /// `score()`, set once a step before the beam is cut (the cut compares it
+    /// instead of taking two log-sum-exps a comparison).
+    rank: f32,
 }
 
 impl State {
@@ -163,6 +186,7 @@ impl Step {
                 pnb,
                 frames: frames(),
                 frames_logp: contribution,
+                rank: 0.0,
             });
         }
     }
@@ -177,6 +201,23 @@ pub fn prefix_beam_search(
     top_k_per_step: usize,
 ) -> Vec<BeamHypothesis> {
     prefix_beam_search_crf(steps, blank_id, beam_width, top_k_per_step, None)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the beam without the cut's bound (every path merged), to compare against it.
+    static NO_CUT_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn cut_bound_off() -> bool {
+    NO_CUT_BOUND.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn cut_bound_off() -> bool {
+    false
 }
 
 /// [`prefix_beam_search`] with a CTC-CRF's transitions: a path that emits a
@@ -201,6 +242,7 @@ pub fn prefix_beam_search_crf(
         pnb: NEG_INF,
         frames: 0,
         frames_logp: 0.0,
+        rank: 0.0,
     }];
     let mut next = Step {
         states: Vec::new(),
@@ -208,12 +250,72 @@ pub fn prefix_beam_search_crf(
         stamp: vec![0],
     };
 
+    // the cut's bound (below): each beam state's tokens whose child prefix is also in the beam, and the bounds
+    let mut beam_children: Vec<Vec<u32>> = Vec::new();
+    let mut state_of: Vec<(u32, u32)> = Vec::new();
+    let mut bounds: Vec<f32> = Vec::new();
     for (t, step) in steps.iter().enumerate() {
         let mark = t as u32 + 1;
         let frame = t as u32;
         let candidates = &step.top[..top_k.min(step.top.len())];
+        // A bound for the cut that never drops a prefix the cut keeps (2026-11-19: 20 x 16 merges a frame were
+        // the 23 MB CTC model's 0.44 ms of beam, p50): each beam prefix's score is at least its blank path's (and its repeat
+        // path's), and a prefix new to the beam is reached by one path alone (its parent is a beam prefix, the
+        // token its own), its score that path's. These are distinct prefixes; when more than `beam_width`, a new
+        // prefix whose path scores below the `beam_width`-th largest of them ranks below at least `beam_width`
+        // others whatever else merges, so the cut drops it: it is not built. The paths kept merge in the same order.
+        beam_children.iter_mut().for_each(Vec::clear);
+        beam_children.resize_with(beam.len(), Vec::new);
+        let thr = if beam.len() * (candidates.len() + 1) > beam_width && !cut_bound_off() {
+            if state_of.len() < trie.parent.len() {
+                state_of.resize(trie.parent.len(), (0, 0));
+            }
+            for (i, s) in beam.iter().enumerate() {
+                state_of[s.node as usize] = (mark, i as u32);
+            }
+            for s in &beam {
+                if s.node != 0 {
+                    let (m, p) = state_of[trie.parent[s.node as usize] as usize];
+                    if m == mark {
+                        beam_children[p as usize].push(trie.token[s.node as usize]);
+                    }
+                }
+            }
+            bounds.clear();
+            for (i, s) in beam.iter().enumerate() {
+                let (pb, pnb) = (s.pb, s.pnb);
+                let whole = logsumexp(pb, pnb);
+                let last = trie.last(s.node);
+                let mut own = whole + step.blank;
+                for &(c, c_logp) in candidates {
+                    if c == blank_id {
+                        continue;
+                    }
+                    let psi = crf.map_or(0.0, |t| t.log_psi(last, c));
+                    if last == Some(c) {
+                        own = own.max(pnb + c_logp);
+                    }
+                    if !beam_children[i].contains(&c) {
+                        bounds.push(if last == Some(c) {
+                            pb + c_logp + psi
+                        } else {
+                            whole + c_logp + psi
+                        });
+                    }
+                }
+                bounds.push(own);
+            }
+            if bounds.len() > beam_width {
+                bounds.select_nth_unstable_by(beam_width - 1, |a, b| b.total_cmp(a));
+                bounds[beam_width - 1]
+            } else {
+                NEG_INF
+            }
+        } else {
+            NEG_INF
+        };
         next.states.clear();
-        for s in &beam {
+        for (i, s) in beam.iter().enumerate() {
             let (pb, pnb) = (s.pb, s.pnb);
             // Emit blank: the prefix is unchanged.
             next.merge(
@@ -228,8 +330,22 @@ pub fn prefix_beam_search_crf(
                 if c == blank_id {
                     continue;
                 }
-                let child = trie.child(s.node, c);
                 let psi = crf.map_or(0.0, |t| t.log_psi(last, c));
+                if thr > NEG_INF && !beam_children[i].contains(&c) {
+                    let path = if last == Some(c) {
+                        pb + c_logp + psi
+                    } else {
+                        logsumexp(pb, pnb) + c_logp + psi
+                    };
+                    if path < thr {
+                        // a new prefix the cut drops (above); a repeat's own mass still merges, in its place
+                        if last == Some(c) {
+                            next.merge(mark, s.node, NEG_INF, pnb + c_logp, || s.frames);
+                        }
+                        continue;
+                    }
+                }
+                let child = trie.child(s.node, c);
                 let mut extended = || {
                     frame_list.push((frame, s.frames));
                     frame_list.len() as u32 - 1
@@ -247,12 +363,15 @@ pub fn prefix_beam_search_crf(
         }
 
         let by_rank = |a: &State, b: &State| {
-            b.score()
-                .partial_cmp(&a.score())
+            b.rank
+                .partial_cmp(&a.rank)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| trie.tokens(a.node).cmp(&trie.tokens(b.node)))
         };
         if next.states.len() > beam_width {
+            for s in next.states.iter_mut() {
+                s.rank = s.score();
+            }
             next.states.select_nth_unstable_by(beam_width - 1, by_rank);
             next.states.truncate(beam_width);
         }
@@ -333,6 +452,65 @@ pub fn hypotheses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `logsumexp` with its early return gives the bits of the plain formula: random pairs over the scores' range,
+    /// pairs whose gap sits around the early return's bound, powers of two, zero, subnormals and infinities.
+    #[test]
+    fn logsumexp_early_return_keeps_the_bits() {
+        let plain = |a: f32, b: f32| -> f32 {
+            if a == NEG_INF {
+                return b;
+            }
+            if b == NEG_INF {
+                return a;
+            }
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            hi + (lo - hi).exp().ln_1p()
+        };
+        let mut seed = 3u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut pairs = Vec::new();
+        for _ in 0..200_000 {
+            pairs.push((-(rnd() * 200.0), -(rnd() * 200.0)));
+        }
+        for e in -20..12 {
+            for &sign in &[1.0f32, -1.0] {
+                let hi = sign * 2f32.powi(e);
+                let bound = negligible_below(hi);
+                for k in -64..64 {
+                    let d = bound + k as f32 * 0.05;
+                    pairs.push((hi, hi + d));
+                    pairs.push((hi * (1.0 + rnd() * 0.99), hi + d));
+                }
+            }
+        }
+        for &v in &[
+            0.0f32,
+            -0.0,
+            1e-40,
+            -1e-40,
+            f32::INFINITY,
+            -1.0e-3,
+            -3.0e-38,
+        ] {
+            for &w in &[-150.0f32, -60.0, -1.0, 0.0, NEG_INF] {
+                pairs.push((v, w));
+                pairs.push((w, v));
+            }
+        }
+        for (a, b) in pairs {
+            assert_eq!(
+                logsumexp(a, b).to_bits(),
+                plain(a, b).to_bits(),
+                "logsumexp({a}, {b})"
+            );
+        }
+    }
     use crate::pipeline::lse;
     use crate::pipeline::proposal::{log_probs_from_logits, log_probs_with, FrameReduce};
     use ndarray::{arr2, Array2};
@@ -734,6 +912,50 @@ mod tests {
             beam_width: [2, 3, 5, 8, 20][rng.below(5)],
             k: [1, 2, 4, 8, 16][rng.below(5)],
         }
+    }
+
+    /// The cut's bound changes nothing: the beam with it and without it (every path merged) give the same
+    /// hypotheses, frames and score bits, on peaky and flat random frames with the engine's widths and others.
+    #[test]
+    fn the_cut_bound_drops_only_what_the_cut_drops() {
+        let mut built = 0usize;
+        for seed in 1..=600u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let scale = [2.0, 4.0, 12.0][rng.below(3)];
+            let mut c = random_case(&mut rng, scale);
+            if seed % 3 == 0 {
+                (c.beam_width, c.k) = (20, 16);
+            }
+            let proposal = log_probs_with(
+                &c.logits,
+                c.t_len,
+                c.vocab,
+                &c.blacklist,
+                c.blank,
+                c.k,
+                FrameReduce { lse: lse::exact },
+            );
+            let with = prefix_beam_search(&proposal.steps, c.blank, c.beam_width, c.k);
+            NO_CUT_BOUND.with(|f| f.set(true));
+            let without = prefix_beam_search(&proposal.steps, c.blank, c.beam_width, c.k);
+            NO_CUT_BOUND.with(|f| f.set(false));
+            assert_eq!(with.len(), without.len(), "seed {seed}");
+            for (a, b) in with.iter().zip(&without) {
+                assert_eq!(
+                    (&a.tokens, &a.frames),
+                    (&b.tokens, &b.frames),
+                    "seed {seed}"
+                );
+                assert_eq!(
+                    a.score.to_bits(),
+                    b.score.to_bits(),
+                    "seed {seed}: {:?}",
+                    a.tokens
+                );
+            }
+            built += with.len();
+        }
+        assert!(built > 1000);
     }
 
     #[test]

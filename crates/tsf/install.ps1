@@ -32,7 +32,7 @@
 #   10 unsupported architecture (need x64)
 #   20 regsvr32 failed
 #   30 model file(s) not found, download failed, or integrity check failed
-#   40 source DLL, engine.exe or onnxruntime.dll not found
+#   40 source DLL or engine.exe not found
 #   50 file copy failed
 #   60 Visual C++ runtime missing and could not be installed
 #   70 the new IME DLL did not come up (setsuna-tsf-check): core.txt still
@@ -58,9 +58,6 @@
 #   <dir>\setsuna-engine.exe
 #   <dir>\setsuna-engine_<sha256>.exe  (fallback when running daemons lock it;
 #                                                     config engine_exe points at it)
-#   <dir>\onnxruntime.dll  (official ONNX Runtime the engine loads;
-#                                           a content-addressed fallback when locked,
-#                                           config ort_dylib points at it)
 #   <dir>\setsuna-settings.exe  (settings GUI, when built)
 #   <dir>\setsuna-rewrite.exe  (rewriter, when built; a content-addressed
 #                                            fallback when locked, config [rewriter] exe follows)
@@ -161,7 +158,6 @@ $DllName    = 'setsuna_tsf.dll'
 $ShimName   = 'setsuna_tsf_shim.dll'
 $CheckExe   = 'setsuna-tsf-check.exe'
 $EngineExe  = 'setsuna-engine.exe'
-$OrtDll     = 'onnxruntime.dll'
 $SettingsExe = 'setsuna-settings.exe'
 $RewriteExe = 'setsuna-rewrite.exe'
 $RerankExe  = 'setsuna-rerank.exe'
@@ -533,6 +529,8 @@ function Remove-StaleFiles {
 
     $stale = @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object {
         $_.Name -match '^(setsuna_tsf|setsuna_tsf_shim|setsuna-tsf-check|setsuna-engine|setsuna-rewrite|onnxruntime)_[0-9a-f]{12}\.(dll|exe)$' -or
+        # the ONNX Runtime an earlier engine loaded (the engine runs its own inference since 0.3)
+        $_.Name -eq 'onnxruntime.dll' -or
         # the IME DLL registered itself before the shim (registered no more
         # once this install registered the shim)
         (-not $NoElevate -and $_.Name -eq $DllName) -or
@@ -640,7 +638,6 @@ function Update-ExistingConfig {
         [string]$ConfigPath,
         [string]$ManifestPath,
         [string]$EnginePath,
-        [string]$OrtPath,
         [string]$RerankManifestPath,
         [string]$RerankExePath,
         [string]$RewriteExePath,
@@ -653,13 +650,13 @@ function Update-ExistingConfig {
     $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -ErrorAction Stop)
     $qManifestPath = '"' + ($ManifestPath.Replace('\','/').Replace('"','\"')) + '"'
     $qEnginePath = '"' + ($EnginePath.Replace('\','/').Replace('"','\"')) + '"'
-    $qOrtPath = '"' + ($OrtPath.Replace('\','/').Replace('"','\"')) + '"'
 
     # `model_dir` would compete with the explicit manifest.
     $lines = Remove-ConfigValue -Lines $lines -Section 'engine' -Key 'model_dir'
     $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'model_manifest' -Value $qManifestPath
     $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'engine_exe' -Value $qEnginePath
-    $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'ort_dylib' -Value $qOrtPath
+    # an earlier install's ONNX Runtime (the engine loads none since 0.3)
+    $lines = Remove-ConfigValue -Lines $lines -Section 'engine' -Key 'ort_dylib'
     # Decode knobs are left alone: the manifest's decode_defaults carry the
     # recipe the artifact was verified with; a knob kept in config.toml is a
     # deliberate user override.
@@ -714,10 +711,6 @@ if (-not (Test-Path -LiteralPath $DllSrc))    { Write-Log ERROR "source DLL not 
 if (-not (Test-Path -LiteralPath $ShimSrc))   { Write-Log ERROR "shim DLL not found: $ShimSrc";     exit 40 }
 if (-not (Test-Path -LiteralPath $CheckSrc))  { Write-Log ERROR "$CheckExe not found: $CheckSrc";  exit 40 }
 if (-not (Test-Path -LiteralPath $EngineSrc)) { Write-Log ERROR "engine.exe not found: $EngineSrc"; exit 40 }
-$OrtSrc = Join-Path $SourceDir $OrtDll
-if (-not (Test-Path -LiteralPath $OrtSrc)) {
-    Write-Log ERROR "onnxruntime.dll not found: $OrtSrc (run crates\engine\fetch-onnxruntime.ps1)"; exit 40
-}
 
 # Resolve the public artifact before elevation. The elevated invocation receives
 # this local manifest, so it neither downloads again nor changes cache ownership.
@@ -936,16 +929,6 @@ try {
     Write-Log ERROR "copy failed $EngineSrc -> $EngineInstalled`: $_"; exit 50
 }
 
-# The ONNX Runtime the engine loads (by absolute path, config ort_dylib).
-# Running daemons lock it; a new build then goes next to it under a
-# content-addressed name.
-$OrtInstalled = Join-Path $InstallDir $OrtDll
-try {
-    $OrtInstalled = Copy-InstallFile -Source $OrtSrc -Destination $OrtInstalled -AllowLockedFallback
-} catch {
-    Write-Log ERROR "copy failed $OrtSrc -> $OrtInstalled`: $_"; exit 50
-}
-
 # The settings GUI is optional: the IME works without it.
 $SettingsSrc = Join-Path $SourceDir $SettingsExe
 if (Test-Path -LiteralPath $SettingsSrc) {
@@ -1081,7 +1064,6 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
     $ModelConfigDir = (Join-Path $InstallDir 'models\onnx').Replace('\','/').Replace('"','\"')
     $ModelConfigFile = (Join-Path $ModelConfigDir $ManifestItem.Name).Replace('\','/').Replace('"','\"')
     $EngineConfigExe = $EngineInstalled.Replace('\','/').Replace('"','\"')
-    $OrtConfigDll = $OrtInstalled.Replace('\','/').Replace('"','\"')
     $DefaultConfig = @"
 # Setsuna TSF IME configuration. Edit and save; the IME picks up new values
 # when the next input starts.
@@ -1093,8 +1075,6 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
 # manifest's decode_defaults; set a knob here only to override it.
 model_manifest = "$ModelConfigFile"
 engine_exe = "$EngineConfigExe"
-# Official ONNX Runtime the engine loads.
-ort_dylib = "$OrtConfigDll"
 
 [ui.candidate_window]
 font_face = "Meiryo UI"
@@ -1131,12 +1111,12 @@ shift_9 = "）"
 "@
     Write-Utf8Lines -Path $ConfigPath -Lines ($DefaultConfig -split "`r?`n")
     if ($RerankInstalled -or $RewriteInstalled -or $MixedInstalled -or $NamesInstalled -or $LexiconInstalled -or $AnalyzerInstalled) {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
     }
     Write-Log INFO "wrote default config: $ConfigPath"
 } else {
     try {
-        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -OrtPath $OrtInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
+        Update-ExistingConfig -ConfigPath $ConfigPath -ManifestPath $InstalledManifest -EnginePath $EngineInstalled -RerankManifestPath $RerankManifestInstalled -RerankExePath $RerankInstalled -RewriteExePath $RewriteInstalled -MixedModelPath $MixedInstalled -NameDictionaryPath $NamesInstalled -LexiconPath $LexiconInstalled -AnalyzerPath $AnalyzerInstalled
         Write-Log INFO "updated engine config: $ConfigPath"
     } catch {
         Write-Log WARN "config exists but engine update failed (preserved): $ConfigPath : $_"
@@ -1152,8 +1132,7 @@ $Installed = @(
     '# Written by install.ps1: the files the IME runs and loads in an elevated app.',
     '[engine]',
     "model_manifest = $(ConvertTo-TomlPath $InstalledManifest)",
-    "engine_exe = $(ConvertTo-TomlPath $EngineInstalled)",
-    "ort_dylib = $(ConvertTo-TomlPath $OrtInstalled)"
+    "engine_exe = $(ConvertTo-TomlPath $EngineInstalled)"
 )
 if ($AnalyzerInstalled) { $Installed += "analyzer_manifest = $(ConvertTo-TomlPath $AnalyzerInstalled)" }
 $Installed += '[frontend]'
@@ -1260,14 +1239,14 @@ function Stop-ReplacedEngines {
 # (files-only installs, as the tests run them, leave the running ones be)
 if (-not $NoElevate) {
     try {
-        Stop-ReplacedEngines -Dirs @($InstallDir, $UserDir) -Engine $EngineInstalled -Files @($InstalledManifest, $AnalyzerInstalled, $OrtInstalled)
+        Stop-ReplacedEngines -Dirs @($InstallDir, $UserDir) -Engine $EngineInstalled -Files @($InstalledManifest, $AnalyzerInstalled)
     } catch {
         Write-Log WARN "could not stop the engines this install replaced: $_"
     }
 }
 
 # ---- what earlier installs left ----
-$InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInstalled, $OrtInstalled, $RewriteInstalled, $RerankInstalled,
+$InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInstalled, $RewriteInstalled, $RerankInstalled,
                     $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled)
 $InstalledFiles += @($ArtifactFiles | ForEach-Object { Join-Path $ModelDstDir $_ })
 try {

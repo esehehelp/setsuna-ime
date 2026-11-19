@@ -171,6 +171,7 @@ pub(crate) fn splice(
             score: 0.0,
             source: CandidateSource::Fallback,
             reading_pos: Vec::new(),
+            parts: None,
         });
     primary.text = full.clone();
     primary.reading_pos = full_pos.clone().unwrap_or_default();
@@ -240,6 +241,7 @@ mod tests {
             source: CandidateSource::Beam,
             // one position per char, all at the span's first reading char
             reading_pos: vec![0; text.chars().count()],
+            parts: None,
         }
     }
 

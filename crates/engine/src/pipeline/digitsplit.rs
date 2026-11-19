@@ -135,6 +135,7 @@ mod tests {
             score,
             source: CandidateSource::Beam,
             reading_pos: (0..text.chars().count() as u32).collect(),
+            parts: None,
         }
     }
 

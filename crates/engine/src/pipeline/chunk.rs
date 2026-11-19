@@ -57,7 +57,7 @@ fn goes_on(chars: &[char], i: usize) -> bool {
 /// A short reading of several sentences went a sentence after another
 /// (2026-10-20 to 2026-10-24): each after the top 1 of the ones before, the
 /// list varying the last. Whole, the beam varies every sentence: over
-/// wiki_fresh_v2's 1,055 such lines with Shiran-v2 s7080, gold in the
+/// wiki_fresh_v2's 1,055 such lines with an int4 MoE model, gold in the
 /// engine's top 20 878 -> 924 of them, EM1 in the IME's pipeline over the
 /// top 20 81.39 -> 82.09 (p = 8e-5), keeping the 3 best of each earlier
 /// sentence 81.77, and the conversion 9.8 -> 7.4 ms at p50 in one pass.
@@ -321,6 +321,7 @@ mod tests {
             score: -1.0,
             source: CandidateSource::Beam,
             reading_pos: (0..text.chars().count() as u32).collect(),
+            parts: None,
         }
     }
 

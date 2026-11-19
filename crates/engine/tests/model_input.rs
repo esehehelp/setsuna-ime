@@ -1,6 +1,6 @@
-//! The model input contract (tests/fixtures/model_input, written by the
-//! training side's encoder): the engine lays the input out as the training
-//! rows are laid out.
+//! The model input contract shared with the research side
+//! (tests/fixtures/model_input, written by its training input): the engine lays the
+//! input out as the training rows are laid out. Change both together.
 
 use std::path::{Path, PathBuf};
 

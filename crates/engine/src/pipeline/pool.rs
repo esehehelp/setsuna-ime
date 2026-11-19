@@ -70,6 +70,7 @@ pub fn candidates(
                 score: h.score,
                 source,
                 reading_pos,
+                parts: None,
             });
         }
     }
@@ -83,27 +84,50 @@ pub fn candidates(
                 score: 0.0,
                 source: CandidateSource::Greedy,
                 reading_pos,
+                parts: None,
             });
         }
     }
     if out.is_empty() {
-        out.push(Candidate {
-            text: reading.to_string(),
-            score: 0.0,
-            source: CandidateSource::Fallback,
-            reading_pos: identity_pos(reading),
-        });
-        let kata = hira_to_kata(reading);
-        if kata != reading {
-            out.push(Candidate {
-                reading_pos: identity_pos(&kata),
-                text: kata,
-                score: 0.0,
-                source: CandidateSource::Fallback,
-            });
-        }
+        out = fallback(reading);
     }
     out
+}
+
+/// The candidates of a span decoding produced nothing for: the reading and
+/// its katakana form (when it differs).
+pub fn fallback(reading: &str) -> Vec<Candidate> {
+    let mut out = vec![Candidate {
+        text: reading.to_string(),
+        score: 0.0,
+        source: CandidateSource::Fallback,
+        reading_pos: identity_pos(reading),
+        parts: None,
+    }];
+    let kata = hira_to_kata(reading);
+    if kata != reading {
+        out.push(Candidate {
+            reading_pos: identity_pos(&kata),
+            text: kata,
+            score: 0.0,
+            source: CandidateSource::Fallback,
+            parts: None,
+        });
+    }
+    out
+}
+
+/// Text of an AR hypothesis's ids: decoded, normalized with `normalize`
+/// (else as decoded; a whitespace-only text is empty either way).
+pub fn ar_text(tokenizer: &SharedCharTokenizer, ids: &[u32], normalize: bool) -> String {
+    let raw = tokenizer.decode(ids);
+    if normalize {
+        normalize_candidate(&raw)
+    } else if raw.chars().all(char::is_whitespace) {
+        String::new()
+    } else {
+        raw
+    }
 }
 
 fn hira_to_kata(s: &str) -> String {

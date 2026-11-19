@@ -12,8 +12,6 @@ use setsuna_core::session::{Field, Session};
 /// The engine binary in the native library directory: packaged as a
 /// library so that the system extracts it, executable, with the others.
 pub const ENGINE_LIB: &str = "libsetsuna_engine.so";
-/// ONNX Runtime, from Microsoft's onnxruntime-android package.
-pub const ORT_LIB: &str = "libonnxruntime.so";
 
 /// The app's directories, as its `Context` names them.
 #[derive(Debug, Clone)]
@@ -22,7 +20,7 @@ pub struct Dirs {
     /// the logs (`state/setsuna-ime`), and the mixed input model the app
     /// unpacks from its assets (`mixed`).
     pub files: PathBuf,
-    /// `ApplicationInfo.nativeLibraryDir`: [`ENGINE_LIB`] and [`ORT_LIB`].
+    /// `ApplicationInfo.nativeLibraryDir`: [`ENGINE_LIB`].
     pub native_lib: PathBuf,
     /// Where the models are: `models/onnx/<manifest>` and its files, the one
     /// `models/lexicon/*.lexicon`, the one
@@ -68,9 +66,6 @@ pub fn with_app_defaults(mut cfg: Config, dirs: &Dirs) -> Config {
     let e = &mut cfg.engine;
     if e.engine_exe.is_none() {
         e.engine_exe = Some(dirs.native_lib.join(ENGINE_LIB));
-    }
-    if e.ort_dylib.is_none() {
-        e.ort_dylib = Some(dirs.native_lib.join(ORT_LIB));
     }
     if e.analyzer_manifest.is_none() {
         e.analyzer_manifest = the_one(&models.join("analyzer"), |p| {
@@ -250,7 +245,6 @@ mod tests {
             cfg.engine.engine_exe,
             Some(dirs.native_lib.join(ENGINE_LIB))
         );
-        assert_eq!(cfg.engine.ort_dylib, Some(dirs.native_lib.join(ORT_LIB)));
         assert_eq!(
             cfg.engine.analyzer_manifest,
             Some(models.join("analyzer/v1/analyzer.manifest.json"))
@@ -267,10 +261,10 @@ mod tests {
 
         // config.toml's own wins; two lexicons: which one is not guessed
         let mut own = Config::default();
-        own.engine.ort_dylib = Some(PathBuf::from("/o.so"));
+        own.engine.engine_exe = Some(PathBuf::from("/e.so"));
         std::fs::write(models.join("lexicon/other.lexicon"), "LEXICON1").unwrap();
         let cfg = with_app_defaults(own, &dirs);
-        assert_eq!(cfg.engine.ort_dylib, Some(PathBuf::from("/o.so")));
+        assert_eq!(cfg.engine.engine_exe, Some(PathBuf::from("/e.so")));
         assert!(cfg.lexicon.file.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }

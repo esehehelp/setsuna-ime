@@ -14,7 +14,6 @@
 #   libsetsuna_android.so  the Rust half (crates/android), loaded by the service
 #   libsetsuna_engine.so   the engine binary (crates/engine), run as the daemon:
 #                          the system extracts a library executable, another file not
-#   libonnxruntime.so      from Microsoft's onnxruntime-android (Gradle)
 #
 # The APK carries crates/tsf/models.json (assets/models.json, from
 # app\build\catalog), by which the app downloads the conversion model, the

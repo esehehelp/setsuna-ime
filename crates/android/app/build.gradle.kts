@@ -64,8 +64,3 @@ kotlin {
         jvmTarget.set(JvmTarget.JVM_17)
     }
 }
-
-dependencies {
-    // libonnxruntime.so, which the engine loads (Windows pins the same release)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
-}

@@ -39,11 +39,29 @@ pub struct ProposalArtifact {
     /// One of fp32 / fp16 / int8 / int4. One manifest names exactly one
     /// proposal graph; another precision is another manifest.
     pub precision: String,
-    /// Weight files the graph stores outside itself (`*.onnx.data`).
-    /// onnxruntime resolves them from the graph; they are listed so the
-    /// artifact's file set is complete.
+    /// Weight files the graph stores outside itself (`*.onnx.data`), listed
+    /// so the artifact's file set is complete (the engine reads the native
+    /// weights, not the graph).
     #[serde(default)]
     pub external_data: Vec<PathBuf>,
+    /// The vocabulary id of each column of the graph's logits (ascending), when it writes only those (the
+    /// research export's: a reading corrector's head cut to the tokens a reading has);
+    /// absent, a column a vocabulary id.
+    #[serde(default)]
+    pub logit_ids: Option<Vec<u32>>,
+    /// The graph's weights for the engine's own implementation of it (the research export's, a
+    /// safetensors file; the engine's `pipeline::native_encoder`), on an int8 manifest.
+    #[serde(default)]
+    pub native: Option<NativeEncoderArtifact>,
+}
+
+/// The encoder's weights for the engine's own implementation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEncoderArtifact {
+    pub path: PathBuf,
+    /// int8 (the int8head graph's weights)
+    pub precision: String,
 }
 
 /// A CTC-CRF's transition table (the research export's): `a` ((V+1) x
@@ -148,6 +166,115 @@ struct CtcNatManifestFile {
     /// The candidates' rescoring tables.
     #[serde(default)]
     rescore: RescoreArtifact,
+    /// A model decoded by its shallow AR decoder (the research export's AR
+    /// form); the proposal graph is then its encoder graph.
+    #[serde(default)]
+    ar_decoder: Option<ArDecoderArtifact>,
+    /// A reading corrector the engine runs before each conversion.
+    #[serde(default)]
+    corrector: Option<CorrectorArtifact>,
+}
+
+/// A reading corrector carried by a CTC-NAT artifact (the research export's; the engine's
+/// `pipeline::correct`): its own CTC graph over the converter's vocabulary and special ids, read greedily before each
+/// conversion with its own decode defaults (its context length, symbol token); `threshold`, the margin log
+/// P(corrected) - log P(as typed) above which the corrected reading is converted first.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorrectorArtifact {
+    pub proposal: ProposalArtifact,
+    pub max_seq_len: usize,
+    #[serde(default)]
+    pub decode_defaults: DecodeDefaults,
+    pub threshold: f32,
+}
+
+/// A manifest's reading corrector, resolved: a CTC-NAT manifest of its own (the converter's vocabulary, input
+/// vocabulary and special ids; no CRF, rescoring, AR decoder or corrector) and its threshold.
+#[derive(Debug, Clone)]
+pub struct BundledCorrector {
+    pub manifest: CtcNatManifest,
+    pub threshold: f32,
+}
+
+/// Logit columns (`ProposalArtifact::logit_ids`) ascending, distinct and not empty.
+fn check_logit_ids(ids: &[u32], path: &Path, what: &str) -> Result<()> {
+    anyhow::ensure!(
+        !ids.is_empty() && ids.windows(2).all(|w| w[0] < w[1]),
+        "manifest {}: {what}.logit_ids must be ascending, distinct and not empty",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The shallow AR decoder of a model (the research export's AR form): the
+/// proposal graph is its encoder graph, (input_ids,
+/// attention_mask) -> `cross_k` / `cross_v` f32 (layers, B, heads, T,
+/// head_dim); `step` is one output position of N hypotheses, (tokens,
+/// positions i64 (N); past_k / past_v f32 (layers, N, heads, S, head_dim);
+/// cross_k / cross_v (layers, 1, heads, T, head_dim); memory_bias f32 (1, T))
+/// -> `log_probs` f32 (N, V), `new_k` / `new_v` (layers, N, heads, 1,
+/// head_dim). Position 0 reads `bos_id`; `eos_id` ends a hypothesis.
+/// `native`: the step's int8 weights for the engine's own implementation of
+/// it (the research export's native step, a safetensors file; the engine
+/// `pipeline::ar_native`), on an int8 manifest.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArDecoderArtifact {
+    pub step: ProposalArtifact,
+    #[serde(default)]
+    pub native: Option<NativeStepArtifact>,
+    pub layers: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub max_positions: usize,
+    pub bos_id: u32,
+    pub eos_id: u32,
+    /// The best next tokens the step graph gives a hypothesis.
+    pub top_k: usize,
+    /// The script latent at choice points (the research export's script scores): the step graph takes
+    /// `script_bias` (one number per class, in `classes`' order) added to the prior's logits of the classes.
+    #[serde(default)]
+    pub script: Option<ScriptLatentArtifact>,
+}
+
+/// The classes of [`ScriptLatentArtifact`], in the order of its `script_bias`.
+pub const SCRIPT_CLASSES: [&str; 4] = ["other", "kanji", "hiragana", "katakana"];
+
+/// A model's script latent (`ar_decoder.script`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptLatentArtifact {
+    /// "choice": the latent at choice points, class 0 reading every token, 1-3 their own class's
+    pub mode: String,
+    /// [`SCRIPT_CLASSES`]
+    pub classes: Vec<String>,
+}
+
+/// The step's weights for the engine's own implementation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeStepArtifact {
+    pub path: PathBuf,
+    /// int8
+    pub precision: String,
+}
+
+/// [`ArDecoderArtifact`] with the step graph's path (and the native step's)
+/// resolved.
+#[derive(Debug, Clone)]
+pub struct ArDecoder {
+    pub step_path: PathBuf,
+    pub native_path: Option<PathBuf>,
+    pub layers: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub max_positions: usize,
+    pub bos_id: u32,
+    pub eos_id: u32,
+    pub top_k: usize,
+    /// Whether the model has the script latent at choice points (`ar_decoder.script`, checked).
+    pub script: bool,
 }
 
 /// A CTC-NAT manifest with every artifact path resolved against the
@@ -157,6 +284,10 @@ pub struct CtcNatManifest {
     pub manifest_path: PathBuf,
     pub proposal_path: PathBuf,
     pub precision: String,
+    /// See `ProposalArtifact::logit_ids` (checked ascending and distinct).
+    pub logit_ids: Option<Vec<u32>>,
+    /// See `ProposalArtifact::native` (resolved; int8 only).
+    pub proposal_native_path: Option<PathBuf>,
     pub vocab_path: PathBuf,
     /// See `CtcNatManifestFile::input_vocab`.
     pub input_vocab_path: Option<PathBuf>,
@@ -168,6 +299,10 @@ pub struct CtcNatManifest {
     /// The rescoring tables (`RescoreArtifact`), paths resolved.
     pub rescore_pairs: Option<PathBuf>,
     pub rescore_words: Option<PathBuf>,
+    /// The AR decoder (`ArDecoderArtifact`), its step graph resolved.
+    pub ar_decoder: Option<ArDecoder>,
+    /// The reading corrector (`CorrectorArtifact`), its graph resolved.
+    pub corrector: Option<Box<BundledCorrector>>,
 }
 
 impl CtcNatManifest {
@@ -220,16 +355,149 @@ impl CtcNatManifest {
         for extra in &file.proposal.external_data {
             resolve(extra, "external data")?;
         }
+        let ar_decoder = match &file.ar_decoder {
+            None => None,
+            Some(a) => {
+                for extra in &a.step.external_data {
+                    resolve(extra, "AR step external data")?;
+                }
+                anyhow::ensure!(
+                    a.layers > 0
+                        && a.heads > 0
+                        && a.head_dim > 0
+                        && a.max_positions > 1
+                        && a.top_k > 0,
+                    "manifest {}: ar_decoder sizes must be positive",
+                    path.display()
+                );
+                if let Some(n) = &a.native {
+                    anyhow::ensure!(
+                        n.precision == "int8",
+                        "manifest {}: native AR step precision {:?}, expected int8",
+                        path.display(),
+                        n.precision
+                    );
+                }
+                if let Some(s) = &a.script {
+                    anyhow::ensure!(
+                        s.mode == "choice" && s.classes == SCRIPT_CLASSES,
+                        "manifest {}: ar_decoder.script {s:?}, expected mode \"choice\" and classes {SCRIPT_CLASSES:?}",
+                        path.display()
+                    );
+                }
+                Some(ArDecoder {
+                    step_path: resolve(&a.step.path, "AR step graph")?,
+                    native_path: a
+                        .native
+                        .as_ref()
+                        .map(|n| resolve(&n.path, "AR native step"))
+                        .transpose()?,
+                    layers: a.layers,
+                    heads: a.heads,
+                    head_dim: a.head_dim,
+                    max_positions: a.max_positions,
+                    bos_id: a.bos_id,
+                    eos_id: a.eos_id,
+                    top_k: a.top_k,
+                    script: a.script.is_some(),
+                })
+            }
+        };
+        if let Some(ids) = &file.proposal.logit_ids {
+            check_logit_ids(ids, path, "proposal")?;
+            anyhow::ensure!(
+                file.ar_decoder.is_none(),
+                "manifest {}: proposal.logit_ids is for a CTC graph, not an AR model's encoder",
+                path.display()
+            );
+        }
+        let proposal_native_path = match &file.proposal.native {
+            None => None,
+            Some(n) => {
+                anyhow::ensure!(
+                    n.precision == "int8" && file.proposal.precision == "int8",
+                    "manifest {}: native encoder precision {:?} on a {:?} proposal, expected int8 on int8",
+                    path.display(),
+                    n.precision,
+                    file.proposal.precision
+                );
+                anyhow::ensure!(
+                    file.proposal.logit_ids.is_none(),
+                    "manifest {}: proposal.native is for the whole vocabulary's logits or an AR encoder, not cut \
+                     logit columns",
+                    path.display()
+                );
+                Some(resolve(&n.path, "native encoder")?)
+            }
+        };
+        if let Some(c) = &file.corrector {
+            anyhow::ensure!(
+                c.proposal.native.is_none(),
+                "manifest {}: corrector.proposal.native is not read (the corrector runs its graph)",
+                path.display()
+            );
+        }
+        let vocab_path = resolve(&file.vocab, "vocab")?;
+        let input_vocab_path = file
+            .input_vocab
+            .as_deref()
+            .map(|p| resolve(p, "input vocab"))
+            .transpose()?;
+        let corrector = match &file.corrector {
+            None => None,
+            Some(c) => {
+                anyhow::ensure!(
+                    matches!(
+                        c.proposal.precision.as_str(),
+                        "fp32" | "fp16" | "int8" | "int4"
+                    ),
+                    "manifest {}: unknown corrector precision {:?}",
+                    path.display(),
+                    c.proposal.precision
+                );
+                anyhow::ensure!(
+                    c.proposal.external_data.is_empty(),
+                    "manifest {}: the corrector's graph must hold its weights itself",
+                    path.display()
+                );
+                anyhow::ensure!(
+                    !c.threshold.is_nan(),
+                    "manifest {}: corrector.threshold is NaN",
+                    path.display()
+                );
+                if let Some(ids) = &c.proposal.logit_ids {
+                    check_logit_ids(ids, path, "corrector.proposal")?;
+                }
+                Some(Box::new(BundledCorrector {
+                    manifest: CtcNatManifest {
+                        manifest_path: path.to_path_buf(),
+                        proposal_path: resolve(&c.proposal.path, "corrector proposal")?,
+                        precision: c.proposal.precision.clone(),
+                        logit_ids: c.proposal.logit_ids.clone(),
+                        proposal_native_path: None,
+                        vocab_path: vocab_path.clone(),
+                        input_vocab_path: input_vocab_path.clone(),
+                        special_ids: file.special_ids,
+                        max_seq_len: c.max_seq_len,
+                        decode_defaults: c.decode_defaults.clone(),
+                        crf: None,
+                        rescore_pairs: None,
+                        rescore_words: None,
+                        ar_decoder: None,
+                        corrector: None,
+                    },
+                    threshold: c.threshold,
+                }))
+            }
+        };
         Ok(Self {
             manifest_path: path.to_path_buf(),
             proposal_path: resolve(&file.proposal.path, "proposal")?,
             precision: file.proposal.precision,
-            vocab_path: resolve(&file.vocab, "vocab")?,
-            input_vocab_path: file
-                .input_vocab
-                .as_deref()
-                .map(|p| resolve(p, "input vocab"))
-                .transpose()?,
+            logit_ids: file.proposal.logit_ids,
+            proposal_native_path,
+            vocab_path,
+            input_vocab_path,
             special_ids: file.special_ids,
             max_seq_len: file.max_seq_len,
             decode_defaults: file.decode_defaults,
@@ -250,6 +518,8 @@ impl CtcNatManifest {
                 .as_deref()
                 .map(|p| resolve(p, "rescore words"))
                 .transpose()?,
+            ar_decoder,
+            corrector,
         })
     }
 }
@@ -603,30 +873,259 @@ mod tests {
         assert_eq!(m.decode_defaults.top_k, None);
         assert_eq!(m.decode_defaults.symbol_token, Some(true));
         assert_eq!(m.decode_defaults.digit_split, Some(true));
-        assert_eq!(m.crf, None);
+        assert_eq!(m.logit_ids, None);
     }
 
+    /// A proposal graph's logit columns: read when ascending and distinct, refused otherwise.
     #[test]
-    fn a_ctc_crf_table_resolves_beside_the_manifest() {
-        let dir = temp_dir("crf");
+    fn loads_the_logit_ids() {
+        let dir = temp_dir("cols");
+        write(&dir, "m.int8.onnx", "");
+        write(&dir, "m.vocab.hex.tsv", "");
+        let with = |cols: &str| {
+            let body = manifest_body("m.int8.onnx", "m.vocab.hex.tsv", "").replace(
+                r#""precision":"fp32"}"#,
+                &format!(r#""precision":"int8","logit_ids":{cols}}}"#),
+            );
+            CtcNatManifest::load(&write(&dir, "m.int8.manifest.json", &body))
+        };
+        assert_eq!(with("[4, 6, 7]").unwrap().logit_ids, Some(vec![4, 6, 7]));
+        assert!(with("[6, 4]").is_err());
+        assert!(with("[4, 4]").is_err());
+        assert!(with("[]").is_err());
+    }
+
+    /// The encoder's weights for the engine's own implementation: resolved on an int8 proposal; refused on another
+    /// precision, missing, or beside cut logit columns.
+    #[test]
+    fn loads_the_native_encoder() {
+        let dir = temp_dir("native-enc");
+        write(&dir, "m.int8.onnx", "");
+        write(&dir, "m.vocab.hex.tsv", "");
+        write(&dir, "m.encoder.native.safetensors", "");
+        let with = |precision: &str, native: &str| {
+            let body = manifest_body("m.int8.onnx", "m.vocab.hex.tsv", "").replace(
+                r#""precision":"fp32"}"#,
+                &format!(r#""precision":"{precision}",{native}}}"#),
+            );
+            CtcNatManifest::load(&write(&dir, "m.int8.manifest.json", &body))
+        };
+        let native =
+            |file: &str, p: &str| format!(r#""native":{{"path":"{file}","precision":"{p}"}}"#);
+        let m = with("int8", &native("m.encoder.native.safetensors", "int8")).unwrap();
+        assert_eq!(
+            m.proposal_native_path,
+            Some(std::fs::canonicalize(dir.join("m.encoder.native.safetensors")).unwrap())
+        );
+        assert!(with("fp32", &native("m.encoder.native.safetensors", "int8")).is_err());
+        assert!(with("int8", &native("m.encoder.native.safetensors", "fp32")).is_err());
+        assert!(with("int8", &native("missing.safetensors", "int8")).is_err());
+        assert!(with(
+            "int8",
+            &format!(
+                r#"{},"logit_ids":[4,6]"#,
+                native("m.encoder.native.safetensors", "int8")
+            )
+        )
+        .is_err());
+        assert_eq!(
+            with("int8", r#""logit_ids":[4,6]"#)
+                .unwrap()
+                .proposal_native_path,
+            None
+        );
+    }
+
+    /// A reading corrector: its graph resolved, the converter's vocabulary and special ids, its own decode defaults
+    /// and threshold; a missing graph, external data or bad columns refused.
+    #[test]
+    fn loads_the_corrector_section() {
+        let dir = temp_dir("corrector");
+        write(&dir, "m.int8.onnx", "");
+        write(&dir, "m.corrector.int8head.onnx", "");
+        write(&dir, "m.vocab.hex.tsv", "");
+        let with = |section: &str| {
+            let body = manifest_body(
+                "m.int8.onnx",
+                "m.vocab.hex.tsv",
+                &format!(r#","corrector":{section}"#),
+            );
+            CtcNatManifest::load(&write(&dir, "m.int8.manifest.json", &body))
+        };
+        let m = with(
+            r#"{"proposal":{"path":"m.corrector.int8head.onnx","precision":"int8","logit_ids":[4,6]},
+            "max_seq_len":128,"decode_defaults":{"max_context":0,"symbol_token":true},"threshold":11.5}"#,
+        )
+        .unwrap();
+        let c = m.corrector.as_ref().unwrap();
+        let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        assert_eq!(
+            c.manifest.proposal_path,
+            canon(dir.join("m.corrector.int8head.onnx"))
+        );
+        assert_eq!(c.manifest.vocab_path, m.vocab_path);
+        assert_eq!(c.manifest.special_ids, m.special_ids);
+        assert_eq!(c.manifest.logit_ids, Some(vec![4, 6]));
+        assert_eq!(c.manifest.decode_defaults.max_context, Some(0));
+        assert!(c.manifest.corrector.is_none() && c.manifest.ar_decoder.is_none());
+        assert_eq!(c.threshold, 11.5);
+        assert!(with(r#"{"proposal":{"path":"none.onnx","precision":"int8"},"max_seq_len":128,"threshold":1}"#)
+            .is_err());
+        assert!(with(
+            r#"{"proposal":{"path":"m.corrector.int8head.onnx","precision":"int8","logit_ids":[6,4]},
+            "max_seq_len":128,"threshold":1}"#
+        )
+        .is_err());
+        assert!(with(
+            r#"{"proposal":{"path":"m.corrector.int8head.onnx","precision":"int8","external_data":["x"]},
+            "max_seq_len":128,"threshold":1}"#
+        )
+        .is_err());
+        assert!(with(
+            r#"{"proposal":{"path":"m.corrector.int8head.onnx","precision":"int8"},"threshold":1}"#
+        )
+        .is_err());
+    }
+
+    /// An AR decoder section: its step graph resolved with its external data;
+    /// none on a CTC manifest; a missing step graph or a zero size refused.
+    #[test]
+    fn loads_the_ar_decoder_section() {
+        let dir = temp_dir("ar");
         write(&dir, "m.fp32.onnx", "");
         write(&dir, "m.vocab.hex.tsv", "");
-        write(&dir, "m.crf.f32", "");
-        let crf = |path: &str| format!(r#","crf":{{"path":"{path}","rank":8}}"#);
-        let manifest = write(
+        write(&dir, "m.ar_step.fp32.onnx", "");
+        write(&dir, "m.ar_step.fp32.onnx.data", "");
+        let section = |step: &str, layers: usize| {
+            format!(
+                r#","ar_decoder":{{"step":{{"path":"{step}","precision":"fp32","external_data":["m.ar_step.fp32.onnx.data"]}},
+                "layers":{layers},"heads":6,"head_dim":32,"max_positions":128,"bos_id":3,"eos_id":2,"top_k":32}}"#
+            )
+        };
+        let ok = write(
             &dir,
-            "m.json",
-            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &crf("m.crf.f32")),
+            "ok.json",
+            &manifest_body(
+                "m.fp32.onnx",
+                "m.vocab.hex.tsv",
+                &section("m.ar_step.fp32.onnx", 2),
+            ),
         );
-        let m = CtcNatManifest::load(&manifest).unwrap();
-        let canon = std::fs::canonicalize(dir.join("m.crf.f32")).unwrap();
-        assert_eq!(m.crf, Some((canon, 8)));
+        let m = CtcNatManifest::load(&ok).unwrap();
+        let ar = m.ar_decoder.expect("ar_decoder");
+        assert_eq!(
+            ar.step_path,
+            std::fs::canonicalize(dir.join("m.ar_step.fp32.onnx")).unwrap()
+        );
+        assert_eq!(
+            (
+                ar.layers,
+                ar.heads,
+                ar.head_dim,
+                ar.max_positions,
+                ar.bos_id,
+                ar.eos_id,
+                ar.top_k
+            ),
+            (2, 6, 32, 128, 3, 2, 32)
+        );
+        assert!(ar.native_path.is_none());
+        // the native step's weights: resolved; int8 only; a missing file refused
+        write(&dir, "m.ar_step.native.safetensors", "");
+        let native = |file: &str, precision: &str| {
+            section("m.ar_step.fp32.onnx", 1).replacen(
+                r#""layers""#,
+                &format!(r#""native":{{"path":"{file}","precision":"{precision}"}},"layers""#),
+                1,
+            )
+        };
+        let with = write(
+            &dir,
+            "native.json",
+            &manifest_body(
+                "m.fp32.onnx",
+                "m.vocab.hex.tsv",
+                &native("m.ar_step.native.safetensors", "int8"),
+            ),
+        );
+        assert_eq!(
+            CtcNatManifest::load(&with)
+                .unwrap()
+                .ar_decoder
+                .unwrap()
+                .native_path,
+            Some(std::fs::canonicalize(dir.join("m.ar_step.native.safetensors")).unwrap())
+        );
+        for (name, file, precision) in [
+            ("fp.json", "m.ar_step.native.safetensors", "fp32"),
+            ("gone.json", "none", "int8"),
+        ] {
+            let bad = write(
+                &dir,
+                name,
+                &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &native(file, precision)),
+            );
+            assert!(CtcNatManifest::load(&bad).is_err(), "{name}");
+        }
+        // the script latent: read as the research export writes it; another mode or class order refused; none without it
+        assert!(!ar.script);
+        let script = |mode: &str, classes: &str| {
+            section("m.ar_step.fp32.onnx", 1).replacen(
+                r#""layers""#,
+                &format!(r#""script":{{"mode":"{mode}","classes":{classes}}},"layers""#),
+                1,
+            )
+        };
+        let order = r#"["other","kanji","hiragana","katakana"]"#;
+        let with = write(
+            &dir,
+            "script.json",
+            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &script("choice", order)),
+        );
+        assert!(
+            CtcNatManifest::load(&with)
+                .unwrap()
+                .ar_decoder
+                .unwrap()
+                .script
+        );
+        for (name, mode, classes) in [
+            ("within.json", "within", order),
+            (
+                "order.json",
+                "choice",
+                r#"["other","hiragana","kanji","katakana"]"#,
+            ),
+        ] {
+            let bad = write(
+                &dir,
+                name,
+                &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &script(mode, classes)),
+            );
+            assert!(CtcNatManifest::load(&bad).is_err(), "{name}");
+        }
+        let plain = write(
+            &dir,
+            "plain.json",
+            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", ""),
+        );
+        assert!(CtcNatManifest::load(&plain).unwrap().ar_decoder.is_none());
         let missing = write(
             &dir,
             "missing.json",
-            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &crf("x.crf.f32")),
+            &manifest_body("m.fp32.onnx", "m.vocab.hex.tsv", &section("none.onnx", 1)),
         );
         assert!(CtcNatManifest::load(&missing).is_err());
+        let zero = write(
+            &dir,
+            "zero.json",
+            &manifest_body(
+                "m.fp32.onnx",
+                "m.vocab.hex.tsv",
+                &section("m.ar_step.fp32.onnx", 0),
+            ),
+        );
+        assert!(CtcNatManifest::load(&zero).is_err());
     }
 
     /// The fixture the Python writer test reproduces byte for byte.

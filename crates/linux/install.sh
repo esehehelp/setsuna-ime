@@ -36,7 +36,7 @@
 # Layout:
 #   <fcitx5 addon dir>/setsuna.so
 #   /usr/share/fcitx5/{addon,inputmethod,themes}/, /usr/share/icons/hicolor/scalable/apps/setsuna*.svg
-#   /usr/lib/setsuna-ime/  the engine, reranker and rewriter daemons, libonnxruntime.so,
+#   /usr/lib/setsuna-ime/  the engine, reranker and rewriter daemons,
 #                          llama.cpp's libraries, mixed/, models/onnx/, licenses/,
 #                          uninstall.sh, installed-files
 #   /usr/lib/setsuna-ime/models/rerank/<manifest> + its weights (and tokenizer)  (with --rerank-manifest)

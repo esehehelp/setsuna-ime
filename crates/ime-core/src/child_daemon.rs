@@ -824,9 +824,6 @@ fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
         "--normalize-candidates".into(),
     ];
     let c = engine_cfg;
-    if let Some(p) = &c.ort_dylib {
-        args.push(format!("--ort-dylib={}", p.display()));
-    }
     let mut flag = |name: &str, value: Option<String>| {
         if let Some(v) = value {
             args.push(format!("--{name}={v}"));
@@ -882,6 +879,7 @@ mod tests {
             ]
         );
         let cfg = EngineCfg {
+            // an earlier install's, ignored
             ort_dylib: Some(PathBuf::from("ort/onnxruntime.dll")),
             beam_width: Some(20),
             symbol_split: Some(true),
@@ -898,7 +896,6 @@ mod tests {
                 "m.manifest.json",
                 "--emit-alignment",
                 "--normalize-candidates",
-                "--ort-dylib=ort/onnxruntime.dll",
                 "--beam-width=20",
                 "--symbol-split=true",
                 "--symbol-token=true",

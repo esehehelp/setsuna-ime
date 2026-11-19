@@ -1,230 +1,29 @@
-//! `neo_ime.TokenMoE`: a token-routed mixture of experts as one CPU kernel, registered with every session.
+//! The int8 matrix products the encoder's kernels share, and the helpers of its token-routed experts.
 //!
-//! The research export's int8 form of a token-routed `RoutedExperts` layer: per frame, the
-//! router's logits (fp32), the top-`k` experts and their softmax weights renormalised over the `k`; each expert's two
-//! Linears run only on the frames routed to it, with exact GELU between them; the weighted outputs are summed. ONNX
-//! Runtime's own `com.microsoft.MoE` / `QMoE` run every frame through the experts one by one (3-4 ms a layer at 30
-//! frames on one thread); here the frames of an expert share one pass over its weights.
-//!
-//! Inputs: `x` f32 (..., d); `router` f32 (E, d); `w1` i8 (E, f, d), `s1` f32 (E, f), `b1` f32 (E, f); `w2` i8 (E, d, f),
-//! `s2` f32 (E, d), `b2` f32 (E, d), the weights symmetric int8 per output row (`w ~= s * q`). Attribute `k`. Output
-//! f32 shaped as `x`; padding frames are routed too (the graph masks them after). The activations are quantized to u8
-//! per row (asymmetric, zero exact) and multiplied with the int8 weights as u8 x i8 dot products of four, with
-//! AVX-512 VNNI, AVX-VNNI or plain Rust, the same integer sums on every path.
-//!
-//! `neo_ime.TokenMoEBlocked` is the same op with `w1` / `w2` written already in the kernel's blocked layout (each
-//! expert's matrix 16 output rows x 4 inputs a block, `Packed`): the kernel reads them where ONNX Runtime holds
-//! them, so the experts (most of a Shiran-v2 model) are in memory once. A distinct op so an engine that predates
-//! it refuses such a graph instead of reading blocked weights as rows.
-
-use ort::operator::{
-    ComputeContext, Kernel, KernelContext, Operator, OperatorDomain, OperatorInput, OperatorOutput,
-};
-use ort::value::{DynValueTypeMarker, TensorElementType};
-use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
-
-/// The custom op domain of the research export's fused ops, as the exported
-/// graphs name it (like the manifest schema names, kept as they are).
-pub const DOMAIN: &str = "neo_ime";
-
-/// The `neo_ime` operator domain, for `SessionBuilder::with_operators`.
-pub fn domain() -> ort::Result<OperatorDomain> {
-    OperatorDomain::new(DOMAIN)?
-        .add(TokenMoE)?
-        .add(TokenMoEBlocked)?
-        .add(TokenMoEBlocked4)?
-        .add(crate::norm_op::AddLayerNorm)?
-        .add(crate::group_q::LinearQ4G)?
-        .add(crate::group_q::TokenMoEQ4G)
-}
-
-const MOE_INPUTS: [TensorElementType; 8] = {
-    use TensorElementType::{Float32, Int8};
-    [
-        Float32, Float32, Int8, Float32, Float32, Int8, Float32, Float32,
-    ]
-};
-
-/// `TokenMoEBlocked4`: the weights uint8, two int4 values a byte.
-const MOE4_INPUTS: [TensorElementType; 8] = {
-    use TensorElementType::{Float32, Uint8};
-    [
-        Float32, Float32, Uint8, Float32, Float32, Uint8, Float32, Float32,
-    ]
-};
-
-/// `neo_ime.TokenMoEBlocked4`: `TokenMoEBlocked` with int4 weights (one scale per output row as before), `w1` u8
-/// (E, f, d / 2) and `w2` u8 (E, d, f / 2), each 64-value block of the blocked layout as 32 bytes (value b in byte
-/// b's low nibble, value b + 32 in its high one, each stored as value + 8, 0..15); read in place, the nibbles taken
-/// as they are for the dot products and 8 times the activations' sum taken off after.
-struct TokenMoEBlocked4;
-
-impl Operator for TokenMoEBlocked4 {
-    type Kernel<'attr> = MoeKernel;
-
-    fn name(&self) -> &str {
-        "TokenMoEBlocked4"
-    }
-
-    fn inputs(&self) -> impl IntoIterator<Item = OperatorInput> {
-        MOE4_INPUTS.map(OperatorInput::required)
-    }
-
-    fn outputs(&self) -> impl IntoIterator<Item = OperatorOutput> {
-        [OperatorOutput::required(TensorElementType::Float32)]
-    }
-
-    fn create_kernel<'attr>(&self, kctx: &KernelContext<'attr>) -> ort::Result<MoeKernel> {
-        let k = kctx
-            .get::<i64>("k")
-            .ok_or_else(|| ort::Error::new("TokenMoE: attribute k missing"))?;
-        let f32s = |idx: usize| -> ort::Result<(Vec<usize>, Vec<f32>)> {
-            let v = kctx.constant_input::<DynValueTypeMarker>(idx)?;
-            let (shape, data) = v.try_extract_tensor::<f32>()?;
-            Ok((shape.iter().map(|&s| s as usize).collect(), data.to_vec()))
-        };
-        let (rs, router) = f32s(1)?;
-        let (_, s1) = f32s(3)?;
-        let (_, b1) = f32s(4)?;
-        let (_, s2) = f32s(6)?;
-        let (_, b2) = f32s(7)?;
-        let v1 = kctx.constant_input::<DynValueTypeMarker>(2)?;
-        let (w1s, w1) = v1.try_extract_tensor::<u8>()?;
-        let v2 = kctx.constant_input::<DynValueTypeMarker>(5)?;
-        let (_, w2) = v2.try_extract_tensor::<u8>()?;
-        let (e, d, f) = (rs[0], rs[1], w1s[1] as usize);
-        // SAFETY: as TokenMoEBlocked's
-        let moe =
-            unsafe { MoeWeights::in_place4(e, d, f, k as usize, router, w1, s1, b1, w2, s2, b2) }
-                .map_err(|m| ort::Error::new(format!("TokenMoE: {m}")))?;
-        Ok(MoeKernel {
-            moe,
-            scratch: Scratch::default(),
-        })
-    }
-}
-
-/// The kernel of either op: `blocked`, the weights are in the blocked layout already and read in place.
-fn moe_kernel(kctx: &KernelContext<'_>, blocked: bool) -> ort::Result<MoeKernel> {
-    let k = kctx
-        .get::<i64>("k")
-        .ok_or_else(|| ort::Error::new("TokenMoE: attribute k missing"))?;
-    let f32s = |idx: usize| -> ort::Result<(Vec<usize>, Vec<f32>)> {
-        let v = kctx.constant_input::<DynValueTypeMarker>(idx)?;
-        let (shape, data) = v.try_extract_tensor::<f32>()?;
-        Ok((shape.iter().map(|&s| s as usize).collect(), data.to_vec()))
-    };
-    let (rs, router) = f32s(1)?;
-    let (_, s1) = f32s(3)?;
-    let (_, b1) = f32s(4)?;
-    let (_, s2) = f32s(6)?;
-    let (_, b2) = f32s(7)?;
-    // the int8 weights are read where ONNX Runtime holds them: packed from there, or (blocked) used there
-    let v1 = kctx.constant_input::<DynValueTypeMarker>(2)?;
-    let (w1s, w1) = v1.try_extract_tensor::<i8>()?;
-    let v2 = kctx.constant_input::<DynValueTypeMarker>(5)?;
-    let (_, w2) = v2.try_extract_tensor::<i8>()?;
-    let (e, d, f) = (rs[0], rs[1], w1s[1] as usize);
-    let moe = if blocked {
-        // SAFETY: a constant initializer of the session, immutable and alive as long as the session and so the
-        // kernel it built
-        unsafe { MoeWeights::in_place(e, d, f, k as usize, router, w1, s1, b1, w2, s2, b2) }
-    } else {
-        MoeWeights::new(e, d, f, k as usize, router, w1, s1, b1, w2, s2, b2)
-    }
-    .map_err(|m| ort::Error::new(format!("TokenMoE: {m}")))?;
-    Ok(MoeKernel {
-        moe,
-        scratch: Scratch::default(),
-    })
-}
-
-struct TokenMoEBlocked;
-
-impl Operator for TokenMoEBlocked {
-    type Kernel<'attr> = MoeKernel;
-
-    fn name(&self) -> &str {
-        "TokenMoEBlocked"
-    }
-
-    fn inputs(&self) -> impl IntoIterator<Item = OperatorInput> {
-        MOE_INPUTS.map(OperatorInput::required)
-    }
-
-    fn outputs(&self) -> impl IntoIterator<Item = OperatorOutput> {
-        [OperatorOutput::required(TensorElementType::Float32)]
-    }
-
-    fn create_kernel<'attr>(&self, kctx: &KernelContext<'attr>) -> ort::Result<MoeKernel> {
-        moe_kernel(kctx, true)
-    }
-}
-
-struct TokenMoE;
-
-impl Operator for TokenMoE {
-    type Kernel<'attr> = MoeKernel;
-
-    fn name(&self) -> &str {
-        "TokenMoE"
-    }
-
-    fn inputs(&self) -> impl IntoIterator<Item = OperatorInput> {
-        MOE_INPUTS.map(OperatorInput::required)
-    }
-
-    fn outputs(&self) -> impl IntoIterator<Item = OperatorOutput> {
-        [OperatorOutput::required(TensorElementType::Float32)]
-    }
-
-    fn create_kernel<'attr>(&self, kctx: &KernelContext<'attr>) -> ort::Result<MoeKernel> {
-        moe_kernel(kctx, false)
-    }
-}
-
-pub struct MoeKernel {
-    moe: MoeWeights,
-    scratch: Scratch,
-}
-
-impl Kernel for MoeKernel {
-    fn compute(&mut self, ctx: &ComputeContext) -> ort::Result<()> {
-        let x = ctx
-            .input(0)?
-            .ok_or_else(|| ort::Error::new("TokenMoE: input x missing"))?;
-        let (shape, x) = x.try_extract_tensor::<f32>()?;
-        let shape = shape.to_vec();
-        let mut y = ctx
-            .output(0, shape)?
-            .ok_or_else(|| ort::Error::new("TokenMoE: output missing"))?;
-        let (_, y) = y.try_extract_tensor_mut::<f32>()?;
-        self.moe.forward(x, y, &mut self.scratch);
-        Ok(())
-    }
-}
+//! A row of activations is quantized to u8 per row (asymmetric, zero exact: `quantize_row`) and multiplied with int8
+//! weights prepacked in blocks (`Packed`) as u8 x i8 dot products of four (`gemm_u8i8`, and `gemm_u8i8_f32` with its
+//! epilogue: the scales, the bias and GELU), with AVX-512 VNNI, AVX-VNNI, AVX2, AVX or plain Rust, the same integer
+//! sums on every path. `route` and `add_routed` are a token-routed mixture of experts' router and sum (per frame the
+//! router's fp32 logits, the top-`k` experts with their softmax renormalised over the `k`, the weighted outputs
+//! summed), the experts' Linears being `group_q`'s.
 
 /// An int8 matrix (out, in) prepacked for the u8 x i8 dot products: 16 output rows x 4 inputs a 64-byte block (lane j
 /// = row 16 * b + j), blocks along the inputs; `colsum` the sum of each row (for the activations' zero point). Only
-/// one layout is kept (2026-10-23: both were, the experts' weights three times over with ONNX Runtime's own copy):
+/// one layout is kept:
 /// `blocked` for the VNNI paths, else `raw` (row-major, the plain path).
-struct Packed {
+pub(crate) struct Packed {
     out: usize,
     inp: usize,
     blocked: Blocked,
     raw: Vec<i8>,
     colsum: Vec<i32>,
-    /// `blocked` holds int4 values (`TokenMoEBlocked4`): each 64-value block as 32 bytes, byte b the value b in its
-    /// low nibble and the value b + 32 in its high one, each as value + 8 (0..15)
-    nibbles: bool,
+    /// the AVX2 kernel's 16-bit copy of `blocked` (`widen`), made when the engine's level is AVX2; else empty
+    wide: Vec<i16>,
 }
 
-/// The blocked layout: packed here, or read in place from ONNX Runtime's initializer of a `TokenMoEBlocked` graph.
+/// The blocked layout, packed here.
 enum Blocked {
     Owned(Vec<i8>),
-    InPlace(*const i8, usize),
 }
 
 impl std::ops::Deref for Blocked {
@@ -233,91 +32,13 @@ impl std::ops::Deref for Blocked {
     fn deref(&self) -> &[i8] {
         match self {
             Blocked::Owned(v) => v,
-            // SAFETY: `in_place`'s contract: memory alive and unchanged while the kernel lives
-            Blocked::InPlace(p, n) => unsafe { std::slice::from_raw_parts(*p, *n) },
         }
     }
 }
 
-// SAFETY: in place, an immutable initializer of the session, only read
-unsafe impl Send for Blocked {}
-unsafe impl Sync for Blocked {}
-
 impl Packed {
-    /// A matrix already blocked (`TokenMoEBlocked`), read where it lies.
-    ///
-    /// # Safety
-    /// `w` stays valid and unchanged as long as the returned `Packed`.
-    unsafe fn in_place(w: &[i8], out: usize, inp: usize) -> Self {
-        assert_eq!(w.len(), out * inp);
-        assert!(
-            out % 16 == 0 && inp % 4 == 0,
-            "a blocked matrix is 16 x 4 blocks"
-        );
-        let k4 = inp / 4;
-        let colsum = (0..out)
-            .map(|o| {
-                (0..k4)
-                    .map(|g| {
-                        let b = ((o / 16 * k4 + g) * 16 + o % 16) * 4;
-                        w[b..b + 4].iter().map(|&v| v as i32).sum::<i32>()
-                    })
-                    .sum()
-            })
-            .collect();
-        Packed {
-            out,
-            inp,
-            blocked: Blocked::InPlace(w.as_ptr(), w.len()),
-            raw: Vec::new(),
-            colsum,
-            nibbles: false,
-        }
-    }
-
-    /// A matrix of int4 values already blocked (`TokenMoEBlocked4`, `nibbles`), read where it lies.
-    ///
-    /// # Safety
-    /// `w` stays valid and unchanged as long as the returned `Packed`.
-    unsafe fn in_place4(w: &[u8], out: usize, inp: usize) -> Self {
-        assert_eq!(w.len() * 2, out * inp);
-        assert!(
-            out % 16 == 0 && inp % 4 == 0,
-            "a blocked matrix is 16 x 4 blocks"
-        );
-        let mut p = Packed {
-            out,
-            inp,
-            blocked: Blocked::InPlace(w.as_ptr() as *const i8, w.len()),
-            raw: Vec::new(),
-            colsum: Vec::new(),
-            nibbles: true,
-        };
-        p.colsum = (0..out)
-            .map(|o| (0..inp).map(|i| p.at(o, i) as i32).sum())
-            .collect();
-        p
-    }
-
-    /// The value of row `o`, input `i`, whatever the layout.
-    #[inline(always)]
-    fn at(&self, o: usize, i: usize) -> i8 {
-        if !self.raw.is_empty() {
-            return self.raw[o * self.inp + i];
-        }
-        let block = o / 16 * (self.inp / 4) + i / 4;
-        let v = (o % 16) * 4 + i % 4;
-        if self.nibbles {
-            let byte = self.blocked[block * 32 + v % 32] as u8;
-            let nib = if v < 32 { byte & 0x0f } else { byte >> 4 };
-            nib as i8 - 8
-        } else {
-            self.blocked[block * 64 + v]
-        }
-    }
-
     /// `blocked`: pack for the VNNI paths (when the shape allows 16 x 4 blocks), else keep the matrix as it is.
-    fn new(w: &[i8], out: usize, inp: usize, blocked: bool) -> Self {
+    pub(crate) fn new(w: &[i8], out: usize, inp: usize, blocked: bool) -> Self {
         assert_eq!(w.len(), out * inp);
         let colsum = (0..out)
             .map(|o| w[o * inp..(o + 1) * inp].iter().map(|&v| v as i32).sum())
@@ -329,7 +50,7 @@ impl Packed {
                 blocked: Blocked::Owned(Vec::new()),
                 raw: w.to_vec(),
                 colsum,
-                nibbles: false,
+                wide: Vec::new(),
             };
         }
         let mut blocked = vec![0i8; out * inp];
@@ -343,215 +64,183 @@ impl Packed {
                 }
             }
         }
+        let wide = if matches!(detect_isa(), Isa::Avx2 | Isa::Avx) {
+            widen(&blocked)
+        } else {
+            Vec::new()
+        };
         Packed {
             out,
             inp,
             blocked: Blocked::Owned(blocked),
             raw: Vec::new(),
             colsum,
-            nibbles: false,
+            wide,
         }
+    }
+
+    /// Tests only: `new` with the AVX2 kernel's 16-bit copy whatever the CPU.
+    #[cfg(test)]
+    pub(crate) fn with_wide(mut self) -> Self {
+        if !self.blocked.is_empty() {
+            self.wide = widen(&self.blocked);
+        }
+        self
     }
 }
 
-// x86_64 (VNNI) and aarch64 (dotprod) have kernels of their own; elsewhere every GEMM is plain
-#[allow(dead_code)]
+/// The AVX2 kernel's copy of a blocked int8 matrix in 16 bits: for each block of 16 outputs and each 4 inputs, 4
+/// registers of 16 values, outputs 0-7 with inputs 0 and 1 (output after output, its two inputs side by side), then
+/// with inputs 2 and 3, then outputs 8-15 likewise; so one 16-bit multiply-add of a pair of inputs gives 8 outputs'
+/// partial sums (`x86::tile_avx2w`).
+fn widen(blocked: &[i8]) -> Vec<i16> {
+    let mut wide = Vec::with_capacity(blocked.len());
+    for b in blocked.chunks_exact(64) {
+        for half in 0..2 {
+            for pair in 0..2 {
+                for o in 0..8 {
+                    let at = (half * 8 + o) * 4 + pair * 2;
+                    wide.push(b[at] as i16);
+                    wide.push(b[at + 1] as i16);
+                }
+            }
+        }
+    }
+    wide
+}
+
+/// The int8 GEMM's kernels: AVX-512 VNNI, AVX-VNNI, AVX2 (without a dot product instruction), plain Rust; the same
+/// integer sums on each.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Isa {
+pub(crate) enum Isa {
     Vnni512,
     Vnni256,
-    /// ARMv8.2 SDOT (phones since about 2018): `arm`.
-    Dot,
+    Avx2,
+    Avx,
     Plain,
 }
 
-fn detect_isa() -> Isa {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
-        {
-            return Isa::Vnni512;
-        }
-        if std::arch::is_x86_feature_detected!("avxvnni") {
-            return Isa::Vnni256;
-        }
+/// The kernel for the engine's level (`crate::cpu`; SETSUNA_CPU_LEVEL caps it).
+pub(crate) fn detect_isa() -> Isa {
+    use crate::cpu::Level;
+    match crate::cpu::level() {
+        Level::Avx512 => Isa::Vnni512,
+        Level::AvxVnni => Isa::Vnni256,
+        Level::Avx2 => Isa::Avx2,
+        Level::Avx => Isa::Avx,
+        Level::Plain => Isa::Plain,
     }
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("dotprod") {
-        return Isa::Dot;
-    }
-    Isa::Plain
 }
 
 /// The integer sums acc[r][o] = sum_i q[r][i] * w[o][i] of `rows` u8 rows (stride `w.inp`) with the int8 matrix.
-fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+pub(crate) fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
     debug_assert!(q.len() >= rows * w.inp && acc.len() >= rows * w.out);
     if w.blocked.is_empty() {
         return gemm_plain(q, rows, w, acc);
     }
-    match (isa, w.nibbles) {
+    match isa {
         #[cfg(target_arch = "x86_64")]
-        (Isa::Vnni512, false) => unsafe { x86::gemm_vnni512(q, rows, w, acc) },
+        Isa::Vnni512 => unsafe { x86::gemm_vnni512(q, rows, w, acc) },
         #[cfg(target_arch = "x86_64")]
-        (Isa::Vnni256, false) => unsafe { x86::gemm_vnni256(q, rows, w, acc) },
+        Isa::Vnni256 => unsafe { x86::gemm_vnni256(q, rows, w, acc) },
+        // AVX2: the 16-bit copy's kernel when the matrix has it (the engine's level was AVX2 when it was packed)
         #[cfg(target_arch = "x86_64")]
-        (Isa::Vnni512, true) => unsafe { x86::gemm4_vnni512(q, rows, w, acc) },
+        Isa::Avx2 if !w.wide.is_empty() => unsafe { x86::gemm_avx2w(q, rows, w, acc) },
         #[cfg(target_arch = "x86_64")]
-        (Isa::Vnni256, true) => unsafe { x86::gemm4_vnni256(q, rows, w, acc) },
-        #[cfg(target_arch = "aarch64")]
-        (Isa::Dot, _) => unsafe { arm::gemm_dot(q, rows, w, acc) },
+        Isa::Avx2 => unsafe { x86::gemm_avx2(q, rows, w, acc) },
+        // AVX (128-bit integers): the 16-bit copy's kernel (a matrix packed at the AVX level has it)
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx if !w.wide.is_empty() => unsafe { x86::gemm_avxw(q, rows, w, acc) },
         _ => gemm_plain(q, rows, w, acc),
     }
 }
 
-/// The blocked GEMMs with ARM's SDOT (signed i8 x i8 dot products of four into each i32 lane), the int8 and the int4
-/// weights alike: a block's 64 bytes are four vectors, outputs 0-3, 4-7, 8-11 and 12-15, each lane an output's four
-/// inputs, so the layout of the VNNI paths serves as it is. The u8 codes go in as i8 with their top bit flipped (code -
-/// 128), and the 128 * row sum of the weights this takes off is put back after, so the sums are the plain path's.
-#[cfg(target_arch = "aarch64")]
-mod arm {
-    use super::Packed;
-    use std::arch::aarch64::*;
+/// How `gemm_u8i8_f32` turns a row's integer sums into its outputs: with the row's activation scale and zero point
+/// (`xs`: one pair a row, or one for every row) and the column sums `cs`, i = acc - zx cs; then `i * (sx * scale)`
+/// (one weight scale, `col` None: the native encoder's `Lin8`) or `sx * col[o] * i` (a scale an output: the AR step's
+/// `Linear8`), plus `bias[o]` when given; the first `out` columns.
+pub(crate) struct Epilogue<'a> {
+    pub xs: &'a [(f32, i32)],
+    pub col: Option<&'a [f32]>,
+    pub scale: f32,
+    pub bias: Option<&'a [f32]>,
+    pub out: usize,
+}
 
-    /// SDOT: each lane of `acc` plus the dot product of its four i8 of `w` and of `x` (the intrinsic is not stable).
-    #[inline(always)]
-    unsafe fn sdot(acc: int32x4_t, w: int8x16_t, x: int8x16_t) -> int32x4_t {
-        let mut r = acc;
-        std::arch::asm!(
-            "sdot {r:v}.4s, {w:v}.16b, {x:v}.16b",
-            r = inout(vreg) r,
-            w = in(vreg) w,
-            x = in(vreg) x,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-        r
-    }
-
-    /// Row r's four codes at input 4 kg, top bits flipped, in every lane.
-    #[inline(always)]
-    unsafe fn codes(q: *const u8, at: usize) -> int8x16_t {
-        let v = vreinterpretq_u8_u32(vdupq_n_u32((q.add(at) as *const u32).read_unaligned()));
-        vreinterpretq_s8_u8(veorq_u8(v, vdupq_n_u8(0x80)))
-    }
-
-    /// RT rows x C output blocks (block c `bstride` bytes after block 0) of int8 weights, or (`NIB`) of int4 ones,
-    /// 32 bytes a block: low nibbles of bytes 0-15 outputs 0-3, of 16-31 outputs 4-7, high nibbles 8-11 and 12-15,
-    /// as value + 8.
-    #[target_feature(enable = "neon,dotprod")]
-    unsafe fn tile<const RT: usize, const C: usize, const NIB: bool>(
-        q: *const u8,
-        k: usize,
-        wb: *const i8,
-        bstride: usize,
-        acc: *mut i32,
-        n: usize,
-    ) {
-        let mut a = [[[vdupq_n_s32(0); 4]; C]; RT];
-        let low = vdupq_n_u8(0x0f);
-        for kg in 0..k / 4 {
-            let mut x = [vdupq_n_s8(0); RT];
-            for (r, xr) in x.iter_mut().enumerate() {
-                *xr = codes(q, r * k + kg * 4);
-            }
-            for c in 0..C {
-                let w = if NIB {
-                    let p = wb.add(c * bstride + kg * 32) as *const u8;
-                    let (b0, b1) = (vld1q_u8(p), vld1q_u8(p.add(16)));
-                    [
-                        vreinterpretq_s8_u8(vandq_u8(b0, low)),
-                        vreinterpretq_s8_u8(vandq_u8(b1, low)),
-                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(b0)),
-                        vreinterpretq_s8_u8(vshrq_n_u8::<4>(b1)),
-                    ]
-                } else {
-                    let p = wb.add(c * bstride + kg * 64);
-                    [
-                        vld1q_s8(p),
-                        vld1q_s8(p.add(16)),
-                        vld1q_s8(p.add(32)),
-                        vld1q_s8(p.add(48)),
-                    ]
-                };
-                for (ar, xr) in a.iter_mut().zip(&x) {
-                    for (av, wv) in ar[c].iter_mut().zip(&w) {
-                        *av = sdot(*av, *wv, *xr);
-                    }
-                }
-            }
-        }
-        for (r, ar) in a.iter().enumerate() {
-            for (c, ac) in ar.iter().enumerate() {
-                for (v, av) in ac.iter().enumerate() {
-                    vst1q_s32(acc.add(r * n + c * 16 + v * 4), *av);
-                }
-            }
-        }
-    }
-
-    /// `tile::<rt, c, NIB>` for a row count known at run time: 1 row on 4 blocks, 2 on 2 (16 sums each), else up
-    /// to 4 rows on one block.
-    macro_rules! by_rows {
-        ($rt:expr, $c:expr, $nib:expr, $($arg:expr),*) => {
-            match ($rt, $c) {
-                (1, 4) => tile::<1, 4, $nib>($($arg),*),
-                (2, 2) => tile::<2, 2, $nib>($($arg),*),
-                (1, _) => tile::<1, 1, $nib>($($arg),*),
-                (2, _) => tile::<2, 1, $nib>($($arg),*),
-                (3, _) => tile::<3, 1, $nib>($($arg),*),
-                _ => tile::<4, 1, $nib>($($arg),*),
-            }
+/// y (rows, `e.out`) of the u8 rows `q` with the int8 matrix: `gemm_u8i8`'s sums turned to floats by `e`, in the
+/// GEMM's registers with AVX-512 VNNI (2026-11-19: an 8006-token head's i32 sums of 30 rows were 960 KB written and
+/// read again), else the sums into `acc` and a pass: the same operations in the same order, the same bits.
+pub(crate) fn gemm_u8i8_f32(
+    isa: Isa,
+    q: &[u8],
+    rows: usize,
+    w: &Packed,
+    e: &Epilogue,
+    acc: &mut Vec<i32>,
+    y: &mut [f32],
+) {
+    let per_row = e.xs.len() > 1;
+    assert!(
+        per_row && e.xs.len() >= rows || e.xs.len() == 1,
+        "{} scales for {rows} rows",
+        e.xs.len()
+    );
+    assert!(e.out <= w.out && y.len() >= rows * e.out && w.colsum.len() >= e.out);
+    assert!(e.col.is_none_or(|c| c.len() >= e.out) && e.bias.is_none_or(|b| b.len() >= e.out));
+    #[cfg(target_arch = "x86_64")]
+    {
+        let raw = x86::Epi {
+            xs: e.xs.as_ptr(),
+            per_row,
+            cs: w.colsum.as_ptr(),
+            col: e.col.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            scale: e.scale,
+            bias: e.bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            out: e.out,
         };
-    }
-
-    /// The integer sums of `super::gemm_u8i8` on a blocked matrix, int8 or int4 (`Packed::nibbles`).
-    #[target_feature(enable = "neon,dotprod")]
-    pub(super) unsafe fn gemm_dot(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
-        let (n, k) = (w.out, w.inp);
-        let bstride = if w.nibbles { k * 8 } else { k * 16 };
-        let (qp, ap, wp) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr());
-        // few rows (an expert's frames): more blocks at once, so the sums do not wait on each other
-        let c = match rows {
-            1 => 4,
-            2 => 2,
-            _ => 1,
-        };
-        let blocks = n / 16;
-        let mut ob = 0;
-        while ob < blocks {
-            let cb = if ob + c <= blocks { c } else { 1 };
-            let mut r0 = 0;
-            while r0 < rows {
-                let rt = (rows - r0).min(4);
-                let args = (
-                    qp.add(r0 * k),
-                    k,
-                    wp.add(ob * bstride),
-                    bstride,
-                    ap.add(r0 * n + ob * 16),
-                    n,
-                );
-                if w.nibbles {
-                    by_rows!(rt, cb, true, args.0, args.1, args.2, args.3, args.4, args.5)
-                } else {
-                    by_rows!(rt, cb, false, args.0, args.1, args.2, args.3, args.4, args.5)
-                }
-                r0 += rt;
-            }
-            ob += cb;
+        if isa == Isa::Vnni512 && !w.blocked.is_empty() {
+            // SAFETY: the CPU has AVX-512 VNNI (`isa`); the slices hold what the asserts say
+            return unsafe { x86::gemm_vnni512_f32(q, rows, w, &raw, y) };
         }
-        // the codes went in as code - 128 (and int4 values as value + 8): put back what that took off
-        for r in 0..rows {
-            let fix = if w.nibbles {
-                let flipped =
-                    q[r * k..(r + 1) * k].iter().map(|&v| v as i32).sum::<i32>() - 128 * k as i32;
-                -8 * flipped
-            } else {
-                0
+        if matches!(isa, Isa::Avx2 | Isa::Avx) && !w.wide.is_empty() {
+            // the 16-bit copy's kernels read each row's inputs as 16-bit pairs (x0 | x1 << 16), made here into `acc`
+            let k = w.inp;
+            acc.clear();
+            acc.extend(
+                q[..rows * k]
+                    .chunks_exact(2)
+                    .map(|p| p[0] as i32 | (p[1] as i32) << 16),
+            );
+            // SAFETY: the CPU has AVX2 and FMA, or AVX, SSSE3 and SSE4.1 (`isa`); as above
+            return unsafe {
+                if isa == Isa::Avx2 {
+                    x86::gemm_avx2w_f32(acc, rows, w, &raw, y)
+                } else {
+                    x86::gemm_avxw_f32(acc, rows, w, &raw, y)
+                }
             };
-            for (a, &cs) in acc[r * n..(r + 1) * n].iter_mut().zip(&w.colsum) {
-                *a += 128 * cs + fix;
+        }
+    }
+    let n = w.out;
+    acc.resize(rows * n, 0);
+    gemm_u8i8(isa, q, rows, w, acc);
+    let cs = &w.colsum[..e.out];
+    for r in 0..rows {
+        let (sx, zx) = e.xs[if per_row { r } else { 0 }];
+        let (a, yr) = (
+            &acc[r * n..r * n + e.out],
+            &mut y[r * e.out..(r + 1) * e.out],
+        );
+        for o in 0..e.out {
+            let f = a[o].wrapping_sub(zx.wrapping_mul(cs[o])) as f32;
+            let mut v = match e.col {
+                None => f * (sx * e.scale),
+                Some(c) => sx * c[o] * f,
+            };
+            if let Some(b) = e.bias {
+                v += b[o];
             }
+            yr[o] = v;
         }
     }
 }
@@ -561,13 +250,11 @@ mod arm {
 static ONE_BLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn one_block() -> bool {
     ONE_BLOCK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(not(test))]
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline(always)]
 fn one_block() -> bool {
     false
@@ -578,9 +265,7 @@ fn gemm_plain(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
     for r in 0..rows {
         let qr = &q[r * k..(r + 1) * k];
         for o in 0..n {
-            acc[r * n + o] = if w.nibbles {
-                (0..k).map(|i| qr[i] as i32 * w.at(o, i) as i32).sum()
-            } else if w.raw.is_empty() {
+            acc[r * n + o] = if w.raw.is_empty() {
                 // the blocked layout: row o's inputs 4g..4g+4 at ((o / 16 * k / 4 + g) * 16 + o % 16) * 4
                 (0..k / 4)
                     .map(|g| {
@@ -638,7 +323,9 @@ mod x86 {
     /// 4 weight vectors and the broadcast input in 29 of the 32 registers), then single blocks by up to 8 rows;
     /// `tile(rows in the tile, first row, first block, blocks)`. An expert's few rows on one block left each sum
     /// waiting on the dot product's latency: on 4 blocks the sums are 4 times as many and each weight vector serves
-    /// all of the tile's rows.
+    /// all of the tile's rows. The rows are split evenly over the fewest tiles (2026-11-19: the AR step's 8 rows were a
+    /// tile of 6 and one of 2, whose 8 sums waited on the dot product's latency; now 4 and 4, the same passes over the
+    /// weights; each sum is still made whole in one tile, the same integers).
     #[inline(always)]
     unsafe fn tiles(rows: usize, blocks: usize, mut tile: impl FnMut(usize, usize, usize, usize)) {
         let mut ob = 0;
@@ -648,9 +335,11 @@ mod x86 {
             } else {
                 (1, 8)
             };
+            let count = rows.div_ceil(max);
             let mut r0 = 0;
-            while r0 < rows {
-                let rt = (rows - r0).min(max);
+            for t in 0..count {
+                // the first rows % count tiles one row more
+                let rt = rows / count + usize::from(t < rows % count);
                 tile(rt, r0, ob, c);
                 r0 += rt;
             }
@@ -686,6 +375,133 @@ mod x86 {
                 _mm512_storeu_si512(acc.add(r * n + c * 16) as *mut _, *ac);
             }
         }
+    }
+
+    /// `gemm_u8i8_f32`'s outputs: its epilogue as raw pointers (`xs` one pair a row, or one for all rows).
+    #[derive(Clone, Copy)]
+    pub(super) struct Epi {
+        pub xs: *const (f32, i32),
+        pub per_row: bool,
+        pub cs: *const i32,
+        pub col: *const f32,
+        pub scale: f32,
+        pub bias: *const f32,
+        pub out: usize,
+    }
+
+    /// RT rows x C output blocks of int8 weights as `tile512`, the sums turned to `gemm_u8i8_f32`'s outputs in
+    /// registers: row r's outputs at `y + r * ystride`, block c's at column `col0 + 16 c`, the columns past `out`
+    /// left unwritten (masked).
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tile512_f32<const RT: usize, const C: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i8,
+        bstride: usize,
+        y: *mut f32,
+        ystride: usize,
+        col0: usize,
+        r0: usize,
+        e: &Epi,
+    ) {
+        let mut a = [[_mm512_setzero_si512(); C]; RT];
+        for kg in 0..k / 4 {
+            let mut w = [_mm512_setzero_si512(); C];
+            for (c, wc) in w.iter_mut().enumerate() {
+                *wc = _mm512_loadu_si512(wb.add(c * bstride + kg * 64) as *const _);
+            }
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x = _mm512_set1_epi32(bcast4(q.add(r * k + kg * 4)));
+                for (ac, wc) in ar.iter_mut().zip(&w) {
+                    *ac = _mm512_dpbusd_epi32(*ac, x, *wc);
+                }
+            }
+        }
+        for c in 0..C {
+            let o = col0 + c * 16;
+            if o >= e.out {
+                break;
+            }
+            let m: __mmask16 = if o + 16 <= e.out {
+                0xFFFF
+            } else {
+                (1u16 << (e.out - o)) - 1
+            };
+            let cs = _mm512_loadu_si512(e.cs.add(o) as *const _);
+            let col = if e.col.is_null() {
+                _mm512_setzero_ps()
+            } else {
+                _mm512_maskz_loadu_ps(m, e.col.add(o))
+            };
+            let bias = if e.bias.is_null() {
+                _mm512_setzero_ps()
+            } else {
+                _mm512_maskz_loadu_ps(m, e.bias.add(o))
+            };
+            for (r, ar) in a.iter().enumerate() {
+                let (sx, zx) = *e.xs.add(if e.per_row { r0 + r } else { 0 });
+                let iv = _mm512_sub_epi32(ar[c], _mm512_mullo_epi32(_mm512_set1_epi32(zx), cs));
+                let f = _mm512_cvtepi32_ps(iv);
+                let mut f = if e.col.is_null() {
+                    _mm512_mul_ps(f, _mm512_set1_ps(sx * e.scale))
+                } else {
+                    _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(sx), col), f)
+                };
+                if !e.bias.is_null() {
+                    f = _mm512_add_ps(f, bias);
+                }
+                _mm512_mask_storeu_ps(y.add(r * ystride + o), m, f);
+            }
+        }
+    }
+
+    /// `gemm_u8i8_f32` with AVX-512 VNNI (`gemm_vnni512`'s tiles).
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    pub(super) unsafe fn gemm_vnni512_f32(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        e: &Epi,
+        y: &mut [f32],
+    ) {
+        let (n, k, out) = (w.out, w.inp, e.out);
+        assert!(y.len() >= rows * out && w.colsum.len() >= n);
+        let (qp, yp, wp, bstride) = (q.as_ptr(), y.as_mut_ptr(), w.blocked.as_ptr(), k * 16);
+        tiles(rows, n / 16, |rt, r0, ob, c| {
+            let (q, yr, wb) = (qp.add(r0 * k), yp.add(r0 * out), wp.add(ob * bstride));
+            if c == 4 {
+                by_rows!(
+                    rt,
+                    tile512_f32,
+                    4,
+                    q,
+                    k,
+                    wb,
+                    bstride,
+                    yr,
+                    out,
+                    ob * 16,
+                    r0,
+                    e
+                )
+            } else {
+                by_rows!(
+                    rt,
+                    tile512_f32,
+                    1,
+                    q,
+                    k,
+                    wb,
+                    bstride,
+                    yr,
+                    out,
+                    ob * 16,
+                    r0,
+                    e
+                )
+            }
+        });
     }
 
     #[target_feature(enable = "avx512f,avx512vnni")]
@@ -792,6 +608,447 @@ mod x86 {
         }
     }
 
+    /// RT rows x one block of int8 weights with AVX2 alone (no dot product instruction): u8 x i8 pair products into
+    /// 16 bits would overflow (255 x 127 x 2), so each activation byte is its low 7 bits plus 128 times its top bit,
+    /// the two pair products (at most 127 x 128 x 2 and 1 x 128 x 2) summed by pairs into 32 bits and the second
+    /// shifted by 7: the exact integer sums.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn tile_avx2<const RT: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i8,
+        acc: *mut i32,
+        n: usize,
+    ) {
+        let ones = _mm256_set1_epi16(1);
+        let mut a = [[_mm256_setzero_si256(); 2]; RT];
+        for kg in 0..k / 4 {
+            let p = wb.add(kg * 64);
+            let w = [
+                _mm256_loadu_si256(p as *const _),
+                _mm256_loadu_si256(p.add(32) as *const _),
+            ];
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x4 = bcast4(q.add(r * k + kg * 4));
+                let lo = _mm256_set1_epi32(x4 & 0x7f7f_7f7f);
+                let hi = _mm256_set1_epi32((x4 >> 7) & 0x0101_0101);
+                for (ac, wc) in ar.iter_mut().zip(&w) {
+                    let l = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, *wc), ones);
+                    let h = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, *wc), ones);
+                    *ac = _mm256_add_epi32(*ac, _mm256_add_epi32(l, _mm256_slli_epi32::<7>(h)));
+                }
+            }
+        }
+        for (r, ar) in a.iter().enumerate() {
+            _mm256_storeu_si256(acc.add(r * n) as *mut _, ar[0]);
+            _mm256_storeu_si256(acc.add(r * n + 8) as *mut _, ar[1]);
+        }
+    }
+
+    /// The integer sums of RT rows with one block of the 16-bit copy (`widen`; `wb` the block's start): for each 4
+    /// inputs, a row's pairs (0, 1) and (2, 3) as two 16-bit values broadcast, 16-bit multiply-adds with the block's 4
+    /// registers into its two registers of 8 sums (exact: a pair's products, 255 x 128 at most each, fit 32 bits);
+    /// 4 operations for each 32 products against `tile_avx2`'s 7.
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn sums_avx2w<const RT: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i16,
+    ) -> [[__m256i; 2]; RT] {
+        let mut a = [[_mm256_setzero_si256(); 2]; RT];
+        for kg in 0..k / 4 {
+            let p = wb.add(kg * 64);
+            let w = [
+                _mm256_loadu_si256(p as *const _),
+                _mm256_loadu_si256(p.add(16) as *const _),
+                _mm256_loadu_si256(p.add(32) as *const _),
+                _mm256_loadu_si256(p.add(48) as *const _),
+            ];
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x = q.add(r * k + kg * 4);
+                let x01 = _mm256_set1_epi32(((*x.add(1) as i32) << 16) | *x as i32);
+                let x23 = _mm256_set1_epi32(((*x.add(3) as i32) << 16) | *x.add(2) as i32);
+                ar[0] = _mm256_add_epi32(
+                    ar[0],
+                    _mm256_add_epi32(_mm256_madd_epi16(x01, w[0]), _mm256_madd_epi16(x23, w[1])),
+                );
+                ar[1] = _mm256_add_epi32(
+                    ar[1],
+                    _mm256_add_epi32(_mm256_madd_epi16(x01, w[2]), _mm256_madd_epi16(x23, w[3])),
+                );
+            }
+        }
+        a
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn tile_avx2w<const RT: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i16,
+        acc: *mut i32,
+        n: usize,
+    ) {
+        for (r, ar) in sums_avx2w::<RT>(q, k, wb).iter().enumerate() {
+            _mm256_storeu_si256(acc.add(r * n) as *mut _, ar[0]);
+            _mm256_storeu_si256(acc.add(r * n + 8) as *mut _, ar[1]);
+        }
+    }
+
+    /// `gemm_u8i8` with AVX2 from the 16-bit copy: one block at a time, up to 4 rows a tile.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn gemm_avx2w(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+        let (n, k) = (w.out, w.inp);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        for ob in 0..n / 16 {
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                let (q, a, wb) = (
+                    qp.add(r0 * k),
+                    ap.add(r0 * n + ob * 16),
+                    wp.add(ob * bstride),
+                );
+                match rt {
+                    1 => tile_avx2w::<1>(q, k, wb, a, n),
+                    2 => tile_avx2w::<2>(q, k, wb, a, n),
+                    3 => tile_avx2w::<3>(q, k, wb, a, n),
+                    _ => tile_avx2w::<4>(q, k, wb, a, n),
+                }
+                r0 += rt;
+            }
+        }
+    }
+
+    /// `tile512_f32`'s outputs from `sums_avx2w`: each half block's 8 sums turned to the outputs in registers, the
+    /// columns past `out` masked.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tile_avx2w_f32<const RT: usize>(
+        x: *const i32,
+        k: usize,
+        wb: *const i16,
+        y: *mut f32,
+        ystride: usize,
+        col0: usize,
+        r0: usize,
+        e: &Epi,
+    ) {
+        let s = sums_avx2p::<RT>(x, k, wb);
+        let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        for h in 0..2 {
+            let o = col0 + h * 8;
+            if o >= e.out {
+                break;
+            }
+            let m = _mm256_cmpgt_epi32(_mm256_set1_epi32((e.out - o).min(8) as i32), lanes);
+            let cs = _mm256_loadu_si256(e.cs.add(o) as *const _);
+            let col = if e.col.is_null() {
+                _mm256_setzero_ps()
+            } else {
+                _mm256_maskload_ps(e.col.add(o), m)
+            };
+            let bias = if e.bias.is_null() {
+                _mm256_setzero_ps()
+            } else {
+                _mm256_maskload_ps(e.bias.add(o), m)
+            };
+            for (r, sr) in s.iter().enumerate() {
+                let (sx, zx) = *e.xs.add(if e.per_row { r0 + r } else { 0 });
+                let iv = _mm256_sub_epi32(sr[h], _mm256_mullo_epi32(_mm256_set1_epi32(zx), cs));
+                let f = _mm256_cvtepi32_ps(iv);
+                let mut f = if e.col.is_null() {
+                    _mm256_mul_ps(f, _mm256_set1_ps(sx * e.scale))
+                } else {
+                    _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(sx), col), f)
+                };
+                if !e.bias.is_null() {
+                    f = _mm256_add_ps(f, bias);
+                }
+                _mm256_maskstore_ps(y.add(r * ystride + o), m, f);
+            }
+        }
+    }
+
+    /// `gemm_u8i8_f32` with AVX2 from the 16-bit copy.
+    #[target_feature(enable = "avx2,fma")]
+    /// `gemm_avx2w_f32` from the rows' 16-bit pairs (`pairs`: row r's inputs 2i, 2i + 1 as x | y << 16 at
+    /// r * k / 2 + i; 2026-11-19: the bytes put together for each broadcast took scalar operations as many as the
+    /// multiply-adds).
+    pub(super) unsafe fn gemm_avx2w_f32(
+        pairs: &[i32],
+        rows: usize,
+        w: &Packed,
+        e: &Epi,
+        y: &mut [f32],
+    ) {
+        let (n, k, out) = (w.out, w.inp, e.out);
+        assert!(
+            y.len() >= rows * out
+                && w.colsum.len() >= n
+                && w.wide.len() == n * k
+                && pairs.len() >= rows * k / 2
+        );
+        let (xp, yp, wp, bstride) = (pairs.as_ptr(), y.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        for ob in 0..n / 16 {
+            if ob * 16 >= out {
+                break;
+            }
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                let (x, yr, wb) = (xp.add(r0 * k / 2), yp.add(r0 * out), wp.add(ob * bstride));
+                match rt {
+                    1 => tile_avx2w_f32::<1>(x, k, wb, yr, out, ob * 16, r0, e),
+                    2 => tile_avx2w_f32::<2>(x, k, wb, yr, out, ob * 16, r0, e),
+                    3 => tile_avx2w_f32::<3>(x, k, wb, yr, out, ob * 16, r0, e),
+                    _ => tile_avx2w_f32::<4>(x, k, wb, yr, out, ob * 16, r0, e),
+                }
+                r0 += rt;
+            }
+        }
+    }
+
+    /// `sums_avx2w` from the rows' 16-bit pairs (`gemm_avx2w_f32`'s), each pair broadcast by one load.
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn sums_avx2p<const RT: usize>(
+        x: *const i32,
+        k: usize,
+        wb: *const i16,
+    ) -> [[__m256i; 2]; RT] {
+        let mut a = [[_mm256_setzero_si256(); 2]; RT];
+        let kp = k / 2;
+        for kg in 0..k / 4 {
+            let p = wb.add(kg * 64);
+            let w = [
+                _mm256_loadu_si256(p as *const _),
+                _mm256_loadu_si256(p.add(16) as *const _),
+                _mm256_loadu_si256(p.add(32) as *const _),
+                _mm256_loadu_si256(p.add(48) as *const _),
+            ];
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x01 = _mm256_set1_epi32(*x.add(r * kp + kg * 2));
+                let x23 = _mm256_set1_epi32(*x.add(r * kp + kg * 2 + 1));
+                ar[0] = _mm256_add_epi32(
+                    ar[0],
+                    _mm256_add_epi32(_mm256_madd_epi16(x01, w[0]), _mm256_madd_epi16(x23, w[1])),
+                );
+                ar[1] = _mm256_add_epi32(
+                    ar[1],
+                    _mm256_add_epi32(_mm256_madd_epi16(x01, w[2]), _mm256_madd_epi16(x23, w[3])),
+                );
+            }
+        }
+        a
+    }
+
+    /// `sums_avxw` from the rows' 16-bit pairs (`gemm_avx2w_f32`'s).
+    #[target_feature(enable = "avx,ssse3,sse4.1")]
+    #[inline]
+    unsafe fn sums_avxp<const RT: usize>(
+        x: *const i32,
+        k: usize,
+        wb: *const i16,
+    ) -> [[__m128i; 4]; RT] {
+        let mut a = [[_mm_setzero_si128(); 4]; RT];
+        let kp = k / 2;
+        for kg in 0..k / 4 {
+            let p = wb.add(kg * 64);
+            let ld = |i: usize| _mm_loadu_si128(p.add(i * 8) as *const _);
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x01 = _mm_set1_epi32(*x.add(r * kp + kg * 2));
+                let x23 = _mm_set1_epi32(*x.add(r * kp + kg * 2 + 1));
+                for (h, ah) in ar.iter_mut().enumerate() {
+                    let (p01, p23) = ((h / 2) * 4 + h % 2, (h / 2) * 4 + 2 + h % 2);
+                    let s =
+                        _mm_add_epi32(_mm_madd_epi16(x01, ld(p01)), _mm_madd_epi16(x23, ld(p23)));
+                    *ah = _mm_add_epi32(*ah, s);
+                }
+            }
+        }
+        a
+    }
+
+    /// The AVX level's integer sums (128-bit integers): RT rows with one block of the 16-bit copy as `sums_avx2w`, its
+    /// 16 outputs in four registers of 4 (each 16-value run of the copy is two registers: its outputs 0-3, then 4-7).
+    #[target_feature(enable = "avx,ssse3,sse4.1")]
+    #[inline]
+    unsafe fn sums_avxw<const RT: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i16,
+    ) -> [[__m128i; 4]; RT] {
+        let mut a = [[_mm_setzero_si128(); 4]; RT];
+        for kg in 0..k / 4 {
+            let p = wb.add(kg * 64);
+            let ld = |i: usize| _mm_loadu_si128(p.add(i * 8) as *const _);
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x = q.add(r * k + kg * 4);
+                let x01 = _mm_set1_epi32(((*x.add(1) as i32) << 16) | *x as i32);
+                let x23 = _mm_set1_epi32(((*x.add(3) as i32) << 16) | *x.add(2) as i32);
+                // the copy's runs: outputs 0-7 with inputs 0, 1 (registers 0, 1), with 2, 3 (2, 3); 8-15 likewise
+                for (h, ah) in ar.iter_mut().enumerate() {
+                    let (p01, p23) = ((h / 2) * 4 + h % 2, (h / 2) * 4 + 2 + h % 2);
+                    let s =
+                        _mm_add_epi32(_mm_madd_epi16(x01, ld(p01)), _mm_madd_epi16(x23, ld(p23)));
+                    *ah = _mm_add_epi32(*ah, s);
+                }
+            }
+        }
+        a
+    }
+
+    #[target_feature(enable = "avx,ssse3,sse4.1")]
+    unsafe fn tile_avxw<const RT: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i16,
+        acc: *mut i32,
+        n: usize,
+    ) {
+        for (r, ar) in sums_avxw::<RT>(q, k, wb).iter().enumerate() {
+            for (h, ah) in ar.iter().enumerate() {
+                _mm_storeu_si128(acc.add(r * n + h * 4) as *mut _, *ah);
+            }
+        }
+    }
+
+    /// `gemm_u8i8` at the AVX level from the 16-bit copy: one block at a time, up to 2 rows a tile.
+    #[target_feature(enable = "avx,ssse3,sse4.1")]
+    pub(super) unsafe fn gemm_avxw(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+        let (n, k) = (w.out, w.inp);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        for ob in 0..n / 16 {
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(2);
+                let (q, a, wb) = (
+                    qp.add(r0 * k),
+                    ap.add(r0 * n + ob * 16),
+                    wp.add(ob * bstride),
+                );
+                if rt == 1 {
+                    tile_avxw::<1>(q, k, wb, a, n);
+                } else {
+                    tile_avxw::<2>(q, k, wb, a, n);
+                }
+                r0 += rt;
+            }
+        }
+    }
+
+    /// `tile512_f32`'s outputs at the AVX level: each 4 outputs' sums turned to the outputs in registers, the columns
+    /// past `out` masked.
+    #[target_feature(enable = "avx,ssse3,sse4.1")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tile_avxw_f32<const RT: usize>(
+        x: *const i32,
+        k: usize,
+        wb: *const i16,
+        y: *mut f32,
+        ystride: usize,
+        col0: usize,
+        r0: usize,
+        e: &Epi,
+    ) {
+        let s = sums_avxp::<RT>(x, k, wb);
+        let lanes = _mm_setr_epi32(0, 1, 2, 3);
+        for h in 0..4 {
+            let o = col0 + h * 4;
+            if o >= e.out {
+                break;
+            }
+            let m = _mm_cmpgt_epi32(_mm_set1_epi32((e.out - o).min(4) as i32), lanes);
+            let cs = _mm_loadu_si128(e.cs.add(o) as *const _);
+            let col = if e.col.is_null() {
+                _mm_setzero_ps()
+            } else {
+                _mm_maskload_ps(e.col.add(o), m)
+            };
+            let bias = if e.bias.is_null() {
+                _mm_setzero_ps()
+            } else {
+                _mm_maskload_ps(e.bias.add(o), m)
+            };
+            for (r, sr) in s.iter().enumerate() {
+                let (sx, zx) = *e.xs.add(if e.per_row { r0 + r } else { 0 });
+                let iv = _mm_sub_epi32(sr[h], _mm_mullo_epi32(_mm_set1_epi32(zx), cs));
+                let f = _mm_cvtepi32_ps(iv);
+                let mut f = if e.col.is_null() {
+                    _mm_mul_ps(f, _mm_set1_ps(sx * e.scale))
+                } else {
+                    _mm_mul_ps(_mm_mul_ps(_mm_set1_ps(sx), col), f)
+                };
+                if !e.bias.is_null() {
+                    f = _mm_add_ps(f, bias);
+                }
+                _mm_maskstore_ps(y.add(r * ystride + o), m, f);
+            }
+        }
+    }
+
+    /// `gemm_u8i8_f32` at the AVX level from the 16-bit copy and the rows' 16-bit pairs (`gemm_avx2w_f32`'s).
+    #[target_feature(enable = "avx,ssse3,sse4.1")]
+    pub(super) unsafe fn gemm_avxw_f32(
+        pairs: &[i32],
+        rows: usize,
+        w: &Packed,
+        e: &Epi,
+        y: &mut [f32],
+    ) {
+        let (n, k, out) = (w.out, w.inp, e.out);
+        assert!(
+            y.len() >= rows * out
+                && w.colsum.len() >= n
+                && w.wide.len() == n * k
+                && pairs.len() >= rows * k / 2
+        );
+        let (xp, yp, wp, bstride) = (pairs.as_ptr(), y.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        for ob in 0..n / 16 {
+            if ob * 16 >= out {
+                break;
+            }
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(2);
+                let (x, yr, wb) = (xp.add(r0 * k / 2), yp.add(r0 * out), wp.add(ob * bstride));
+                if rt == 1 {
+                    tile_avxw_f32::<1>(x, k, wb, yr, out, ob * 16, r0, e);
+                } else {
+                    tile_avxw_f32::<2>(x, k, wb, yr, out, ob * 16, r0, e);
+                }
+                r0 += rt;
+            }
+        }
+    }
+
+    /// `gemm_u8i8` with AVX2 alone: one block at a time, up to 4 rows a tile.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn gemm_avx2(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+        let (n, k) = (w.out, w.inp);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr(), k * 16);
+        for ob in 0..n / 16 {
+            let mut r0 = 0;
+            while r0 < rows {
+                let rt = (rows - r0).min(4);
+                let (q, a, wb) = (
+                    qp.add(r0 * k),
+                    ap.add(r0 * n + ob * 16),
+                    wp.add(ob * bstride),
+                );
+                match rt {
+                    1 => tile_avx2::<1>(q, k, wb, a, n),
+                    2 => tile_avx2::<2>(q, k, wb, a, n),
+                    3 => tile_avx2::<3>(q, k, wb, a, n),
+                    _ => tile_avx2::<4>(q, k, wb, a, n),
+                }
+                r0 += rt;
+            }
+        }
+    }
+
     #[target_feature(enable = "avx2,avxvnni")]
     pub(super) unsafe fn gemm_vnni256(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
         let (n, k) = (w.out, w.inp);
@@ -804,129 +1061,6 @@ mod x86 {
             );
             by_rows256!(rt, c, tile256, q, k, wb, bstride, a, n)
         });
-    }
-
-    /// The 64 int4 values of a block (32 bytes: value b in byte b's low nibble, value b + 32 in its high one) as
-    /// int8, values 0-31 then 32-63.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn unpack4(p: *const i8) -> (__m256i, __m256i) {
-        let v = _mm256_loadu_si256(p as *const _);
-        let m = _mm256_set1_epi8(0x0f);
-        // value + 8 as stored (0..15): the products' 8 * (row sum of the codes) comes off after (`sub_offset`)
-        (
-            _mm256_and_si256(v, m),
-            _mm256_and_si256(_mm256_srli_epi16(v, 4), m),
-        )
-    }
-
-    /// acc[r][o] -= 8 * sum_i q[r][i]: the int4 values were multiplied as stored, value + 8.
-    #[inline]
-    fn sub_offset(q: &[u8], rows: usize, k: usize, acc: &mut [i32], n: usize) {
-        for r in 0..rows {
-            let off = 8 * q[r * k..(r + 1) * k].iter().map(|&v| v as i32).sum::<i32>();
-            acc[r * n..(r + 1) * n].iter_mut().for_each(|a| *a -= off);
-        }
-    }
-
-    /// `tile512` on int4 values: each block unpacked to int8 once for the tile's rows.
-    #[target_feature(enable = "avx512f,avx512vnni,avx2")]
-    unsafe fn tile4_512<const RT: usize, const C: usize>(
-        q: *const u8,
-        k: usize,
-        wb: *const i8,
-        bstride: usize,
-        acc: *mut i32,
-        n: usize,
-    ) {
-        let mut a = [[_mm512_setzero_si512(); C]; RT];
-        for kg in 0..k / 4 {
-            let mut w = [_mm512_setzero_si512(); C];
-            for (c, wc) in w.iter_mut().enumerate() {
-                let (lo, hi) = unpack4(wb.add(c * bstride + kg * 32));
-                *wc = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
-            }
-            for (r, ar) in a.iter_mut().enumerate() {
-                let x = _mm512_set1_epi32(bcast4(q.add(r * k + kg * 4)));
-                for (ac, wc) in ar.iter_mut().zip(&w) {
-                    *ac = _mm512_dpbusd_epi32(*ac, x, *wc);
-                }
-            }
-        }
-        for (r, ar) in a.iter().enumerate() {
-            for (c, ac) in ar.iter().enumerate() {
-                _mm512_storeu_si512(acc.add(r * n + c * 16) as *mut _, *ac);
-            }
-        }
-    }
-
-    /// `gemm_vnni512` on int4 values (`Packed::nibbles`).
-    #[target_feature(enable = "avx512f,avx512vnni,avx2")]
-    pub(super) unsafe fn gemm4_vnni512(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
-        let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr(), k * 8);
-        tiles(rows, n / 16, |rt, r0, ob, c| {
-            let (q, a, wb) = (
-                qp.add(r0 * k),
-                ap.add(r0 * n + ob * 16),
-                wp.add(ob * bstride),
-            );
-            if c == 4 {
-                by_rows!(rt, tile4_512, 4, q, k, wb, bstride, a, n)
-            } else {
-                by_rows!(rt, tile4_512, 1, q, k, wb, bstride, a, n)
-            }
-        });
-        sub_offset(q, rows, k, acc, n);
-    }
-
-    /// `tile256` on int4 values: each block unpacked to int8 once for the tile's rows.
-    #[target_feature(enable = "avx2,avxvnni")]
-    unsafe fn tile4_256<const RT: usize, const C: usize>(
-        q: *const u8,
-        k: usize,
-        wb: *const i8,
-        bstride: usize,
-        acc: *mut i32,
-        n: usize,
-    ) {
-        let mut a = [[[_mm256_setzero_si256(); 2]; C]; RT];
-        for kg in 0..k / 4 {
-            let mut w = [[_mm256_setzero_si256(); 2]; C];
-            for (c, wc) in w.iter_mut().enumerate() {
-                let (lo, hi) = unpack4(wb.add(c * bstride + kg * 32));
-                *wc = [lo, hi];
-            }
-            for (r, ar) in a.iter_mut().enumerate() {
-                let x = _mm256_set1_epi32(bcast4(q.add(r * k + kg * 4)));
-                for (ac, wc) in ar.iter_mut().zip(&w) {
-                    ac[0] = _mm256_dpbusd_avx_epi32(ac[0], x, wc[0]);
-                    ac[1] = _mm256_dpbusd_avx_epi32(ac[1], x, wc[1]);
-                }
-            }
-        }
-        for (r, ar) in a.iter().enumerate() {
-            for (c, ac) in ar.iter().enumerate() {
-                _mm256_storeu_si256(acc.add(r * n + c * 16) as *mut _, ac[0]);
-                _mm256_storeu_si256(acc.add(r * n + c * 16 + 8) as *mut _, ac[1]);
-            }
-        }
-    }
-
-    /// `gemm_vnni256` on int4 values (`Packed::nibbles`).
-    #[target_feature(enable = "avx2,avxvnni")]
-    pub(super) unsafe fn gemm4_vnni256(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
-        let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr(), k * 8);
-        tiles256(rows, n / 16, |rt, r0, ob, c| {
-            let (q, a, wb) = (
-                qp.add(r0 * k),
-                ap.add(r0 * n + ob * 16),
-                wp.add(ob * bstride),
-            );
-            by_rows256!(rt, c, tile4_256, q, k, wb, bstride, a, n)
-        });
-        sub_offset(q, rows, k, acc, n);
     }
 }
 
@@ -995,7 +1129,7 @@ pub(crate) fn gelu(x: f32) -> f32 {
 
 /// sum a[i] * b[i] in 16 partial sums (vectorizes).
 #[inline(always)]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 16];
     let (ca, cb) = (a.chunks_exact(16), b.chunks_exact(16));
     let tail: f32 = ca
@@ -1010,420 +1144,6 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     acc.iter().sum::<f32>() + tail
-}
-
-#[derive(Default)]
-struct Scratch {
-    xq: Vec<u8>,
-    xs: Vec<(f32, i32)>,
-    rows: Vec<Vec<(usize, f32)>>,
-    out: Vec<f32>,
-    es: ExpertScratch,
-}
-
-/// One expert's buffers.
-#[derive(Default)]
-struct ExpertScratch {
-    gq: Vec<u8>,
-    acc: Vec<i32>,
-    h: Vec<f32>,
-    hq: Vec<u8>,
-    hs: Vec<(f32, i32)>,
-}
-
-/// One TokenMoE layer's weights, prepacked.
-pub struct MoeWeights {
-    e: usize,
-    d: usize,
-    f: usize,
-    k: usize,
-    router: Vec<f32>,
-    w1: Vec<Packed>,
-    s1: Vec<f32>,
-    b1: Vec<f32>,
-    w2: Vec<Packed>,
-    s2: Vec<f32>,
-    b2: Vec<f32>,
-    isa: Isa,
-}
-
-impl MoeWeights {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        e: usize,
-        d: usize,
-        f: usize,
-        k: usize,
-        router: Vec<f32>,
-        w1: &[i8],
-        s1: Vec<f32>,
-        b1: Vec<f32>,
-        w2: &[i8],
-        s2: Vec<f32>,
-        b2: Vec<f32>,
-    ) -> Result<Self, String> {
-        let blocked = detect_isa() != Isa::Plain;
-        Self::build(
-            e,
-            d,
-            f,
-            k,
-            router,
-            w1,
-            s1,
-            b1,
-            w2,
-            s2,
-            b2,
-            1,
-            |w, out, inp| Packed::new(w, out, inp, blocked),
-        )
-    }
-
-    /// `new` for weights already in the blocked layout (`TokenMoEBlocked`), read in place.
-    ///
-    /// # Safety
-    /// `w1` and `w2` stay valid and unchanged as long as the returned weights.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn in_place(
-        e: usize,
-        d: usize,
-        f: usize,
-        k: usize,
-        router: Vec<f32>,
-        w1: &[i8],
-        s1: Vec<f32>,
-        b1: Vec<f32>,
-        w2: &[i8],
-        s2: Vec<f32>,
-        b2: Vec<f32>,
-    ) -> Result<Self, String> {
-        if f % 16 != 0 || d % 16 != 0 {
-            return Err(format!(
-                "blocked weights need d and f in 16s (d {d}, f {f})"
-            ));
-        }
-        Self::build(
-            e,
-            d,
-            f,
-            k,
-            router,
-            w1,
-            s1,
-            b1,
-            w2,
-            s2,
-            b2,
-            1,
-            |w, out, inp| Packed::in_place(w, out, inp),
-        )
-    }
-
-    /// `in_place` for int4 weights (`TokenMoEBlocked4`): `w1` / `w2` two values a byte.
-    ///
-    /// # Safety
-    /// As `in_place`.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn in_place4(
-        e: usize,
-        d: usize,
-        f: usize,
-        k: usize,
-        router: Vec<f32>,
-        w1: &[u8],
-        s1: Vec<f32>,
-        b1: Vec<f32>,
-        w2: &[u8],
-        s2: Vec<f32>,
-        b2: Vec<f32>,
-    ) -> Result<Self, String> {
-        if f % 16 != 0 || d % 16 != 0 {
-            return Err(format!(
-                "blocked weights need d and f in 16s (d {d}, f {f})"
-            ));
-        }
-        Self::build(
-            e,
-            d,
-            f,
-            k,
-            router,
-            w1,
-            s1,
-            b1,
-            w2,
-            s2,
-            b2,
-            2,
-            |w, out, inp| Packed::in_place4(w, out, inp),
-        )
-    }
-
-    /// The weights of `e` experts from `w1` / `w2` holding `per` values an element, each expert's matrix made by
-    /// `pack`.
-    #[allow(clippy::too_many_arguments)]
-    fn build<T>(
-        e: usize,
-        d: usize,
-        f: usize,
-        k: usize,
-        router: Vec<f32>,
-        w1: &[T],
-        s1: Vec<f32>,
-        b1: Vec<f32>,
-        w2: &[T],
-        s2: Vec<f32>,
-        b2: Vec<f32>,
-        per: usize,
-        pack: impl Fn(&[T], usize, usize) -> Packed,
-    ) -> Result<Self, String> {
-        let want = [
-            ("router", router.len(), e * d),
-            ("w1", w1.len() * per, e * f * d),
-            ("s1", s1.len(), e * f),
-            ("b1", b1.len(), e * f),
-            ("w2", w2.len() * per, e * d * f),
-            ("s2", s2.len(), e * d),
-            ("b2", b2.len(), e * d),
-        ];
-        for (name, got, n) in want {
-            if got != n {
-                return Err(format!(
-                    "{name} has {got} values, expected {n} (E {e}, d {d}, f {f})"
-                ));
-            }
-        }
-        if !(1..=e).contains(&k) {
-            return Err(format!("k {k} with {e} experts"));
-        }
-        let isa = detect_isa();
-        let m = f * d / per;
-        let w1 = (0..e)
-            .map(|i| pack(&w1[i * m..(i + 1) * m], f, d))
-            .collect();
-        let w2 = (0..e)
-            .map(|i| pack(&w2[i * m..(i + 1) * m], d, f))
-            .collect();
-        Ok(MoeWeights {
-            e,
-            d,
-            f,
-            k,
-            router,
-            w1,
-            s1,
-            b1,
-            w2,
-            s2,
-            b2,
-            isa,
-        })
-    }
-
-    fn forward(&self, x: &[f32], y: &mut [f32], s: &mut Scratch) {
-        self.forward_in(x, y, s, pool())
-    }
-
-    /// `forward` with the experts on `pool` (None: one after another).
-    fn forward_in(
-        &self,
-        x: &[f32],
-        y: &mut [f32],
-        s: &mut Scratch,
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        match self.isa {
-            // AVX-512 VNNI CPUs: the routing, quantization and GELU loops 16 wide
-            Isa::Vnni512 => return unsafe { self.forward_avx512(x, y, s, pool) },
-            // every AVX-VNNI CPU has AVX2 and FMA: 8 wide
-            Isa::Vnni256 => return unsafe { self.forward_avx2(x, y, s, pool) },
-            Isa::Dot | Isa::Plain => {}
-        }
-        self.forward_body(x, y, s, pool)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
-    unsafe fn forward_avx512(
-        &self,
-        x: &[f32],
-        y: &mut [f32],
-        s: &mut Scratch,
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        self.forward_body(x, y, s, pool)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn forward_avx2(
-        &self,
-        x: &[f32],
-        y: &mut [f32],
-        s: &mut Scratch,
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        self.forward_body(x, y, s, pool)
-    }
-
-    #[inline(always)]
-    fn forward_body(
-        &self,
-        x: &[f32],
-        y: &mut [f32],
-        s: &mut Scratch,
-        pool: Option<&rayon::ThreadPool>,
-    ) {
-        let (e, d, k) = (self.e, self.d, self.k);
-        let n = x.len() / d;
-        y.fill(0.0);
-        route(x, &self.router, e, d, k, &mut s.rows);
-        // the frames' u8 codes, once for every expert they go to
-        s.xq.resize(n * d, 0);
-        s.xs.clear();
-        for r in 0..n {
-            let qs = quantize_row(&x[r * d..(r + 1) * d], &mut s.xq[r * d..(r + 1) * d]);
-            s.xs.push(qs);
-        }
-        let active: Vec<usize> = (0..e).filter(|&ex| !s.rows[ex].is_empty()).collect();
-        let Scratch {
-            rows,
-            xq,
-            xs,
-            out,
-            es,
-        } = s;
-        match pool {
-            // the experts on the pool, each into its own buffer, then added in expert order as below: the same sums
-            Some(p) if active.len() > 1 => {
-                let outs: Vec<Vec<f32>> = p.install(|| {
-                    active
-                        .par_iter()
-                        .map(|&ex| {
-                            let mut o = vec![0f32; rows[ex].len() * d];
-                            let mut sc = ExpertScratch::default();
-                            self.expert(ex, &rows[ex], xq, xs, &mut o, &mut sc);
-                            o
-                        })
-                        .collect()
-                });
-                for (&ex, o) in active.iter().zip(&outs) {
-                    add_routed(y, &rows[ex], o, d);
-                }
-            }
-            _ => {
-                for &ex in &active {
-                    out.resize(rows[ex].len() * d, 0.0);
-                    self.expert(ex, &rows[ex], xq, xs, out, es);
-                    add_routed(y, &rows[ex], out, d);
-                }
-            }
-        }
-    }
-
-    /// Expert `ex` on its routed frames (`routed`: frame, weight; `xq` / `xs` every frame's u8 codes, scale and zero
-    /// point): its output for each, unweighted, into `out` (m x d).
-    fn expert(
-        &self,
-        ex: usize,
-        routed: &[(usize, f32)],
-        xq: &[u8],
-        xs: &[(f32, i32)],
-        out: &mut [f32],
-        s: &mut ExpertScratch,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        match self.isa {
-            Isa::Vnni512 => return unsafe { self.expert_avx512(ex, routed, xq, xs, out, s) },
-            Isa::Vnni256 => return unsafe { self.expert_avx2(ex, routed, xq, xs, out, s) },
-            Isa::Dot | Isa::Plain => {}
-        }
-        self.expert_body(ex, routed, xq, xs, out, s)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
-    unsafe fn expert_avx512(
-        &self,
-        ex: usize,
-        routed: &[(usize, f32)],
-        xq: &[u8],
-        xs: &[(f32, i32)],
-        out: &mut [f32],
-        s: &mut ExpertScratch,
-    ) {
-        self.expert_body(ex, routed, xq, xs, out, s)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn expert_avx2(
-        &self,
-        ex: usize,
-        routed: &[(usize, f32)],
-        xq: &[u8],
-        xs: &[(f32, i32)],
-        out: &mut [f32],
-        s: &mut ExpertScratch,
-    ) {
-        self.expert_body(ex, routed, xq, xs, out, s)
-    }
-
-    #[inline(always)]
-    fn expert_body(
-        &self,
-        ex: usize,
-        routed: &[(usize, f32)],
-        xq: &[u8],
-        xs: &[(f32, i32)],
-        out: &mut [f32],
-        s: &mut ExpertScratch,
-    ) {
-        let (d, f) = (self.d, self.f);
-        let m = routed.len();
-        s.gq.resize(m * d, 0);
-        for (i, &(r, _)) in routed.iter().enumerate() {
-            s.gq[i * d..(i + 1) * d].copy_from_slice(&xq[r * d..(r + 1) * d]);
-        }
-        s.acc.resize(m * f.max(d), 0);
-        let w1 = &self.w1[ex];
-        gemm_u8i8(self.isa, &s.gq, m, w1, &mut s.acc);
-        s.h.resize(m * f, 0.0);
-        let (s1, b1) = (
-            &self.s1[ex * f..(ex + 1) * f],
-            &self.b1[ex * f..(ex + 1) * f],
-        );
-        for (i, &(r, _)) in routed.iter().enumerate() {
-            let (sx, zx) = xs[r];
-            let (acc, h) = (&s.acc[i * f..(i + 1) * f], &mut s.h[i * f..(i + 1) * f]);
-            for ((((hv, &a), &c), &sc), &b) in h.iter_mut().zip(acc).zip(&w1.colsum).zip(s1).zip(b1)
-            {
-                *hv = gelu(sx * sc * (a - zx * c) as f32 + b);
-            }
-        }
-        s.hq.resize(m * f, 0);
-        s.hs.clear();
-        for i in 0..m {
-            let qs = quantize_row(&s.h[i * f..(i + 1) * f], &mut s.hq[i * f..(i + 1) * f]);
-            s.hs.push(qs);
-        }
-        let w2 = &self.w2[ex];
-        gemm_u8i8(self.isa, &s.hq, m, w2, &mut s.acc);
-        let (s2, b2) = (
-            &self.s2[ex * d..(ex + 1) * d],
-            &self.b2[ex * d..(ex + 1) * d],
-        );
-        for i in 0..m {
-            let (sh, zh) = s.hs[i];
-            let (acc, o) = (&s.acc[i * d..(i + 1) * d], &mut out[i * d..(i + 1) * d]);
-            for ((((ov, &a), &c), &sc), &b) in o.iter_mut().zip(acc).zip(&w2.colsum).zip(s2).zip(b2)
-            {
-                *ov = sh * sc * (a - zh * c) as f32 + b;
-            }
-        }
-    }
 }
 
 /// Each frame of `x` (n, d) routed to the top-`k` of its router logits (`router` (e, d)), with the softmax over the k
@@ -1479,31 +1199,6 @@ pub(crate) fn add_routed(y: &mut [f32], routed: &[(usize, f32)], out: &[f32], d:
     }
 }
 
-/// Threads a layer's experts are spread over (`set_threads`: the session's intra-op threads); 1, one after another.
-static THREADS: AtomicUsize = AtomicUsize::new(1);
-static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-
-/// The experts' threads, set before the first conversion: a pool of `n` (n > 1) is built at the first one.
-pub fn set_threads(n: usize) {
-    THREADS.store(n.max(1), Ordering::Relaxed);
-}
-
-fn pool() -> Option<&'static rayon::ThreadPool> {
-    POOL.get_or_init(|| {
-        let n = THREADS.load(Ordering::Relaxed);
-        (n > 1)
-            .then(|| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .thread_name(|i| format!("setsuna-moe-{i}"))
-                    .build()
-                    .ok()
-            })
-            .flatten()
-    })
-    .as_ref()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1532,6 +1227,101 @@ mod tests {
         (q, s)
     }
 
+    /// `gemm_u8i8_f32` on the CPU's ISA against its plain pass, the same bits: both epilogues (one scale with a
+    /// bias or none, a scale an output with a bias), one pair of scales for all rows or one a row, outputs not in 16s
+    /// (the last block masked), 1 to 13 rows.
+    #[test]
+    fn gemm_f32_gives_the_plain_epilogues_bits() {
+        let mut rng = Rng(23);
+        let isa = detect_isa();
+        for (out, inp) in [(70usize, 64usize), (8006, 192), (16, 4), (33, 96)] {
+            let stride = out.div_ceil(16) * 16;
+            let w: Vec<f32> = (0..out * inp).map(|_| rng.next()).collect();
+            let (mut q8, _) = quantize_rows(&w, out, inp);
+            q8.resize(stride * inp, 0);
+            let packed = Packed::new(&q8, stride, inp, isa != Isa::Plain);
+            let wide = Packed::new(&q8, stride, inp, true).with_wide();
+            let col: Vec<f32> = (0..out).map(|_| 0.01 + rng.next().abs() * 0.02).collect();
+            let bias: Vec<f32> = (0..out).map(|_| rng.next()).collect();
+            for rows in [1usize, 6, 7, 13] {
+                let q: Vec<u8> = (0..rows * inp)
+                    .map(|_| ((rng.next() + 1.0) * 127.5) as u8)
+                    .collect();
+                let xs: Vec<(f32, i32)> = (0..rows)
+                    .map(|_| {
+                        (
+                            0.02 + rng.next().abs() * 0.01,
+                            (rng.next().abs() * 255.0) as i32,
+                        )
+                    })
+                    .collect();
+                let cases: [Epilogue; 4] = [
+                    Epilogue {
+                        xs: &xs[..1],
+                        col: None,
+                        scale: 0.013,
+                        bias: None,
+                        out,
+                    },
+                    Epilogue {
+                        xs: &xs[..1],
+                        col: None,
+                        scale: 0.013,
+                        bias: Some(&bias),
+                        out,
+                    },
+                    Epilogue {
+                        xs: &xs,
+                        col: Some(&col),
+                        scale: 0.0,
+                        bias: Some(&bias),
+                        out,
+                    },
+                    Epilogue {
+                        xs: &xs,
+                        col: Some(&col),
+                        scale: 0.0,
+                        bias: None,
+                        out,
+                    },
+                ];
+                for (i, e) in cases.iter().enumerate() {
+                    let (mut got, mut want) = (vec![f32::NAN; rows * out], vec![0f32; rows * out]);
+                    let (mut a1, mut a2) = (Vec::new(), Vec::new());
+                    gemm_u8i8_f32(isa, &q, rows, &packed, e, &mut a1, &mut got);
+                    gemm_u8i8_f32(Isa::Plain, &q, rows, &packed, e, &mut a2, &mut want);
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "out {out} inp {inp} rows {rows} case {i}"
+                    );
+                    // the AVX2 level's kernel from the 16-bit copy, where this CPU has AVX2
+                    #[cfg(target_arch = "x86_64")]
+                    if isa != Isa::Plain && std::arch::is_x86_feature_detected!("avx2") {
+                        let mut got = vec![f32::NAN; rows * out];
+                        gemm_u8i8_f32(Isa::Avx2, &q, rows, &wide, e, &mut a1, &mut got);
+                        assert_eq!(
+                            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "AVX2 from 16 bits, out {out} inp {inp} rows {rows} case {i}"
+                        );
+                    }
+                    // and the AVX level's (128-bit integers)
+                    #[cfg(target_arch = "x86_64")]
+                    if isa != Isa::Plain && std::arch::is_x86_feature_detected!("avx") {
+                        let mut got = vec![f32::NAN; rows * out];
+                        gemm_u8i8_f32(Isa::Avx, &q, rows, &wide, e, &mut a1, &mut got);
+                        assert_eq!(
+                            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "AVX from 16 bits, out {out} inp {inp} rows {rows} case {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_isa_gives_the_same_integer_sums() {
         let mut rng = Rng(7);
@@ -1555,10 +1345,9 @@ mod tests {
             let mut got = vec![0i32; rows * out];
             gemm_plain(&q, rows, &p, &mut got);
             assert_eq!(got, want, "plain on blocked, rows {rows}");
-            for isa in [Isa::Vnni512, Isa::Vnni256, Isa::Dot] {
+            for isa in [Isa::Vnni512, Isa::Vnni256, Isa::Avx2] {
                 if detect_isa() == Isa::Plain
                     || (isa == Isa::Vnni512 && detect_isa() != Isa::Vnni512)
-                    || (isa == Isa::Dot && detect_isa() != Isa::Dot)
                 {
                     continue;
                 }
@@ -1566,170 +1355,28 @@ mod tests {
                 if isa == Isa::Vnni256 && !std::arch::is_x86_feature_detected!("avxvnni") {
                     continue;
                 }
-                let mut got = vec![0i32; rows * out];
-                gemm_u8i8(isa, &q, rows, &p, &mut got);
-                assert_eq!(got, want, "{isa:?} rows {rows}");
-            }
-        }
-    }
-
-    /// `TokenMoEBlocked`: weights written blocked and read in place give the outputs of `TokenMoE` on the same
-    /// weights as rows.
-    #[test]
-    fn blocked_weights_read_in_place_match_the_row_weights() {
-        let mut rng = Rng(5);
-        let (e, d, f, k, n) = (4, 64, 80, 2, 17);
-        let router: Vec<f32> = (0..e * d).map(|_| rng.next()).collect();
-        let w1f: Vec<f32> = (0..e * f * d).map(|_| rng.next() * 0.3).collect();
-        let w2f: Vec<f32> = (0..e * d * f).map(|_| rng.next() * 0.3).collect();
-        let b1: Vec<f32> = (0..e * f).map(|_| rng.next() * 0.1).collect();
-        let b2: Vec<f32> = (0..e * d).map(|_| rng.next() * 0.1).collect();
-        let (w1, s1) = quantize_rows(&w1f, e * f, d);
-        let (w2, s2) = quantize_rows(&w2f, e * d, f);
-        // each expert's matrix blocked as an export writes it
-        let block = |w: &[i8], out: usize, inp: usize| -> Vec<i8> {
-            (0..e)
-                .flat_map(|i| {
-                    Packed::new(&w[i * out * inp..(i + 1) * out * inp], out, inp, true)
-                        .blocked
-                        .to_vec()
-                })
-                .collect()
-        };
-        let (w1b, w2b) = (block(&w1, f, d), block(&w2, d, f));
-        let rows = MoeWeights::new(
-            e,
-            d,
-            f,
-            k,
-            router.clone(),
-            &w1,
-            s1.clone(),
-            b1.clone(),
-            &w2,
-            s2.clone(),
-            b2.clone(),
-        )
-        .unwrap();
-        let blocked =
-            unsafe { MoeWeights::in_place(e, d, f, k, router, &w1b, s1, b1, &w2b, s2, b2) }
-                .unwrap();
-        let x: Vec<f32> = (0..n * d).map(|_| rng.next()).collect();
-        let (mut ya, mut yb) = (vec![0f32; n * d], vec![0f32; n * d]);
-        rows.forward(&x, &mut ya, &mut Scratch::default());
-        blocked.forward(&x, &mut yb, &mut Scratch::default());
-        assert_eq!(ya, yb);
-        for (a, b) in rows.w1.iter().zip(&blocked.w1) {
-            assert_eq!(a.colsum, b.colsum);
-        }
-    }
-
-    /// int8 values in -8..=7 written as `TokenMoEBlocked4` writes them: blocked, each 64-value block as 32 bytes,
-    /// value b in byte b's low nibble and value b + 32 in its high one.
-    pub(super) fn nibble_pack(w: &[i8], out: usize, inp: usize) -> Vec<u8> {
-        let b = Packed::new(w, out, inp, true);
-        b.blocked
-            .chunks(64)
-            .flat_map(|blk| {
-                (0..32).map(move |i| ((blk[i] + 8) as u8 & 0x0f) | (((blk[i + 32] + 8) as u8) << 4))
-            })
-            .collect()
-    }
-
-    #[test]
-    fn int4_weights_give_the_int8_paths_sums() {
-        let mut rng = Rng(9);
-        let (out, inp) = (80, 40);
-        let w: Vec<i8> = (0..out * inp)
-            .map(|_| ((rng.next() * 8.0) as i8).clamp(-8, 7))
-            .collect();
-        let raw = Packed::new(&w, out, inp, false);
-        let bytes = nibble_pack(&w, out, inp);
-        let p = unsafe { Packed::in_place4(&bytes, out, inp) };
-        assert_eq!(p.colsum, raw.colsum);
-        for o in 0..out {
-            for i in 0..inp {
-                assert_eq!(p.at(o, i), w[o * inp + i], "value {o} {i}");
-            }
-        }
-        for rows in [1, 3, 8, 9, 13] {
-            let q: Vec<u8> = (0..rows * inp)
-                .map(|_| ((rng.next() + 1.0) * 127.0) as u8)
-                .collect();
-            let mut want = vec![0i32; rows * out];
-            gemm_plain(&q, rows, &raw, &mut want);
-            for isa in [Isa::Plain, Isa::Vnni512, Isa::Vnni256, Isa::Dot] {
-                if (isa == Isa::Vnni512 || isa == Isa::Dot) && detect_isa() != isa {
-                    continue;
-                }
                 #[cfg(target_arch = "x86_64")]
-                if isa == Isa::Vnni256 && !std::arch::is_x86_feature_detected!("avxvnni") {
+                if isa == Isa::Avx2
+                    && !(std::arch::is_x86_feature_detected!("avx2")
+                        && std::arch::is_x86_feature_detected!("fma"))
+                {
                     continue;
                 }
                 let mut got = vec![0i32; rows * out];
                 gemm_u8i8(isa, &q, rows, &p, &mut got);
                 assert_eq!(got, want, "{isa:?} rows {rows}");
+                if isa == Isa::Avx2 {
+                    // the 16-bit copy's kernel too (a CPU at the AVX2 level packs it)
+                    let pw = Packed::new(&w, out, inp, true).with_wide();
+                    let mut got = vec![0i32; rows * out];
+                    gemm_u8i8(isa, &q, rows, &pw, &mut got);
+                    assert_eq!(got, want, "AVX2 from 16 bits, rows {rows}");
+                    // and the AVX level's kernel on it
+                    let mut got = vec![0i32; rows * out];
+                    gemm_u8i8(Isa::Avx, &q, rows, &pw, &mut got);
+                    assert_eq!(got, want, "AVX from 16 bits, rows {rows}");
+                }
             }
-        }
-    }
-
-    /// `TokenMoEBlocked4` gives `TokenMoE`'s outputs on the same int4-valued weights.
-    #[test]
-    fn int4_experts_match_the_int8_kernel_on_the_same_values() {
-        let mut rng = Rng(13);
-        let (e, d, f, k, n) = (4, 64, 80, 2, 19);
-        let router: Vec<f32> = (0..e * d).map(|_| rng.next()).collect();
-        let int4 = |len: usize, rng: &mut Rng| -> Vec<i8> {
-            (0..len)
-                .map(|_| ((rng.next() * 8.0) as i8).clamp(-7, 7))
-                .collect()
-        };
-        let (w1, w2) = (int4(e * f * d, &mut rng), int4(e * d * f, &mut rng));
-        let s1: Vec<f32> = (0..e * f)
-            .map(|_| (rng.next().abs() + 0.1) * 0.05)
-            .collect();
-        let s2: Vec<f32> = (0..e * d)
-            .map(|_| (rng.next().abs() + 0.1) * 0.05)
-            .collect();
-        let b1: Vec<f32> = (0..e * f).map(|_| rng.next() * 0.1).collect();
-        let b2: Vec<f32> = (0..e * d).map(|_| rng.next() * 0.1).collect();
-        let pack_all = |w: &[i8], out: usize, inp: usize| -> Vec<u8> {
-            (0..e)
-                .flat_map(|i| nibble_pack(&w[i * out * inp..(i + 1) * out * inp], out, inp))
-                .collect()
-        };
-        let (w1b, w2b) = (pack_all(&w1, f, d), pack_all(&w2, d, f));
-        let rows = MoeWeights::new(
-            e,
-            d,
-            f,
-            k,
-            router.clone(),
-            &w1,
-            s1.clone(),
-            b1.clone(),
-            &w2,
-            s2.clone(),
-            b2.clone(),
-        )
-        .unwrap();
-        let nib = unsafe { MoeWeights::in_place4(e, d, f, k, router, &w1b, s1, b1, &w2b, s2, b2) }
-            .unwrap();
-        let x: Vec<f32> = (0..n * d).map(|_| rng.next()).collect();
-        let (mut ya, mut yb) = (vec![0f32; n * d], vec![0f32; n * d]);
-        rows.forward(&x, &mut ya, &mut Scratch::default());
-        nib.forward(&x, &mut yb, &mut Scratch::default());
-        assert_eq!(ya, yb);
-        // the experts on a pool add up as one after another, bit for bit
-        let p = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        for moe in [&rows, &nib] {
-            let (mut serial, mut pooled) = (vec![0f32; n * d], vec![0f32; n * d]);
-            moe.forward_in(&x, &mut serial, &mut Scratch::default(), None);
-            moe.forward_in(&x, &mut pooled, &mut Scratch::default(), Some(&p));
-            assert_eq!(serial, pooled);
         }
     }
 
@@ -1813,292 +1460,5 @@ mod tests {
                 assert_eq!(a, b, "len {len} case {case}");
             }
         }
-    }
-
-    /// The kernel against an fp32 MoE with the dequantized weights: top-2 of the same logits, exact GELU.
-    #[test]
-    fn kernel_matches_the_fp32_moe_of_its_weights() {
-        let mut rng = Rng(11);
-        let (e, d, f, k, n) = (6, 64, 80, 2, 23);
-        let router: Vec<f32> = (0..e * d).map(|_| rng.next()).collect();
-        let w1f: Vec<f32> = (0..e * f * d).map(|_| rng.next() * 0.3).collect();
-        let w2f: Vec<f32> = (0..e * d * f).map(|_| rng.next() * 0.3).collect();
-        let b1: Vec<f32> = (0..e * f).map(|_| rng.next() * 0.1).collect();
-        let b2: Vec<f32> = (0..e * d).map(|_| rng.next() * 0.1).collect();
-        let (w1, s1) = quantize_rows(&w1f, e * f, d);
-        let (w2, s2) = quantize_rows(&w2f, e * d, f);
-        let moe = MoeWeights::new(
-            e,
-            d,
-            f,
-            k,
-            router.clone(),
-            &w1,
-            s1.clone(),
-            b1.clone(),
-            &w2,
-            s2.clone(),
-            b2.clone(),
-        )
-        .unwrap();
-        let x: Vec<f32> = (0..n * d).map(|_| rng.next()).collect();
-        let mut y = vec![0f32; n * d];
-        moe.forward(&x, &mut y, &mut Scratch::default());
-        let deq = |q: &[i8], s: &[f32], cols: usize| -> Vec<f32> {
-            q.iter()
-                .enumerate()
-                .map(|(i, &v)| v as f32 * s[i / cols])
-                .collect()
-        };
-        let (w1d, w2d) = (deq(&w1, &s1, d), deq(&w2, &s2, f));
-        let mut worst = 0f32;
-        for r in 0..n {
-            let xr = &x[r * d..(r + 1) * d];
-            let logits: Vec<f32> = (0..e)
-                .map(|j| {
-                    xr.iter()
-                        .zip(&router[j * d..(j + 1) * d])
-                        .map(|(a, b)| a * b)
-                        .sum()
-                })
-                .collect();
-            let mut idx: Vec<usize> = (0..e).collect();
-            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-            let top = &idx[..k];
-            let z: f32 = top
-                .iter()
-                .map(|&j| (logits[j] - logits[top[0]]).exp())
-                .sum();
-            let mut want = vec![0f32; d];
-            for &j in top {
-                let wt = (logits[j] - logits[top[0]]).exp() / z;
-                let h: Vec<f32> = (0..f)
-                    .map(|o| {
-                        let w = &w1d[(j * f + o) * d..(j * f + o + 1) * d];
-                        gelu(xr.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() + b1[j * f + o])
-                    })
-                    .collect();
-                for o in 0..d {
-                    let w = &w2d[(j * d + o) * f..(j * d + o + 1) * f];
-                    want[o] +=
-                        wt * (h.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() + b2[j * d + o]);
-                }
-            }
-            let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
-            for o in 0..d {
-                worst = worst.max((y[r * d + o] - want[o]).abs() / scale);
-            }
-        }
-        // u8 activations on both Linears: about 1% of the output's range
-        assert!(worst < 0.03, "worst relative error {worst}");
-    }
-}
-
-#[cfg(test)]
-mod timing {
-    use super::*;
-    use std::time::Instant;
-
-    /// M-tok's layer shape (E 16, d 512, f 1024, top-2) on 30 frames: the kernel and its parts, median of 200.
-    /// cargo test -p setsuna-engine --release --lib moe_op::timing -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn mtok_layer_time() {
-        let (e, d, f, k, n) = (16, 512, 1024, 2, 30);
-        let mut seed = 5u64;
-        let mut rnd = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
-        };
-        let router: Vec<f32> = (0..e * d).map(|_| rnd()).collect();
-        let w1: Vec<i8> = (0..e * f * d).map(|_| (rnd() * 127.0) as i8).collect();
-        let w2: Vec<i8> = (0..e * d * f).map(|_| (rnd() * 127.0) as i8).collect();
-        let s1 = vec![0.001f32; e * f];
-        let s2 = vec![0.001f32; e * d];
-        let (b1, b2) = (vec![0.0f32; e * f], vec![0.0f32; e * d]);
-        let moe = MoeWeights::new(e, d, f, k, router, &w1, s1, b1, &w2, s2, b2).unwrap();
-        let x: Vec<f32> = (0..n * d).map(|_| rnd()).collect();
-        let mut y = vec![0f32; n * d];
-        let mut s = Scratch::default();
-        let med = |mut t: Vec<f64>| {
-            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            t[t.len() / 2] * 1e3
-        };
-        let mut t = Vec::new();
-        for _ in 0..200 {
-            let a = Instant::now();
-            moe.forward(&x, &mut y, &mut s);
-            t.push(a.elapsed().as_secs_f64());
-        }
-        println!("isa {:?}: forward {:.3} ms", moe.isa, med(t));
-        let q: Vec<u8> = (0..8 * d).map(|i| (i % 251) as u8).collect();
-        let mut acc = vec![0i32; 8 * f];
-        for rows in [4usize, 8] {
-            let mut t = Vec::new();
-            for _ in 0..200 {
-                let a = Instant::now();
-                for ex in 0..e {
-                    gemm_u8i8(moe.isa, &q, rows, &moe.w1[ex], &mut acc);
-                }
-                t.push(a.elapsed().as_secs_f64());
-            }
-            println!("  gemm1 x16 experts, {rows} rows: {:.3} ms", med(t));
-        }
-        let h: Vec<f32> = (0..60 * f).map(|_| rnd() * 3.0).collect();
-        let mut t = Vec::new();
-        let mut sink = 0f32;
-        for _ in 0..200 {
-            let a = Instant::now();
-            for &v in &h {
-                sink += gelu(v);
-            }
-            t.push(a.elapsed().as_secs_f64());
-        }
-        println!("  gelu on 60 x {f}: {:.3} ms ({sink})", med(t));
-        // the expert's dequantize + GELU loop as `expert_body` runs it (AVX-512 enabled), 120 rows of f
-        #[cfg(target_arch = "x86_64")]
-        if moe.isa == Isa::Vnni512 {
-            #[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
-            unsafe fn dequant_gelu(
-                acc: &[i32],
-                colsum: &[i32],
-                s: &[f32],
-                b: &[f32],
-                h: &mut [f32],
-            ) {
-                for ((((hv, &a), &c), &sc), &bv) in h.iter_mut().zip(acc).zip(colsum).zip(s).zip(b)
-                {
-                    *hv = gelu(0.01 * sc * (a - 3 * c) as f32 + bv);
-                }
-            }
-            let acc: Vec<i32> = (0..f).map(|i| (i as i32 % 2001) - 1000).collect();
-            let colsum: Vec<i32> = (0..f).map(|i| i as i32 % 7).collect();
-            let (sc, bv) = (vec![0.01f32; f], vec![0.1f32; f]);
-            let mut h = vec![0f32; f];
-            let mut t = Vec::new();
-            for _ in 0..200 {
-                let a = Instant::now();
-                for _ in 0..120 {
-                    unsafe { dequant_gelu(&acc, &colsum, &sc, &bv, &mut h) };
-                    sink += h[3];
-                }
-                t.push(a.elapsed().as_secs_f64());
-            }
-            println!(
-                "  dequantize + gelu, 120 x {f} as in expert_body: {:.3} ms ({sink})",
-                med(t)
-            );
-            #[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
-            unsafe fn quantize(h: &[f32], q: &mut [u8]) -> (f32, i32) {
-                quantize_row(h, q)
-            }
-            let hv: Vec<f32> = (0..f)
-                .map(|i| ((i * 37 % 1001) as f32 - 500.0) * 0.01)
-                .collect();
-            let mut hq = vec![0u8; f];
-            let mut t = Vec::new();
-            let mut zs = 0i32;
-            for _ in 0..200 {
-                let a = Instant::now();
-                for _ in 0..120 {
-                    zs += unsafe { quantize(&hv, &mut hq) }.1;
-                }
-                t.push(a.elapsed().as_secs_f64());
-            }
-            println!("  quantize_row, 120 x {f}: {:.3} ms ({zs})", med(t));
-        }
-
-        // int4 values (TokenMoEBlocked4) on more frames: the whole forward, and its two GEMMs over every expert
-        let w1: Vec<i8> = w1.iter().map(|&v| (v / 16).clamp(-8, 7)).collect();
-        let w2: Vec<i8> = w2.iter().map(|&v| (v / 16).clamp(-8, 7)).collect();
-        let pack = |w: &[i8], out: usize, inp: usize| -> Vec<u8> {
-            (0..e)
-                .flat_map(|i| {
-                    super::tests::nibble_pack(&w[i * out * inp..(i + 1) * out * inp], out, inp)
-                })
-                .collect()
-        };
-        let (w1b, w2b) = (pack(&w1, f, d), pack(&w2, d, f));
-        let router: Vec<f32> = (0..e * d).map(|_| rnd()).collect();
-        let nib = unsafe {
-            MoeWeights::in_place4(
-                e,
-                d,
-                f,
-                k,
-                router,
-                &w1b,
-                vec![0.01f32; e * f],
-                vec![0.0f32; e * f],
-                &w2b,
-                vec![0.01f32; e * d],
-                vec![0.0f32; e * d],
-            )
-        }
-        .unwrap();
-        let xs: Vec<Vec<f32>> = [10usize, 30, 60, 100]
-            .iter()
-            .map(|&n| (0..n * d).map(|_| rnd()).collect())
-            .collect();
-        let q: Vec<u8> = (0..16 * f).map(|i| (i % 251) as u8).collect();
-        let mut acc = vec![0i32; 16 * f];
-        // single 16-output blocks (the kernel before 4-block tiles), then the tiles
-        for one in [true, false] {
-            ONE_BLOCK.store(one, std::sync::atomic::Ordering::Relaxed);
-            println!("{} blocks a tile:", if one { 1 } else { 4 });
-            let mut t = Vec::new();
-            for _ in 0..200 {
-                let a = Instant::now();
-                moe.forward(&xs[1], &mut y, &mut s);
-                t.push(a.elapsed().as_secs_f64());
-            }
-            println!("  int8 forward, 30 frames: {:.3} ms", med(t));
-            for x in &xs {
-                let n = x.len() / d;
-                let mut y = vec![0f32; n * d];
-                let mut t = Vec::new();
-                for _ in 0..200 {
-                    let a = Instant::now();
-                    nib.forward(x, &mut y, &mut s);
-                    t.push(a.elapsed().as_secs_f64());
-                }
-                println!("  int4 forward, {n} frames: {:.3} ms", med(t));
-            }
-            for rows in [2usize, 4, 6, 8, 16] {
-                let (mut t1, mut t2) = (Vec::new(), Vec::new());
-                for _ in 0..200 {
-                    let a = Instant::now();
-                    for ex in 0..e {
-                        gemm_u8i8(nib.isa, &q, rows, &nib.w1[ex], &mut acc);
-                    }
-                    t1.push(a.elapsed().as_secs_f64());
-                    let a = Instant::now();
-                    for ex in 0..e {
-                        gemm_u8i8(nib.isa, &q, rows, &nib.w2[ex], &mut acc);
-                    }
-                    t2.push(a.elapsed().as_secs_f64());
-                }
-                println!(
-                    "  int4 gemm1 / gemm2 x16 experts, {rows} rows: {:.3} / {:.3} ms",
-                    med(t1),
-                    med(t2)
-                );
-                #[cfg(target_arch = "x86_64")]
-                if std::arch::is_x86_feature_detected!("avxvnni") {
-                    let mut t = Vec::new();
-                    for _ in 0..200 {
-                        let a = Instant::now();
-                        for ex in 0..e {
-                            gemm_u8i8(Isa::Vnni256, &q, rows, &nib.w1[ex], &mut acc);
-                        }
-                        t.push(a.elapsed().as_secs_f64());
-                    }
-                    println!("    the same gemm1 on AVX-VNNI (256): {:.3} ms", med(t));
-                }
-            }
-        }
-        ONE_BLOCK.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
