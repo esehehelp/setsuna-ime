@@ -548,7 +548,7 @@ function Remove-StaleFiles {
         (-not $NoElevate -and $_.Name -eq $DllName) -or
         $_.Extension -eq '.lexicon' })
     $stale += @(Get-ChildItem -LiteralPath $InstallDir -Directory | Where-Object { $_.Name -match '^rerank(_[0-9a-f]{12})?$' })
-    foreach ($sub in 'models\onnx', 'models\lexicon', 'models\rerank') {
+    foreach ($sub in 'models\onnx', 'models\lexicon', 'models\rerank', 'models\corrector') {
         $dir = Join-Path $InstallDir $sub
         if (Test-Path -LiteralPath $dir) { $stale += @(Get-ChildItem -LiteralPath $dir -File -Recurse) }
     }
@@ -1327,6 +1327,10 @@ $InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInst
                     $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled,
                     $CorrectorInstalled)
 $InstalledFiles += @($ArtifactFiles | ForEach-Object { Join-Path $ModelDstDir $_ })
+# the reading corrector's files, one by one (an earlier package's other file beside them goes)
+if ($CorrectorInstalled) {
+    $InstalledFiles += @($CorrectorFiles | ForEach-Object { Join-Path (Split-Path -Parent $CorrectorInstalled) $_ })
+}
 try {
     Remove-StaleFiles -Keep $InstalledFiles -ConfigPath $ConfigPath
 } catch {
