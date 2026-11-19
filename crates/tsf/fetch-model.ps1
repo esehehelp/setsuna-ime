@@ -186,6 +186,18 @@ if ($manifest.proposal.external_data) { $artifacts += @($manifest.proposal.exter
 if ($manifest.input_vocab) { $artifacts += @($manifest.input_vocab) }
 if ($manifest.crf) { $artifacts += @($manifest.crf.path) }
 foreach ($table in @($manifest.rescore.pairs, $manifest.rescore.words)) { if ($table) { $artifacts += $table } }
+# the engine's own weights; an AR decoder's step; a bundled reading corrector
+if ($manifest.proposal.native) { $artifacts += @($manifest.proposal.native.path) }
+if ($manifest.ar_decoder) {
+    $artifacts += @($manifest.ar_decoder.step.path)
+    if ($manifest.ar_decoder.step.external_data) { $artifacts += @($manifest.ar_decoder.step.external_data) }
+    if ($manifest.ar_decoder.native) { $artifacts += @($manifest.ar_decoder.native.path) }
+}
+if ($manifest.corrector) {
+    $artifacts += @($manifest.corrector.proposal.path)
+    if ($manifest.corrector.proposal.native) { $artifacts += @($manifest.corrector.proposal.native.path) }
+}
+$artifacts = @($artifacts | Select-Object -Unique)
 $relativeFiles = @($artifacts | ForEach-Object {
     Assert-ArtifactPath $_
     if ($manifestDir) { "$($manifestDir.Replace('\', '/'))/$_" } else { $_ }

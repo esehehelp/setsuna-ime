@@ -759,6 +759,18 @@ if ($ManifestJson.crf) { $ArtifactFiles += @($ManifestJson.crf.path) }
 # the candidates' rescoring tables
 if ($ManifestJson.rescore.pairs) { $ArtifactFiles += @($ManifestJson.rescore.pairs) }
 if ($ManifestJson.rescore.words) { $ArtifactFiles += @($ManifestJson.rescore.words) }
+# the engine's own weights; an AR decoder's step; a bundled reading corrector
+if ($ManifestJson.proposal.native) { $ArtifactFiles += @($ManifestJson.proposal.native.path) }
+if ($ManifestJson.ar_decoder) {
+    $ArtifactFiles += @($ManifestJson.ar_decoder.step.path)
+    if ($ManifestJson.ar_decoder.step.external_data) { $ArtifactFiles += @($ManifestJson.ar_decoder.step.external_data) }
+    if ($ManifestJson.ar_decoder.native) { $ArtifactFiles += @($ManifestJson.ar_decoder.native.path) }
+}
+if ($ManifestJson.corrector) {
+    $ArtifactFiles += @($ManifestJson.corrector.proposal.path)
+    if ($ManifestJson.corrector.proposal.native) { $ArtifactFiles += @($ManifestJson.corrector.proposal.native.path) }
+}
+$ArtifactFiles = @($ArtifactFiles | Select-Object -Unique)
 foreach ($rel in $ArtifactFiles) {
     Assert-InsideDir -Rel $rel -Dir $ManifestItem.Directory.FullName -What 'manifest'
     $src = Join-Path $ManifestItem.Directory.FullName $rel
