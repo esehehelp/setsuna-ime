@@ -190,6 +190,8 @@ impl EngineArgs {
             normalize_candidates: self.normalize_candidates,
             pair_weight: self.pair_weight,
             word_weight: self.word_weight,
+            // the corrector's own manifest's (or SETSUNA_CORRECTOR_THRESHOLD), not a conversion knob
+            corrector_threshold: None,
         }
     }
 }

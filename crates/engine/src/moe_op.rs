@@ -1288,6 +1288,297 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     acc.iter().sum::<f32>() + tail
 }
 
+#[derive(Default)]
+pub(crate) struct Scratch {
+    xq: Vec<u8>,
+    xs: Vec<(f32, i32)>,
+    rows: Vec<Vec<(usize, f32)>>,
+    out: Vec<f32>,
+    es: ExpertScratch,
+}
+
+/// One expert's buffers.
+#[derive(Default)]
+struct ExpertScratch {
+    gq: Vec<u8>,
+    acc: Vec<i32>,
+    h: Vec<f32>,
+    hq: Vec<u8>,
+    hs: Vec<(f32, i32)>,
+}
+
+/// A token-routed mixture of experts on int8 Linears (the research export's `TokenMoE`: per frame the router's fp32
+/// logits, the top-`k` experts with their softmax renormalised over the k, each expert's two Linears with exact GELU
+/// between them, symmetric int8 per output row, on the frames routed to it; the weighted outputs summed), prepacked
+/// for the engine's level. A model trained without QAT has them (ONNX Runtime's dynamic int8 export: a reading
+/// corrector's).
+pub struct MoeWeights {
+    e: usize,
+    d: usize,
+    f: usize,
+    k: usize,
+    router: Vec<f32>,
+    w1: Vec<Packed>,
+    s1: Vec<f32>,
+    b1: Vec<f32>,
+    w2: Vec<Packed>,
+    s2: Vec<f32>,
+    b2: Vec<f32>,
+    isa: Isa,
+}
+
+impl MoeWeights {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        e: usize,
+        d: usize,
+        f: usize,
+        k: usize,
+        router: Vec<f32>,
+        w1: &[i8],
+        s1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: &[i8],
+        s2: Vec<f32>,
+        b2: Vec<f32>,
+    ) -> Result<Self, String> {
+        let blocked = detect_isa() != Isa::Plain;
+        Self::build(
+            e,
+            d,
+            f,
+            k,
+            router,
+            w1,
+            s1,
+            b1,
+            w2,
+            s2,
+            b2,
+            1,
+            |w, out, inp| Packed::new(w, out, inp, blocked),
+        )
+    }
+
+    /// The weights of `e` experts from `w1` / `w2` holding `per` values an element, each expert's matrix made by
+    /// `pack`.
+    #[allow(clippy::too_many_arguments)]
+    fn build<T>(
+        e: usize,
+        d: usize,
+        f: usize,
+        k: usize,
+        router: Vec<f32>,
+        w1: &[T],
+        s1: Vec<f32>,
+        b1: Vec<f32>,
+        w2: &[T],
+        s2: Vec<f32>,
+        b2: Vec<f32>,
+        per: usize,
+        pack: impl Fn(&[T], usize, usize) -> Packed,
+    ) -> Result<Self, String> {
+        let want = [
+            ("router", router.len(), e * d),
+            ("w1", w1.len() * per, e * f * d),
+            ("s1", s1.len(), e * f),
+            ("b1", b1.len(), e * f),
+            ("w2", w2.len() * per, e * d * f),
+            ("s2", s2.len(), e * d),
+            ("b2", b2.len(), e * d),
+        ];
+        for (name, got, n) in want {
+            if got != n {
+                return Err(format!(
+                    "{name} has {got} values, expected {n} (E {e}, d {d}, f {f})"
+                ));
+            }
+        }
+        if !(1..=e).contains(&k) {
+            return Err(format!("k {k} with {e} experts"));
+        }
+        let isa = detect_isa();
+        let m = f * d / per;
+        let w1 = (0..e)
+            .map(|i| pack(&w1[i * m..(i + 1) * m], f, d))
+            .collect();
+        let w2 = (0..e)
+            .map(|i| pack(&w2[i * m..(i + 1) * m], d, f))
+            .collect();
+        Ok(MoeWeights {
+            e,
+            d,
+            f,
+            k,
+            router,
+            w1,
+            s1,
+            b1,
+            w2,
+            s2,
+            b2,
+            isa,
+        })
+    }
+
+    /// y (frames, d) for x (frames, d): every frame through its top-k experts, one expert after another.
+    pub(crate) fn forward(&self, x: &[f32], y: &mut [f32], s: &mut Scratch) {
+        #[cfg(target_arch = "x86_64")]
+        match self.isa {
+            // AVX-512 VNNI CPUs: the routing, quantization and GELU loops 16 wide
+            Isa::Vnni512 => return unsafe { self.forward_avx512(x, y, s) },
+            // every AVX-VNNI CPU has AVX2 and FMA, and an AVX2 one: 8 wide
+            Isa::Vnni256 | Isa::Avx2 => return unsafe { self.forward_avx2(x, y, s) },
+            Isa::Avx | Isa::Dot | Isa::Plain => {}
+        }
+        self.forward_body(x, y, s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
+    unsafe fn forward_avx512(&self, x: &[f32], y: &mut [f32], s: &mut Scratch) {
+        self.forward_body(x, y, s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn forward_avx2(&self, x: &[f32], y: &mut [f32], s: &mut Scratch) {
+        self.forward_body(x, y, s)
+    }
+
+    #[inline(always)]
+    fn forward_body(&self, x: &[f32], y: &mut [f32], s: &mut Scratch) {
+        let (e, d, k) = (self.e, self.d, self.k);
+        let n = x.len() / d;
+        y.fill(0.0);
+        route(x, &self.router, e, d, k, &mut s.rows);
+        // the frames' u8 codes, once for every expert they go to
+        s.xq.resize(n * d, 0);
+        s.xs.clear();
+        for r in 0..n {
+            let qs = quantize_row(&x[r * d..(r + 1) * d], &mut s.xq[r * d..(r + 1) * d]);
+            s.xs.push(qs);
+        }
+        let active: Vec<usize> = (0..e).filter(|&ex| !s.rows[ex].is_empty()).collect();
+        let Scratch {
+            rows,
+            xq,
+            xs,
+            out,
+            es,
+        } = s;
+        for &ex in &active {
+            out.resize(rows[ex].len() * d, 0.0);
+            self.expert(ex, &rows[ex], xq, xs, out, es);
+            add_routed(y, &rows[ex], out, d);
+        }
+    }
+
+    /// Expert `ex` on its routed frames (`routed`: frame, weight; `xq` / `xs` every frame's u8 codes, scale and zero
+    /// point): its output for each, unweighted, into `out` (m x d).
+    fn expert(
+        &self,
+        ex: usize,
+        routed: &[(usize, f32)],
+        xq: &[u8],
+        xs: &[(f32, i32)],
+        out: &mut [f32],
+        s: &mut ExpertScratch,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        match self.isa {
+            Isa::Vnni512 => return unsafe { self.expert_avx512(ex, routed, xq, xs, out, s) },
+            Isa::Vnni256 | Isa::Avx2 => {
+                return unsafe { self.expert_avx2(ex, routed, xq, xs, out, s) }
+            }
+            Isa::Avx | Isa::Dot | Isa::Plain => {}
+        }
+        self.expert_body(ex, routed, xq, xs, out, s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx2,fma")]
+    unsafe fn expert_avx512(
+        &self,
+        ex: usize,
+        routed: &[(usize, f32)],
+        xq: &[u8],
+        xs: &[(f32, i32)],
+        out: &mut [f32],
+        s: &mut ExpertScratch,
+    ) {
+        self.expert_body(ex, routed, xq, xs, out, s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn expert_avx2(
+        &self,
+        ex: usize,
+        routed: &[(usize, f32)],
+        xq: &[u8],
+        xs: &[(f32, i32)],
+        out: &mut [f32],
+        s: &mut ExpertScratch,
+    ) {
+        self.expert_body(ex, routed, xq, xs, out, s)
+    }
+
+    #[inline(always)]
+    fn expert_body(
+        &self,
+        ex: usize,
+        routed: &[(usize, f32)],
+        xq: &[u8],
+        xs: &[(f32, i32)],
+        out: &mut [f32],
+        s: &mut ExpertScratch,
+    ) {
+        let (d, f) = (self.d, self.f);
+        let m = routed.len();
+        s.gq.resize(m * d, 0);
+        for (i, &(r, _)) in routed.iter().enumerate() {
+            s.gq[i * d..(i + 1) * d].copy_from_slice(&xq[r * d..(r + 1) * d]);
+        }
+        s.acc.resize(m * f.max(d), 0);
+        let w1 = &self.w1[ex];
+        gemm_u8i8(self.isa, &s.gq, m, w1, &mut s.acc);
+        s.h.resize(m * f, 0.0);
+        let (s1, b1) = (
+            &self.s1[ex * f..(ex + 1) * f],
+            &self.b1[ex * f..(ex + 1) * f],
+        );
+        for (i, &(r, _)) in routed.iter().enumerate() {
+            let (sx, zx) = xs[r];
+            let (acc, h) = (&s.acc[i * f..(i + 1) * f], &mut s.h[i * f..(i + 1) * f]);
+            for ((((hv, &a), &c), &sc), &b) in h.iter_mut().zip(acc).zip(&w1.colsum).zip(s1).zip(b1)
+            {
+                *hv = gelu(sx * sc * (a - zx * c) as f32 + b);
+            }
+        }
+        s.hq.resize(m * f, 0);
+        s.hs.clear();
+        for i in 0..m {
+            let qs = quantize_row(&s.h[i * f..(i + 1) * f], &mut s.hq[i * f..(i + 1) * f]);
+            s.hs.push(qs);
+        }
+        let w2 = &self.w2[ex];
+        gemm_u8i8(self.isa, &s.hq, m, w2, &mut s.acc);
+        let (s2, b2) = (
+            &self.s2[ex * d..(ex + 1) * d],
+            &self.b2[ex * d..(ex + 1) * d],
+        );
+        for i in 0..m {
+            let (sh, zh) = s.hs[i];
+            let (acc, o) = (&s.acc[i * d..(i + 1) * d], &mut out[i * d..(i + 1) * d]);
+            for ((((ov, &a), &c), &sc), &b) in o.iter_mut().zip(acc).zip(&w2.colsum).zip(s2).zip(b2)
+            {
+                *ov = sh * sc * (a - zh * c) as f32 + b;
+            }
+        }
+    }
+}
+
 /// Each frame of `x` (n, d) routed to the top-`k` of its router logits (`router` (e, d)), with the softmax over the k
 /// as its weights: `rows[j]` the (frame, weight) pairs of expert j, in frame order (cleared first).
 #[inline(always)]
@@ -1521,6 +1812,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The kernel against an fp32 MoE with the dequantized weights: top-2 of the same logits, exact GELU.
+    #[test]
+    fn kernel_matches_the_fp32_moe_of_its_weights() {
+        let mut rng = Rng(11);
+        let (e, d, f, k, n) = (6, 64, 80, 2, 23);
+        let router: Vec<f32> = (0..e * d).map(|_| rng.next()).collect();
+        let w1f: Vec<f32> = (0..e * f * d).map(|_| rng.next() * 0.3).collect();
+        let w2f: Vec<f32> = (0..e * d * f).map(|_| rng.next() * 0.3).collect();
+        let b1: Vec<f32> = (0..e * f).map(|_| rng.next() * 0.1).collect();
+        let b2: Vec<f32> = (0..e * d).map(|_| rng.next() * 0.1).collect();
+        let (w1, s1) = quantize_rows(&w1f, e * f, d);
+        let (w2, s2) = quantize_rows(&w2f, e * d, f);
+        let moe = MoeWeights::new(
+            e,
+            d,
+            f,
+            k,
+            router.clone(),
+            &w1,
+            s1.clone(),
+            b1.clone(),
+            &w2,
+            s2.clone(),
+            b2.clone(),
+        )
+        .unwrap();
+        let x: Vec<f32> = (0..n * d).map(|_| rng.next()).collect();
+        let mut y = vec![0f32; n * d];
+        moe.forward(&x, &mut y, &mut Scratch::default());
+        let deq = |q: &[i8], s: &[f32], cols: usize| -> Vec<f32> {
+            q.iter()
+                .enumerate()
+                .map(|(i, &v)| v as f32 * s[i / cols])
+                .collect()
+        };
+        let (w1d, w2d) = (deq(&w1, &s1, d), deq(&w2, &s2, f));
+        let mut worst = 0f32;
+        for r in 0..n {
+            let xr = &x[r * d..(r + 1) * d];
+            let logits: Vec<f32> = (0..e)
+                .map(|j| {
+                    xr.iter()
+                        .zip(&router[j * d..(j + 1) * d])
+                        .map(|(a, b)| a * b)
+                        .sum()
+                })
+                .collect();
+            let mut idx: Vec<usize> = (0..e).collect();
+            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            let top = &idx[..k];
+            let z: f32 = top
+                .iter()
+                .map(|&j| (logits[j] - logits[top[0]]).exp())
+                .sum();
+            let mut want = vec![0f32; d];
+            for &j in top {
+                let wt = (logits[j] - logits[top[0]]).exp() / z;
+                let h: Vec<f32> = (0..f)
+                    .map(|o| {
+                        let w = &w1d[(j * f + o) * d..(j * f + o + 1) * d];
+                        gelu(xr.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() + b1[j * f + o])
+                    })
+                    .collect();
+                for o in 0..d {
+                    let w = &w2d[(j * d + o) * f..(j * d + o + 1) * f];
+                    want[o] +=
+                        wt * (h.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() + b2[j * d + o]);
+                }
+            }
+            let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            for o in 0..d {
+                worst = worst.max((y[r * d + o] - want[o]).abs() / scale);
+            }
+        }
+        // u8 activations on both Linears: about 1% of the output's range
+        assert!(worst < 0.03, "worst relative error {worst}");
     }
 
     #[test]

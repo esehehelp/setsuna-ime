@@ -125,6 +125,11 @@ pub struct DecodeDefaults {
     /// Weight of the word term of the rescoring (`rescore.words`); unset or
     /// 0, off.
     pub word_weight: Option<f32>,
+    /// A reading corrector's own manifest (an engine's corrector named by its
+    /// manifest, not bundled): the margin log P(corrected) - log P(as typed)
+    /// above which the corrected reading is converted first, as a bundled
+    /// corrector's `threshold`. Unset: never first, only offered.
+    pub corrector_threshold: Option<f32>,
 }
 
 /// Keys of the dictionary / n-gram fusion recipe that engine v1 read and v2
@@ -928,6 +933,36 @@ mod tests {
             with("int8", r#""logit_ids":[4,6]"#)
                 .unwrap()
                 .proposal_native_path,
+            None
+        );
+    }
+
+    /// A reading corrector's own manifest: its threshold in decode_defaults.corrector_threshold, absent by default.
+    #[test]
+    fn loads_the_corrector_threshold() {
+        let dir = temp_dir("corrector-threshold");
+        write(&dir, "m.int8.onnx", "");
+        write(&dir, "m.vocab.hex.tsv", "");
+        let with = |defaults: &str| {
+            let body = manifest_body(
+                "m.int8.onnx",
+                "m.vocab.hex.tsv",
+                &format!(r#","decode_defaults":{defaults}"#),
+            );
+            CtcNatManifest::load(&write(&dir, "m.int8.manifest.json", &body))
+        };
+        assert_eq!(
+            with(r#"{"max_context":0,"corrector_threshold":11.5}"#)
+                .unwrap()
+                .decode_defaults
+                .corrector_threshold,
+            Some(11.5)
+        );
+        assert_eq!(
+            with(r#"{"max_context":0}"#)
+                .unwrap()
+                .decode_defaults
+                .corrector_threshold,
             None
         );
     }

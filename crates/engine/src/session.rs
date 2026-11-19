@@ -121,8 +121,9 @@ struct RuntimeEnv {
     /// `SETSUNA_CORRECTOR_MANIFEST` (unset: the manifest's own `corrector`, if any): a reading corrector's manifest
     /// ([`Corrector`], `pipeline::correct`) run in place of the manifest's, a research knob.
     corrector_manifest: Option<PathBuf>,
-    /// `SETSUNA_CORRECTOR_THRESHOLD` (unset: the manifest's corrector's threshold, or +inf for a
-    /// `SETSUNA_CORRECTOR_MANIFEST` one: the corrected reading never converted first, only offered): the margin
+    /// `SETSUNA_CORRECTOR_THRESHOLD` (unset: the manifest's corrector's threshold, or for a corrector of its own
+    /// manifest its decode_defaults.corrector_threshold, else +inf: the corrected reading never converted first, only
+    /// offered): the margin
     /// log P(corrected) - log P(as typed) above which the corrected reading is converted first.
     corrector_threshold: Option<f32>,
     /// `SETSUNA_CORRECTOR=0` (or `off`): no reading corrector, not even the manifest's (the conversion alone, a
@@ -406,15 +407,19 @@ impl EngineSession {
             None => None,
             Some(path) => Some(Self::load_fusion(path, env, &tokenizer, &model, manifest)?),
         };
-        // SETSUNA_CORRECTOR=0: none; SETSUNA_CORRECTOR_MANIFEST: that one (threshold from the environment, else +inf);
-        // else the manifest's own (its threshold unless the environment gives one)
+        // SETSUNA_CORRECTOR=0: none; SETSUNA_CORRECTOR_MANIFEST (or the daemon's --corrector): that one (threshold
+        // from the environment, else its manifest's decode_defaults.corrector_threshold, else +inf); else the
+        // manifest's own (its threshold unless the environment gives one)
         let corrector = if env.corrector_off {
             None
         } else if let Some(path) = &env.corrector_manifest {
             let m = CtcNatManifest::load(path).with_context(|| {
                 format!("load the reading corrector's manifest {}", path.display())
             })?;
-            let threshold = env.corrector_threshold.unwrap_or(f32::INFINITY);
+            let threshold = env
+                .corrector_threshold
+                .or(m.decode_defaults.corrector_threshold)
+                .unwrap_or(f32::INFINITY);
             Some(Self::load_corrector(&m, path, threshold, env)?)
         } else if let Some(b) = &manifest.corrector {
             let threshold = env.corrector_threshold.unwrap_or(b.threshold);

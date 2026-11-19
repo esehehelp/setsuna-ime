@@ -347,11 +347,12 @@ impl ProposalRunner {
             mask.len() >= actual && mask[..actual].iter().all(|&m| m == 1),
             "the native encoder takes a row without padding"
         );
+        // the logits a column a vocabulary id, or (a head cut to `logit_ids`) a column an id of those
         anyhow::ensure!(
-            enc.logit_width() == width,
-            "native encoder logits of {} columns, {width} expected (the vocabulary's {}, or the manifest's \
-             proposal.logit_ids)",
+            enc.config.vocab == tokenizer.vocab_size() && enc.logit_width() == Some(width),
+            "native encoder logits {:?} wide over {} tokens, the tokenizer's vocabulary {} (columns {width})",
             enc.logit_width(),
+            enc.config.vocab,
             tokenizer.vocab_size()
         );
         anyhow::ensure!(

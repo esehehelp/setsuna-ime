@@ -101,6 +101,15 @@ impl Weights {
         }
     }
 
+    /// An int8 tensor of any shape, with its shape.
+    pub(crate) fn i8_any(&self, name: &str) -> Result<(&[i8], &[usize])> {
+        match self.0.get(name) {
+            Some(Weight::I8(v, s)) => Ok((v, s)),
+            Some(w) => anyhow::bail!("{name} is {}, expected int8", w.kind()),
+            None => anyhow::bail!("{name} missing"),
+        }
+    }
+
     /// A uint8 tensor of any shape, with its shape.
     pub(crate) fn u8_any(&self, name: &str) -> Result<(&[u8], &[usize])> {
         match self.0.get(name) {

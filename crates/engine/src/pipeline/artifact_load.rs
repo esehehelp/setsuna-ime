@@ -61,9 +61,9 @@ pub fn load(manifest: &CtcNatManifest) -> Result<(SharedCharTokenizer, Model)> {
         .as_ref()
         .map_or(tokenizer.vocab_size(), Vec::len);
     anyhow::ensure!(
-        encoder.ar_shape().is_some() || encoder.logit_width() == columns,
-        "native encoder {} gives {} logits a frame, the manifest {columns} (its proposal.logit_ids, or the \
-         vocabulary)",
+        manifest.ar_decoder.is_some() || encoder.logit_width() == Some(columns),
+        "native encoder {} writes logits {:?} wide, the manifest's proposal {columns} (proposal.logit_ids or \
+         the vocabulary)",
         path.display(),
         encoder.logit_width()
     );

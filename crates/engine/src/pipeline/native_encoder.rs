@@ -30,7 +30,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::group_q::{group_moe, GroupMoe, GroupMoeScratch, GroupScratch, GroupWeights};
-use crate::moe_op::{detect_isa, gelu, gemm_u8i8_f32, Epilogue, Isa, Packed};
+use crate::moe_op::{detect_isa, gelu, gemm_u8i8_f32, Epilogue, Isa, MoeWeights, Packed};
 use crate::norm_op::add_layer_norm_here;
 use crate::pipeline::ar_native::{lane_sum, parse_safetensors, row_max, Weight, Weights};
 use crate::pipeline::lse::exp;
@@ -66,15 +66,21 @@ pub struct EncoderConfig {
     pub moe: Option<MoeConfig>,
     /// "ctc" (`decoder` and `head.*`) or "ar_cross" (`ar` and `ar.*`)
     pub output: String,
-    /// The CTC head's rows when it holds some of the vocabulary's tokens alone (a reading corrector's head cut to the
-    /// manifest's `proposal.logit_ids`, in their order; its input rows then the file's own `embedding.*`); none: one
-    /// a token.
-    #[serde(default)]
-    pub head_rows: Option<usize>,
     #[serde(default)]
     pub decoder: Option<DecoderConfig>,
     #[serde(default)]
     pub ar: Option<ArCrossConfig>,
+    /// The Linears and the routed experts as ONNX Runtime's dynamic quantization left them (an int8 graph without
+    /// LinearQ4G, as a reading corrector trained without QAT): `<name>.q` (out, in) int8 with `.scale` (1) and
+    /// `.zero` (1) 0, a row an output; the experts' `w1` (E, f, d) / `w2` (E, d, f) int8 with a scale per row `s1`
+    /// (E, f) / `s2` (E, d), as `neo_ime.TokenMoE`'s inputs. Unset: LinearQ4G and TokenMoEQ4G.
+    #[serde(default)]
+    pub int8_linears: bool,
+    /// The CTC head's rows (`head.q` (head_rows, hidden)): the manifest's `proposal.logit_ids` in their order, the
+    /// logits that wide (a reading corrector's head cut to the tokens of readings, as the research export cuts it).
+    /// Unset: the whole vocabulary. Below it the embedding is "own" (the cut head cannot be the input rows).
+    #[serde(default)]
+    pub head_rows: Option<usize>,
 }
 
 /// The per-layer PLE: the hash of every slot (an n-gram order and a head), the table, and per layer a gate and a
@@ -255,9 +261,20 @@ struct Lin8 {
     scale: f32,
     bias: Option<Vec<f32>>,
     out: usize,
+    inp: usize,
 }
 
 impl Lin8 {
+    /// `load` of whatever shape `name`.q has.
+    fn load_any(isa: Isa, w: &Weights, name: &str, bias: bool) -> Result<Self> {
+        let (_, shape) = w.i8_any(&format!("{name}.q"))?;
+        anyhow::ensure!(
+            shape.len() == 2,
+            "{name}.q is {shape:?}, expected (out, in)"
+        );
+        Self::load(isa, w, name, shape[0], shape[1], bias)
+    }
+
     /// `name`.q (out, inp) int8, `.scale` (1), `.zero` (1) int8 and 0, `.bias` (out) when `bias`.
     fn load(isa: Isa, w: &Weights, name: &str, out: usize, inp: usize, bias: bool) -> Result<Self> {
         let q = w.i8(&format!("{name}.q"), &[out, inp])?;
@@ -279,6 +296,7 @@ impl Lin8 {
                 None
             },
             out,
+            inp,
         })
     }
 
@@ -323,6 +341,83 @@ fn quantize_tensor(x: &[f32], q: &mut Vec<u8>) -> (f32, i32) {
             .map(|&v| ((v / scale).clamp(lo_c, hi_c).round_ties_even() + zp) as u8),
     );
     (scale, zp as i32)
+}
+
+/// A Linear of the encoder or the decoder: the graph's `neo_ime.LinearQ4G`, or (config `int8_linears`) ONNX Runtime's
+/// dynamically quantized MatMul, its input quantized as the graph's DynamicQuantizeLinear does (`quantize_tensor`)
+/// and the product as its MatMulInteger, Cast and Mul, then the bias's Add (`Lin8`).
+enum Linear {
+    Q4g(Q4g),
+    Int8(Lin8),
+}
+
+impl Linear {
+    fn load(isa: Isa, int8: bool, w: &Weights, name: &str, bias: bool) -> Result<Self> {
+        Ok(if int8 {
+            Linear::Int8(Lin8::load_any(isa, w, name, bias)?)
+        } else {
+            Linear::Q4g(Q4g::load(w, name, bias)?)
+        })
+    }
+
+    /// The outputs.
+    fn n(&self) -> usize {
+        match self {
+            Linear::Q4g(l) => l.n,
+            Linear::Int8(l) => l.out,
+        }
+    }
+
+    /// The inputs.
+    fn k(&self) -> usize {
+        match self {
+            Linear::Q4g(l) => l.k,
+            Linear::Int8(l) => l.inp,
+        }
+    }
+
+    /// y (rows, N) of x (rows, K), the bias added.
+    fn forward(&self, isa: Isa, x: &[f32], y: &mut Vec<f32>, s: &mut LinScratch) {
+        match self {
+            Linear::Q4g(l) => l.forward(x, y, &mut s.group),
+            Linear::Int8(l) => {
+                let sx = quantize_tensor(x, &mut s.q8);
+                l.forward(isa, &s.q8, x.len() / l.inp, sx, &mut s.acc, y);
+            }
+        }
+    }
+}
+
+/// A Linear's buffers.
+#[derive(Default)]
+struct LinScratch {
+    group: GroupScratch,
+    q8: Vec<u8>,
+    acc: Vec<i32>,
+}
+
+/// A layer's routed experts: the graph's `neo_ime.TokenMoEQ4G` (with the codes its weights point into), or (config
+/// `int8_linears`) its `neo_ime.TokenMoEBlocked` / `TokenMoE`, the int8 experts of `moe_op` on the same weights.
+enum Moe {
+    // the codes are only held: the GroupMoe's weights point into them
+    Q4g(GroupMoe, #[allow(dead_code)] Vec<Vec<u8>>),
+    Int8(MoeWeights),
+}
+
+impl Moe {
+    /// y (rows, d) of x (rows, d).
+    fn forward(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        g: &mut GroupMoeScratch,
+        e: &mut crate::moe_op::Scratch,
+    ) {
+        match self {
+            Moe::Q4g(m, _) => m.forward(x, y, g),
+            Moe::Int8(m) => m.forward(x, y, e),
+        }
+    }
 }
 
 /// The relative position biases of an attention stack: the table (SEGMENTS^2 x buckets, heads) with its heads (the
@@ -393,8 +488,8 @@ struct Ple {
     c: PleConfig,
     max_order: usize,
     table: Table8,
-    gates: Vec<Q4g>,
-    projs: Vec<Q4g>,
+    gates: Vec<Linear>,
+    projs: Vec<Linear>,
 }
 
 impl Ple {
@@ -438,31 +533,31 @@ impl Ple {
 }
 
 struct EncoderLayer {
-    qkv: Q4g,
-    out: Q4g,
+    qkv: Linear,
+    out: Linear,
     norm1: Norm,
-    ffn1: Q4g,
-    ffn2: Q4g,
+    ffn1: Linear,
+    ffn2: Linear,
     norm2: Norm,
-    moe: Option<(GroupMoe, Vec<Vec<u8>>)>,
+    moe: Option<Moe>,
 }
 
 struct DecoderLayer {
     self_norm: Norm,
-    self_qkv: Q4g,
-    self_out: Q4g,
+    self_qkv: Linear,
+    self_out: Linear,
     cross_norm: Norm,
-    cross_q: Q4g,
-    cross_out: Q4g,
+    cross_q: Linear,
+    cross_out: Linear,
     ffn_norm: Norm,
-    ffn1: Q4g,
-    ffn2: Q4g,
+    ffn1: Linear,
+    ffn2: Linear,
 }
 
 struct Decoder {
     c: DecoderConfig,
     /// every layer's cross-attention keys and values from the encoder's frames, columns [K_0 | V_0 | K_1 | ...]
-    kv: Q4g,
+    kv: Linear,
     positions: Option<Table8>,
     relative: Option<Relative>,
     layers: Vec<DecoderLayer>,
@@ -497,8 +592,9 @@ struct Scratch {
     lookup: Vec<f32>,
     q8: Vec<u8>,
     acc: Vec<i32>,
-    lin: GroupScratch,
+    lin: LinScratch,
     moe: GroupMoeScratch,
+    moe8: crate::moe_op::Scratch,
 }
 
 /// The parts of a conversion [`Profile`] times.
@@ -608,14 +704,15 @@ impl NativeEncoder {
             c.layers > 0 && c.heads > 0 && d % c.heads == 0 && v > 0 && p > 0,
             "config {c:?}: sizes must be positive and hidden a multiple of heads"
         );
-        let rows = c.head_rows.unwrap_or(v);
-        anyhow::ensure!(
-            rows > 0 && rows <= v,
-            "config {c:?}: head_rows must be 1 to the vocabulary's {v}"
-        );
         let isa = detect_isa();
+        let int8 = c.int8_linears;
+        let head_rows = c.head_rows.unwrap_or(v);
+        anyhow::ensure!(
+            head_rows > 0 && head_rows <= v && (head_rows == v || c.output == "ctc"),
+            "head_rows {head_rows}: 1 to the vocabulary's {v}, and a CTC head's"
+        );
         let head = match (c.output.as_str(), &c.decoder, &c.ar) {
-            ("ctc", Some(_), None) => Some(Lin8::load(isa, w, "head", rows, d, false)?),
+            ("ctc", Some(_), None) => Some(Lin8::load(isa, w, "head", head_rows, d, false)?),
             ("ar_cross", None, Some(_)) => None,
             (o, dec, ar) => anyhow::bail!(
                 "output {o:?} with decoder {} and ar {}: \"ctc\" takes a decoder, \"ar_cross\" the AR layers",
@@ -627,8 +724,12 @@ impl NativeEncoder {
             "own" => Table8::load(w, "embedding", v, d)?,
             "tied" => {
                 anyhow::ensure!(
-                    c.output == "ctc" && rows == v,
-                    "a tied embedding reads the CTC head's rows, every token's"
+                    c.output == "ctc",
+                    "a tied embedding reads the CTC head's rows"
+                );
+                anyhow::ensure!(
+                    head_rows == v,
+                    "a tied embedding reads the whole head's rows, not {head_rows} of {v}"
                 );
                 Table8::load(w, "head", v, d)?
             }
@@ -662,10 +763,10 @@ impl NativeEncoder {
                 Some(Ple {
                     table: Table8::load(w, "ple.table", pc.rows, pc.dim)?,
                     gates: (0..c.layers)
-                        .map(|i| Q4g::load(w, &format!("ple.gate.{i}"), true))
+                        .map(|i| Linear::load(isa, int8, w, &format!("ple.gate.{i}"), true))
                         .collect::<Result<_>>()?,
                     projs: (0..c.layers)
-                        .map(|i| Q4g::load(w, &format!("ple.proj.{i}"), false))
+                        .map(|i| Linear::load(isa, int8, w, &format!("ple.proj.{i}"), false))
                         .collect::<Result<_>>()?,
                     max_order,
                     c: pc.clone(),
@@ -678,16 +779,22 @@ impl NativeEncoder {
                 let n = format!("layers.{i}");
                 let moe = if moe_layers.contains(&i) {
                     let mc = c.moe.as_ref().expect("moe layers");
-                    Some(load_moe(w, &format!("{n}.moe"), mc, d)?)
+                    Some(if int8 {
+                        Moe::Int8(load_moe8(w, &format!("{n}.moe"), mc, d)?)
+                    } else {
+                        let (m, codes) = load_moe(w, &format!("{n}.moe"), mc, d)?;
+                        Moe::Q4g(m, codes)
+                    })
                 } else {
                     None
                 };
+                let lin = |part: &str| Linear::load(isa, int8, w, &format!("{n}.{part}"), true);
                 Ok(EncoderLayer {
-                    qkv: Q4g::load(w, &format!("{n}.qkv"), true)?,
-                    out: Q4g::load(w, &format!("{n}.out"), true)?,
+                    qkv: lin("qkv")?,
+                    out: lin("out")?,
                     norm1: Norm::load(w, &format!("{n}.norm1"), d)?,
-                    ffn1: Q4g::load(w, &format!("{n}.ffn1"), true)?,
-                    ffn2: Q4g::load(w, &format!("{n}.ffn2"), true)?,
+                    ffn1: lin("ffn1")?,
+                    ffn2: lin("ffn2")?,
                     norm2: Norm::load(w, &format!("{n}.norm2"), d)?,
                     moe,
                 })
@@ -695,9 +802,24 @@ impl NativeEncoder {
             .collect::<Result<Vec<_>>>()?;
         for l in &layers {
             anyhow::ensure!(
-                (l.qkv.k, l.qkv.n, l.out.k, l.out.n, l.ffn1.k, l.ffn2.n, l.ffn2.k)
-                    == (d, 3 * d, d, d, d, d, l.ffn1.n),
+                (
+                    l.qkv.k(),
+                    l.qkv.n(),
+                    l.out.k(),
+                    l.out.n(),
+                    l.ffn1.k(),
+                    l.ffn2.n(),
+                    l.ffn2.k()
+                ) == (d, 3 * d, d, d, d, d, l.ffn1.n()),
                 "an encoder layer's Linears are not shaped for hidden {d}"
+            );
+        }
+        if let Some(ple) = &ple {
+            anyhow::ensure!(
+                ple.gates.iter().all(|g| (g.k(), g.n()) == (d, d))
+                    && ple.projs.iter().all(|p| (p.k(), p.n()) == (ple.c.dim, d)),
+                "the PLE gates are not ({d}, {d}) or its projections ({}, {d})",
+                ple.c.dim
             );
         }
         let output = match (&c.decoder, &c.ar) {
@@ -717,25 +839,37 @@ impl NativeEncoder {
                 let dl = (0..dc.layers)
                     .map(|i| {
                         let n = format!("decoder.layers.{i}");
-                        Ok(DecoderLayer {
+                        let lin =
+                            |part: &str| Linear::load(isa, int8, w, &format!("{n}.{part}"), true);
+                        let layer = DecoderLayer {
                             self_norm: Norm::load(w, &format!("{n}.self_norm"), d)?,
-                            self_qkv: Q4g::load(w, &format!("{n}.self_qkv"), true)?,
-                            self_out: Q4g::load(w, &format!("{n}.self_out"), true)?,
+                            self_qkv: lin("self_qkv")?,
+                            self_out: lin("self_out")?,
                             cross_norm: Norm::load(w, &format!("{n}.cross_norm"), d)?,
-                            cross_q: Q4g::load(w, &format!("{n}.cross_q"), true)?,
-                            cross_out: Q4g::load(w, &format!("{n}.cross_out"), true)?,
+                            cross_q: lin("cross_q")?,
+                            cross_out: lin("cross_out")?,
                             ffn_norm: Norm::load(w, &format!("{n}.ffn_norm"), d)?,
-                            ffn1: Q4g::load(w, &format!("{n}.ffn1"), true)?,
-                            ffn2: Q4g::load(w, &format!("{n}.ffn2"), true)?,
-                        })
+                            ffn1: lin("ffn1")?,
+                            ffn2: lin("ffn2")?,
+                        };
+                        anyhow::ensure!(
+                            [&layer.self_out, &layer.cross_q, &layer.cross_out]
+                                .iter()
+                                .all(|l| (l.k(), l.n()) == (d, d))
+                                && (layer.self_qkv.k(), layer.self_qkv.n()) == (d, 3 * d)
+                                && (layer.ffn1.k(), layer.ffn2.n(), layer.ffn2.k())
+                                    == (d, d, layer.ffn1.n()),
+                            "decoder layer {i}'s Linears are not shaped for hidden {d}"
+                        );
+                        Ok(layer)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let kv = Q4g::load(w, "decoder.kv", true)?;
+                let kv = Linear::load(isa, int8, w, "decoder.kv", true)?;
                 anyhow::ensure!(
-                    (kv.k, kv.n) == (d, 2 * d * dc.layers) && d % dc.heads == 0,
+                    (kv.k(), kv.n()) == (d, 2 * d * dc.layers) && d % dc.heads == 0,
                     "decoder.kv is ({}, {}), expected ({d}, {})",
-                    kv.k,
-                    kv.n,
+                    kv.k(),
+                    kv.n(),
                     2 * d * dc.layers
                 );
                 Output::Ctc {
@@ -811,9 +945,12 @@ impl NativeEncoder {
         }
     }
 
-    /// The width of the CTC logits: the vocabulary's, or the head's rows when it holds some of its tokens.
-    pub fn logit_width(&self) -> usize {
-        self.config.head_rows.unwrap_or(self.config.vocab)
+    /// The width of the CTC logits (the head's rows: the vocabulary, or `head_rows`), for a "ctc" encoder.
+    pub fn logit_width(&self) -> Option<usize> {
+        match &self.output {
+            Output::Ctc { head, .. } => Some(head.out),
+            Output::ArCross { .. } => None,
+        }
     }
 
     /// The CTC logits (T, `logit_width`) of one row of ids.
@@ -830,6 +967,7 @@ impl NativeEncoder {
             unreachable!()
         };
         decode(
+            self.isa,
             decoder,
             self.config.hidden,
             self.config.norm_eps,
@@ -902,6 +1040,7 @@ impl NativeEncoder {
             c.vocab
         );
         let mut s = std::mem::take(&mut self.scratch);
+        let isa = self.isa;
         let sep = ids
             .iter()
             .position(|&id| id == c.sep_id as i64)
@@ -933,12 +1072,12 @@ impl NativeEncoder {
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ple) = &self.ple {
                 // x + sigmoid(gate(x)) * proj(lookup)
-                ple.gates[i].forward(&s.x, &mut s.a, &mut s.lin);
-                ple.projs[i].forward(&s.lookup, &mut s.b, &mut s.lin);
+                ple.gates[i].forward(isa, &s.x, &mut s.a, &mut s.lin);
+                ple.projs[i].forward(isa, &s.lookup, &mut s.b, &mut s.lin);
                 add_gated(&mut s.x, &s.a, &s.b);
                 lap(prof, 1);
             }
-            layer.qkv.forward(&s.x, &mut s.qkv, &mut s.lin);
+            layer.qkv.forward(isa, &s.x, &mut s.qkv, &mut s.lin);
             lap(prof, 2);
             s.a.resize(t * d, 0.0);
             attention(
@@ -960,7 +1099,7 @@ impl NativeEncoder {
                 &mut s.attn,
             );
             lap(prof, 3);
-            layer.out.forward(&s.a, &mut s.b, &mut s.lin);
+            layer.out.forward(isa, &s.a, &mut s.b, &mut s.lin);
             s.h.resize(t * d, 0.0);
             add_layer_norm_here(
                 &s.x,
@@ -973,13 +1112,13 @@ impl NativeEncoder {
             );
             lap(prof, 4);
             // the FFN (and the routed experts) on the normed frames
-            layer.ffn1.forward(&s.h, &mut s.f, &mut s.lin);
+            layer.ffn1.forward(isa, &s.h, &mut s.f, &mut s.lin);
             gelu_in_place(&mut s.f);
-            layer.ffn2.forward(&s.f, &mut s.b, &mut s.lin);
+            layer.ffn2.forward(isa, &s.f, &mut s.b, &mut s.lin);
             lap(prof, 5);
-            if let Some((moe, _)) = &layer.moe {
+            if let Some(moe) = &layer.moe {
                 s.a.resize(t * d, 0.0);
-                moe.forward(&s.h, &mut s.a, &mut s.moe);
+                moe.forward(&s.h, &mut s.a, &mut s.moe, &mut s.moe8);
                 for (bv, &mv) in s.b.iter_mut().zip(&s.a) {
                     *bv += mv;
                 }
@@ -1058,8 +1197,37 @@ fn load_moe(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<(GroupM
     Ok((moe, vec![w1, w2]))
 }
 
+/// The int8 routed experts of a layer (config `int8_linears`): `<name>.router` (E, d), `.w1` (E, f, d) int8 a row an
+/// output, `.s1` / `.b1` (E, f), `.w2` (E, d, f), `.s2` / `.b2` (E, d), as `neo_ime.TokenMoE`'s inputs (the graph's
+/// `TokenMoEBlocked` holds the same rows in the kernel's blocked layout).
+fn load_moe8(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<MoeWeights> {
+    let e = mc.experts;
+    let (w1, shape) = w.i8_any(&format!("{name}.w1"))?;
+    anyhow::ensure!(
+        shape.len() == 3 && shape[0] == e && shape[2] == d,
+        "{name}.w1 is {shape:?}, expected (E {e}, f, d {d})"
+    );
+    let f = shape[1];
+    let w2 = w.i8(&format!("{name}.w2"), &[e, d, f])?;
+    MoeWeights::new(
+        e,
+        d,
+        f,
+        mc.top_k,
+        w.f32(&format!("{name}.router"), &[e, d])?.to_vec(),
+        w1,
+        w.f32(&format!("{name}.s1"), &[e, f])?.to_vec(),
+        w.f32(&format!("{name}.b1"), &[e, f])?.to_vec(),
+        w2,
+        w.f32(&format!("{name}.s2"), &[e, d])?.to_vec(),
+        w.f32(&format!("{name}.b2"), &[e, d])?.to_vec(),
+    )
+    .map_err(|m| anyhow::anyhow!("{name}: {m}"))
+}
+
 /// The NAT decoder over the encoder's frames `s.x` (T, d), its output in `s.x`.
 fn decode(
+    isa: Isa,
     dec: &Decoder,
     d: usize,
     eps: f32,
@@ -1072,7 +1240,7 @@ fn decode(
     let dh = d / heads;
     let layers = dec.layers.len();
     // every layer's keys and values from the encoder's frames
-    dec.kv.forward(&s.x, &mut s.kv, &mut s.lin);
+    dec.kv.forward(isa, &s.x, &mut s.kv, &mut s.lin);
     let (mut self_bias, mut cross_bias) =
         (std::mem::take(&mut s.bias), std::mem::take(&mut s.bias2));
     if let Some(r) = &dec.relative {
@@ -1105,7 +1273,7 @@ fn decode(
             Some(&mut sum),
         );
         std::mem::swap(&mut x, &mut sum);
-        layer.self_qkv.forward(&s.h, &mut s.qkv, &mut s.lin);
+        layer.self_qkv.forward(isa, &s.h, &mut s.qkv, &mut s.lin);
         s.a.resize(t * d, 0.0);
         attention(
             &s.qkv,
@@ -1125,7 +1293,7 @@ fn decode(
             &mut s.a,
             &mut s.attn,
         );
-        layer.self_out.forward(&s.a, &mut skip, &mut s.lin);
+        layer.self_out.forward(isa, &s.a, &mut skip, &mut s.lin);
         lap(prof, 10);
         add_layer_norm_here(
             &x,
@@ -1137,7 +1305,7 @@ fn decode(
             Some(&mut sum),
         );
         std::mem::swap(&mut x, &mut sum);
-        layer.cross_q.forward(&s.h, &mut s.b, &mut s.lin);
+        layer.cross_q.forward(isa, &s.h, &mut s.b, &mut s.lin);
         let kvw = 2 * d * layers;
         attention(
             &s.b,
@@ -1157,7 +1325,7 @@ fn decode(
             &mut s.a,
             &mut s.attn,
         );
-        layer.cross_out.forward(&s.a, &mut skip, &mut s.lin);
+        layer.cross_out.forward(isa, &s.a, &mut skip, &mut s.lin);
         lap(prof, 11);
         add_layer_norm_here(
             &x,
@@ -1169,9 +1337,9 @@ fn decode(
             Some(&mut sum),
         );
         std::mem::swap(&mut x, &mut sum);
-        layer.ffn1.forward(&s.h, &mut s.f, &mut s.lin);
+        layer.ffn1.forward(isa, &s.h, &mut s.f, &mut s.lin);
         gelu_in_place(&mut s.f);
-        layer.ffn2.forward(&s.f, &mut skip, &mut s.lin);
+        layer.ffn2.forward(isa, &s.f, &mut skip, &mut s.lin);
         lap(prof, 12);
     }
     s.x.resize(t * d, 0.0);
@@ -2361,7 +2529,7 @@ mod tests {
         let x = rnd(t * 8 * d);
         let (mut y, mut s, mut ms) = (
             Vec::new(),
-            GroupScratch::default(),
+            LinScratch::default(),
             GroupMoeScratch::default(),
         );
         let mut parts: Vec<(String, f64)> = Vec::new();
@@ -2378,24 +2546,26 @@ mod tests {
             ] {
                 add(
                     name,
-                    time(2000, &mut || q.forward(&x[..t * q.k], &mut y, &mut s)),
+                    time(2000, &mut || {
+                        q.forward(enc.isa, &x[..t * q.k()], &mut y, &mut s)
+                    }),
                 );
             }
             if let Some(ple) = &enc.ple {
                 add(
                     "ple_gate",
                     time(2000, &mut || {
-                        ple.gates[l].forward(&x[..t * d], &mut y, &mut s)
+                        ple.gates[l].forward(enc.isa, &x[..t * d], &mut y, &mut s)
                     }),
                 );
                 add(
                     "ple_proj",
                     time(2000, &mut || {
-                        ple.projs[l].forward(&x[..t * ple.c.dim], &mut y, &mut s)
+                        ple.projs[l].forward(enc.isa, &x[..t * ple.c.dim], &mut y, &mut s)
                     }),
                 );
             }
-            if let Some((moe, _)) = &layer.moe {
+            if let Some(Moe::Q4g(moe, _)) = &layer.moe {
                 y.resize(t * d, 0.0);
                 add(
                     "moe",
@@ -2453,7 +2623,7 @@ mod tests {
                     )
                 }),
             );
-            let mut f = x[..t * layer.ffn1.n].to_vec();
+            let mut f = x[..t * layer.ffn1.n()].to_vec();
             add("gelu", time(2000, &mut || gelu_in_place(&mut f)));
         }
         let mut q8 = Vec::new();
@@ -2499,9 +2669,11 @@ mod tests {
                 let (mut dense, mut experts) = (0f64, 0f64);
                 for layer in &enc.layers {
                     for q in [&layer.qkv, &layer.out, &layer.ffn1, &layer.ffn2] {
-                        dense += time(1000, &mut || q.forward(&x[..t * q.k], &mut y, &mut s));
+                        dense += time(1000, &mut || {
+                            q.forward(enc.isa, &x[..t * q.k()], &mut y, &mut s)
+                        });
                     }
-                    if let Some((moe, _)) = &layer.moe {
+                    if let Some(Moe::Q4g(moe, _)) = &layer.moe {
                         y.resize(t * d, 0.0);
                         experts += time(1000, &mut || {
                             moe.forward(&x[..t * d], &mut y[..t * d], &mut ms)
