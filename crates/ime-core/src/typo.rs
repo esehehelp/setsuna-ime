@@ -136,20 +136,16 @@ pub fn correct(typed: &str, lm: Option<&crate::mixed::MixedModel>) -> Option<Str
 
 /// `typed` with the capitals a Shift released a key late left in lowercase
 /// (`IMENo` for IME + の, `PCWokatta` for PC + をかった), `None` for none:
-/// a capital right after two or more, the lowercase letters after it, with
-/// it, reading wholly as kana from a particle on and no Latin word the
-/// model knows (`IMENote`, `DOMNode`, `AIToken` stay), unless the particle
-/// itself (`No`). Mixed input reads a capital as English, and the reading
-/// as typed keeps it so; this is the other reading, converted next to it
-/// (issue #6, user 2026-11-19: typoのdomainとして扱う).
-pub fn shift_slips(typed: &str, lm: &MixedModel) -> Option<String> {
+/// a capital right after two or more, with lowercase letters after it that
+/// read wholly as kana with it, the capital starting a kana of more letters
+/// (the consonant of の), not one of its own (the E of `IMEno`, IME + の as
+/// meant) nor the ん of `CNNno`. A word that reads so too (`IMENote`,
+/// `AIToken`) is put right as well: mixed input reads the capitals as
+/// English, and that reading, as typed, stays first; this is only the
+/// other reading, its conversions offered next to it (issue #6, user
+/// 2026-11-19: typoのdomainとして扱う, 余計な候補でも入れておく).
+pub fn shift_slips(typed: &str) -> Option<String> {
     let mut chars: Vec<char> = typed.chars().collect();
-    // the particles alone (ら before one is for a word ending in r: Judd + らは)
-    let particles = || {
-        crate::mixed::PARTICLES
-            .iter()
-            .filter(|p| !p.starts_with("ra"))
-    };
     let mut found = false;
     for at in 2..chars.len() {
         if !chars[at - 2..=at].iter().all(|c| c.is_ascii_uppercase()) {
@@ -165,12 +161,11 @@ pub fn shift_slips(typed: &str, lm: &MixedModel) -> Option<String> {
             .iter()
             .map(|c| c.to_ascii_lowercase())
             .collect();
-        let word_str: String = word.iter().collect();
-        let particle = particles().any(|p| word_str == *p);
-        if particles().any(|p| word_str.starts_with(p))
-            && reads(&word).is_some()
-            && (particle || !lm.knows(&word_str))
-        {
+        // the capital starts a kana of two letters or more
+        let starts = romaji_units(&word, true)
+            .first()
+            .is_some_and(|u| u.end >= 2 && !matches!(u.kind, UnitKind::Kana("ん")));
+        if starts && reads(&word).is_some() {
             chars[at] = word[0];
             found = true;
         }
@@ -252,7 +247,6 @@ mod tests {
     #[test]
     fn a_shift_released_a_key_late_after_capitals_is_put_right() {
         // issue #6
-        let m = lm();
         for (typed, meant) in [
             ("IMENo", "IMEno"),
             ("PCWokatta", "PCwokatta"),
@@ -262,25 +256,38 @@ mod tests {
             ("OKDesu", "OKdesu"),
             ("JRNishinihon", "JRnishinihon"),
             ("PCWokattaIMENo", "PCwokattaIMEno"),
+            // starting with no particle, or spelling a word
+            ("AIDake", "AIdake"),
+            ("PCMade", "PCmade"),
+            ("IMENara", "IMEnara"),
+            ("IMEDemo", "IMEdemo"),
+            // a word that reads as kana too: only another reading offered
+            ("IMENote", "IMEnote"),
+            ("DOMNode", "DOMnode"),
+            ("AIToken", "AItoken"),
         ] {
-            assert_eq!(shift_slips(typed, &m).as_deref(), Some(meant), "{typed}");
+            assert_eq!(shift_slips(typed).as_deref(), Some(meant), "{typed}");
         }
         for typed in [
-            // typed as meant
+            // typed as meant: an acronym, then romaji
             "IMEno",
+            "APIno",
+            "NHKno",
+            "USBni",
+            "CNNno",
             "IMENO",
             "kaisha",
-            // a word after the capitals, read as kana or not
+            // a word that reads as no kana
             "GPTWorks",
+            "PDFViewer",
             "NSNotification",
-            "IMENote",
-            "DOMNode",
-            "AIToken",
-            "CSSMode",
+            "HTMLElement",
+            "IOError",
+            "USBHub",
             // one capital before: a word's (Wo), not an acronym's
             "AWokatta",
         ] {
-            assert_eq!(shift_slips(typed, &m), None, "{typed}");
+            assert_eq!(shift_slips(typed), None, "{typed}");
         }
     }
 

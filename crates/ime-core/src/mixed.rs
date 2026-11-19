@@ -285,7 +285,7 @@ const MAX_EN: usize = 40;
 /// before one (Judd + らは). 側 (gawa) starts with が, です with で. Not
 /// まで: `Ollamade` would split before `ma` (Olla + まで); not ら alone:
 /// `Sakura` would.
-pub(crate) const PARTICLES: &[&str] = &[
+const PARTICLES: &[&str] = &[
     "ga", "wo", "de", "no", "ni", "ha", "to", "mo", "he", "kara", "yori", "raga", "rawo", "rade",
     "rano", "rani", "raha", "rato", "ramo",
 ];

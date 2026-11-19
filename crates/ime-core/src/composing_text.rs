@@ -439,11 +439,12 @@ impl ComposingText {
     /// to the one typed; `None` for none, or without mixed input (which
     /// alone reads a capital as English).
     pub fn shift_slip_alt(&self) -> Option<String> {
-        let mixed = self.mixed.as_ref()?;
-        let fixed = crate::typo::shift_slips(&self.raw, &mixed.model)?;
+        self.mixed.as_ref()?;
+        let fixed = crate::typo::shift_slips(&self.raw)?;
         let converted = self.convert(&fixed, true);
         let reading = converted.text + &converted.pending;
-        (reading != self.full_reading()).then_some(reading)
+        // read as English again (the capital lowercase): nothing to offer
+        (!reading.eq_ignore_ascii_case(&self.full_reading())).then_some(reading)
     }
 
     /// `text` with ず and づ as the kana model reads them, when it does.
