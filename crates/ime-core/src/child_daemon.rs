@@ -72,6 +72,8 @@ struct DaemonResponse {
     #[serde(default)]
     candidate_scores: Vec<f32>,
     #[serde(default)]
+    corrected_reading: Option<String>,
+    #[serde(default)]
     engine_ms: Option<f64>,
     #[serde(default)]
     frames: Option<serde_json::Value>,
@@ -575,6 +577,7 @@ fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, no
             candidates: resp.candidates,
             reading_pos: resp.candidate_reading_pos,
             scores: resp.candidate_scores,
+            corrected_reading: resp.corrected_reading,
             engine_ms: resp.engine_ms,
             frames: resp.frames,
             round_trip_ms: dispatched_at.elapsed().as_secs_f64() * 1000.0,

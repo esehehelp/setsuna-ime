@@ -603,6 +603,8 @@ struct RewriteJob {
 /// sent them, the first `k` of which are being (or were) scored by the LM.
 struct RerankJob {
     reading: String,
+    /// The engine's reading corrector's reading (`EngineResult::corrected_reading`).
+    corrected_reading: Option<String>,
     context: String,
     raw: Vec<String>,
     scores: Vec<f32>,
@@ -1288,7 +1290,12 @@ impl EngineBridge {
             return actions;
         }
         let raw = std::mem::take(&mut result.candidates);
-        let list = self.finish_list(&result.reading, raw.clone(), true);
+        let list = self.finish_list(
+            &result.reading,
+            result.corrected_reading.as_deref(),
+            raw.clone(),
+            true,
+        );
         let starts = self.list_starts_of(&result.reading, &raw, &result.reading_pos, &list);
         result.candidates = list;
         let current_hira = self.composing.live_reading();
@@ -1319,6 +1326,7 @@ impl EngineBridge {
             if whole {
                 self.start_rerank(
                     &result.reading,
+                    result.corrected_reading.as_deref(),
                     &raw,
                     &result.scores,
                     &result.reading_pos,
@@ -1392,6 +1400,7 @@ impl EngineBridge {
         // the candidate window is open: rerank at once
         self.start_rerank(
             &result.reading,
+            result.corrected_reading.as_deref(),
             &raw,
             &result.scores,
             &result.reading_pos,
@@ -1620,7 +1629,12 @@ impl EngineBridge {
         else {
             return false;
         };
-        let candidates = self.finish_list(&reading, result.candidates, false);
+        let candidates = self.finish_list(
+            &reading,
+            result.corrected_reading.as_deref(),
+            result.candidates,
+            false,
+        );
         let user_words = self
             .user_dict()
             .map(|d| d.words(&reading))
@@ -2061,7 +2075,7 @@ impl EngineBridge {
                     }
                     // This also works without a model or while it loads.
                     let mut list = if dynamic {
-                        self.finish_list(&reading, vec![reading.clone()], true)
+                        self.finish_list(&reading, None, vec![reading.clone()], true)
                     } else {
                         Vec::new()
                     };
@@ -2477,8 +2491,13 @@ impl EngineBridge {
             for k in 0..s.segs.len() {
                 let reading = s.reading_of(k);
                 let cands = std::mem::take(&mut s.segs[k].cands);
-                let cands =
-                    with_romaji_kana(&reading, crate::kana_candidates::arrange(&reading, cands));
+                // the text the segment was cut to stays, even a hiragana other
+                // than its reading's (a corrected reading's, ありがとう of ありがと)
+                let cut = cands.first().cloned();
+                let cands = with_romaji_kana(
+                    &reading,
+                    crate::kana_candidates::arrange(&reading, cut.as_deref(), cands),
+                );
                 let generated = if date_time_enabled {
                     char_rules.apply(crate::date_time::candidates(&reading, &date_now))
                 } else {
@@ -2714,7 +2733,12 @@ impl EngineBridge {
             else {
                 return Some(Vec::new());
             };
-            let list = self.finish_list(&kana, result.candidates.clone(), false);
+            let list = self.finish_list(
+                &kana,
+                result.corrected_reading.as_deref(),
+                result.candidates.clone(),
+                false,
+            );
             if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
                 if !s.segs[k].stale {
                     s.take(k, with_romaji_kana(&reading, list));
@@ -2728,7 +2752,12 @@ impl EngineBridge {
         if reading != result.reading {
             return Some(Vec::new());
         }
-        let mut list = self.finish_list(&reading, result.candidates.clone(), false);
+        let mut list = self.finish_list(
+            &reading,
+            result.corrected_reading.as_deref(),
+            result.candidates.clone(),
+            false,
+        );
         let dates = self.char_rules.apply(self.date_time_candidates(&reading));
         if let Some(s) = self.segmented() {
             let chosen = s.text_of(k);
@@ -2784,6 +2813,7 @@ impl EngineBridge {
     fn start_rerank(
         &mut self,
         reading: &str,
+        corrected: Option<&str>,
         raw: &[String],
         scores: &[f32],
         reading_pos: &[Vec<u32>],
@@ -2820,6 +2850,7 @@ impl EngineBridge {
         };
         self.rerank = Some(RerankJob {
             reading: reading.to_string(),
+            corrected_reading: corrected.map(str::to_string),
             context: self.context.clone(),
             raw: raw.to_vec(),
             scores: scores.to_vec(),
@@ -3050,6 +3081,7 @@ impl EngineBridge {
             Vec::new()
         };
         let reading = job.reading.clone();
+        let corrected = job.corrected_reading.clone();
         let (k, n) = (job.k, job.raw.len());
         crate::diagnostics::log(if crate::diagnostics::log_typed_text() {
             format!(
@@ -3063,7 +3095,7 @@ impl EngineBridge {
                 raw[0] != job.raw[0]
             )
         });
-        let list = self.finish_list(&reading, raw.clone(), true);
+        let list = self.finish_list(&reading, corrected.as_deref(), raw.clone(), true);
         let starts = self.list_starts_of(&reading, &raw, &reading_pos, &list);
         let actions = self.show_reranked(&reading, list, starts);
         let max = self.rerank_max(n);
@@ -3149,7 +3181,13 @@ impl EngineBridge {
     /// The engine's candidates for `reading` as the IME lists them:
     /// post-processing, kana forms, symbols, char rules and (for a whole
     /// reading) the learned reranking.
-    fn finish_list(&mut self, reading: &str, raw: Vec<String>, rerank: bool) -> Vec<String> {
+    fn finish_list(
+        &mut self,
+        reading: &str,
+        corrected: Option<&str>,
+        raw: Vec<String>,
+        rerank: bool,
+    ) -> Vec<String> {
         let processed = crate::postprocess::apply(reading, raw, self.symbol_width, &self.context);
         let processed = if self.drop_untyped_symbols {
             crate::postprocess::drop_untyped_symbols(reading, processed)
@@ -3171,7 +3209,7 @@ impl EngineBridge {
         } else {
             processed
         };
-        let mut arranged = crate::kana_candidates::arrange(reading, processed);
+        let mut arranged = crate::kana_candidates::arrange(reading, corrected, processed);
         // a reading of one word: the lexicon's words for it that the model
         // left out (検収 for けんしゅう), after its first candidates; not
         // for a reading with English in it (`is_mixed` says only that the
@@ -7948,5 +7986,43 @@ mod tests {
         assert!(list.contains(&"京".to_string()), "{list:?}");
         assert!(!list.contains(&"況日".to_string()), "{list:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_corrected_readings_kana_candidate_stays_in_the_list_and_its_segment() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "arigato");
+        // the engine's reading corrector made ありがとう of ありがと, both
+        // readings' candidates merged, positions on the reading typed
+        mock.set_aligned(
+            "ありがと",
+            &["ありがとう", "有難う", "ありがど"],
+            &[&[0, 1, 2, 3, 3], &[0, 2, 3], &[0, 1, 2, 3]],
+        );
+        mock.state
+            .next
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .corrected_reading = Some("ありがとう".into());
+        bridge.apply_async_result();
+        let out = bridge.handle_space();
+        let list = out
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::ShowCandidates { list, .. } => Some(list.clone()),
+                _ => None,
+            })
+            .expect("ShowCandidates");
+        assert_eq!(
+            list[..4],
+            v(&["ありがとう", "有難う", "ありがと", "アリガト"])[..]
+        );
+        // segment editing keeps the text it was cut from
+        let out = bridge.handle_move_cursor(1);
+        assert_eq!(segments_shown(&out.actions), (v(&["ありがとう"]), 0));
+        let (list, selected, _) = segment_list(&out.actions);
+        assert_eq!(list[selected], "ありがとう");
     }
 }

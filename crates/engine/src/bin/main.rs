@@ -222,12 +222,22 @@ fn build_session(args: &EngineArgs) -> Result<(EngineSession, &'static str)> {
 }
 
 /// Candidates of one request and the conversion timings.
+/// One request's answer (`decode_one`).
+struct Decoded {
+    cands: Vec<Candidate>,
+    perf: Option<ConvertPerf>,
+    frames: Option<Vec<FrameView>>,
+    /// The reading corrector's reading, when it changed the one requested
+    /// (both were converted, their candidates merged).
+    corrected_reading: Option<String>,
+}
+
 fn decode_one(
     session: &mut EngineSession,
     context: &str,
     reading: &str,
     continue_beam: usize,
-) -> Result<(Vec<Candidate>, Option<ConvertPerf>, Option<Vec<FrameView>>)> {
+) -> Result<Decoded> {
     if reading.is_empty() {
         let empty = Candidate {
             text: String::new(),
@@ -236,7 +246,12 @@ fn decode_one(
             reading_pos: Vec::new(),
             parts: None,
         };
-        return Ok((vec![empty], None, None));
+        return Ok(Decoded {
+            cands: vec![empty],
+            perf: None,
+            frames: None,
+            corrected_reading: None,
+        });
     }
     let set = session.convert(ConversionRequest {
         context,
@@ -256,7 +271,12 @@ fn decode_one(
     if session.config.beam_width <= 1 && continue_beam == 0 {
         cands.truncate(greedy_answers(&cands));
     }
-    Ok((cands, Some(set.perf), set.frames))
+    Ok(Decoded {
+        cands,
+        perf: Some(set.perf),
+        frames: set.frames,
+        corrected_reading: set.correction.filter(|c| c.changed).map(|c| c.reading),
+    })
 }
 
 /// Greedy decoding has one answer for each reading converted: the first
@@ -315,6 +335,11 @@ struct Response<'a> {
     /// (and not for a reading split at symbols).
     #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<Vec<FrameView>>,
+    /// The reading corrector's reading, when it changed the one requested:
+    /// `candidates` then holds both readings' (`candidate_reading_pos` still
+    /// on the reading requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corrected_reading: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
 }
@@ -328,6 +353,7 @@ impl<'a> Response<'a> {
         meta: bool,
         alignment: bool,
         frames: Option<Vec<FrameView>>,
+        corrected_reading: Option<String>,
     ) -> Self {
         let candidate_meta = meta.then(|| cands.iter().map(CandidateMetaJson::from).collect());
         let candidate_reading_pos =
@@ -342,6 +368,7 @@ impl<'a> Response<'a> {
             candidate_meta,
             candidate_reading_pos,
             frames,
+            corrected_reading,
             error: None,
         }
     }
@@ -356,6 +383,7 @@ impl<'a> Response<'a> {
             candidate_meta: None,
             candidate_reading_pos: None,
             frames: None,
+            corrected_reading: None,
             error: Some(error),
         }
     }
@@ -686,16 +714,17 @@ impl Daemon {
         let result = decode_one(&mut self.session, context, reading, req.continue_beam);
         let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
         match result {
-            Ok((cands, perf, frames)) => {
-                let perf = perf.filter(|_| self.perf_enabled).map(PerfResponse::from);
+            Ok(d) => {
+                let perf = d.perf.filter(|_| self.perf_enabled).map(PerfResponse::from);
                 to_line(&Response::ok(
                     req.id,
-                    cands,
+                    d.cands,
                     engine_ms,
                     perf,
                     self.args.emit_meta,
                     self.args.emit_alignment,
-                    frames,
+                    d.frames,
+                    d.corrected_reading,
                 ))
             }
             Err(e) => to_line(&Response::err(req.id, engine_ms, &e.to_string())),
@@ -809,19 +838,20 @@ fn run_convert(
     let (mut session, _) = build_session(&args)?;
     let perf_enabled = env_flag("SETSUNA_PERF");
     let t0 = Instant::now();
-    let (cands, perf, frames) = decode_one(&mut session, &context, &reading, continue_beam)?;
+    let d = decode_one(&mut session, &context, &reading, continue_beam)?;
     let engine_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let perf = perf.filter(|_| perf_enabled).map(PerfResponse::from);
+    let perf = d.perf.filter(|_| perf_enabled).map(PerfResponse::from);
     println!(
         "{}",
         serde_json::to_string(&Response::ok(
             0,
-            cands,
+            d.cands,
             engine_ms,
             perf,
             args.emit_meta,
             args.emit_alignment,
-            frames,
+            d.frames,
+            d.corrected_reading,
         ))?
     );
     Ok(())
@@ -905,14 +935,14 @@ mod tests {
             reading_pos: vec![0, 2],
             parts: None,
         }];
-        let resp = Response::ok(7, cands.clone(), 1.0, None, true, false, None);
+        let resp = Response::ok(7, cands.clone(), 1.0, None, true, false, None, None);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["candidates"][0], "天気");
         assert_eq!(json["candidate_meta"][0]["source"], "beam");
         assert_eq!(json["candidate_meta"][0]["score"], -0.5);
         assert!(json.get("candidate_reading_pos").is_none());
-        let json =
-            serde_json::to_value(Response::ok(7, cands, 1.0, None, false, true, None)).unwrap();
+        let json = serde_json::to_value(Response::ok(7, cands, 1.0, None, false, true, None, None))
+            .unwrap();
         assert_eq!(json["candidate_reading_pos"][0], serde_json::json!([0, 2]));
     }
 

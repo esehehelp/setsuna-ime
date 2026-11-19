@@ -32,6 +32,10 @@ pub struct EngineResult {
     /// Per candidate, the engine's log-probability score; empty when not
     /// given.
     pub scores: Vec<f32>,
+    /// The engine's reading corrector's reading, when it changed `reading`:
+    /// `candidates` holds both readings' (their `reading_pos` still on
+    /// `reading`), so a kana spelling of it is a candidate, not a slip.
+    pub corrected_reading: Option<String>,
     /// Time the engine spent on the conversion, when it reports it.
     pub engine_ms: Option<f64>,
     /// From dispatch to the result arriving, queueing included.
