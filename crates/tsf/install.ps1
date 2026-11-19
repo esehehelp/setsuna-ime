@@ -1349,7 +1349,10 @@ if ($UserDir -ne $InstallDir) {
     }
     $old = @(Get-ChildItem -LiteralPath $UserDir -File -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -match '^(setsuna_tsf.*\.dll|setsuna-tsf-check.*\.exe|setsuna-engine.*\.exe|setsuna-rewrite.*\.exe|setsuna-settings\.exe|onnxruntime.*\.dll|uninstall\.ps1|core\.txt\.new|.*\.lexicon)$' })
-    $old += @(Get-ChildItem -LiteralPath $UserDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(models|rerank(_[0-9a-f]{12})?)$' })
+    $old += @(Get-ChildItem -LiteralPath $UserDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^rerank(_[0-9a-f]{12})?$' })
+    # models\ kind by kind (onnx, lexicon, analyzer, ...): one config.toml names keeps that kind alone
+    $userModels = Join-Path $UserDir 'models'
+    $old += @(Get-ChildItem -LiteralPath $userModels -ErrorAction SilentlyContinue)
     foreach ($item in $old) {
         $prefix = $item.FullName.TrimEnd('\') + '\'
         if (@($named | Where-Object { $_ -eq $item.FullName -or $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
@@ -1362,6 +1365,9 @@ if ($UserDir -ne $InstallDir) {
         } catch {
             Write-Log INFO "kept $($item.FullName) (in use)"
         }
+    }
+    if ((Test-Path -LiteralPath $userModels) -and -not (Get-ChildItem -LiteralPath $userModels -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $userModels -Force -ErrorAction SilentlyContinue
     }
     if (-not (Get-ChildItem -LiteralPath $UserDir -Filter 'setsuna_tsf*.dll' -ErrorAction SilentlyContinue)) {
         Remove-Item -LiteralPath (Join-Path $UserDir 'core.txt') -Force -ErrorAction SilentlyContinue
