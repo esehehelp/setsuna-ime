@@ -480,7 +480,8 @@ pub unsafe extern "C" fn setsuna_session_configure(s: *mut SetsunaSession) {
 /// mixed input model (`<module_dir>/mixed`), the Latin names dictionary
 /// (`<module_dir>/names/latin-names.tsv`), the reading lexicon
 /// (`<module_dir>/lexicon/words.lexicon`), the engine's analyzer (the one
-/// `*manifest.json` of `<module_dir>/analyzer`) and the reranker's model (the
+/// `*manifest.json` of `<module_dir>/analyzer`), the reading corrector (the one
+/// `*manifest.json` of `<module_dir>/corrector`) and the reranker's model (the
 /// one `*manifest.json` of `<module_dir>/models/rerank`). Every (re)load goes
 /// through here, so a reload on activation or focus keeps them.
 fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
@@ -502,6 +503,9 @@ fn with_module_defaults(mut cfg: Config, module_dir: Option<&Path>) -> Config {
     }
     if cfg.engine.analyzer_manifest.is_none() {
         cfg.engine.analyzer_manifest = the_manifest_in(&dir.join("analyzer"));
+    }
+    if cfg.engine.corrector_manifest.is_none() {
+        cfg.engine.corrector_manifest = the_manifest_in(&dir.join("corrector"));
     }
     if cfg.rerank.manifest.is_none() {
         cfg.rerank.manifest = the_manifest_in(&dir.join("models").join("rerank"));
@@ -794,6 +798,10 @@ mod tests {
         std::fs::write(dir.join("names/latin-names.tsv"), "GitHub\t1\n").unwrap();
         std::fs::write(dir.join("lexicon/words.lexicon"), "LEXICON1").unwrap();
         std::fs::write(rerank.join("lm.manifest.json"), "{}").unwrap();
+        let corrector = dir.join("corrector");
+        std::fs::create_dir_all(&corrector).unwrap();
+        std::fs::write(corrector.join("c.manifest.json"), "{}").unwrap();
+        std::fs::write(corrector.join("c.encoder.safetensors"), "").unwrap();
         let cfg = with_module_defaults(Config::default(), Some(&dir));
         let names = dir
             .join("names")
@@ -811,13 +819,19 @@ mod tests {
             cfg.engine.analyzer_manifest,
             Some(analyzer.join("analyzer.manifest.json"))
         );
+        assert_eq!(
+            cfg.engine.corrector_manifest,
+            Some(corrector.join("c.manifest.json"))
+        );
         // config.toml's own wins (analyzer_manifest = "" turns it off)
         let mut own = Config::default();
         own.rerank.manifest = Some(PathBuf::from("/m.json"));
         own.engine.analyzer_manifest = Some(PathBuf::new());
+        own.engine.corrector_manifest = Some(PathBuf::new());
         let cfg = with_module_defaults(own, Some(&dir));
         assert_eq!(cfg.rerank.manifest, Some(PathBuf::from("/m.json")));
         assert_eq!(cfg.engine.analyzer_manifest, Some(PathBuf::new()));
+        assert_eq!(cfg.engine.corrector_manifest, Some(PathBuf::new()));
         // two models: which one is not guessed
         std::fs::write(rerank.join("other.manifest.json"), "{}").unwrap();
         let cfg = with_module_defaults(Config::default(), Some(&dir));

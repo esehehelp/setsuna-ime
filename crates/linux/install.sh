@@ -23,15 +23,19 @@
 #                           alternates it names) instead of the download:
 #                           segment editing cuts a conversion by its words
 #   --no-dictionaries       download neither the lexicon nor the analyzer
+#   --no-corrector          do not download the reading corrector (models.json's
+#                           `corrector`: a reading with a slip converted as it
+#                           reads it)
 #   --rerank-manifest <m>   also the reranker's LM (an LM scorer manifest, the
 #                           weights and tokenizer it names): candidates are reranked
 #   --name-dictionary <tsv> also mixed input's Latin names dictionary
 #   --no-register           install only; leave fcitx5 as it is
 #   --root <dir>            install under <dir> (staging, tests): no root
 #                           needed, implies --no-register
-# A reranker model, names dictionary, lexicon or analyzer installed before
-# stays when this install does not bring one (--no-dictionaries, a failed
-# download, the option not given again).
+# A reranker model, names dictionary, lexicon, analyzer or reading corrector
+# installed before stays when this install does not bring one
+# (--no-dictionaries, --no-corrector, a failed download, the option not given
+# again).
 #
 # Layout:
 #   <fcitx5 addon dir>/setsuna.so
@@ -43,6 +47,7 @@
 #   /usr/lib/setsuna-ime/names/latin-names.tsv  (with --name-dictionary)
 #   /usr/lib/setsuna-ime/lexicon/words.lexicon  (downloaded, or --lexicon)
 #   /usr/lib/setsuna-ime/analyzer/<manifest> + its dictionary and alternates  (downloaded, or --analyzer)
+#   /usr/lib/setsuna-ime/corrector/<manifest> + its weights and vocabulary  (downloaded)
 # These are the addon's defaults where config.toml sets nothing.
 #   /usr/bin/setsuna-settings  (when WebKitGTK 4.1 is there)
 #   /var/cache/setsuna-ime/models  (downloads while installing: hard-linked into
@@ -75,6 +80,7 @@ name_dictionary=
 lexicon=
 analyzer=
 dictionaries=1
+corrector=1
 
 log() { echo "setsuna-install: $*" >&2; }
 fail() {
@@ -94,6 +100,7 @@ while (($#)); do
         --lexicon) lexicon=${2:?}; shift 2 ;;
         --analyzer) analyzer=${2:?}; shift 2 ;;
         --no-dictionaries) dictionaries=0; shift ;;
+        --no-corrector) corrector=0; shift ;;
         --no-register) register=0; shift ;;
         --root) root=${2:?}; register=0; shift 2 ;;
         -h | --help) sed -n '1d; /^#/!q; s/^# \{0,1\}//p' "$0"; exit 0 ;;
@@ -311,8 +318,8 @@ done <"$src/models.tsv"
 [[ -n $manifest ]] || fail 30 "the archive pins no $precision model"
 
 # component_dst <name> <entry> <path>: where a component's file goes. The
-# lexicon is words.lexicon; the analyzer's files keep their paths relative to
-# its manifest, as the manifest names them.
+# lexicon is words.lexicon; the analyzer's and the reading corrector's files
+# keep their paths relative to its manifest, as the manifest names them.
 component_dst() {
     local entry_dir
     case $1 in
@@ -320,13 +327,13 @@ component_dst() {
             [[ $3 == "$2" ]] || return 1
             echo "$module/lexicon/words.lexicon"
             ;;
-        analyzer)
+        analyzer | corrector)
             entry_dir=$(dirname "$2")
             if [[ $entry_dir == . ]]; then
-                echo "$module/analyzer/$3"
+                echo "$module/$1/$3"
             else
                 [[ $3 == "$entry_dir"/* ]] || return 1
-                echo "$module/analyzer/${3#"$entry_dir"/}"
+                echo "$module/$1/${3#"$entry_dir"/}"
             fi
             ;;
         *) return 1 ;;
@@ -374,6 +381,8 @@ fetch_component() {
 have_lexicon=0
 have_analyzer=0
 analyzer_name=
+have_corrector=0
+corrector_name=
 [[ -n $lexicon ]] && have_lexicon=1
 [[ -n $analyzer ]] && have_analyzer=1 && analyzer_name=$(basename "$analyzer")
 if ((dictionaries && !have_lexicon)); then
@@ -389,6 +398,14 @@ if ((dictionaries && !have_analyzer)); then
         analyzer_name=$(basename "$comp_entry")
     else
         log "warning: no analyzer: installing without it (run again to retry)"
+    fi
+fi
+if ((corrector)); then
+    if fetch_component corrector; then
+        have_corrector=1
+        corrector_name=$(basename "$comp_entry")
+    else
+        log "warning: no reading corrector: installing without it (run again to retry)"
     fi
 fi
 
@@ -447,10 +464,18 @@ for m in "$root$module"/models/onnx/*; do
     done
     ((keep)) || rm -f -- "$m"
 done
-# One analyzer: the addon gives the engine the only manifest there.
+# One analyzer, one reading corrector: the addon gives the engine the only
+# manifest there.
 if ((have_analyzer)); then
     for m in "$root$module"/analyzer/*manifest.json; do
         if [[ -e $m && $(basename "$m") != "$analyzer_name" ]]; then
+            rm -f -- "$m"
+        fi
+    done
+fi
+if ((have_corrector)); then
+    for m in "$root$module"/corrector/*manifest.json; do
+        if [[ -e $m && $(basename "$m") != "$corrector_name" ]]; then
             rm -f -- "$m"
         fi
     done
@@ -502,7 +527,8 @@ if [[ -f $root$module/installed-files ]]; then
         if [[ ($f == "$module"/models/rerank/* && -z $rerank_manifest) ||
             ($f == "$module"/names/* && -z $name_dictionary) ||
             ($f == "$module"/lexicon/* && $have_lexicon == 0) ||
-            ($f == "$module"/analyzer/* && $have_analyzer == 0) ]] && [[ -f $root$f ]]; then
+            ($f == "$module"/analyzer/* && $have_analyzer == 0) ||
+            ($f == "$module"/corrector/* && $have_corrector == 0) ]] && [[ -f $root$f ]]; then
             installed+=("$f")
             continue
         fi

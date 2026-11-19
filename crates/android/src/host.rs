@@ -73,6 +73,14 @@ pub fn with_app_defaults(mut cfg: Config, dirs: &Dirs) -> Config {
             m.is_file().then_some(m)
         });
     }
+    // the reading corrector the app downloads with the model: models/corrector/<name>/<name>.manifest.json
+    if e.corrector_manifest.is_none() {
+        e.corrector_manifest = the_one(&models.join("corrector"), |p| {
+            let name = p.file_name()?.to_str()?;
+            let m = p.join(format!("{name}.manifest.json"));
+            m.is_file().then_some(m)
+        });
+    }
     if cfg.lexicon.file.is_none() {
         cfg.lexicon.file = the_one(&models.join("lexicon"), |p| {
             (p.is_file() && p.extension().is_some_and(|x| x == "lexicon")).then(|| p.to_path_buf())
@@ -235,6 +243,8 @@ mod tests {
         let models = dirs.data.join("models");
         std::fs::create_dir_all(models.join("analyzer/v1")).unwrap();
         std::fs::write(models.join("analyzer/v1/analyzer.manifest.json"), "{}").unwrap();
+        std::fs::create_dir_all(models.join("corrector/N-tiny")).unwrap();
+        std::fs::write(models.join("corrector/N-tiny/N-tiny.manifest.json"), "{}").unwrap();
         std::fs::create_dir_all(models.join("lexicon")).unwrap();
         std::fs::write(models.join("lexicon/words.lexicon"), "LEXICON1").unwrap();
         std::fs::create_dir_all(dirs.files.join("mixed")).unwrap();
@@ -248,6 +258,10 @@ mod tests {
         assert_eq!(
             cfg.engine.analyzer_manifest,
             Some(models.join("analyzer/v1/analyzer.manifest.json"))
+        );
+        assert_eq!(
+            cfg.engine.corrector_manifest,
+            Some(models.join("corrector/N-tiny/N-tiny.manifest.json"))
         );
         assert_eq!(
             cfg.lexicon.file.map(PathBuf::from),

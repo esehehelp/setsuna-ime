@@ -19,7 +19,8 @@ import java.security.MessageDigest
  * partial lexicon the catalog pins as `lexicon-small` (the commoner words and
  * every one-char kanji, a few MB: user 2026-11-10 "辞書でかいしインストール
  * できなくない？", "単語辞書だけ作るか") unless the full lexicon is in
- * lexicon/ already, each file checked by its
+ * lexicon/ already, and the reading corrector the catalog pins as
+ * `corrector` (models/corrector/<name>/), each file checked by its
  * size and SHA-256 and put where setsuna-core looks for it, the app's
  * files/models: onnx/, lexicon/, analyzer/<name>/. The files arrive as
  * `.part` beside their place; once all of them are in, what each directory
@@ -106,13 +107,24 @@ object Downloads {
                 // the full lexicon, downloaded with the analyzer, stays (the session takes the only lexicon)
                 val name = small?.getString("entry")?.substringAfterLast('/')
                 val full = lexiconDir.listFiles()?.any { it.isFile && it.name.endsWith(".lexicon") && it.name != name } == true
-                if (small == null || full) {
-                    listOf(model)
-                } else {
-                    listOf(model, part(small, small.getJSONArray("files"), lexiconDir) {
+                val parts = mutableListOf(model)
+                if (small != null && !full) {
+                    parts.add(part(small, small.getJSONArray("files"), lexiconDir) {
                         File(lexiconDir, it.substringAfterLast('/'))
                     })
                 }
+                // the reading corrector, a few MB: its files under models/corrector/<its manifest's name>/
+                val corrector = catalog.optJSONObject("components")?.optJSONObject("corrector")
+                if (corrector != null) {
+                    val entry = corrector.getString("entry")
+                    val base = entry.substringBeforeLast('/', "")
+                    val correctors = File(models, "corrector")
+                    val dir = File(correctors, entry.substringAfterLast('/').removeSuffix(".manifest.json"))
+                    parts.add(part(corrector, corrector.getJSONArray("files"), correctors) {
+                        File(dir, if (base.isEmpty()) it else it.removePrefix("$base/"))
+                    })
+                }
+                parts
             }
             What.DICTIONARIES -> {
                 val components = catalog.getJSONObject("components")

@@ -113,7 +113,7 @@ Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキス
 
 | モデル | サイズ | 用途 |
 |---|---:|---|
-| [**Nandina-v1.0-tiny**](https://huggingface.co/esehe/Nandina-v1.0-tiny) | 約 4 MB | 打ち間違いを含む読みを、補正してから変換します（補正の確からしさが閾値を超えたとき。打ったままの読みの候補も出します）。Windows のインストーラが既定で入れます（`-NoCorrector` で入れない、`[engine] corrector_manifest` を空にすると使わない） |
+| [**Nandina-v1.0-tiny**](https://huggingface.co/esehe/Nandina-v1.0-tiny) | 約 4 MB | 打ち間違いを含む読みを、補正してから変換します（補正の確からしさが閾値を超えたとき。打ったままの読みの候補も出します）。インストーラ（Windows・Linux）と Android アプリ（変換モデルと一緒に）が既定で入れます（Windows は `-NoCorrector`、Linux は `--no-corrector` で入れない。`[engine] corrector_manifest` を空にすると使わない） |
 
 ### 辞書・解析器（CC BY-SA 4.0 / [esehe/setsuna-ime-dict](https://huggingface.co/esehe/setsuna-ime-dict)）
 
