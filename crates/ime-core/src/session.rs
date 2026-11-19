@@ -405,21 +405,35 @@ impl Session {
         outcome.consumed
     }
 
-    /// Commit the composition as it stands (the input context loses focus
-    /// or switches input method), then forget the left context: the next
-    /// text is typed elsewhere.
+    /// Pick candidate `index` of the open list or suggestions and accept it:
+    /// commits it, or during segment editing fixes the focused segment and
+    /// moves to the next (committing after the last), matching digit keys.
+    pub fn pick(&mut self, index: usize) -> bool {
+        self.view.commits.clear();
+        let outcome = self.bridge.handle_pick(index);
+        self.apply(outcome.actions);
+        outcome.consumed
+    }
+
+    /// Commit what is currently shown without waiting for a pending live
+    /// conversion (the input context loses focus or switches input method),
+    /// then forget the left context: the next text is typed elsewhere.
     pub fn flush(&mut self) {
         self.view.commits.clear();
-        let outcome = self.bridge.handle_enter();
+        let outcome = self.bridge.flush_shown();
         self.apply(outcome.actions);
         self.apply(vec![Action::HideCandidates, Action::EndComposition]);
         self.bridge.forget_context();
     }
 
     /// Turn the IME on or off, committing what is composed. Text typed while
-    /// it was off never reached the left context, which `flush` forgets.
+    /// it was off never reached the left context, which this forgets.
     pub fn toggle(&mut self) {
-        self.flush();
+        self.view.commits.clear();
+        let outcome = self.bridge.handle_enter();
+        self.apply(outcome.actions);
+        self.apply(vec![Action::HideCandidates, Action::EndComposition]);
+        self.bridge.forget_context();
         self.enabled = !self.enabled;
         crate::diagnostics::log(format!("toggle: enabled={}", self.enabled));
     }
@@ -827,6 +841,33 @@ mod tests {
     }
 
     #[test]
+    fn pick_advances_segment_and_commits_on_last() {
+        let (mut s, echo) = session();
+        type_str(&mut s, "kishanokisha");
+        echo.answer("きしゃのきしゃ", &["記者の記者", "汽車の記者"]);
+        s.apply_async_result();
+        press(&mut s, SPACE, 0);
+        // Enter segment editing on the first segment.
+        assert!(press(&mut s, RIGHT, 0));
+        let segs = s.view().preedit.len();
+        assert!(segs > 1, "{:?}", s.view().preedit);
+        assert_eq!(s.view().focus, Some(0));
+        // Picking a candidate on a non-final segment fixes it and moves to the
+        // next segment rather than committing the whole sentence.
+        assert!(s.pick(0));
+        assert!(s.view().commits.is_empty(), "{:?}", s.view().commits);
+        assert_eq!(s.view().focus, Some(1));
+        // Advance to the last segment and pick there: commits the sentence.
+        while s.view().focus.is_some_and(|f| f + 1 < segs) {
+            assert!(s.pick(0));
+            assert!(s.view().commits.is_empty());
+        }
+        assert!(s.pick(0));
+        assert!(!s.view().commits.is_empty());
+        assert!(s.view().preedit.is_empty());
+    }
+
+    #[test]
     fn flush_commits_what_is_shown() {
         let (mut s, echo) = session();
         type_str(&mut s, "kyouha");
@@ -838,6 +879,21 @@ mod tests {
         // focus moved: the next context starts empty
         type_str(&mut s, "desuyo");
         assert_eq!(echo.context(), "");
+    }
+
+    #[test]
+    fn flush_does_not_wait_for_pending_conversion() {
+        let (mut s, _echo) = session();
+        type_str(&mut s, "kyouha");
+        let start = std::time::Instant::now();
+        s.flush();
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "flush blocked for {:?}",
+            start.elapsed()
+        );
+        assert_eq!(s.view().commits, vec!["きょうは"]);
+        assert!(s.view().preedit.is_empty());
     }
 
     #[test]

@@ -137,10 +137,14 @@ impl Store {
 
     fn lock(&self) -> Result<File> {
         let path = self.dir.join(LOCK_NAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
         file.lock()
@@ -163,7 +167,7 @@ impl Store {
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -171,8 +175,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
+    // Narrow permissions even if a pre-existing temp file had a wider mode.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", path.display()))?;
     f.write_all(bytes)
-        .with_context(|| format!("write {}", path.display()))
+        .with_context(|| format!("write {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("sync {}", path.display()))
 }
 
 #[cfg(not(unix))]
@@ -327,5 +336,33 @@ mod tests {
         });
         assert!(r.is_err());
         assert!(store.load().unwrap().plan_notice_shown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_tmp_permissions_are_narrowed_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new("perms");
+        std::fs::create_dir_all(&t.0).unwrap();
+        let store = Store::at(&t.0);
+        let tmp = store.path().with_extension("tmp");
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        store
+            .update(|c| {
+                c.api_keys.insert(
+                    api_key_slot("https://api.openai.com/v1"),
+                    "sk-secret".into(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "got mode {mode:o}");
     }
 }

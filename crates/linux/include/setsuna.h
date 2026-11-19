@@ -88,7 +88,12 @@ bool setsuna_session_key(SetsunaSession *s, uint32_t sym, uint32_t code,
 bool setsuna_session_apply_async(SetsunaSession *s);
 /* Pick candidate `index` of the open list (moves the selection there). */
 bool setsuna_session_select(SetsunaSession *s, size_t index);
-/* Commit the composition (focus out, input method switch). */
+/* Pick candidate `index` of the open list or suggestions and accept it:
+ * commits it, or while editing segments fixes the focused segment and moves
+ * to the next (committing after the last), matching digit keys. */
+bool setsuna_session_pick(SetsunaSession *s, size_t index);
+/* Commit what is currently shown without waiting for a pending conversion
+ * (focus out, input method switch). */
 void setsuna_session_flush(SetsunaSession *s);
 /* Drop the composition (the app reset the input context). */
 void setsuna_session_reset(SetsunaSession *s);

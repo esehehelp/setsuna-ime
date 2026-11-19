@@ -2171,13 +2171,25 @@ impl EngineBridge {
     }
 
     pub fn handle_enter(&mut self) -> KeyOutcome {
+        self.commit_composition(true)
+    }
+
+    /// Commit what is currently shown without waiting for a pending live
+    /// conversion (focus out, input method switch): never blocks the host's
+    /// event loop, and keeps the commit aligned with what was displayed.
+    pub fn flush_shown(&mut self) -> KeyOutcome {
+        self.commit_composition(false)
+    }
+
+    fn commit_composition(&mut self, wait: bool) -> KeyOutcome {
         self.passing = false;
         // mixed input reading the whole otherwise once typing is done
         // (げんだいぶんめいok: お and a pending k while typed, ok when done):
         // that reading is converted, as Space does (its kana went
         // unconverted); one with no kana is committed as it reads (`ok`: OK)
         let done_otherwise = self.composing.reads_otherwise_when_done();
-        let convert_done = done_otherwise
+        let convert_done = wait
+            && done_otherwise
             && self.live_conversion
             && matches!(self.phase, Phase::Composing { .. })
             && self.composing.cursor_at_end()
@@ -2191,7 +2203,9 @@ impl EngineBridge {
             self.composing.commit_reading();
             self.dispatch_live();
         }
-        self.await_live_conversion(convert_done);
+        if wait {
+            self.await_live_conversion(convert_done);
+        }
         self.invalidate_engine_results();
         match &self.phase {
             Phase::Empty => not_consumed(),
@@ -2232,6 +2246,7 @@ impl EngineBridge {
                 // after Escape the kana shown is what goes
                 let kana = std::mem::take(&mut self.kana_shown);
                 let reading = self.composing.full_reading();
+                let deferred = self.deferred.is_some();
                 let cand_top = candidates
                     .first()
                     .filter(|_| {
@@ -2240,6 +2255,7 @@ impl EngineBridge {
                             && self.list_reading == self.composing.live_reading()
                             && !done_otherwise
                             && !kana
+                            && (wait || !deferred)
                     })
                     .cloned();
                 let text = match cand_top {
@@ -2861,6 +2877,7 @@ impl EngineBridge {
     /// The conversion being reranked is gone (typed over, committed,
     /// dropped): no more requests for it.
     fn stop_rerank(&mut self) {
+        self.deferred = None;
         if self.rerank.take().is_some() {
             if let Some(r) = &self.reranker {
                 r.cancel();
@@ -3595,7 +3612,18 @@ impl EngineBridge {
         if slot > self.page_size || index >= n {
             return consumed(Vec::new());
         }
-        let mut actions = self.handle_select(index).actions;
+        self.handle_pick(index)
+    }
+
+    /// Pick candidate `index` of the open list (or suggestions) and accept it:
+    /// commits it, or, while editing segments, fixes the focused segment and
+    /// moves to the next one (committing after the last), matching digit keys.
+    pub fn handle_pick(&mut self, index: usize) -> KeyOutcome {
+        let picked = self.handle_select(index);
+        if !picked.consumed {
+            return picked;
+        }
+        let mut actions = picked.actions;
         let last_segment = match &self.phase {
             Phase::Converting { seg: Some(s), .. } => s.focus + 1 == s.segs.len(),
             _ => true,

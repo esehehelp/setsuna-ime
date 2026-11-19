@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/option.h>
@@ -145,7 +148,22 @@ FCITX_CONFIGURATION(SetsunaConfig,
                     ExternalOption settings{this, "Settings", "Setsuna の設定",
                                             "fcitx://config/addon/setsuna/settings"};);
 
-void openSettings() { startProcess({SETSUNA_SETTINGS_EXE}); }
+bool hasSettingsExe() {
+    const char *exe = SETSUNA_SETTINGS_EXE;
+    if (!exe || !*exe) {
+        return false;
+    }
+    if (std::string_view(exe).find('/') != std::string_view::npos) {
+        return ::access(exe, X_OK) == 0;
+    }
+    return true;
+}
+
+void openSettings() {
+    if (hasSettingsExe()) {
+        startProcess({SETSUNA_SETTINGS_EXE});
+    }
+}
 
 class SetsunaEngine final : public InputMethodEngineV2 {
 public:
@@ -164,6 +182,7 @@ public:
     }
 
     ~SetsunaEngine() override {
+        deferredTimer_.reset();
         instance_->userInterfaceManager().unregisterAction(&settingsAction_);
         instance_->userInterfaceManager().unregisterAction(&modeAction_);
         factory_.unregister();
@@ -191,32 +210,44 @@ public:
         setsuna_session_set_enabled(session_, state->enabled);
         ic_ = ic->watch();
         ic->statusArea().addAction(StatusGroup::InputMethod, &modeAction_);
-        ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
+        if (hasSettingsExe()) {
+            ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
+        }
         modeAction_.update(ic);
         ic->updateUserInterface(UserInterfaceComponent::StatusArea);
     }
 
-    const Configuration *getConfig() const override { return &config_; }
+    const Configuration *getConfig() const override {
+        return hasSettingsExe() ? &config_ : nullptr;
+    }
     void setSubConfig(const std::string &path, const RawConfig &) override {
         if (path == "settings") {
             openSettings();
         }
     }
 
-    /* Focus out or input method switch: commit what is composed. On focus
-     * out fcitx5 already commits the client preedit (itself, or the client
-     * does with ClientUnfocusCommit), so only a server-side preedit is
-     * committed here. */
+    /* Focus out or input method switch. On focus out with client preedit,
+     * fcitx5 (or the client via ClientUnfocusCommit) already commits the
+     * displayed preedit, so drop session state without blocking or recording
+     * a different conversion. Otherwise commit what is currently shown
+     * without waiting on the engine. */
     void deactivate(const InputMethodEntry &, InputContextEvent &event) override {
         auto *ic = event.inputContext();
-        setsuna_session_flush(session_);
+        deferredTimer_.reset();
         bool committed = event.type() == EventType::InputContextFocusOut &&
                          ic->capabilityFlags().test(CapabilityFlag::Preedit);
+        if (committed) {
+            setsuna_session_reset(session_);
+        } else {
+            setsuna_session_flush(session_);
+        }
         render(ic, !committed);
+        ic_.unwatch();
     }
 
     /* The app reset the context (moved the caret, cleared the field). */
     void reset(const InputMethodEntry &, InputContextEvent &event) override {
+        deferredTimer_.reset();
         setsuna_session_reset(session_);
         render(event.inputContext());
     }
@@ -238,6 +269,7 @@ public:
                                 known ? before.c_str() : nullptr)) {
             event.filterAndAccept();
             render(ic);
+            armDeferred();
         }
         bool nowEnabled = setsuna_session_enabled(session_);
         if (wasEnabled != nowEnabled) {
@@ -279,6 +311,7 @@ public:
     void toggle(InputContext *ic) {
         setsuna_session_toggle(session_);
         render(ic);
+        armDeferred();
         recordEnabled(ic, setsuna_session_enabled(session_));
         modeChanged(ic);
     }
@@ -291,6 +324,7 @@ public:
             auto *ic = ic_.get();
             if (ic && setsuna_session_key(session_, sym, 0, 0, SETSUNA_FIELD_NORMAL, nullptr)) {
                 render(ic);
+                armDeferred();
             }
         });
     }
@@ -303,11 +337,12 @@ public:
         return enabled(&ic) ? "" : "Direct";
     }
 
-    /* A click on a candidate: pick and commit it, as its digit would. */
+    /* A click on a candidate: accept it as its digit key would (commits, or
+     * while editing segments fixes the focused segment and moves to the next). */
     void select(InputContext *ic, size_t index) {
-        if (setsuna_session_select(session_, index)) {
-            setsuna_session_key(session_, FcitxKey_Return, 0, 0, SETSUNA_FIELD_NORMAL, nullptr);
+        if (setsuna_session_pick(session_, index)) {
             render(ic);
+            armDeferred();
         }
     }
 

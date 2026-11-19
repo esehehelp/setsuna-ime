@@ -71,7 +71,7 @@ h2 { font-size: 15px; font-weight: 600; margin: 28px 0 8px; }
   display: flex; align-items: center; gap: 24px;
   padding: 14px 18px; min-height: 64px;
 }
-.row + .row { border-top: 1px solid var(--line); }
+.row + .row, [data-windows]:not([hidden]) + .row { border-top: 1px solid var(--line); }
 .row .text { flex: 1; min-width: 0; }
 .row .title { font-size: 14px; }
 .row .desc { font-size: 12.5px; color: var(--ink-2); margin-top: 1px; }
@@ -279,29 +279,31 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
 </section>
 
 <section data-desktop>
-<h2>候補の窓</h2>
+<h2 data-linux-text="候補の表示">候補の窓</h2>
 <div class="card">
-  <div class="row">
-    <div class="text">
-      <div class="title">テーマ</div>
-      <div class="desc">自動は Windows のアプリのモード（ライト・ダーク）に合わせます</div>
+  <div data-windows>
+    <div class="row">
+      <div class="text">
+        <div class="title">テーマ</div>
+        <div class="desc">自動は Windows のアプリのモード（ライト・ダーク）に合わせます</div>
+      </div>
+      <div class="control"><div class="segmented" id="window_theme"></div></div>
     </div>
-    <div class="control"><div class="segmented" id="window_theme"></div></div>
-  </div>
-  <div class="row" data-window-range="size_percent" data-min="80" data-max="200" data-step="10" data-unit="%">
-    <div class="text"><div class="title">大きさ</div></div>
-  </div>
-  <div class="row" data-window-range="font_pt" data-min="10" data-max="32" data-step="1" data-unit="px">
-    <div class="text"><div class="title">文字の大きさ</div></div>
-  </div>
-  <div class="row" data-window-range="font_weight" data-min="300" data-max="700" data-step="100" data-unit="">
-    <div class="text"><div class="title">文字の太さ</div><div class="desc">400 が標準、700 が太字</div></div>
-  </div>
-  <div class="row" data-window-range="corner_radius" data-min="0" data-max="24" data-step="1" data-unit="px">
-    <div class="text"><div class="title">角の丸み</div></div>
-  </div>
-  <div class="row" data-window-range="opacity_percent" data-min="20" data-max="100" data-step="5" data-unit="%">
-    <div class="text"><div class="title">不透明度</div></div>
+    <div class="row" data-window-range="size_percent" data-min="80" data-max="200" data-step="10" data-unit="%">
+      <div class="text"><div class="title">大きさ</div></div>
+    </div>
+    <div class="row" data-window-range="font_pt" data-min="10" data-max="32" data-step="1" data-unit="px">
+      <div class="text"><div class="title">文字の大きさ</div></div>
+    </div>
+    <div class="row" data-window-range="font_weight" data-min="300" data-max="700" data-step="100" data-unit="">
+      <div class="text"><div class="title">文字の太さ</div><div class="desc">400 が標準、700 が太字</div></div>
+    </div>
+    <div class="row" data-window-range="corner_radius" data-min="0" data-max="24" data-step="1" data-unit="px">
+      <div class="text"><div class="title">角の丸み</div></div>
+    </div>
+    <div class="row" data-window-range="opacity_percent" data-min="20" data-max="100" data-step="5" data-unit="%">
+      <div class="text"><div class="title">不透明度</div></div>
+    </div>
   </div>
   <div class="row">
     <div class="text">
@@ -353,14 +355,14 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row" data-desktop>
     <div class="text">
       <div class="title">オンにするキー</div>
-      <div class="desc">ImeOn はオンにする専用のキー（VK_IME_ON）を送るキーボードのためのものです（例: Henkan）</div>
+      <div class="desc" data-linux-text="例: Henkan、Kana（fcitx5 が先に取るキーは fcitx5 側で設定してください）">ImeOn はオンにする専用のキー（VK_IME_ON）を送るキーボードのためのものです（例: Henkan）</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="on_keys" placeholder="ImeOn"></div>
   </div>
   <div class="row" data-desktop>
     <div class="text">
       <div class="title">オフにするキー</div>
-      <div class="desc">ImeOff はオフにする専用のキー（VK_IME_OFF）です（例: Muhenkan）</div>
+      <div class="desc" data-linux-text="例: Muhenkan、Eisu">ImeOff はオフにする専用のキー（VK_IME_OFF）です（例: Muhenkan）</div>
     </div>
     <div class="control"><input type="text" class="wide" data-keys="off_keys" placeholder="ImeOff"></div>
   </div>
@@ -476,7 +478,7 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   <div class="row">
     <div class="text">
       <div class="title">アプリごとに変える</div>
-      <div class="desc" data-android-text="パッケージ名（com.android.chrome など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります">実行ファイル名（code.exe など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります</div>
+      <div class="desc" data-android-text="パッケージ名（com.android.chrome など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります" data-linux-text="プログラム名（firefox、konsole など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります">実行ファイル名（code.exe など）ごとに、開始時のオン・オフと各機能を変えます。「既定」はほかの設定のままです。URL・メール・数字・パスワードなどの入力欄では、どのアプリでも直接入力になります</div>
     </div>
     <div class="control"><button id="add_app">追加</button></div>
   </div>
@@ -728,6 +730,7 @@ const $ = (id) => document.getElementById(id);
 // app the keyboard's); it has no rewriter, no candidate window and no keys of
 // a PC keyboard, and names apps by their packages.
 const ANDROID = !!window.SetsunaAndroid;
+let platform = ANDROID ? "android" : "windows";
 const send = (msg) => ANDROID
   ? window.SetsunaAndroid.post(JSON.stringify(msg))
   : window.ipc.postMessage(JSON.stringify(msg));
@@ -735,6 +738,21 @@ for (const e of document.querySelectorAll("[data-desktop]")) if (ANDROID) e.hidd
 for (const e of document.querySelectorAll("[data-android]")) e.hidden = !ANDROID;
 for (const e of document.querySelectorAll("[data-android-text]")) {
   if (ANDROID) e.textContent = e.dataset.androidText;
+}
+function applyPlatform(p) {
+  if (!p) return;
+  platform = p;
+  for (const e of document.querySelectorAll("[data-windows]")) {
+    e.hidden = platform !== "windows";
+  }
+  if (!ANDROID && platform !== "windows") {
+    $("romaji_path").placeholder = "/path/to/romaji.tsv";
+    document.querySelector('[data-keys="on_keys"]').placeholder = "Henkan";
+    document.querySelector('[data-keys="off_keys"]').placeholder = "Muhenkan";
+    for (const e of document.querySelectorAll("[data-linux-text]")) {
+      e.textContent = e.dataset.linuxText;
+    }
+  }
 }
 const at = (path) => path.split(".").reduce((o, k) => o[k], cfg);
 const setAt = (path, v) => {
@@ -921,7 +939,11 @@ function triState(value, onChange) {
 function renderApps() {
   cfg.apps = cfg.apps ?? [];
   $("apps").replaceChildren(...cfg.apps.map((a, i) => {
-    const name = el("input", { type: "text", value: a.process, placeholder: ANDROID ? "com.android.chrome" : "code.exe" });
+    const name = el("input", {
+      type: "text",
+      value: a.process,
+      placeholder: ANDROID ? "com.android.chrome" : platform === "linux" ? "firefox" : "code.exe",
+    });
     name.addEventListener("input", () => { a.process = name.value; changed(); });
     const start = el("select", {},
       el("option", { value: "keep", textContent: "開始: 既定" }),
@@ -1306,6 +1328,7 @@ window.setsuna = {
       return;
     }
     if (msg.type !== "state") return;
+    applyPlatform(msg.platform);
     $("version").textContent = msg.version ? `バージョン ${msg.version}` : "";
     symbolKeys = msg.symbol_keys ?? [];
     learned = msg.learned;

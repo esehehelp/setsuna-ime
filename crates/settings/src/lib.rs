@@ -223,6 +223,7 @@ impl Settings {
             "type": "state",
             "action": action,
             "version": VERSION,
+            "platform": std::env::consts::OS,
             "ok": ok,
             "status": status,
             "path": self.path.as_ref().map(|p| p.display().to_string()),
@@ -348,6 +349,7 @@ mod tests {
         assert!(page.handle(&json!({"type": "list_models"})).is_none());
         let reply = page.handle(&json!({"type": "save", "config": {}})).unwrap();
         assert_eq!(reply["type"], "state");
+        assert_eq!(reply["platform"], std::env::consts::OS);
         assert_eq!(reply["ok"], false);
         assert!(reply["version"]
             .as_str()

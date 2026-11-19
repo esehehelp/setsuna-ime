@@ -52,7 +52,28 @@ const PAGE_UP: u32 = 0xff55;
 const PAGE_DOWN: u32 = 0xff56;
 const END: u32 = 0xff57;
 const INSERT: u32 = 0xff63;
+const KP_SPACE: u32 = 0xff80;
+const KP_TAB: u32 = 0xff89;
 const KP_ENTER: u32 = 0xff8d;
+const KP_HOME: u32 = 0xff95;
+const KP_LEFT: u32 = 0xff96;
+const KP_UP: u32 = 0xff97;
+const KP_RIGHT: u32 = 0xff98;
+const KP_DOWN: u32 = 0xff99;
+const KP_PAGE_UP: u32 = 0xff9a;
+const KP_PAGE_DOWN: u32 = 0xff9b;
+const KP_END: u32 = 0xff9c;
+const KP_INSERT: u32 = 0xff9e;
+const KP_DELETE: u32 = 0xff9f;
+const KP_MULTIPLY: u32 = 0xffaa;
+const KP_ADD: u32 = 0xffab;
+const KP_SEPARATOR: u32 = 0xffac;
+const KP_SUBTRACT: u32 = 0xffad;
+const KP_DECIMAL: u32 = 0xffae;
+const KP_DIVIDE: u32 = 0xffaf;
+const KP_0: u32 = 0xffb0;
+const KP_9: u32 = 0xffb9;
+const KP_EQUAL: u32 = 0xffbd;
 const ISO_LEFT_TAB: u32 = 0xfe20;
 const F1: u32 = 0xffbe;
 const F6: u32 = 0xffc3;
@@ -215,6 +236,36 @@ fn form_key(key: &Key) -> Option<Form> {
     })
 }
 
+/// Map numeric keypad keysyms onto their main-keyboard counterparts so numpad
+/// digits, operators and navigation keys work during composition and candidate
+/// selection rather than leaking through to the application.
+fn normalize_keypad(sym: u32) -> u32 {
+    match sym {
+        KP_SPACE => SPACE,
+        KP_TAB => TAB,
+        KP_ENTER => RETURN,
+        KP_HOME => HOME,
+        KP_LEFT => LEFT,
+        KP_UP => UP,
+        KP_RIGHT => RIGHT,
+        KP_DOWN => DOWN,
+        KP_PAGE_UP => PAGE_UP,
+        KP_PAGE_DOWN => PAGE_DOWN,
+        KP_END => END,
+        KP_INSERT => INSERT,
+        KP_DELETE => DELETE,
+        KP_EQUAL => '=' as u32,
+        KP_MULTIPLY => '*' as u32,
+        KP_ADD => '+' as u32,
+        KP_SEPARATOR => ',' as u32,
+        KP_SUBTRACT => '-' as u32,
+        KP_DECIMAL => '.' as u32,
+        KP_DIVIDE => '/' as u32,
+        KP_0..=KP_9 => '0' as u32 + (sym - KP_0),
+        other => other,
+    }
+}
+
 /// The engine key `key` is, or `None` for a key the IME leaves to the app.
 /// Ctrl / Alt / Super combinations are never the IME's, but for the
 /// Ctrl+U / I / O / P / T conversions (taken only while composing).
@@ -222,15 +273,16 @@ pub fn classify(key: &Key, symbols: &BTreeMap<String, String>) -> Option<KeyKind
     if let Some(form) = form_key(key) {
         return Some(KeyKind::ConvertTo(form));
     }
+    let sym = normalize_keypad(key.sym);
     // Ctrl+Delete: forget or hide the candidate (taken only while converting)
-    if key.sym == DELETE && key.mods & (MOD_CTRL | MOD_ALT | MOD_SUPER) == MOD_CTRL {
+    if sym == DELETE && key.mods & (MOD_CTRL | MOD_ALT | MOD_SUPER) == MOD_CTRL {
         return Some(KeyKind::ForgetCandidate);
     }
     if key.mods & (MOD_CTRL | MOD_ALT | MOD_SUPER) != 0 {
         return None;
     }
     let shift = key.shift();
-    match key.sym {
+    match sym {
         BACKSPACE => Some(KeyKind::Backspace),
         DELETE => Some(KeyKind::Delete),
         HOME => Some(KeyKind::Home),
@@ -238,7 +290,7 @@ pub fn classify(key: &Key, symbols: &BTreeMap<String, String>) -> Option<KeyKind
         ISO_LEFT_TAB => Some(KeyKind::ShiftTab),
         TAB if shift => Some(KeyKind::ShiftTab),
         TAB => Some(KeyKind::Tab),
-        RETURN | KP_ENTER => Some(KeyKind::Enter),
+        RETURN => Some(KeyKind::Enter),
         ESCAPE => Some(KeyKind::Escape),
         SPACE if shift => Some(KeyKind::ShiftSpace),
         SPACE => Some(KeyKind::Space),
@@ -252,11 +304,11 @@ pub fn classify(key: &Key, symbols: &BTreeMap<String, String>) -> Option<KeyKind
         DOWN => Some(KeyKind::Down),
         // chōon in romaji
         0x2d => Some(KeyKind::Char('-')),
-        0x30..=0x39 => Some(KeyKind::Char(key.sym as u8 as char)),
+        0x30..=0x39 => Some(KeyKind::Char(sym as u8 as char)),
         // Letters by Shift, not by the keysym's case: Shift+letter starts the
         // temporary alphabet mode, Caps Lock alone still types romaji.
         0x41..=0x5a | 0x61..=0x7a => {
-            let c = (key.sym as u8 as char).to_ascii_lowercase();
+            let c = (sym as u8 as char).to_ascii_lowercase();
             Some(KeyKind::Char(if shift {
                 c.to_ascii_uppercase()
             } else {
@@ -264,7 +316,7 @@ pub fn classify(key: &Key, symbols: &BTreeMap<String, String>) -> Option<KeyKind
             }))
         }
         0x21..=0x7e => Some(KeyKind::Punctuation(crate::config::typed_symbol(
-            key.sym as u8 as char,
+            sym as u8 as char,
             key.code == KEYCODE_RO,
             symbols,
         ))),
@@ -288,8 +340,8 @@ pub fn breaks_context(key: &Key) -> bool {
         return !matches!(key.sym, 0x43 | 0x63);
     }
     matches!(
-        key.sym,
-        BACKSPACE | TAB | RETURN | KP_ENTER | SPACE | HOME..=END | INSERT | DELETE
+        normalize_keypad(key.sym),
+        BACKSPACE | TAB | RETURN | SPACE | HOME..=END | INSERT | DELETE
     )
 }
 
@@ -382,6 +434,62 @@ mod tests {
         assert_eq!(classify_default(DELETE, 0), Some(KeyKind::Delete));
         assert_eq!(classify_default(HOME, 0), Some(KeyKind::Home));
         assert_eq!(classify_default(0xffbe, 0), None); // F1
+    }
+
+    #[test]
+    fn numpad_digits_operators_and_navigation_are_classified() {
+        for d in 0..=9u32 {
+            assert_eq!(
+                classify_default(KP_0 + d, 0),
+                Some(KeyKind::Char((b'0' + d as u8) as char))
+            );
+        }
+        assert_eq!(classify_default(KP_SPACE, 0), Some(KeyKind::Space));
+        assert_eq!(
+            classify_default(KP_SPACE, MOD_SHIFT),
+            Some(KeyKind::ShiftSpace)
+        );
+        assert_eq!(classify_default(KP_TAB, 0), Some(KeyKind::Tab));
+        assert_eq!(classify_default(KP_TAB, MOD_SHIFT), Some(KeyKind::ShiftTab));
+        assert_eq!(classify_default(KP_HOME, 0), Some(KeyKind::Home));
+        assert_eq!(classify_default(KP_END, 0), Some(KeyKind::End));
+        assert_eq!(classify_default(KP_LEFT, 0), Some(KeyKind::Left));
+        assert_eq!(
+            classify_default(KP_LEFT, MOD_SHIFT),
+            Some(KeyKind::ShiftLeft)
+        );
+        assert_eq!(classify_default(KP_RIGHT, 0), Some(KeyKind::Right));
+        assert_eq!(
+            classify_default(KP_RIGHT, MOD_SHIFT),
+            Some(KeyKind::ShiftRight)
+        );
+        assert_eq!(classify_default(KP_UP, 0), Some(KeyKind::Up));
+        assert_eq!(classify_default(KP_DOWN, 0), Some(KeyKind::Down));
+        assert_eq!(classify_default(KP_PAGE_UP, 0), Some(KeyKind::PageUp));
+        assert_eq!(classify_default(KP_PAGE_DOWN, 0), Some(KeyKind::PageDown));
+        assert_eq!(classify_default(KP_DELETE, 0), Some(KeyKind::Delete));
+        assert_eq!(
+            classify_default(KP_DELETE, MOD_CTRL),
+            Some(KeyKind::ForgetCandidate)
+        );
+        assert_eq!(classify_default(KP_SUBTRACT, 0), Some(KeyKind::Char('-')));
+        assert_eq!(classify_default(KP_DECIMAL, 0), p("。"));
+        assert_eq!(classify_default(KP_SEPARATOR, 0), p("、"));
+        assert_eq!(classify_default(KP_DIVIDE, 0), p("・"));
+        assert_eq!(classify_default(KP_ADD, 0), classify_default('+' as u32, 0));
+        assert_eq!(
+            classify_default(KP_MULTIPLY, 0),
+            classify_default('*' as u32, 0)
+        );
+        assert_eq!(
+            classify_default(KP_EQUAL, 0),
+            classify_default('=' as u32, 0)
+        );
+        for sym in [
+            KP_ENTER, KP_SPACE, KP_TAB, KP_LEFT, KP_HOME, KP_DELETE, KP_INSERT,
+        ] {
+            assert!(breaks_context(&key(sym, 0)), "{sym:#x}");
+        }
     }
 
     #[test]

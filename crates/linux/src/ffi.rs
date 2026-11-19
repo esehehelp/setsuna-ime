@@ -620,7 +620,7 @@ pub unsafe extern "C" fn setsuna_session_apply_async(s: *mut SetsunaSession) -> 
     with(s, false, |sess| sess.apply_async_result())
 }
 
-/// Pick candidate `index` of the open list (a click in the panel).
+/// Pick candidate `index` of the open list (moves selection there).
 ///
 /// # Safety
 /// `s` is a live session.
@@ -629,7 +629,18 @@ pub unsafe extern "C" fn setsuna_session_select(s: *mut SetsunaSession, index: u
     with(s, false, |sess| sess.select(index))
 }
 
-/// Commit the composition (focus out / input method switch).
+/// Pick candidate `index` of the open list or suggestions and accept it
+/// (commits it, or fixes the focused segment and advances to the next).
+///
+/// # Safety
+/// `s` is a live session.
+#[no_mangle]
+pub unsafe extern "C" fn setsuna_session_pick(s: *mut SetsunaSession, index: usize) -> bool {
+    with(s, false, |sess| sess.pick(index))
+}
+
+/// Commit what is currently shown without waiting for a pending conversion
+/// (focus out / input method switch).
 ///
 /// # Safety
 /// `s` is a live session.
