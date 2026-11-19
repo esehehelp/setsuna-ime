@@ -241,12 +241,15 @@ const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(150)
 const ENTER_WAIT: Duration = Duration::from_millis(1000);
 
 /// How long Space waits for the other reading's list (`await_alt`) before
-/// the list opens without it (it is added when it comes). One conversion of
+/// the list opens without it: it is added when it comes, the selection
+/// staying where it is (`apply_alt_result`), so a candidate the user's
+/// choices put first is first but not chosen. One conversion of
 /// Cymbidium-v1.1-xsmall, warm, not cached, measured 2026-11-19 on a 4-vCPU
-/// Xeon at 2.1 GHz with AVX-512 VNNI: 2.6 ms (IMEの) to 8.0 ms (きょうはIMEの
-/// つかいかたをしらべた), median of 30; v1.0 takes 33 ms a sentence on a CPU
-/// with none of its SIMD kernels (README).
-const ALT_WAIT: Duration = Duration::from_millis(100);
+/// Xeon at 2.1 GHz with AVX-512 VNNI, median of 30 (max): 2.6 ms (IMEの),
+/// 5.8 ms a reading of 18 chars, 10.4 (11.2) of 42, 17.7 (18.6) of 80; v1.0
+/// takes 33 ms a sentence on a CPU with none of its SIMD kernels (README).
+/// User 2026-11-19: 20 ms.
+const ALT_WAIT: Duration = Duration::from_millis(20);
 
 /// The engine's top of what is typed, waiting for the reranked one
 /// (`[rerank] defer_ms`).
