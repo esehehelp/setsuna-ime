@@ -52,7 +52,7 @@ curl -fsSL https://github.com/esehehelp/setsuna-ime/releases/latest/download/ins
 
 ### Android（開発中 / arm64・Android 8 以降）
 
-Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキスト編集・クリップボード履歴を備えた Android IME です。アプリ内の設定画面（「この端末」）から変換モデルや辞書を Hugging Face 経由でダウンロードできます。現在はソースからのビルドで導入します（[Android のビルド](#android) を参照）。
+Gboard 風の日本語 QWERTY（数字行付き）＋数字パッド・テキスト編集・クリップボード履歴を備えた Android IME です。アプリ内の設定画面（「この端末」）から変換モデルや辞書を Hugging Face 経由でダウンロードできます。リリースの `setsuna-ime-<version>-android-arm64.apk`（デバッグ用の鍵で署名）を入れるか、ソースからビルドして導入します（[Android のビルド](#android) を参照）。
 
 ---
 
