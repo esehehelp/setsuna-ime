@@ -2451,7 +2451,69 @@ impl EngineBridge {
             }
         }
         self.seg_requests.clear();
-        seg.is_some()
+        let segments = self.segmented().map_or(0, |s| s.segs.len());
+        for k in 0..segments {
+            self.learn_segment(k, false);
+        }
+        segments > 0
+    }
+
+    /// The user's choices in segment `k`'s list (`Learning::rerank`): each
+    /// candidate read as the sentence it makes, the other segments as
+    /// chosen, over the whole reading, so that a sentence choice and a word
+    /// choice whose context lies in the segments around apply as in a
+    /// whole list. The candidate they rank over the chosen one goes right
+    /// after it, the chosen one staying chosen: what is shown does not
+    /// change by itself, and one ↓ or Space picks it. `fresh`: the list
+    /// just replaced a resized segment's, whose first is chosen anyway: the
+    /// candidate goes first.
+    fn learn_segment(&mut self, k: usize, fresh: bool) {
+        let Some(s) = self.segmented() else {
+            return;
+        };
+        let Some(seg) = s.segs.get(k) else {
+            return;
+        };
+        let reading = s.full_reading();
+        let before = s.text_before(k);
+        let after: String = s.texts()[k + 1..].concat();
+        // the chosen one first: the one to outscore
+        let order: Vec<usize> = std::iter::once(seg.selected)
+            .chain((0..seg.cands.len()).filter(|&i| i != seg.selected))
+            .filter(|&i| i < seg.cands.len())
+            .collect();
+        let sentences: Vec<String> = order
+            .iter()
+            .map(|&i| format!("{before}{}{after}", seg.cands[i]))
+            .collect();
+        let Some(learning) = self.learning.as_mut() else {
+            return;
+        };
+        let Some(top) = learning
+            .rerank(&reading, sentences.clone())
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let Some(best) = sentences.iter().position(|c| *c == top).filter(|&b| b > 0) else {
+            return;
+        };
+        let Phase::Converting { seg: Some(s), .. } = &mut self.phase else {
+            return;
+        };
+        let seg = &mut s.segs[k];
+        let at = order[best];
+        let c = seg.cands.remove(at);
+        if fresh {
+            seg.cands.insert(0, c);
+            seg.selected = 0;
+        } else {
+            if at < seg.selected {
+                seg.selected -= 1;
+            }
+            seg.cands.insert(seg.selected + 1, c);
+        }
     }
 
     fn segmented(&self) -> Option<&Segmented> {
@@ -2613,6 +2675,7 @@ impl EngineBridge {
                     s.take(k, with_romaji_kana(&reading, list));
                 }
             }
+            self.learn_segment(k, false);
             self.query_next_stale();
             self.query_focused_segment();
             return Some(self.segment_actions());
@@ -2634,8 +2697,10 @@ impl EngineBridge {
             list.retain(|c| dates.contains(c) || crate::segments::fits(&reading, &chosen, c));
         }
         let mut again = false;
+        let mut fresh = false;
         if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
             let before = s.segs[k].cands.len();
+            fresh = s.segs[k].stale;
             s.take(k, with_romaji_kana(&reading, list));
             let seg = &mut s.segs[k];
             let added = seg.cands.len() > before;
@@ -2658,6 +2723,7 @@ impl EngineBridge {
                 }
             }
         }
+        self.learn_segment(k, fresh);
         if again {
             self.continue_focused();
         }
@@ -6939,6 +7005,49 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("\"chosen\":\"記者の汽車\""), "{log}");
         assert!(log.contains("\"rejected\":\"記者の記者\""), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_segments_list_offers_what_the_user_chose_before() {
+        // a choice learned for the sentence applies in a segment's list,
+        // each candidate read as the sentence it makes
+        let dir =
+            std::env::temp_dir().join(format!("setsuna-bridge-seg-learned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let learned = |chosen: &str, tag: &str| {
+            let mut learning = Learning::at(
+                dir.join(format!("{tag}.jsonl")),
+                &crate::config::LearningCfg::default(),
+            );
+            learning
+                .record("きしゃのきしゃ", chosen, "記者の記者")
+                .unwrap();
+            learning
+        };
+        // 帰社 right after the chosen 記者, which stays chosen
+        let (mut bridge, mock) = converting_kisha();
+        bridge.set_learning(Some(learned("記者の帰社", "after")));
+        bridge.handle_move_cursor(1);
+        bridge.handle_move_cursor(1);
+        mock.answer_last(&["記者の"]);
+        bridge.apply_async_result();
+        mock.answer_last(&["記者", "帰社"]);
+        let out = bridge.apply_async_result();
+        let (list, selected, _) = segment_list(&out);
+        assert_eq!(list[..3], v(&["記者", "帰社", "汽車"])[..]);
+        assert_eq!(selected, 0);
+        assert_eq!(segments_shown(&out).0, v(&["記者の", "記者"]));
+        bridge.handle_down();
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["記者の帰社"]);
+        // a resized segment's new list takes it first
+        let (mut bridge, mock) = converting_kisha();
+        bridge.set_learning(Some(learned("帰社の記者", "fresh")));
+        bridge.handle_move_cursor(1);
+        bridge.handle_resize(-1);
+        mock.answer_last(&["汽車", "記者", "帰社"]);
+        let out = bridge.apply_async_result();
+        assert_eq!(segments_shown(&out).0, v(&["帰社", "のきしゃ"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
