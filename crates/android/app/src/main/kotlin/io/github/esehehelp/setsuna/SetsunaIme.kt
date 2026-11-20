@@ -54,6 +54,12 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     private var field = Native.FIELD_NORMAL
     private var editorInfo: EditorInfo? = null
 
+    /**
+     * The focused field is private (no personalized learning) or a password: nothing copied
+     * meanwhile is kept, and no recent copy is offered on the toolbar.
+     */
+    private var secret = false
+
     /** The app holds a composing text of ours. */
     private var composing = false
 
@@ -106,6 +112,7 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         // unpacked, and those push-models.ps1 copies
         h = timed("create") { Native.create(filesDir.path, applicationInfo.nativeLibraryDir, filesDir.path, this) }
         clips = ClipHistory(this)
+        clips.keep = { !secret }
         clips.onChange = {
             if (open == CandidateBar.Tool.CLIPBOARD) clipPanel?.show(clips.list())
             showRecent()
@@ -181,13 +188,20 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         if (composing) currentInputConnection?.finishComposingText()
         composing = false
         composeStart = -1
-        selStart = attribute.initialSelStart.coerceAtLeast(0)
-        // the field's text before the caret comes with it (API 30): nothing to ask the app
-        before = if (Build.VERSION.SDK_INT >= 30) attribute.getInitialTextBeforeCursor(BEFORE, 0)?.toString() else null
-        beforeAt = if (before != null) selStart else -1
-        beforeAsked = -1
+        // a selection made backwards starts at its end: the composition replaces it from its start
+        selStart = selectionStart(attribute.initialSelStart, attribute.initialSelEnd).coerceAtLeast(0)
         editorInfo = attribute
         field = fieldOf(attribute)
+        secret = field == Native.FIELD_PRIVATE || isPassword(attribute)
+        // the field's text before the caret comes with it (API 30): nothing to ask the app;
+        // never read from a password, a private field or another the IME leaves alone
+        before = if (Build.VERSION.SDK_INT >= 30 && field == Native.FIELD_NORMAL) {
+            attribute.getInitialTextBeforeCursor(BEFORE, 0)?.toString()
+        } else {
+            null
+        }
+        beforeAt = if (before != null) selStart else -1
+        beforeAsked = -1
         if (h != 0L) timed("configure") { Native.configure(h, attribute.packageName ?: "") }
     }
 
@@ -244,7 +258,7 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     /** The chip for what was just copied, while it is recent. */
     private fun showRecent() {
         main.removeCallbacks(refreshRecent)
-        val recent = if (open == null) clips.recent(recentMs) else null
+        val recent = if (open == null && !secret) clips.recent(recentMs) else null
         bar?.setRecent(recent?.text)
         if (recent != null) {
             main.postDelayed(refreshRecent, recentMs - (System.currentTimeMillis() - recent.time) + 50)
@@ -334,7 +348,7 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         candidatesEnd: Int,
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
-        selStart = newSelStart
+        selStart = selectionStart(newSelStart, newSelEnd)
         if (candidatesStart >= 0) composeStart = candidatesStart
         // the caret went where the text before it is not known: read it, off the main thread
         if (!composing && candidatesStart < 0 && newSelStart == newSelEnd && newSelStart != beforeAt) readBefore()
@@ -481,8 +495,12 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     private fun strings(a: JSONArray?): List<String> =
         if (a == null) emptyList() else List(a.length()) { a.getString(it) }
 
-    /** Read the text before the caret on [reader]; kept when the caret is still there. */
+    /**
+     * Read the text before the caret on [reader]; kept when the caret is still there. Only in a
+     * field the IME converts in with its context ([Native.FIELD_NORMAL]).
+     */
     private fun readBefore() {
+        if (field != Native.FIELD_NORMAL) return
         val ic = currentInputConnection ?: return
         val at = selStart
         if (beforeAsked == at) return
@@ -598,6 +616,24 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
          * or a number takes keys as they are (as the input scopes do on
          * Windows); one that asks for no learning gets none.
          */
+        /** Where a selection starts in the text: its anchor or its end, whichever comes first (-1 unknown). */
+        fun selectionStart(start: Int, end: Int): Int = if (end in 0 until start) end else start
+
+        /** A password field (text or a PIN). */
+        fun isPassword(info: EditorInfo): Boolean {
+            val cls = info.inputType and InputType.TYPE_MASK_CLASS
+            val variation = info.inputType and InputType.TYPE_MASK_VARIATION
+            return when (cls) {
+                InputType.TYPE_CLASS_TEXT -> variation in setOf(
+                    InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                    InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
+                    InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD,
+                )
+                InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                else -> false
+            }
+        }
+
         fun fieldOf(info: EditorInfo): Int {
             val cls = info.inputType and InputType.TYPE_MASK_CLASS
             val variation = info.inputType and InputType.TYPE_MASK_VARIATION

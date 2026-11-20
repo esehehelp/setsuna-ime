@@ -21,9 +21,11 @@ import java.security.MessageDigest
  * before went: two downloads offered a lexicon each). Each file is checked by its
  * size and SHA-256 and put where setsuna-core looks for it, the app's
  * files/models: onnx/, lexicon/, analyzer/<name>/. The files arrive as
- * `.part` beside their place; once all of them are in, what each directory
- * held before goes (the engine takes the only manifest of onnx/, the
- * session the only lexicon and analyzer) and they are renamed into place.
+ * `.part` beside their place; once all of them are in, they are renamed into
+ * place, each manifest last, and what each directory held before goes (the
+ * engine takes the only manifest of onnx/, the session the only lexicon and
+ * analyzer). The engine starts again on the next field (`Host::configure`
+ * sees the manifests changed).
  * A file installed already as pinned is not downloaded again. One download
  * at a time, on a thread of its own; [state] says how it goes.
  */
@@ -173,32 +175,40 @@ object Downloads {
                 set("$label をダウンロード中… ${mb(done)} / ${mb(total)} MB")
             }
         }
-        // every file, as .part beside its place (none of them a manifest the engine would take)
+        // every file, as .part beside its place (none of them a manifest the engine would take);
+        // a download that fails takes the ones it got with it
         val got = mutableListOf<Pair<File, File>>()
-        for (p in parts) {
-            for (pin in p.pins) {
-                if (verified(pin.to, pin)) {
-                    progress(pin.size)
-                    continue
+        try {
+            for (p in parts) {
+                for (pin in p.pins) {
+                    if (verified(pin.to, pin)) {
+                        progress(pin.size)
+                        continue
+                    }
+                    val tmp = File(pin.to.path + ".part")
+                    val url = "https://huggingface.co/${p.repository}/resolve/${p.revision}/" +
+                        pin.path.split('/').joinToString("/") { Uri.encode(it) }
+                    download(url, tmp, pin, progress)
+                    got.add(tmp to pin.to)
                 }
-                val tmp = File(pin.to.path + ".part")
-                val url = "https://huggingface.co/${p.repository}/resolve/${p.revision}/" +
-                    pin.path.split('/').joinToString("/") { Uri.encode(it) }
-                download(url, tmp, pin, progress)
-                got.add(tmp to pin.to)
             }
+        } catch (e: Exception) {
+            for ((tmp, _) in got) tmp.delete()
+            throw e
         }
-        // all in: what the directories held before goes, the new files take their places
+        // all in: the new files take their places, each manifest after the files it names (an
+        // engine starting meanwhile finds the old manifest or the whole new model), then what
+        // the directories held before goes
+        for ((tmp, to) in got.sortedBy { it.second.name.endsWith("manifest.json") }) {
+            if (!tmp.renameTo(to)) throw IOException("cannot put ${to.name} in place")
+        }
         for (p in parts) {
-            val keep = p.pins.map { it.to.canonicalFile }.toSet() + got.map { it.first.canonicalFile }
+            val keep = p.pins.map { it.to.canonicalFile }.toSet()
             p.root.walkBottomUp().forEach { f ->
                 if (f == p.root) return@forEach
                 if (f.isFile && f.canonicalFile !in keep) f.delete()
                 if (f.isDirectory && f.list()?.isEmpty() == true) f.delete()
             }
-        }
-        for ((tmp, to) in got) {
-            if (!tmp.renameTo(to)) throw IOException("cannot put ${to.name} in place")
         }
     }
 
@@ -239,9 +249,11 @@ object Downloads {
                     while (true) {
                         val r = input.read(buf)
                         if (r < 0) break
+                        n += r
+                        // no more than pinned: a server sending on would fill the phone
+                        if (n > pin.size) throw IOException("more than ${pin.size} bytes: ${pin.path}")
                         out.write(buf, 0, r)
                         md.update(buf, 0, r)
-                        n += r
                         progress(r.toLong())
                     }
                 }

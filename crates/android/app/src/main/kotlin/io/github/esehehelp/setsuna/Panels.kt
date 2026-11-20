@@ -82,6 +82,23 @@ class EditPanel(context: Context, private val onOp: (Op) -> Unit) : LinearLayout
         }, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
     }
 
+    // Hidden (back to the keys, the input view gone) or detached, a held key gets no
+    // ACTION_UP: its repeat (this handler's only callbacks) stops here.
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (visibility != VISIBLE) main.removeCallbacksAndMessages(null)
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility != VISIBLE) main.removeCallbacksAndMessages(null)
+    }
+
+    override fun onDetachedFromWindow() {
+        main.removeCallbacksAndMessages(null)
+        super.onDetachedFromWindow()
+    }
+
     private fun row(vararg keys: View) {
         addView(LinearLayout(context).apply {
             orientation = HORIZONTAL

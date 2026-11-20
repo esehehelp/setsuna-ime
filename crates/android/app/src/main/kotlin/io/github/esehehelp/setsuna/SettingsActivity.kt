@@ -47,6 +47,9 @@ class SettingsActivity : Activity() {
         actionBar?.hide()
         web = WebView(this)
         web.settings.javaScriptEnabled = true
+        // the page is an asset (file:///android_asset stays open): no other file is the
+        // page's to read (the default for API 30 on, said)
+        web.settings.allowFileAccess = false
         web.addJavascriptInterface(Bridge(), "SetsunaAndroid")
         // the page and nothing else: no link leads away from it
         web.webViewClient = object : WebViewClient() {
@@ -111,8 +114,20 @@ class SettingsActivity : Activity() {
     override fun onDestroy() {
         picking?.onReceiveValue(null)
         picking = null
+        Downloads.onChange = null
+        destroyed = true
+        (web.parent as? ViewGroup)?.removeView(web)
         web.destroy()
         super.onDestroy()
+    }
+
+    /** The WebView went with the activity: a reply that comes after (the bridge's, a download's) is dropped. */
+    @Volatile
+    private var destroyed = false
+
+    /** `js` in the page, on the main thread, unless the WebView is gone by then. */
+    private fun evaluate(js: String) {
+        web.post { if (!destroyed) web.evaluateJavascript(js, null) }
     }
 
     override fun onResume() {
@@ -135,7 +150,7 @@ class SettingsActivity : Activity() {
     /** [appState] to the page, from any thread (before the page is up, nothing). */
     private fun pushApp() {
         val state = appState()
-        web.post { web.evaluateJavascript("window.setsuna && setsuna.receive($state)", null) }
+        evaluate("window.setsuna && setsuna.receive($state)")
     }
 
     /**
@@ -215,7 +230,7 @@ class SettingsActivity : Activity() {
                 }
                 else -> Native.settings(filesDir.path, message)
             } ?: return
-            web.post { web.evaluateJavascript("setsuna.receive($reply)", null) }
+            evaluate("setsuna.receive($reply)")
         }
 
         private fun keyboard(prefs: KeyboardPrefs, status: String?): String {

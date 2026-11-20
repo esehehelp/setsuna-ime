@@ -9,7 +9,8 @@
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="false"
-        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+        android:theme="@android:style/Theme.DeviceDefault.DayNight"
+        android:usesCleartextTraffic="false">
 
         <!-- the app's one screen, the settings with the app's state and
              downloads (user 2026-11-11: "設定画面だけにしたら？"; a first

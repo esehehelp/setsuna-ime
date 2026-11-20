@@ -153,10 +153,46 @@ fn names_files(key: &std::ffi::OsStr) -> bool {
     k.starts_with("SETSUNA_") || k.starts_with("ORT_")
 }
 
-/// A helper process's environment: in an elevated process without the
+/// The directories an app names for itself (Android: under its files
+/// directory), which [`config_dir`] and the log
+/// (`diagnostics::log_path`) take over the environment's, and helpers get
+/// as theirs ([`scrub_env`]).
+#[derive(Debug)]
+pub struct AppDirs {
+    /// What `XDG_CONFIG_HOME` would be: `setsuna-ime` in it holds config.toml.
+    pub config_home: PathBuf,
+    /// What `XDG_STATE_HOME` would be: `setsuna-ime` in it holds the logs.
+    pub state_home: PathBuf,
+    /// `HOME` for a helper when the environment has none.
+    pub home: PathBuf,
+}
+
+static APP_DIRS: std::sync::OnceLock<AppDirs> = std::sync::OnceLock::new();
+
+/// Name the app's directories, once (a later call, as from another thread
+/// of the same app, changes nothing). In place of setting the environment,
+/// which another thread may be reading (C code's `getenv` takes no lock).
+pub fn set_app_dirs(dirs: AppDirs) {
+    let _ = APP_DIRS.set(dirs);
+}
+
+/// [`set_app_dirs`]'s.
+pub fn app_dirs() -> Option<&'static AppDirs> {
+    APP_DIRS.get()
+}
+
+/// A helper process's environment: the app's directories where it named
+/// them ([`set_app_dirs`]), and in an elevated process without the
 /// variables that name files it would load or write ([`names_files`]), as
 /// [`env_path`] ignores them.
 pub fn scrub_env(cmd: &mut std::process::Command) {
+    if let Some(dirs) = app_dirs() {
+        cmd.env("XDG_CONFIG_HOME", &dirs.config_home);
+        cmd.env("XDG_STATE_HOME", &dirs.state_home);
+        if std::env::var_os("HOME").is_none_or(|h| h.is_empty()) {
+            cmd.env("HOME", &dirs.home);
+        }
+    }
     if !process_is_elevated() {
         return;
     }
@@ -1362,10 +1398,14 @@ impl Config {
     }
 }
 
-/// Directory holding `config.toml` and the learning log: `%APPDATA%\setsuna-ime`
+/// Directory holding `config.toml` and the learning log: the app's own where
+/// it named one ([`set_app_dirs`]: Android), else `%APPDATA%\setsuna-ime`
 /// on Windows, `~/Library/Application Support/setsuna-ime` on macOS,
 /// `$XDG_CONFIG_HOME/setsuna-ime` (or `~/.config/setsuna-ime`) elsewhere.
 pub fn config_dir() -> Option<PathBuf> {
+    if let Some(dirs) = app_dirs() {
+        return Some(dirs.config_home.join("setsuna-ime"));
+    }
     let env = |k: &str| {
         std::env::var_os(k)
             .filter(|v| !v.is_empty())

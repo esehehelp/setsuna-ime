@@ -25,7 +25,11 @@ object Assets {
             context.assets.open("mixed/$name").use { input ->
                 tmp.outputStream().use { input.copyTo(it) }
             }
-            tmp.renameTo(File(dir, name))
+            // one not put in place leaves the stamp unwritten: the next start tries again
+            if (!tmp.renameTo(File(dir, name))) {
+                tmp.delete()
+                return
+            }
         }
         stamp.writeText(installed)
     }

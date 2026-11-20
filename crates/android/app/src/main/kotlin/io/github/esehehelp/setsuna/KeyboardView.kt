@@ -650,17 +650,37 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                     }
                 }
             }
-            MotionEvent.ACTION_CANCEL -> {
-                presses.clear()
-                listener.onPreview(null, null)
-                main.removeCallbacks(repeat)
-                repeating = null
-                main.removeCallbacks(hold)
-                holding = null
-            }
+            MotionEvent.ACTION_CANCEL -> releaseAll()
         }
         invalidate()
         return true
+    }
+
+    /** Every finger let go: no key repeats, nor waits for its hold, any more. */
+    private fun releaseAll() {
+        presses.clear()
+        listener.onPreview(null, null)
+        main.removeCallbacks(repeat)
+        repeating = null
+        main.removeCallbacks(hold)
+        holding = null
+    }
+
+    // A keyboard hidden (a panel in its place, the input view gone) or detached
+    // gets no ACTION_UP: a held Backspace would go on deleting.
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (visibility != VISIBLE) releaseAll()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility != VISIBLE) releaseAll()
+    }
+
+    override fun onDetachedFromWindow() {
+        releaseAll()
+        super.onDetachedFromWindow()
     }
 
     /** What a number pad key types: a digit as its key (composed), a symbol as text. */

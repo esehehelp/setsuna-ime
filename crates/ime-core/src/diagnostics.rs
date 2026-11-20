@@ -108,6 +108,9 @@ fn open_capped(path: &Path, limit: u64) -> Option<File> {
 }
 
 pub fn log_path(name: &str) -> Option<PathBuf> {
+    if let Some(dirs) = crate::config::app_dirs() {
+        return Some(dirs.state_home.join("setsuna-ime").join(name));
+    }
     let env = |k: &str| {
         std::env::var_os(k)
             .filter(|v| !v.is_empty())

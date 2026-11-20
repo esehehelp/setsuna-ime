@@ -28,7 +28,9 @@ class KeyPreview(private val palette: Palette, private val metrics: DisplayMetri
             val d = metrics.density
             val w = key.width() + 10 * d
             val h = key.height() * 1.1f
-            val left = (key.centerX() - w / 2).coerceIn(2 * d, bounds.width() - w - 2 * d)
+            // inside the overlay; one narrower than the bubble (not laid out yet) holds it at its left
+            val right = (bounds.width() - w - 2 * d).coerceAtLeast(2 * d)
+            val left = (key.centerX() - w / 2).coerceIn(2 * d, right)
             val bottom = key.top + 4 * d
             box.set(left, (bottom - h).coerceAtLeast(0f), left + w, bottom)
         }

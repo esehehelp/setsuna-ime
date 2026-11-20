@@ -30,29 +30,24 @@ pub struct Dirs {
 }
 
 impl Dirs {
-    /// Point the config and log directories at the app's own: off Windows
-    /// and macOS, `config_dir` and `log_path` follow XDG_CONFIG_HOME and
-    /// XDG_STATE_HOME. The engine, a child, inherits them.
+    /// Point the config and log directories at the app's own.
     pub fn export(&self) {
         export_files(&self.files);
     }
 }
 
 /// [`Dirs::export`] from the files directory alone, as the settings page
-/// has it (its activity may start before the service). A variable already
-/// so is left alone: setting one while another thread reads the
-/// environment is not safe.
+/// has it (its activity may start before the service): `config_dir` and
+/// `log_path` under it, the engine (a child) given them as its
+/// XDG_CONFIG_HOME and XDG_STATE_HOME. Never through this process's
+/// environment, which ART's threads read with no lock while Rust would set
+/// it.
 pub fn export_files(files: &Path) {
-    let set = |key: &str, value: PathBuf| {
-        if std::env::var_os(key).as_deref() != Some(value.as_os_str()) {
-            std::env::set_var(key, value);
-        }
-    };
-    set("XDG_CONFIG_HOME", files.join("config"));
-    set("XDG_STATE_HOME", files.join("state"));
-    if std::env::var_os("HOME").is_none_or(|h| h.is_empty()) {
-        std::env::set_var("HOME", files);
-    }
+    setsuna_core::config::set_app_dirs(setsuna_core::config::AppDirs {
+        config_home: files.join("config"),
+        state_home: files.join("state"),
+        home: files.to_path_buf(),
+    });
 }
 
 /// `config.toml` over what the app supplies, each where config.toml sets
@@ -140,9 +135,41 @@ pub struct Host {
     engine_key: Option<String>,
 }
 
-/// `[engine]` as compared for a restart of the daemon (the Linux addon's way).
-fn engine_key(cfg: &Config) -> String {
-    format!("{:?}", cfg.engine)
+/// `[engine]` as compared for a restart of the daemon (the Linux addon's
+/// way), with the manifests of the models under `data/models` it reads, by
+/// their size and time: the model is found there, not named in `[engine]`,
+/// and a download replaces it (or the corrector, or the analyzer) in place.
+fn engine_key(cfg: &Config, data: &Path) -> String {
+    let mut manifests = Vec::new();
+    for kind in ["onnx", "corrector", "analyzer"] {
+        let dir = data.join("models").join(kind);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let inner: Vec<PathBuf> = if path.is_dir() {
+                std::fs::read_dir(&path)
+                    .map(|e| e.flatten().map(|e| e.path()).collect())
+                    .unwrap_or_default()
+            } else {
+                vec![path]
+            };
+            for p in inner {
+                if p.to_string_lossy().ends_with("manifest.json") {
+                    let meta = std::fs::metadata(&p).ok();
+                    manifests.push(format!(
+                        "{} {:?} {:?}",
+                        p.display(),
+                        meta.as_ref().map(|m| m.len()),
+                        meta.and_then(|m| m.modified().ok())
+                    ));
+                }
+            }
+        }
+    }
+    manifests.sort();
+    format!("{:?} {manifests:?}", cfg.engine)
 }
 
 /// The daemon the warm-up thread starts: not yet, there to take, or taken
@@ -179,7 +206,7 @@ impl Host {
                             Some(&warm.data),
                             notify,
                         ) {
-                            Some(c) => Started::Ready(c, engine_key(&cfg)),
+                            Some(c) => Started::Ready(c, engine_key(&cfg, &warm.data)),
                             None => Started::Taken,
                         };
                     }
@@ -209,7 +236,7 @@ impl Host {
     /// a field is focused, as the TSF DLL reloads on ActivateEx.
     pub fn configure(&mut self, package: &str) {
         let (cfg, app) = with_app_defaults(Config::load_default(), &self.dirs).for_app(package);
-        let key = engine_key(&cfg);
+        let key = engine_key(&cfg, &self.dirs.data);
         let client = if self.session.has_client() && self.engine_key.as_ref() == Some(&key) {
             None
         } else {
@@ -346,6 +373,33 @@ mod tests {
         let cfg = with_app_defaults(own, &dirs);
         assert_eq!(cfg.engine.engine_exe, Some(PathBuf::from("/e.so")));
         assert!(cfg.lexicon.file.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A download replaces the model in place: the next field starts the
+    /// engine again with it.
+    #[test]
+    fn a_model_replaced_in_place_changes_the_engine_key() {
+        let root = temp("engine-key");
+        let onnx = root.join("models/onnx");
+        let corrector = root.join("models/corrector/N-tiny");
+        std::fs::create_dir_all(&onnx).unwrap();
+        std::fs::create_dir_all(&corrector).unwrap();
+        let cfg = Config::default();
+        let none = engine_key(&cfg, &root);
+        std::fs::write(onnx.join("M.manifest.json"), "{}").unwrap();
+        let model = engine_key(&cfg, &root);
+        assert_ne!(none, model);
+        assert_eq!(model, engine_key(&cfg, &root));
+        std::fs::write(onnx.join("M.manifest.json"), r#"{"v":2}"#).unwrap();
+        let replaced = engine_key(&cfg, &root);
+        assert_ne!(model, replaced);
+        std::fs::write(corrector.join("N-tiny.manifest.json"), "{}").unwrap();
+        assert_ne!(replaced, engine_key(&cfg, &root));
+        // what is no manifest (a weight file, a .part) changes nothing
+        let with_corrector = engine_key(&cfg, &root);
+        std::fs::write(onnx.join("M.encoder.safetensors.part"), "x").unwrap();
+        assert_eq!(with_corrector, engine_key(&cfg, &root));
         let _ = std::fs::remove_dir_all(&root);
     }
 
