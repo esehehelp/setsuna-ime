@@ -2832,8 +2832,13 @@ mod tests {
             let gemm = time(&mut || gemm_u8i8(dec.isa, &q, n, &dec.head.w, &mut gemm_acc));
             [head, gemm, qkv, lse_row, top]
         }
+        // `parts` is compiled for AVX-512 F and BW with AVX2 and FMA: all four checked
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
             for n in [1usize, 20] {
                 // SAFETY: the CPU supports the target features.
                 let [head, gemm, qkv, lse_row, top] = unsafe { parts(&dec, n, 2000) };

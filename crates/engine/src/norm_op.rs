@@ -200,18 +200,18 @@ mod tests {
     /// 16 lanes too.
     #[test]
     fn add_layer_norm_matches_f64() {
+        // the paths this CPU has, as each kernel's features want them (AVX-512 with AVX2 and FMA)
         let mut isas = vec![Isa::Plain];
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
+            use crate::cpu::{hardware, Level};
+            if hardware() >= Level::Avx2 {
                 isas.push(Isa::Avx2);
             }
-            if std::arch::is_x86_feature_detected!("avx") {
+            if hardware() >= Level::Avx {
                 isas.push(Isa::Avx);
             }
-            if std::arch::is_x86_feature_detected!("avx512f") {
+            if hardware() == Level::Avx512 {
                 isas.push(Isa::Avx512);
             }
         }

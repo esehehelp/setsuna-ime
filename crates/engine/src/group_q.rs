@@ -29,12 +29,9 @@
 use crate::moe_op::{add_routed, gelu, quantize_row, route};
 
 /// A `GroupMoe` on the experts' nibble codes `w1` (E, d / g, f, g / 2) and `w2` (E, f / g, d, g / 2) with their
-/// scales and zero points (E, out, in / g) and biases.
-///
-/// # Safety
-/// The codes stay valid and unchanged as long as the returned layer (`GroupWeights::in_place`).
+/// scales and zero points (E, out, in / g) and biases (each expert's codes copied: `GroupWeights::in_place`).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) unsafe fn group_moe(
+pub(crate) fn group_moe(
     e: usize,
     d: usize,
     f: usize,
@@ -301,15 +298,18 @@ enum Path {
     Plain,
 }
 
-/// The codes in place and the per-group terms of the output.
+/// The codes and the per-group terms of the output.
 pub(crate) struct GroupWeights {
     n: usize,
     k: usize,
     g: usize,
-    w: *const u8,
-    w_len: usize,
+    /// The codes as they come, two a byte ((K / g) groups of (N, g) blocked codes, g / 2 bytes a row), which the
+    /// tiles that read them packed take: the weights' own copy (they once read their loader's buffer through a
+    /// pointer, which that buffer had to outlive)
+    packed: Vec<u8>,
     /// The codes unpacked to one byte each, blocked as the packed ones (64-byte blocks: (K / g, N / 16, g / 4, 64)),
-    /// read by the VNNI kernel as they are (unpacking the nibbles in the kernel cost more than the dot products)
+    /// read by the VNNI kernel as they are (unpacking the nibbles in the kernel cost more than the dot products), and
+    /// by the plain path (`code`)
     unpacked: Vec<i8>,
     /// (K / g, N): s_g, and -s_g z_g
     scale: Vec<f32>,
@@ -319,10 +319,6 @@ pub(crate) struct GroupWeights {
     path: Path,
 }
 
-// SAFETY: `w` is an immutable initializer of the session, only read
-unsafe impl Send for GroupWeights {}
-unsafe impl Sync for GroupWeights {}
-
 #[derive(Default)]
 pub(crate) struct GroupScratch {
     q: Vec<u8>,
@@ -331,12 +327,9 @@ pub(crate) struct GroupScratch {
 }
 
 impl GroupWeights {
-    /// The weights read where they lie (`w`: (K / g) groups of (N, g) blocked codes, g / 2 bytes a row); `scales` and
-    /// `zeros` (N, K / g).
-    ///
-    /// # Safety
-    /// `w` stays valid and unchanged as long as the returned weights.
-    pub(crate) unsafe fn in_place(
+    /// The weights of the codes `w` ((K / g) groups of (N, g) blocked codes, g / 2 bytes a row), copied and
+    /// unpacked into the weights' own buffers; `scales` and `zeros` (N, K / g).
+    pub(crate) fn in_place(
         w: &[u8],
         scales: &[f32],
         zeros: &[f32],
@@ -363,8 +356,7 @@ impl GroupWeights {
             n,
             k,
             g,
-            w: w.as_ptr(),
-            w_len: w.len(),
+            packed: w.to_vec(),
             // each 32-byte block: the low nibbles are values 0-31, the high ones 32-63
             unpacked: w
                 .chunks(32)
@@ -391,18 +383,23 @@ impl GroupWeights {
         Ok(weights)
     }
 
-    fn codes(&self) -> &[u8] {
-        // SAFETY: `in_place`'s contract
-        unsafe { std::slice::from_raw_parts(self.w, self.w_len) }
-    }
-
-    /// The code of output `o`, input `i`.
+    /// The code of output `o`, input `i`: the packed codes' 32-byte block of it, unpacked to 64 (its low nibbles,
+    /// then its high ones), the code's place in that block.
     fn code(&self, o: usize, i: usize) -> u8 {
         let (g, n) = (self.g, self.n);
         let (gi, ii) = (i / g, i % g);
         let block = (o / 16) * (g / 4) + ii / 4;
         let v = (o % 16) * 4 + ii % 4;
-        let byte = self.codes()[gi * (n * g / 2) + block * 32 + v % 32];
+        self.unpacked[(gi * (n * g / 2) + block * 32) * 2 + v] as u8
+    }
+
+    /// The code as the packed bytes hold it (the tests' check of `code` against them).
+    #[cfg(test)]
+    fn packed_code(w: &[u8], n: usize, g: usize, o: usize, i: usize) -> u8 {
+        let (gi, ii) = (i / g, i % g);
+        let block = (o / 16) * (g / 4) + ii / 4;
+        let v = (o % 16) * 4 + ii % 4;
+        let byte = w[gi * (n * g / 2) + block * 32 + v % 32];
         if v < 32 {
             byte & 0x0f
         } else {
@@ -502,7 +499,19 @@ impl GroupWeights {
         bias: Option<&[f32]>,
     ) {
         let n = self.n;
-        let y = &mut y[..rows * n];
+        // checked in release too: the kernels read q, a and xs by raw pointers
+        let span = crate::moe_op::span;
+        assert!(
+            q.len() >= span(rows, self.k)
+                && a.len() >= span(rows, self.k / self.g)
+                && xs.len() >= rows,
+            "{} codes, {} group sums and {} scales for {rows} rows of {}",
+            q.len(),
+            a.len(),
+            xs.len(),
+            self.k
+        );
+        let y = &mut y[..span(rows, n)];
         // the kernels scale the rows and add the bias themselves
         // SAFETY (each): the CPU has the path's features (`detect`)
         #[cfg(target_arch = "x86_64")]
@@ -731,7 +740,7 @@ mod x86 {
                     let wg = codes.add(gi * gstride + ob * steps * 64);
                     // NIB: the packed codes, 32 bytes for the block's 64 (the low nibbles its codes 0-31, the high
                     // ones 32-63: the two registers below), half the bytes from memory
-                    let pg = w.w.add((gi * gstride + ob * steps * 64) / 2);
+                    let pg = w.packed.as_ptr().add((gi * gstride + ob * steps * 64) / 2);
                     for s in 0..steps {
                         let (w0, w1) = if NIB {
                             let v = _mm256_loadu_si256(pg.add(s * 32) as *const __m256i);
@@ -884,7 +893,7 @@ mod x86 {
         for gi in 0..groups {
             let mut acc = [[_mm_setzero_si128(); 4]; RT];
             let wg = codes.add(gi * gstride + ob * steps * 64);
-            let pg = w.w.add((gi * gstride + ob * steps * 64) / 2);
+            let pg = w.packed.as_ptr().add((gi * gstride + ob * steps * 64) / 2);
             for s in 0..steps {
                 let wv = if NIB {
                     let p0 = _mm_loadu_si128(pg.add(s * 32) as *const __m128i);
@@ -1107,7 +1116,7 @@ mod x86 {
         for gi in 0..groups {
             let mut acc = [[_mm512_setzero_si512(); C]; RT];
             let wg = codes.add(gi * gstride);
-            let pg = w.w.add(gi * gstride / 2);
+            let pg = w.packed.as_ptr().add(gi * gstride / 2);
             for s in 0..steps {
                 let mut wv = [_mm512_setzero_si512(); C];
                 for (c, wc) in wv.iter_mut().enumerate() {
@@ -1313,7 +1322,17 @@ mod tests {
                 })
                 .collect();
             let w = pack(&codes, n, k, g);
-            let weights = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }.unwrap();
+            let weights = GroupWeights::in_place(&w, &scales, &zeros, n, k, g).unwrap();
+            // the weights' own copy holds every code the packed bytes do
+            for o in 0..n {
+                for i in 0..k {
+                    assert_eq!(
+                        weights.code(o, i),
+                        GroupWeights::packed_code(&w, n, g, o, i),
+                        "output {o}, input {i}"
+                    );
+                }
+            }
             for rows in [1usize, 5, 7, 31] {
                 let x: Vec<f32> = (0..rows * k).map(|_| rnd(&mut seed) * 4.0 - 2.0).collect();
                 let mut y = vec![0f32; rows * n];
@@ -1340,7 +1359,7 @@ mod tests {
                         );
                     }
                 }
-                let plain = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }
+                let plain = GroupWeights::in_place(&w, &scales, &zeros, n, k, g)
                     .unwrap()
                     .with_path(Path::Plain);
                 let mut yp = vec![0f32; rows * n];
@@ -1387,7 +1406,7 @@ mod tests {
                     if !has_path(path) {
                         continue;
                     }
-                    let other = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }
+                    let other = GroupWeights::in_place(&w, &scales, &zeros, n, k, g)
                         .unwrap()
                         .with_path(path);
                     // the codes read unpacked (mode 4) and packed (6)
@@ -1454,8 +1473,8 @@ mod tests {
             };
             let p1 = layer(f, d, &mut seed);
             let p2 = layer(d, f, &mut seed);
-            let l1 = unsafe { GroupWeights::in_place(&p1.0, &p1.1, &p1.2, f, d, g) }.unwrap();
-            let l2 = unsafe { GroupWeights::in_place(&p2.0, &p2.1, &p2.2, d, f, g) }.unwrap();
+            let l1 = GroupWeights::in_place(&p1.0, &p1.1, &p1.2, f, d, g).unwrap();
+            let l2 = GroupWeights::in_place(&p2.0, &p2.1, &p2.2, d, f, g).unwrap();
             experts.push((l1, l2));
             keep.push((p1, p2));
         }
@@ -1544,7 +1563,7 @@ mod tests {
             let scales: Vec<f32> = (0..n * groups).map(|_| 0.02).collect();
             let zeros: Vec<f32> = (0..n * groups).map(|_| 8.0).collect();
             let w = pack(&codes, n, k, g);
-            let weights = unsafe { GroupWeights::in_place(&w, &scales, &zeros, n, k, g) }.unwrap();
+            let weights = GroupWeights::in_place(&w, &scales, &zeros, n, k, g).unwrap();
             let rows = 30;
             let x: Vec<f32> = (0..rows * k).map(|_| rnd(&mut seed) * 2.0 - 1.0).collect();
             let mut y = vec![0f32; rows * n];

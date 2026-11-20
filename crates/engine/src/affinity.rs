@@ -102,9 +102,11 @@ fn parse_size(s: &str) -> Option<u64> {
 #[cfg(windows)]
 mod sys {
     use super::Domain;
+    use std::mem::{offset_of, size_of};
     use windows_sys::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, RelationAll, RelationCache, RelationProcessorCore,
-        GROUP_AFFINITY, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        CACHE_RELATIONSHIP, GROUP_AFFINITY, PROCESSOR_RELATIONSHIP,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetProcessAffinityMask, SetProcessAffinityMask,
@@ -114,54 +116,87 @@ mod sys {
         (0..usize::BITS as usize).filter(move |i| mask >> i & 1 == 1)
     }
 
-    /// The CPUs of `n` group masks starting at `first`; None past processor group 0 (a process's affinity mask
-    /// reaches group 0 only, and a CPU of 64 logical processors or fewer has no other).
-    ///
-    /// # Safety
-    /// `first` must point at `n` (or, when `n` is 0, one) group masks.
-    unsafe fn group0(first: *const GROUP_AFFINITY, n: u16) -> Option<Vec<usize>> {
-        let masks = unsafe { std::slice::from_raw_parts(first, n.max(1) as usize) };
-        let mut cpus = Vec::new();
-        for m in masks {
-            if m.Group != 0 {
-                return None;
-            }
-            cpus.extend(bits(m.Mask));
+    /// The bytes of one record, read field by field at the structs' offsets: a record is as long as its `Size`
+    /// says (a cache's or a core's is shorter than the struct, the union's widest), and its group masks run past
+    /// the one the struct declares, so no reference to the struct or its mask array is made.
+    struct Record<'a>(&'a [u8]);
+
+    impl Record<'_> {
+        fn bytes<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
+            self.0.get(at..at.checked_add(N)?)?.try_into().ok()
         }
-        Some(cpus)
+        fn u8(&self, at: usize) -> Option<u8> {
+            self.bytes::<1>(at).map(|b| b[0])
+        }
+        fn u16(&self, at: usize) -> Option<u16> {
+            self.bytes(at).map(u16::from_ne_bytes)
+        }
+        fn u32(&self, at: usize) -> Option<u32> {
+            self.bytes(at).map(u32::from_ne_bytes)
+        }
+        fn usize(&self, at: usize) -> Option<usize> {
+            self.bytes(at).map(usize::from_ne_bytes)
+        }
+
+        /// The CPUs of the `n` group masks at `at`; None past processor group 0 (a process's affinity mask
+        /// reaches group 0 only, and a CPU of 64 logical processors or fewer has no other), or past the record.
+        fn group0(&self, at: usize, n: u16) -> Option<Vec<usize>> {
+            let mut cpus = Vec::new();
+            for i in 0..n.max(1) as usize {
+                let m = at + i * size_of::<GROUP_AFFINITY>();
+                if self.u16(m + offset_of!(GROUP_AFFINITY, Group))? != 0 {
+                    return None;
+                }
+                cpus.extend(bits(self.usize(m + offset_of!(GROUP_AFFINITY, Mask))?));
+            }
+            Some(cpus)
+        }
     }
 
     pub fn topology() -> Option<(Vec<Domain>, Vec<Vec<usize>>, Vec<usize>)> {
         let mut len = 0u32;
         unsafe { GetLogicalProcessorInformationEx(RelationAll, std::ptr::null_mut(), &mut len) };
-        // u64s: the records' alignment
-        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-        let base = buf.as_mut_ptr() as *mut u8;
-        if unsafe { GetLogicalProcessorInformationEx(RelationAll, base.cast(), &mut len) } == 0 {
+        let mut buf = vec![0u8; len as usize];
+        if unsafe {
+            GetLogicalProcessorInformationEx(RelationAll, buf.as_mut_ptr().cast(), &mut len)
+        } == 0
+        {
             return None;
         }
+        buf.truncate(len as usize);
+        // the record's union, and in it the fields read
+        let body = offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let cache_level = body + offset_of!(CACHE_RELATIONSHIP, Level);
+        let cache_size = body + offset_of!(CACHE_RELATIONSHIP, CacheSize);
+        let cache_groups = body + offset_of!(CACHE_RELATIONSHIP, GroupCount);
+        let cache_masks = body + offset_of!(CACHE_RELATIONSHIP, Anonymous);
+        let core_groups = body + offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+        let core_masks = body + offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
         let (mut domains, mut cores) = (Vec::new(), Vec::new());
         let mut off = 0usize;
-        while off + std::mem::size_of::<u32>() * 2 <= len as usize {
-            let rec =
-                unsafe { &*(base.add(off) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) };
-            if rec.Size == 0 {
+        while let Some(head) = buf.get(off..off + 8) {
+            let rel = Record(head);
+            let relationship = rel.u32(offset_of!(
+                SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                Relationship
+            ))? as i32;
+            let size = rel.u32(offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size))? as usize;
+            if size == 0 {
                 break;
             }
-            if rec.Relationship == RelationCache {
-                let c = unsafe { &rec.Anonymous.Cache };
-                if c.Level == 3 {
-                    let cpus = unsafe { group0(c.Anonymous.GroupMasks.as_ptr(), c.GroupCount) }?;
+            // a record past the buffer ends the walk
+            let rec = Record(buf.get(off..off.checked_add(size)?)?);
+            if relationship == RelationCache {
+                if rec.u8(cache_level)? == 3 {
                     domains.push(Domain {
-                        l3_bytes: c.CacheSize as u64,
-                        cpus,
+                        l3_bytes: u64::from(rec.u32(cache_size)?),
+                        cpus: rec.group0(cache_masks, rec.u16(cache_groups)?)?,
                     });
                 }
-            } else if rec.Relationship == RelationProcessorCore {
-                let p = unsafe { &rec.Anonymous.Processor };
-                cores.push(unsafe { group0(p.GroupMask.as_ptr(), p.GroupCount) }?);
+            } else if relationship == RelationProcessorCore {
+                cores.push(rec.group0(core_masks, rec.u16(core_groups)?)?);
             }
-            off += rec.Size as usize;
+            off += size;
         }
         domains.sort_by_key(|d| d.cpus.first().copied());
         let (mut process, mut system) = (0usize, 0usize);
@@ -316,6 +351,30 @@ mod tests {
         assert_eq!(parse_size("32768K\n"), Some(32 << 20));
         assert_eq!(parse_size("96M"), Some(96 << 20));
         assert_eq!(parse_size("512"), Some(512));
+    }
+
+    /// This machine's records read: every core has a CPU, every CPU is one
+    /// core's once, and an L3's CPUs are cores' CPUs.
+    #[cfg(windows)]
+    #[test]
+    fn this_machine_s_topology_is_whole() {
+        let (domains, cores, allowed) = sys::topology().expect("the topology");
+        assert!(!cores.is_empty() && cores.iter().all(|c| !c.is_empty()));
+        let mut all: Vec<usize> = cores.iter().flatten().copied().collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "a CPU on two cores: {cores:?}");
+        assert!(
+            allowed.iter().all(|c| all.contains(c)),
+            "{allowed:?} {all:?}"
+        );
+        for d in &domains {
+            assert!(
+                d.l3_bytes > 0 && d.cpus.iter().all(|c| all.contains(c)),
+                "{d:?}"
+            );
+        }
     }
 
     #[test]

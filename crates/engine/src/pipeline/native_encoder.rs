@@ -195,8 +195,6 @@ impl Table8 {
 /// A `neo_ime.LinearQ4G` (`<name>.w` (K / g, N, g / 2) codes, `<name>.scales` / `<name>.zeros` (N, K / g)) and the
 /// Add of its bias after it (`<name>.bias`, when the graph has one).
 struct Q4g {
-    /// the codes `w` points into (a heap buffer that does not move with the struct)
-    _codes: Vec<u8>,
     w: GroupWeights,
     bias: Option<Vec<f32>>,
     n: usize,
@@ -213,9 +211,8 @@ impl Q4g {
         let (groups, n, g) = (shape[0], shape[1], shape[2] * 2);
         let scales = w.f32(&format!("{name}.scales"), &[n, groups])?;
         let zeros = w.f32(&format!("{name}.zeros"), &[n, groups])?;
-        let codes = codes.to_vec();
-        // SAFETY: `codes` lives in the struct with `w`, unchanged; its heap buffer stays put when the struct moves
-        let gw = unsafe { GroupWeights::in_place(&codes, scales, zeros, n, groups * g, g) }
+        // the weights keep their own copy of the codes
+        let gw = GroupWeights::in_place(codes, scales, zeros, n, groups * g, g)
             .map_err(|m| anyhow::anyhow!("{name}: {m}"))?;
         let bias = if bias {
             Some(w.f32(&format!("{name}.bias"), &[n])?.to_vec())
@@ -223,7 +220,6 @@ impl Q4g {
             None
         };
         Ok(Q4g {
-            _codes: codes,
             w: gw,
             bias,
             n,
@@ -396,11 +392,10 @@ struct LinScratch {
     acc: Vec<i32>,
 }
 
-/// A layer's routed experts: the graph's `neo_ime.TokenMoEQ4G` (with the codes its weights point into), or (config
-/// `int8_linears`) its `neo_ime.TokenMoEBlocked` / `TokenMoE`, the int8 experts of `moe_op` on the same weights.
+/// A layer's routed experts: the graph's `neo_ime.TokenMoEQ4G`, or (config `int8_linears`) its
+/// `neo_ime.TokenMoEBlocked` / `TokenMoE`, the int8 experts of `moe_op` on the same weights.
 enum Moe {
-    // the codes are only held: the GroupMoe's weights point into them
-    Q4g(GroupMoe, #[allow(dead_code)] Vec<Vec<u8>>),
+    Q4g(GroupMoe),
     Int8(MoeWeights),
 }
 
@@ -414,7 +409,7 @@ impl Moe {
         e: &mut crate::moe_op::Scratch,
     ) {
         match self {
-            Moe::Q4g(m, _) => m.forward(x, y, g),
+            Moe::Q4g(m) => m.forward(x, y, g),
             Moe::Int8(m) => m.forward(x, y, e),
         }
     }
@@ -782,8 +777,7 @@ impl NativeEncoder {
                     Some(if int8 {
                         Moe::Int8(load_moe8(w, &format!("{n}.moe"), mc, d)?)
                     } else {
-                        let (m, codes) = load_moe(w, &format!("{n}.moe"), mc, d)?;
-                        Moe::Q4g(m, codes)
+                        Moe::Q4g(load_moe(w, &format!("{n}.moe"), mc, d)?)
                     })
                 } else {
                     None
@@ -1176,7 +1170,7 @@ impl Drop for NativeEncoder {
 
 /// The routed experts of a layer: `<name>.router` (E, d), `.w1` (E, d / g, f, g / 2), `.s1` / `.z1` (E, f, d / g),
 /// `.b1` (E, f), `.w2` (E, f / g, d, g / 2), `.s2` / `.z2` (E, d, f / g), `.b2` (E, d) as TokenMoEQ4G's inputs.
-fn load_moe(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<(GroupMoe, Vec<Vec<u8>>)> {
+fn load_moe(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<GroupMoe> {
     let e = mc.experts;
     let (w1, s1shape) = w.u8_any(&format!("{name}.w1"))?;
     anyhow::ensure!(
@@ -1185,7 +1179,6 @@ fn load_moe(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<(GroupM
     );
     let (f, g) = (s1shape[2], s1shape[3] * 2);
     let (w2, _) = w.u8_any(&format!("{name}.w2"))?;
-    let (w1, w2) = (w1.to_vec(), w2.to_vec());
     let s1 = w.f32(&format!("{name}.s1"), &[e, f, d / g])?;
     let z1 = w.f32(&format!("{name}.z1"), &[e, f, d / g])?;
     let s2 = w.f32(&format!("{name}.s2"), &[e, d, f / g])?;
@@ -1193,21 +1186,18 @@ fn load_moe(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<(GroupM
     let router = w.f32(&format!("{name}.router"), &[e, d])?.to_vec();
     let b1 = w.f32(&format!("{name}.b1"), &[e, f])?.to_vec();
     let b2 = w.f32(&format!("{name}.b2"), &[e, d])?.to_vec();
-    // SAFETY: the codes are returned with the layer and kept beside it, unchanged; their heap buffers do not move
-    let moe = unsafe {
-        group_moe(
-            e,
-            d,
-            f,
-            mc.top_k,
-            g,
-            router,
-            (&w1, s1, z1, b1),
-            (&w2, s2, z2, b2),
-        )
-    }
-    .map_err(|m| anyhow::anyhow!("{name}: {m}"))?;
-    Ok((moe, vec![w1, w2]))
+    // the experts' weights keep their own copies of the codes
+    group_moe(
+        e,
+        d,
+        f,
+        mc.top_k,
+        g,
+        router,
+        (w1, s1, z1, b1),
+        (w2, s2, z2, b2),
+    )
+    .map_err(|m| anyhow::anyhow!("{name}: {m}"))
 }
 
 /// The int8 routed experts of a layer (config `int8_linears`): `<name>.router` (E, d), `.w1` (E, f, d) int8 a row an
@@ -2578,7 +2568,7 @@ mod tests {
                     }),
                 );
             }
-            if let Some(Moe::Q4g(moe, _)) = &layer.moe {
+            if let Some(Moe::Q4g(moe)) = &layer.moe {
                 y.resize(t * d, 0.0);
                 add(
                     "moe",
@@ -2686,7 +2676,7 @@ mod tests {
                             q.forward(enc.isa, &x[..t * q.k()], &mut y, &mut s)
                         });
                     }
-                    if let Some(Moe::Q4g(moe, _)) = &layer.moe {
+                    if let Some(Moe::Q4g(moe)) = &layer.moe {
                         y.resize(t * d, 0.0);
                         experts += time(1000, &mut || {
                             moe.forward(&x[..t * d], &mut y[..t * d], &mut ms)

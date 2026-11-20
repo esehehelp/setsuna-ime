@@ -65,6 +65,30 @@ pub fn dotprod() -> bool {
     })
 }
 
+/// The CPU's own level (no cap): what a kernel of a level may run on.
+pub fn hardware() -> Level {
+    static HARDWARE: OnceLock<Level> = OnceLock::new();
+    *HARDWARE.get_or_init(detected)
+}
+
+/// The CPU has AVX-VNNI (with AVX2 and FMA), whatever level it is at.
+pub fn has_avx_vnni() -> bool {
+    static VNNI: OnceLock<bool> = OnceLock::new();
+    *VNNI.get_or_init(avx_vnni_present)
+}
+
+/// The CPU has ARMv8.2's dot products (no cap).
+pub fn has_dotprod() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
 fn detected() -> Level {
     #[cfg(target_arch = "x86_64")]
     {

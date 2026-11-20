@@ -144,9 +144,37 @@ pub(crate) fn detect_isa() -> Isa {
     }
 }
 
+/// Whether the CPU has what `isa`'s kernels run (whatever SETSUNA_CPU_LEVEL caps): the safe entry points take an
+/// `Isa` from anywhere (a test's too), and one the CPU lacks would run instructions it does not have.
+pub(crate) fn supported(isa: Isa) -> bool {
+    use crate::cpu::{hardware, Level};
+    match isa {
+        Isa::Vnni512 => hardware() == Level::Avx512,
+        Isa::Vnni256 => crate::cpu::has_avx_vnni(),
+        Isa::Avx2 => hardware() >= Level::Avx2,
+        Isa::Avx => hardware() >= Level::Avx,
+        Isa::Dot => crate::cpu::has_dotprod(),
+        Isa::Plain => true,
+    }
+}
+
+/// `rows * width` as the length a kernel reads or writes, which a slice must have: the kernels go by raw pointers.
+pub(crate) fn span(rows: usize, width: usize) -> usize {
+    rows.checked_mul(width).expect("a matrix's size overflows")
+}
+
 /// The integer sums acc[r][o] = sum_i q[r][i] * w[o][i] of `rows` u8 rows (stride `w.inp`) with the int8 matrix.
 pub(crate) fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
-    debug_assert!(q.len() >= rows * w.inp && acc.len() >= rows * w.out);
+    // checked in release too: the kernels read and write by raw pointers
+    assert!(
+        q.len() >= span(rows, w.inp) && acc.len() >= span(rows, w.out),
+        "{} inputs and {} sums for {rows} rows of {} x {}",
+        q.len(),
+        acc.len(),
+        w.inp,
+        w.out
+    );
+    assert!(supported(isa), "{isa:?} on a CPU without it");
     if w.blocked.is_empty() {
         return gemm_plain(q, rows, w, acc);
     }
@@ -200,8 +228,15 @@ pub(crate) fn gemm_u8i8_f32(
         "{} scales for {rows} rows",
         e.xs.len()
     );
-    assert!(e.out <= w.out && y.len() >= rows * e.out && w.colsum.len() >= e.out);
+    assert!(e.out <= w.out && y.len() >= span(rows, e.out) && w.colsum.len() >= e.out);
     assert!(e.col.is_none_or(|c| c.len() >= e.out) && e.bias.is_none_or(|b| b.len() >= e.out));
+    assert!(
+        q.len() >= span(rows, w.inp),
+        "{} inputs for {rows} rows of {}",
+        q.len(),
+        w.inp
+    );
+    assert!(supported(isa), "{isa:?} on a CPU without it");
     #[cfg(target_arch = "x86_64")]
     {
         let raw = x86::Epi {
@@ -1730,7 +1765,7 @@ mod tests {
                     );
                     // the AVX2 level's kernel from the 16-bit copy, where this CPU has AVX2
                     #[cfg(target_arch = "x86_64")]
-                    if isa != Isa::Plain && std::arch::is_x86_feature_detected!("avx2") {
+                    if isa != Isa::Plain && supported(Isa::Avx2) {
                         let mut got = vec![f32::NAN; rows * out];
                         gemm_u8i8_f32(Isa::Avx2, &q, rows, &wide, e, &mut a1, &mut got);
                         assert_eq!(
@@ -1741,7 +1776,7 @@ mod tests {
                     }
                     // and the AVX level's (128-bit integers)
                     #[cfg(target_arch = "x86_64")]
-                    if isa != Isa::Plain && std::arch::is_x86_feature_detected!("avx") {
+                    if isa != Isa::Plain && supported(Isa::Avx) {
                         let mut got = vec![f32::NAN; rows * out];
                         gemm_u8i8_f32(Isa::Avx, &q, rows, &wide, e, &mut a1, &mut got);
                         assert_eq!(
