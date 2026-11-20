@@ -1152,19 +1152,7 @@ impl EngineBridge {
         let was_active = self.is_active();
         self.phase = Phase::Empty;
         self.composing.reset();
-        self.seg_requests.clear();
-        self.list_reading.clear();
-        self.list_starts.clear();
-        self.last_applied_reading.clear();
-        self.cached_prefix_reading.clear();
-        self.cached_prefix_kanji.clear();
-        self.kept = None;
-        self.kana_shown = false;
-        self.prediction = None;
-        self.covers_typed = false;
-        self.form = None;
-        self.stop_rerank();
-        self.stop_rewrite();
+        self.clear_composition();
         self.forget_context();
         if was_active {
             vec![Action::HideCandidates, Action::EndComposition]
@@ -1873,11 +1861,9 @@ impl EngineBridge {
                 }
                 self.composing.delete_left();
                 if self.composing.is_empty() {
+                    self.invalidate_engine_results();
                     self.phase = Phase::Empty;
-                    self.last_applied_reading.clear();
-                    self.cached_prefix_reading.clear();
-                    self.cached_prefix_kanji.clear();
-                    self.kept = None;
+                    self.clear_composition();
                     return KeyOutcome {
                         consumed: true,
                         actions: vec![Action::EndComposition],
@@ -1924,10 +1910,10 @@ impl EngineBridge {
             .as_ref()
             .filter(|(r, t, _)| *r == reading && *t == shown)
             .map(|(_, _, s)| s.clone())
-            .or_else(|| self.list_starts.get(&shown).cloned())
+            .or_else(|| self.list_starts_for(&reading, &shown))
             .or_else(|| crate::segments::char_starts(&reading, &shown, None))?;
         let n = reading.chars().count();
-        if starts.len() != shown.chars().count() {
+        if !starts_fit(&starts, &shown, n) {
             return None;
         }
         if let Some(lex) = &self.lexicon {
@@ -1955,10 +1941,7 @@ impl EngineBridge {
         if self.composing.is_empty() {
             self.composing.reset();
             self.phase = Phase::Empty;
-            self.last_applied_reading.clear();
-            self.cached_prefix_reading.clear();
-            self.cached_prefix_kanji.clear();
-            self.kept = None;
+            self.clear_composition();
             return Some(consumed(vec![Action::EndComposition]));
         }
         let left = self.composing.hiragana().to_string();
@@ -2265,10 +2248,6 @@ impl EngineBridge {
                 let mut actions = self.commit_converting();
                 actions.push(Action::HideCandidates);
                 self.phase = Phase::Empty;
-                self.last_applied_reading.clear();
-                self.cached_prefix_reading.clear();
-                self.cached_prefix_kanji.clear();
-                self.kept = None;
                 KeyOutcome {
                     consumed: true,
                     actions,
@@ -2304,13 +2283,8 @@ impl EngineBridge {
                     }
                     _ => self.composing.commit(),
                 };
-                self.stop_rerank();
-                self.stop_rewrite();
                 self.phase = Phase::Empty;
-                self.last_applied_reading.clear();
-                self.cached_prefix_reading.clear();
-                self.cached_prefix_kanji.clear();
-                self.kept = None;
+                self.clear_composition();
                 if text.is_empty() {
                     return KeyOutcome {
                         consumed: true,
@@ -2392,18 +2366,8 @@ impl EngineBridge {
         let converting = self.is_converting();
         self.invalidate_engine_results();
         self.composing.reset();
-        self.stop_rerank();
-        self.stop_rewrite();
         self.phase = Phase::Empty;
-        self.prediction = None;
-        self.covers_typed = false;
-        self.form = None;
-        self.seg_requests.clear();
-        self.last_applied_reading.clear();
-        self.cached_prefix_reading.clear();
-        self.cached_prefix_kanji.clear();
-        self.kept = None;
-        self.kana_shown = false;
+        self.clear_composition();
         let mut actions = Vec::new();
         if converting {
             actions.push(Action::HideCandidates);
@@ -2864,11 +2828,20 @@ impl EngineBridge {
         } else {
             Instant::now() + Duration::from_millis(self.rerank_cfg.idle_ms)
         };
+        // a candidate of the corrected reading spells it, not the one typed:
+        // it is no less spelled out for that
         let spelled = {
             use unicode_normalization::UnicodeNormalization;
-            let r: Vec<char> = reading.nfkc().collect();
+            let chars = |s: &str| s.nfkc().collect::<Vec<char>>();
+            let r = chars(reading);
+            let fixed = corrected.map(chars);
             raw.iter()
-                .map(|c| crate::reading_align::spells_out(c, &r))
+                .map(|c| {
+                    crate::reading_align::spells_out(c, &r)
+                        || fixed
+                            .as_ref()
+                            .is_some_and(|f| crate::reading_align::spells_out(c, f))
+                })
                 .collect()
         };
         self.rerank = Some(RerankJob {
@@ -2900,14 +2873,19 @@ impl EngineBridge {
         limit.min(n)
     }
 
+    /// The LM's weight: the config's, else the reranker's, else 0.3; a
+    /// weight that is not a finite number is none.
     fn rerank_lambda(&self) -> f32 {
+        let finite = |l: &f32| l.is_finite();
         self.rerank_cfg
             .lambda
+            .filter(finite)
             .or(self
                 .reranker
                 .as_ref()
                 .and_then(|r| r.info())
-                .map(|i| i.lambda))
+                .map(|i| i.lambda)
+                .filter(finite))
             .unwrap_or(0.3)
     }
 
@@ -3072,19 +3050,26 @@ impl EngineBridge {
         if result.req_id != job.req_id || result.logp.len() != job.k {
             return Vec::new();
         }
-        let lambda = f64::from(self.rerank_lambda());
+        let lambda = self.rerank_lambda();
         let order = rerank_order(
             &job.scores[..job.k],
             &result.logp,
-            self.rerank_lambda(),
+            lambda,
             &job.spelled[..job.k],
         );
-        // the scored candidates far below the best go (`RERANK_GAP`)
-        let total = |i: usize| f64::from(job.scores[i]) + lambda * result.logp[i];
+        if order.is_empty() {
+            return Vec::new();
+        }
+        // the scored candidates far below the best go (`RERANK_GAP`); the
+        // best stays, and with no finite best (scores that are not
+        // numbers) none goes
+        let total = |i: usize| rerank_total(job.scores[i], result.logp[i], lambda);
         let best = total(order[0]);
         let order: Vec<usize> = order
             .into_iter()
-            .filter(|&i| best - total(i) <= RERANK_GAP)
+            .enumerate()
+            .filter(|&(at, i)| at == 0 || !best.is_finite() || best - total(i) <= RERANK_GAP)
+            .map(|(_, i)| i)
             .collect();
         let reorder = |v: &[String]| -> Vec<String> {
             order
@@ -3317,6 +3302,16 @@ impl EngineBridge {
             Some(d) => UserDictSource::Fixed(Arc::new(d)),
             None => UserDictSource::None,
         };
+    }
+
+    /// The list's reading starts of the chars of `text`, where the list is
+    /// `reading`'s: those of another reading (the list before a Backspace,
+    /// or one not yet replaced) do not fit it.
+    fn list_starts_for(&self, reading: &str, text: &str) -> Option<Vec<usize>> {
+        if self.list_reading != reading {
+            return None;
+        }
+        self.list_starts.get(text).cloned()
     }
 
     /// Reading starts of the chars of each candidate in `list`: from the
@@ -3701,10 +3696,23 @@ impl EngineBridge {
     /// While typing it picks from [`Self::suggestions`]: the conversion
     /// opens on that candidate.
     pub fn handle_select(&mut self, index: usize) -> KeyOutcome {
-        if matches!(self.phase, Phase::Composing { .. }) && index < self.suggestions().len() {
-            let mut actions = self.handle_space().actions;
-            actions.extend(self.handle_select(index).actions);
-            return consumed(actions);
+        if matches!(self.phase, Phase::Composing { .. }) {
+            if let Some(want) = self.suggestions().get(index).cloned() {
+                // the suggestion picked, where the list Space opens has it
+                // (mixed input's puts the other reading's in: it is not the
+                // suggestions' order)
+                let mut actions = self.handle_space().actions;
+                let at = match &self.phase {
+                    Phase::Converting {
+                        candidates,
+                        seg: None,
+                        ..
+                    } => candidates.iter().position(|c| *c == want),
+                    _ => None,
+                };
+                actions.extend(self.handle_select(at.unwrap_or(index)).actions);
+                return consumed(actions);
+            }
         }
         let current = match &self.phase {
             Phase::Converting { seg: Some(s), .. } => s.segs[s.focus].selected,
@@ -4073,15 +4081,15 @@ impl EngineBridge {
             .as_ref()
             .filter(|(r, t, _)| r == reading && t == text)
             .map(|(_, _, s)| s.clone())
-            .or_else(|| self.list_starts.get(text).cloned())
+            .or_else(|| self.list_starts_for(reading, text))
             .or_else(|| crate::segments::char_starts(reading, text, None))?;
-        if starts.len() != text.chars().count() {
+        let n = reading.chars().count();
+        if !starts_fit(&starts, text, n) {
             return None;
         }
         if let Some(lex) = &self.lexicon {
             split_runs(lex, reading, text, &mut starts);
         }
-        let n = reading.chars().count();
         // char i reads starts[i] .. starts[i + 1] (the last, up to n); chars
         // sharing a start are one unit (今日, きょう), cut after its last
         let ends: Vec<usize> = starts.iter().skip(1).copied().chain([n]).collect();
@@ -4160,6 +4168,32 @@ impl EngineBridge {
             // what it shows is committed next: its actions go
             let _ = self.apply_engine_result();
         }
+    }
+
+    /// Forget what belonged to the composition that ended (committed,
+    /// dropped, deleted to nothing): its list and the reading it is of, the
+    /// conversion cached for the preview, the F6–F10 form, the other
+    /// reading's list, the prediction open, and the rerank and the rewrite
+    /// asked for it; so that none of it is taken for the next one's (the
+    /// same reading typed again and Enter at once committed the kana, not
+    /// waiting for its conversion; a form kept refused Space's list).
+    fn clear_composition(&mut self) {
+        self.seg_requests.clear();
+        self.list_reading.clear();
+        self.list_starts.clear();
+        self.last_applied_reading.clear();
+        self.cached_prefix_reading.clear();
+        self.cached_prefix_kanji.clear();
+        self.cached_shortcut = None;
+        self.kept = None;
+        self.kana_shown = false;
+        self.prediction = None;
+        self.covers_typed = false;
+        self.form = None;
+        self.seg_form = None;
+        self.alt = None;
+        self.stop_rerank();
+        self.stop_rewrite();
     }
 
     fn invalidate_engine_results(&mut self) {
@@ -4390,16 +4424,7 @@ impl EngineBridge {
         self.record_commit(&reading, &text);
         let text = format!("{text}{tail}");
         self.invalidate_engine_results();
-        self.seg_requests.clear();
-        self.stop_rerank();
-        self.stop_rewrite();
-        self.list_reading.clear();
-        self.last_applied_reading.clear();
-        self.cached_prefix_reading.clear();
-        self.cached_prefix_kanji.clear();
-        self.kept = None;
-        self.kana_shown = false;
-        self.seg_form = None;
+        self.clear_composition();
         if !text.is_empty() {
             self.append_context(&text);
             vec![Action::Commit { text }]
@@ -4425,17 +4450,23 @@ const RERANK_GAP: f64 = 20.0;
 /// おしま村 for おおしまむら over おおしま村; kept below, EM1 over the top 20
 /// of wiki_fresh_v2 79.21 -> 79.27, AJIMEE 81.0 -> 81.5).
 fn rerank_order(scores: &[f32], logp: &[f64], lambda: f32, spelled: &[bool]) -> Vec<usize> {
-    let total = |i: usize| f64::from(scores[i]) + f64::from(lambda) * logp[i];
+    let total = |i: usize| rerank_total(scores[i], logp[i], lambda);
     let first = |i: usize| spelled.get(i).copied().unwrap_or(true);
     let mut order: Vec<usize> = (0..scores.len().min(logp.len())).collect();
-    order.sort_by(|&a, &b| {
-        first(b).cmp(&first(a)).then(
-            total(b)
-                .partial_cmp(&total(a))
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
+    order.sort_by(|&a, &b| first(b).cmp(&first(a)).then(total(b).total_cmp(&total(a))));
     order
+}
+
+/// `converter + lambda * LM`, or minus infinity where that is not a finite
+/// number (a score the converter or the LM could not give), so that it
+/// sorts last and the order is total.
+fn rerank_total(score: f32, logp: f64, lambda: f32) -> f64 {
+    let t = f64::from(score) + f64::from(lambda) * logp;
+    if t.is_finite() {
+        t
+    } else {
+        f64::NEG_INFINITY
+    }
 }
 
 /// The status while a rewrite is on its way.
@@ -4489,6 +4520,9 @@ fn with_romaji_kana(reading: &str, mut cands: Vec<String>) -> Vec<String> {
 fn split_runs(lex: &crate::lexicon::Lexicon, reading: &str, text: &str, starts: &mut [usize]) {
     let r: Vec<char> = reading.chars().collect();
     let t: Vec<char> = text.chars().collect();
+    if !starts_fit(starts, text, r.len()) {
+        return;
+    }
     let mut i = 0;
     while i < t.len() {
         let mut j = i + 1;
@@ -4499,7 +4533,7 @@ fn split_runs(lex: &crate::lexicon::Lexicon, reading: &str, text: &str, starts: 
         if j - i > 1 && starts[i] < end {
             let run: String = t[i..j].iter().collect();
             let read: String = r[starts[i]..end].iter().collect();
-            match lex.split_reading(&run, &read) {
+            match lex.split_reading(&run, &read).filter(|s| s.len() == j - i) {
                 Some(split) => {
                     for (k, s) in split.into_iter().enumerate() {
                         starts[i + k] = starts[i] + s;
@@ -4513,6 +4547,14 @@ fn split_runs(lex: &crate::lexicon::Lexicon, reading: &str, text: &str, starts: 
         }
         i = j;
     }
+}
+
+/// Whether `starts` can be the reading starts of the chars of `text` in a
+/// reading of `n` chars: one per char, in order, none past the end.
+fn starts_fit(starts: &[usize], text: &str, n: usize) -> bool {
+    starts.len() == text.chars().count()
+        && starts.windows(2).all(|w| w[0] <= w[1])
+        && starts.last().is_none_or(|&s| s <= n)
 }
 
 /// A kanji, or an iteration or abbreviation mark read as one (々, 〆, ヶ).
@@ -6458,6 +6500,58 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_reading_typed_again_waits_for_its_conversion() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "kasano");
+        mock.set_result("かさの", &["傘の", "笠の"]);
+        bridge.apply_async_result();
+        bridge.handle_enter();
+        // the same reading again, its conversion not in yet: Enter waits
+        // for it rather than taking the list of the one committed for its
+        mock.state
+            .answers
+            .borrow_mut()
+            .insert("かさの".into(), vec!["嵩の".into()]);
+        type_str(&mut bridge, "kasano");
+        let outcome = bridge.handle_enter();
+        assert_eq!(
+            outcome.actions,
+            vec![Action::Commit {
+                text: "嵩の".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_form_committed_leaves_the_next_conversion_of_its_reading_alone() {
+        let (mut bridge, mock) = bridge_with_mock();
+        type_str(&mut bridge, "kasano");
+        bridge.handle_convert_to(Form::Hiragana);
+        bridge.handle_enter();
+        type_str(&mut bridge, "kasano");
+        bridge.handle_space();
+        mock.answer_last(&["傘の", "笠の"]);
+        let (list, _) = shown(&bridge.apply_async_result()).unwrap();
+        assert_eq!(list[0], "傘の");
+    }
+
+    #[test]
+    fn deleting_the_composition_drops_its_rerank() {
+        let (mut bridge, mock, rr) = bridge_with_reranker();
+        type_str(&mut bridge, "kasano");
+        answer_scored(&mock, &["傘の", "笠の"], &[-1.0, -1.5]);
+        bridge.apply_async_result();
+        assert!(bridge.rerank.is_some());
+        bridge.backspace_deletes_shown = false;
+        for _ in 0..3 {
+            bridge.handle_backspace();
+        }
+        assert!(!bridge.is_active());
+        assert!(bridge.rerank.is_none());
+        assert_eq!(*rr.state.cancels.borrow(), 1);
+    }
+
+    #[test]
     fn escape_discards_composition() {
         let (mut bridge, _mock) = bridge_with_mock();
         type_str(&mut bridge, "ka");
@@ -7086,6 +7180,35 @@ mod tests {
         rr.answer(&[-30.0, -70.0, -35.0]);
         let (list, _) = shown(&bridge.apply_async_result()).unwrap();
         assert_eq!(list, v(&["傘の", "嵩の", "かさの", "カサノ"]));
+    }
+
+    #[test]
+    fn a_score_that_is_not_a_number_ranks_last_and_drops_nothing() {
+        let (mut bridge, mock, rr) = bridge_with_reranker();
+        type_str(&mut bridge, "kasano");
+        answer_scored(&mock, &["傘の", "笠の"], &[-1.0, -1.5]);
+        bridge.apply_async_result();
+        bridge.handle_space();
+        rr.answer(&[f64::NAN, f64::NAN]);
+        let (list, _) = shown(&bridge.apply_async_result()).unwrap();
+        assert!(list.starts_with(&v(&["傘の", "笠の"])), "{list:?}");
+        assert_eq!(
+            rerank_order(
+                &[-1.0, -2.0, -3.0],
+                &[f64::NAN, -1.0, f64::INFINITY],
+                0.5,
+                &[true; 3]
+            ),
+            [1, 0, 2]
+        );
+    }
+
+    #[test]
+    fn reading_starts_fit_only_their_text_and_reading() {
+        assert!(starts_fit(&[0, 2, 2], "東京に", 4));
+        assert!(!starts_fit(&[0, 2], "東京に", 4));
+        assert!(!starts_fit(&[0, 3, 2], "東京に", 4));
+        assert!(!starts_fit(&[0, 2, 5], "東京に", 4));
     }
 
     #[test]

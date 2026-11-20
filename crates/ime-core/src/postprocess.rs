@@ -429,8 +429,7 @@ fn misreads_digits(candidate: &str, reading: &[char], typed: bool) -> bool {
     if crate::reading_align::align(&s, reading).is_none() {
         return false;
     }
-    let mut memo = HashMap::new();
-    !reads_numbers(&s, reading, 0, 0, &mut memo)
+    !reads_numbers(&s, reading)
 }
 
 /// A run of digits after a hiragana that is no particle, at the end or
@@ -462,62 +461,82 @@ fn digits_among_kana(s: &[char]) -> bool {
     false
 }
 
-/// Whether `s[i..]` reads as `r[j..]` with each run of digits not typed read
-/// as its number (`drop_misread_digits`); kana and symbols as
-/// `reading_align` matches them, other chars 1 to 4 reading chars each.
-fn reads_numbers(
-    s: &[char],
-    r: &[char],
-    i: usize,
-    j: usize,
-    memo: &mut HashMap<(usize, usize), bool>,
-) -> bool {
+/// Whether `s` reads as `r` with each run of digits not typed read as its
+/// number (`drop_misread_digits`); kana and symbols as `reading_align`
+/// matches them, other chars 1 to 4 reading chars each. A table of whether
+/// `s[i..]` reads as `r[j..]`, filled from the end (not a recursion, which a
+/// long text ran out of stack), for each kana or symbol and each run's
+/// start; the caller has aligned the two (`reading_align::align`), which
+/// bounds its size.
+fn reads_numbers(s: &[char], r: &[char]) -> bool {
     use crate::reading_align::{anchor_matches, is_free};
-    if i == s.len() {
-        return j == r.len();
+    #[derive(PartialEq, Clone, Copy)]
+    enum Kind {
+        Anchor,
+        Digit,
+        Free,
     }
-    if let Some(&ok) = memo.get(&(i, j)) {
-        return ok;
-    }
-    let ok = if !is_free(s[i]) {
-        j < r.len() && anchor_matches(s[i], r[j]) && reads_numbers(s, r, i + 1, j + 1, memo)
-    } else if s[i].is_ascii_digit() {
-        let k = (i..s.len())
-            .find(|&k| !s[k].is_ascii_digit())
-            .unwrap_or(s.len());
-        let digits: String = s[i..k].iter().collect();
-        let n = k - i;
-        let latin = |c: Option<&char>| c.is_some_and(|c| c.is_ascii_alphabetic());
-        let typed = r.get(j..j + n).is_some_and(|t| t == &s[i..k]);
-        if typed && reads_numbers(s, r, k, j + n, memo) {
-            true
-        } else if latin(i.checked_sub(1).and_then(|b| s.get(b))) || latin(s.get(k)) {
-            // a name (MI6, えむあいしっくす): read as it may be
-            (j + 1..=r.len().min(j + 4 * n)).any(|l| reads_numbers(s, r, k, l, memo))
-        } else {
-            let follower = s.get(k).copied();
-            crate::numbers::reading_ends(&digits, r, j)
-                .into_iter()
-                .any(|(end, said)| {
-                    let fits = match said {
-                        crate::numbers::Said::Alone => true,
-                        crate::numbers::Said::BeforeCounter(next) => {
-                            follower.is_some_and(|f| {
-                                !matches!(f, '\u{3041}'..='\u{3096}') || "かこつ".contains(f)
-                            }) && (next.is_empty() || r.get(end).is_some_and(|c| next.contains(*c)))
-                        }
-                    };
-                    fits && reads_numbers(s, r, k, end, memo)
-                })
-        }
-    } else {
-        let k = (i..s.len())
-            .find(|&k| !is_free(s[k]) || s[k].is_ascii_digit())
-            .unwrap_or(s.len());
-        (j + 1..=r.len().min(j + 4 * (k - i))).any(|l| reads_numbers(s, r, k, l, memo))
+    let kind = |c: char| match c {
+        c if !is_free(c) => Kind::Anchor,
+        c if c.is_ascii_digit() => Kind::Digit,
+        _ => Kind::Free,
     };
-    memo.insert((i, j), ok);
-    ok
+    let width = r.len() + 1;
+    let at = |i: usize, j: usize| i * width + j;
+    let mut ok = vec![false; (s.len() + 1) * width];
+    ok[at(s.len(), r.len())] = true;
+    // where the run of digits, or of other free chars, at each char ends
+    let mut run_end = vec![s.len(); s.len() + 1];
+    for i in (0..s.len()).rev() {
+        run_end[i] =
+            if kind(s[i]) != Kind::Anchor && s.get(i + 1).is_some_and(|&c| kind(c) == kind(s[i])) {
+                run_end[i + 1]
+            } else {
+                i + 1
+            };
+    }
+    let latin = |c: Option<&char>| c.is_some_and(|c| c.is_ascii_alphabetic());
+    for i in (0..s.len()).rev() {
+        let k = run_end[i];
+        if kind(s[i]) != Kind::Anchor && i > 0 && kind(s[i - 1]) == kind(s[i]) {
+            continue;
+        }
+        for j in 0..=r.len() {
+            ok[at(i, j)] = match kind(s[i]) {
+                Kind::Anchor => j < r.len() && anchor_matches(s[i], r[j]) && ok[at(i + 1, j + 1)],
+                Kind::Digit => {
+                    let digits: String = s[i..k].iter().collect();
+                    let n = k - i;
+                    let typed = r.get(j..j + n).is_some_and(|t| t == &s[i..k]);
+                    if typed && ok[at(k, j + n)] {
+                        true
+                    } else if latin(i.checked_sub(1).and_then(|b| s.get(b))) || latin(s.get(k)) {
+                        // a name (MI6, えむあいしっくす): read as it may be
+                        (j + 1..=r.len().min(j + 4 * n)).any(|l| ok[at(k, l)])
+                    } else {
+                        let follower = s.get(k).copied();
+                        crate::numbers::reading_ends(&digits, r, j).into_iter().any(
+                            |(end, said)| {
+                                let fits = match said {
+                                    crate::numbers::Said::Alone => true,
+                                    crate::numbers::Said::BeforeCounter(next) => {
+                                        follower.is_some_and(|f| {
+                                            !matches!(f, '\u{3041}'..='\u{3096}')
+                                                || "かこつ".contains(f)
+                                        }) && (next.is_empty()
+                                            || r.get(end).is_some_and(|c| next.contains(*c)))
+                                    }
+                                };
+                                fits && end <= r.len() && ok[at(k, end)]
+                            },
+                        )
+                    }
+                }
+                Kind::Free => (j + 1..=r.len().min(j + 4 * (k - i))).any(|l| ok[at(k, l)]),
+            };
+        }
+    }
+    ok[0]
 }
 
 /// Drop the candidates of kana alone with a katakana char between hiragana

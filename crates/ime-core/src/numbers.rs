@@ -372,6 +372,9 @@ pub fn kana_number(s: &str) -> Option<u64> {
 }
 
 fn below_10000(s: &str) -> Option<u64> {
+    if s == "ぜろ" {
+        return Some(0);
+    }
     let digit = |s: &str| -> Option<u64> {
         Some(match s {
             "" => 0,
@@ -449,7 +452,7 @@ fn below_10000(s: &str) -> Option<u64> {
     } else {
         n += digit(rest)?;
     }
-    (n > 0 || s == "ぜろ").then_some(n)
+    (n > 0).then_some(n)
 }
 
 /// A year: `2025ねん` (digits) -> its era years; `れいわ7ねん` /
@@ -541,9 +544,13 @@ fn calculation(reading: &str) -> Option<Vec<String>> {
     {
         return None;
     }
+    if expr.len() > MAX_EXPR {
+        return None;
+    }
     let mut p = Parser {
         s: expr.as_bytes(),
         i: 0,
+        depth: 0,
     };
     let v = p.sum()?;
     if p.i != p.s.len() || !v.is_finite() {
@@ -558,19 +565,40 @@ fn format_number(v: f64) -> String {
         format!("{}", v as i64)
     } else {
         let s = format!("{v:.10}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        // a value that rounds to nothing is 0, not -0
+        if s == "-0" { "0" } else { s }.to_string()
     }
 }
 
-/// A recursive-descent calculator: + - * / ^ ( ), unary minus.
+/// The longest expression calculated, and the deepest nesting (brackets,
+/// minus signs, powers) in one: deeper, the parser's recursion could run
+/// out of the host app's stack.
+const MAX_EXPR: usize = 256;
+const MAX_DEPTH: u32 = 32;
+
+/// A recursive-descent calculator: + - * / ^ ( ), unary minus (which
+/// binds looser than ^: -2^2 is -4).
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: u32,
 }
 
 impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
         self.s.get(self.i).copied()
+    }
+
+    /// `f` one level deeper; `None` past `MAX_DEPTH`.
+    fn deeper(&mut self, f: impl FnOnce(&mut Self) -> Option<f64>) -> Option<f64> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let v = f(self);
+        self.depth -= 1;
+        v
     }
 
     fn sum(&mut self) -> Option<f64> {
@@ -584,10 +612,10 @@ impl Parser<'_> {
     }
 
     fn product(&mut self) -> Option<f64> {
-        let mut v = self.power()?;
+        let mut v = self.unary()?;
         while let Some(op @ (b'*' | b'/')) = self.peek() {
             self.i += 1;
-            let r = self.power()?;
+            let r = self.unary()?;
             if op == b'/' && r == 0.0 {
                 return None;
             }
@@ -597,10 +625,11 @@ impl Parser<'_> {
     }
 
     fn power(&mut self) -> Option<f64> {
-        let base = self.unary()?;
+        let base = self.atom()?;
         if self.peek() == Some(b'^') {
             self.i += 1;
-            let e = self.power()?;
+            // 2^-1, and 2^3^2 as 2^(3^2)
+            let e = self.deeper(Self::unary)?;
             return Some(base.powf(e));
         }
         Some(base)
@@ -609,15 +638,15 @@ impl Parser<'_> {
     fn unary(&mut self) -> Option<f64> {
         if self.peek() == Some(b'-') {
             self.i += 1;
-            return Some(-self.unary()?);
+            return Some(-self.deeper(Self::unary)?);
         }
-        self.atom()
+        self.power()
     }
 
     fn atom(&mut self) -> Option<f64> {
         if self.peek() == Some(b'(') {
             self.i += 1;
-            let v = self.sum()?;
+            let v = self.deeper(Self::sum)?;
             if self.peek() != Some(b')') {
                 return None;
             }
@@ -995,6 +1024,21 @@ mod tests {
         assert_eq!(candidates("2^10=")[0], "1024");
         assert_eq!(candidates("5ー3＝")[0], "2");
         assert!(candidates("1/0=").is_empty());
+        // minus binds looser than ^; a power's exponent may be negative
+        assert_eq!(candidates("-2^2=")[0], "-4");
+        assert_eq!(candidates("2^-1=")[0], "0.5");
+        assert_eq!(candidates("2^3^2=")[0], "512");
+        assert_eq!(candidates("0-0.00000000001=")[0], "0");
+        // nesting too deep for the stack is no calculation
+        let deep = format!("{}1{}+1=", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(candidates(&deep).is_empty());
+        let minus = format!("{}1+1=", "-".repeat(200));
+        assert!(candidates(&minus).is_empty());
+        assert_eq!(
+            candidates(&format!("{}1{}+1=", "(".repeat(20), ")".repeat(20)))[0],
+            "2"
+        );
+        assert_eq!(below_10000("ぜろ"), Some(0));
         assert_eq!(candidates("う＋3042"), ["あ"]);
         assert_eq!(candidates("U+1F600"), ["😀"]);
         let out = insert("1＋2＝", vec!["1＋2＝".to_string()], candidates("1＋2＝"));

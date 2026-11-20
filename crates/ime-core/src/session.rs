@@ -229,6 +229,7 @@ impl Session {
 
     /// The deferred preedit's deadline passed; true when the view changed.
     pub fn tick(&mut self) -> bool {
+        self.view.commits.clear();
         let actions = self.bridge.tick();
         let changed = !actions.is_empty();
         self.apply(actions);
@@ -271,6 +272,7 @@ impl Session {
     /// for a rewrite, which joins the list first. The TSF DLL turns it on
     /// at every activation.
     pub fn set_rewrite_mode(&mut self, on: bool) {
+        self.view.commits.clear();
         let actions = self.bridge.set_rewrite_mode(on);
         self.apply(actions);
     }

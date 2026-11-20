@@ -72,6 +72,34 @@ fn reads(typed: &[char]) -> Option<String> {
 /// no kana and one edit near it makes all of it read; `lm` judges the
 /// kana (without one, the cheapest edit).
 pub fn correct(typed: &str, lm: Option<&crate::mixed::MixedModel>) -> Option<String> {
+    let edits = corrections(typed)?;
+    // the edit's cost and how the kana it makes read: the kana model's cost
+    // per kana, over the longest reading's length, so that a reading reads
+    // no better for being shorter (a key left out of くもり is no くり). Of
+    // one-key slips that leave a letter unread, this puts right 82% (the
+    // cost as it is: 80%; the edit's cost alone, as when the typed letters
+    // were judged for kana, all unknown: 51%).
+    let len = |k: &str| k.chars().count() as f64 + 1.0;
+    let longest = edits.iter().map(|(k, _)| len(k)).fold(0.0, f64::max);
+    let mut best: Option<(f64, String)> = None;
+    for (kana, channel) in edits {
+        let cost = channel + lm.map_or(0.0, |m| m.kana_cost(&kana) / len(&kana) * longest);
+        if best.as_ref().is_none_or(|(b, _)| cost < *b) {
+            best = Some((cost, kana));
+        }
+    }
+    let (cost, kana) = best?;
+    // with a language model, a correction must also read well
+    let fine = match lm {
+        Some(m) => m.kana_cost(&kana) / (kana.chars().count() as f64 + 1.0) < MAX_COST + 3.0,
+        None => cost <= MAX_COST,
+    };
+    fine.then_some(kana)
+}
+
+/// The readings one edit near the first letter of `typed` that reads as no
+/// kana makes, each with the edit's cost; `None` when every letter reads.
+fn corrections(typed: &str) -> Option<Vec<(String, f64)>> {
     let chars: Vec<char> = typed.chars().map(|c| c.to_ascii_lowercase()).collect();
     if chars.is_empty() || !chars.iter().all(|c| c.is_ascii_lowercase() || *c == '-') {
         return None;
@@ -111,27 +139,12 @@ pub fn correct(typed: &str, lm: Option<&crate::mixed::MixedModel>) -> Option<Str
         v.insert(first + 1, vowel);
         edits.push((v, VOWEL));
     }
-    let original_cost = lm.map(|m| m.kana_cost(&chars.iter().collect::<String>()));
-    let mut best: Option<(f64, String)> = None;
-    for (v, channel) in edits {
-        let Some(kana) = reads(&v) else {
-            continue;
-        };
-        let cost = channel
-            + lm.map_or(0.0, |m| {
-                m.kana_cost(&kana) - original_cost.unwrap_or(0.0).min(m.kana_cost(&kana))
-            });
-        if best.as_ref().is_none_or(|(b, _)| cost < *b) {
-            best = Some((cost, kana));
-        }
-    }
-    let (cost, kana) = best?;
-    // with a language model, a correction must also read well
-    let fine = match lm {
-        Some(m) => m.kana_cost(&kana) / (kana.chars().count() as f64 + 1.0) < MAX_COST + 3.0,
-        None => cost <= MAX_COST,
-    };
-    fine.then_some(kana)
+    Some(
+        edits
+            .into_iter()
+            .filter_map(|(v, channel)| Some((reads(&v)?, channel)))
+            .collect(),
+    )
 }
 
 /// `typed` with the capitals a Shift released a key late left in lowercase
@@ -232,6 +245,22 @@ mod tests {
             correct("konnichiwqa", Some(&m)).as_deref(),
             Some("こんいちわ")
         );
+    }
+
+    #[test]
+    fn the_kana_model_picks_among_the_edits_that_read() {
+        let m = lm();
+        // more than one edit reads (たんご, m for its neighbour n, is the
+        // cheapest; たまご, たみご ... a vowel left out): the kana model picks
+        for (typed, meant, cheapest) in [
+            ("tamgo", "たまご", "たんご"),
+            ("kaimno", "かいもの", "かみの"),
+            ("konbnwa", "こんばんわ", "こんんわ"),
+            ("yasmi", "やすみ", "やあみ"),
+        ] {
+            assert_eq!(correct(typed, Some(&m)).as_deref(), Some(meant), "{typed}");
+            assert_eq!(correct(typed, None).as_deref(), Some(cheapest), "{typed}");
+        }
     }
 
     #[test]

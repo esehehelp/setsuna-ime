@@ -37,47 +37,64 @@ pub(crate) fn anchor_matches(s: char, r: char) -> bool {
     }
 }
 
-struct Aligner<'a> {
-    s: &'a [char],
-    r: &'a [char],
-    memo: Vec<Option<bool>>,
-    /// Reading end chosen for the free run starting at (i, j).
+/// The table of a surface and a reading at most this big (chars of one
+/// plus one, times of the other plus one): longer ones are not aligned.
+const MAX_CELLS: usize = 1 << 22;
+
+/// Whether the surface from char `i` on fits the reading from char `j` on,
+/// for every (i, j), filled from the end (a table, not a recursion: a long
+/// text ran the host app out of stack); and for a free run starting at
+/// (i, j), the reading end it takes, the shortest that fits.
+struct Aligner {
+    width: usize,
+    ok: Vec<bool>,
     choice: Vec<usize>,
 }
 
-impl Aligner<'_> {
-    fn idx(&self, i: usize, j: usize) -> usize {
-        i * (self.r.len() + 1) + j
-    }
-
-    fn go(&mut self, i: usize, j: usize) -> bool {
-        if i == self.s.len() {
-            return j == self.r.len();
+impl Aligner {
+    fn new(s: &[char], r: &[char]) -> Option<Self> {
+        let width = r.len() + 1;
+        let cells = (s.len() + 1).checked_mul(width)?;
+        if cells > MAX_CELLS {
+            return None;
         }
-        let at = self.idx(i, j);
-        if let Some(ok) = self.memo[at] {
-            return ok;
+        let mut a = Aligner {
+            width,
+            ok: vec![false; cells],
+            choice: vec![0; cells],
+        };
+        a.ok[s.len() * width + r.len()] = true;
+        // where the free run at each char ends
+        let mut run_end = vec![s.len(); s.len() + 1];
+        for i in (0..s.len()).rev() {
+            run_end[i] = if is_free(s[i]) { run_end[i + 1] } else { i };
         }
-        let ok = if !is_free(self.s[i]) {
-            j < self.r.len() && anchor_matches(self.s[i], self.r[j]) && self.go(i + 1, j + 1)
-        } else {
-            let k = (i..self.s.len())
-                .find(|&k| !is_free(self.s[k]))
-                .unwrap_or(self.s.len());
-            let max = self.r.len().min(j + MAX_READING_PER_CHAR * (k - i));
-            // Shortest reading first.
-            let mut found = false;
-            for l in j + 1..=max {
-                if self.go(k, l) {
-                    self.choice[at] = l;
-                    found = true;
-                    break;
+        for i in (0..s.len()).rev() {
+            // only a free run's start is asked about
+            if is_free(s[i]) && i > 0 && is_free(s[i - 1]) {
+                continue;
+            }
+            for j in 0..=r.len() {
+                let at = a.idx(i, j);
+                if !is_free(s[i]) {
+                    a.ok[at] =
+                        j < r.len() && anchor_matches(s[i], r[j]) && a.ok[a.idx(i + 1, j + 1)];
+                } else {
+                    let k = run_end[i];
+                    let max = r.len().min(j + MAX_READING_PER_CHAR * (k - i));
+                    // Shortest reading first.
+                    if let Some(l) = (j + 1..=max).find(|&l| a.ok[a.idx(k, l)]) {
+                        a.ok[at] = true;
+                        a.choice[at] = l;
+                    }
                 }
             }
-            found
-        };
-        self.memo[at] = Some(ok);
-        ok
+        }
+        Some(a)
+    }
+
+    fn idx(&self, i: usize, j: usize) -> usize {
+        i * self.width + j
     }
 }
 
@@ -91,14 +108,8 @@ pub(crate) fn spells_out(text: &str, reading: &[char]) -> bool {
 }
 
 pub(crate) fn align(s: &[char], r: &[char]) -> Option<Vec<(usize, usize)>> {
-    let cells = (s.len() + 1) * (r.len() + 1);
-    let mut a = Aligner {
-        s,
-        r,
-        memo: vec![None; cells],
-        choice: vec![0; cells],
-    };
-    if !a.go(0, 0) {
+    let a = Aligner::new(s, r)?;
+    if !a.ok[0] {
         return None;
     }
     let mut out = Vec::with_capacity(s.len());
@@ -136,5 +147,13 @@ mod tests {
         assert!(spells("2ヶ月", "2かげつ"));
         assert!(spells("鎌ヶ谷", "かまがや"));
         assert!(spells("栗ケ沢", "くりがさわ"));
+    }
+
+    #[test]
+    fn a_long_text_aligns_without_recursion_and_a_huge_one_not_at_all() {
+        let text = "東京にいく".repeat(300);
+        assert!(spells(&text, &"とうきょうにいく".repeat(300)));
+        let huge = "あ".repeat(100_000);
+        assert!(!spells(&huge, &huge));
     }
 }

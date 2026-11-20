@@ -634,6 +634,7 @@ impl ComposingText {
     pub fn move_cursor_to_edge(&mut self, end: bool) {
         self.freeze_to_preedit();
         self.cursor = if end { self.raw.chars().count() } else { 0 };
+        self.recompute(false);
     }
 
     /// Whether the cursor is after the last character.
@@ -643,11 +644,17 @@ impl ComposingText {
 
     /// The cursor as a char offset into [`Self::preedit`].
     pub fn caret(&self) -> usize {
-        let left = self.convert(
-            &self.raw[..byte_pos_for_char(&self.raw, self.cursor)],
-            false,
-        );
-        left.text.chars().count() + left.pending.chars().count()
+        let cut = self.cursor_cut();
+        let left = self.convert(&self.raw[..byte_pos_for_char(&self.raw, cut)], false);
+        left.text.chars().count() + left.pending.chars().count() + (self.cursor - cut)
+    }
+
+    /// Where the input is read apart at the cursor: the cursor, or the start
+    /// of the English word it is in (`english_word_around`), which reads
+    /// whole and shows as typed.
+    fn cursor_cut(&self) -> usize {
+        self.english_word_around(self.cursor)
+            .map_or(self.cursor, |(start, _)| start)
     }
 
     /// The whole reading with a pending `n` as ん and other pending romaji
@@ -670,23 +677,51 @@ impl ComposingText {
         let total = self.raw.chars().count() as i32;
         let new_cursor = (self.cursor as i32 + delta).clamp(0, total) as usize;
         self.cursor = new_cursor;
+        self.recompute(false);
     }
 
     /// Rewrite `raw` as exactly what the preedit shows (converted kana plus
     /// any still-pending romaji, on each side of the cursor), keeping the
     /// cursor where it is on screen. After this, one `raw` char is one shown
     /// char. Pending romaji stays raw, so a trailing `n` or `k` still combines
-    /// with the next letter typed; English stays as typed (`frozen`).
+    /// with the next letter typed; English stays as typed (`frozen`), and an
+    /// English word the cursor is in stays whole: read apart, the letters
+    /// right of the cursor were romaji (`google`, ← twice: googlえ).
     fn freeze_to_preedit(&mut self) {
-        let split = byte_pos_for_char(&self.raw, self.cursor);
-        let left = self.frozen(&self.raw[..split], false);
-        let right = self.frozen(&self.raw[split..], false);
+        let (cut, word) = match self.english_word_around(self.cursor) {
+            Some((start, end)) => (start, end),
+            None => (self.cursor, self.cursor),
+        };
+        let chars: Vec<char> = self.raw.chars().collect();
+        let part = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
+        let left = self.frozen(&part(0, cut), false);
+        let right = self.frozen(&part(word, chars.len()), false);
         let mut raw = left.text;
         raw.push_str(&left.pending);
-        self.cursor = raw.chars().count();
+        let cursor = raw.chars().count() + (self.cursor - cut);
+        raw.push_str(&part(cut, word));
         raw.push_str(&right.text);
         raw.push_str(&right.pending);
+        self.cursor = cursor;
         self.raw = raw;
+    }
+
+    /// The chars (start, end) of the English word of mixed input that char
+    /// offset `at` of `raw` falls inside of; `None` at a word's edge or
+    /// outside any.
+    fn english_word_around(&self, at: usize) -> Option<(usize, usize)> {
+        let mixed = self.mixed.as_ref()?;
+        let (_, spans) = mixed.model.cased_with(
+            &self.raw,
+            Some(&mixed.before),
+            false,
+            mixed.casing,
+            self.lexicon.as_deref(),
+        );
+        spans
+            .iter()
+            .find(|s| s.lang == Lang::En && s.start < at && at < s.end)
+            .map(|s| (s.start, s.end))
     }
 
     /// Preedit text = converted raw text plus its pending romaji tail.
@@ -694,7 +729,7 @@ impl ComposingText {
         if self.cursor == self.raw.chars().count() {
             return format!("{}{}", self.hiragana, self.pending);
         }
-        let byte_pos = byte_pos_for_char(&self.raw, self.cursor);
+        let byte_pos = byte_pos_for_char(&self.raw, self.cursor_cut());
         let left = self.convert(&self.raw[..byte_pos], false);
         let right = self.convert(&self.raw[byte_pos..], false);
         let mut out =
@@ -1489,6 +1524,28 @@ mod tests {
             c.input_char(ch);
         }
         assert_eq!(c.commit(), "かじ");
+    }
+
+    #[test]
+    fn cursor_moves_inside_an_english_word_and_leaves_it_whole() {
+        let mut c = ComposingText::new();
+        c.set_mixed(
+            Some(Arc::new(crate::mixed::tests::model())),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
+        for ch in "google".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(c.preedit(), "google");
+        c.move_cursor(-1);
+        c.move_cursor(-1);
+        assert_eq!(c.preedit(), "google");
+        assert_eq!(c.caret(), 4);
+        c.move_cursor_to_edge(true);
+        assert_eq!(c.preedit(), "google");
+        assert_eq!(c.hiragana(), "google");
+        assert_eq!(c.commit(), "google");
     }
 
     #[test]

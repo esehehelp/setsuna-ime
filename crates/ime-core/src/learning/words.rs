@@ -34,11 +34,18 @@ const CONTEXT: usize = 2;
 
 use crate::reading_align::{align, is_free};
 
+/// The longest pair of texts diffed (chars of one times chars of the
+/// other): longer ones learn no words.
+const MAX_DIFF_CELLS: usize = 1 << 22;
+
 /// Differing regions of `a` and `b` (longest common subsequence diff), as
-/// (a_start, a_end, b_start, b_end).
+/// (a_start, a_end, b_start, b_end); none for texts too long to diff.
 fn hunks(a: &[char], b: &[char]) -> Vec<(usize, usize, usize, usize)> {
     let (n, m) = (a.len(), b.len());
-    let mut lcs = vec![vec![0u16; m + 1]; n + 1];
+    if (n + 1).saturating_mul(m + 1) > MAX_DIFF_CELLS {
+        return Vec::new();
+    }
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
             lcs[i][j] = if a[i] == b[j] {
@@ -211,6 +218,15 @@ mod tests {
             hunks(&chars("aXbY"), &chars("aZbW")),
             [(1, 2, 1, 2), (3, 4, 3, 4)]
         );
+        // texts too long to diff: no hunks (a 16-bit count wrapped past
+        // 65535 chars in common); 1500 chars diff as any other
+        let long = "a".repeat(70_000);
+        assert_eq!(
+            hunks(&chars(&format!("{long}X")), &chars(&format!("{long}Y"))),
+            []
+        );
+        let (a, b) = ("a".repeat(1500), "a".repeat(1500) + "b");
+        assert_eq!(hunks(&chars(&a), &chars(&b)), [(1500, 1500, 1500, 1501)]);
     }
 
     #[test]

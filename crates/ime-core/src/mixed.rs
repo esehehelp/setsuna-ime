@@ -535,8 +535,11 @@ impl MixedModel {
                     // nor a word whose kana start inside a Japanese one
                     // (`npo` of でんぽう, んぽ: ん and small kana end the
                     // kana before them)
+                    // (nor one of no kana: a table's entry may put none)
                     if !spelled.chars().eq(kana[ka..kb].iter().copied())
-                        || "んゃゅょぁぃぅぇぉっゎ".contains(kana[ka])
+                        || kana[ka..kb]
+                            .first()
+                            .is_none_or(|&c| "んゃゅょぁぃぅぇぉっゎ".contains(c))
                     {
                         continue;
                     }

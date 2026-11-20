@@ -234,17 +234,22 @@ pub fn cut(
     if words.is_empty() || starts.len() != n || reading_len == 0 {
         return None;
     }
-    // the words cover the text in order
+    // the words cover the text in order, each a char or more
     let covered = words.first()?.start == 0
         && words.last()?.end == n
-        && words
-            .windows(2)
-            .all(|p| p[0].end == p[1].start && p[0].start < p[0].end);
+        && words.windows(2).all(|p| p[0].end == p[1].start)
+        && words.iter().all(|w| w.start < w.end);
     if !covered {
         return None;
     }
     let mut fixed = starts.to_vec();
-    if let Some(ws) = word_starts(words, reading) {
+    // the words are placed on the reading as NFKC reads it (ｶﾞ as ガ): where
+    // that changes its length (…, ㈱), their places are not the reading's
+    // chars, and the starts given stay
+    let placed = (hira(reading).len() == reading_len)
+        .then(|| word_starts(words, reading))
+        .flatten();
+    if let Some(ws) = placed {
         for (k, w) in words.iter().enumerate() {
             let (a, b) = (ws[k], ws.get(k + 1).copied().unwrap_or(reading_len));
             let last = b.max(a + 1) - 1;
@@ -328,6 +333,32 @@ mod tests {
         v.iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn words_that_do_not_cover_the_text_or_read_another_length_cut_nothing_wrong() {
+        // an empty last word at the end of the text
+        let mut w = words("前/まえ/名詞/普通名詞 に/に/助詞/格助詞");
+        w.push(Word {
+            surface: String::new(),
+            start: 2,
+            end: 2,
+            reading: None,
+            pos: "名詞".into(),
+            pos2: "*".into(),
+            alts: Vec::new(),
+            cost: 0,
+        });
+        assert!(cut("前に", "まえに", &w, &[0, 2]).is_none());
+        // a reading NFKC makes longer (… is ...): the starts given stay
+        let (fixed, _) = cut(
+            "前…に",
+            "まえ…に",
+            &words("前/まえ/名詞/普通名詞 …/…/補助記号/一般 に/に/助詞/格助詞"),
+            &[0, 2, 3],
+        )
+        .unwrap();
+        assert_eq!(fixed, [0, 2, 3]);
     }
 
     #[test]
