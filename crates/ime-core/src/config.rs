@@ -1130,6 +1130,12 @@ impl Config {
     /// stay as the file has them, set or not, but for the corrector's
     /// threshold, which the page takes back to the corrector's own.
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        self.save_to_path_then(path, |_| {})
+    }
+
+    /// [`Self::save_to_path`], with `prepare` run on the new file before it
+    /// replaces the old one (the settings GUI grants it to AppContainers).
+    pub fn save_to_path_then(&self, path: &Path, prepare: impl FnOnce(&Path)) -> Result<()> {
         let existing = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::emit_default_toml(),
@@ -1167,6 +1173,7 @@ impl Config {
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("write {}", tmp.display()));
         }
+        prepare(&tmp);
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("replace {}", path.display()));

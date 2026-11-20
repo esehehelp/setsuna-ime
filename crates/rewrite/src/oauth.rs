@@ -276,13 +276,23 @@ impl PendingSignIn {
     }
 
     /// One request to the listener: `Some` for the callback, `None` for
-    /// anything else (the browser asking for a favicon).
+    /// anything else (the browser asking for a favicon, a request with
+    /// another state: any local process or page can reach the port, and
+    /// ending the sign-in at its say would let it stop every one). A
+    /// request has a few seconds in all to come and its answer to go, so
+    /// that one sent a byte at a time holds the listener no longer.
     fn handle_connection(&self, mut stream: TcpStream) -> Result<Option<Callback>> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
         let mut buf = Vec::new();
         let mut chunk = [0u8; 2048];
         while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16384 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            stream.set_read_timeout(Some(left))?;
             match stream.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -304,8 +314,9 @@ impl PendingSignIn {
                 .into_owned()
                 .collect();
         if params.get("state").map(String::as_str) != Some(self.state.as_str()) {
+            // not this sign-in's: it goes on waiting for its own
             let _ = respond(&mut stream, 400, PAGE_FAILED);
-            bail!("the sign-in callback's state did not match");
+            return Ok(None);
         }
         if let Some(err) = params.get("error") {
             let _ = respond(&mut stream, 200, PAGE_FAILED);

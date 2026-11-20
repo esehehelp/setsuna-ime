@@ -83,20 +83,30 @@ impl Rewriter {
             }
             "set_api_key" => {
                 let key = msg["key"].as_str().unwrap_or_default().trim().to_string();
-                let slot = api_key_slot(&endpoint.base_url);
-                let r = store.update(|c| {
-                    if key.is_empty() {
-                        c.api_keys.remove(&slot);
-                    } else {
-                        c.api_keys.insert(slot.clone(), key.clone());
-                    }
-                    Ok(())
-                });
-                Some(match r {
-                    Ok(()) if key.is_empty() => "API キーを削除しました。".to_string(),
-                    Ok(()) => "API キーを保存しました。".to_string(),
-                    Err(e) => format!("API キーの保存に失敗しました: {e:#}"),
-                })
+                // a key is the server's it is for: none for a compatible
+                // server with no URL yet (it took OpenAI's slot), nor one
+                // reached in the clear
+                let refused = (!key.is_empty())
+                    .then(|| api::check_base_url(&endpoint.base_url).err())
+                    .flatten();
+                if let Some(e) = refused {
+                    Some(format!("API キーを保存できません: {e:#}"))
+                } else {
+                    let slot = api_key_slot(&endpoint.base_url);
+                    let r = store.update(|c| {
+                        if key.is_empty() {
+                            c.api_keys.remove(&slot);
+                        } else {
+                            c.api_keys.insert(slot.clone(), key.clone());
+                        }
+                        Ok(())
+                    });
+                    Some(match r {
+                        Ok(()) if key.is_empty() => "API キーを削除しました。".to_string(),
+                        Ok(()) => "API キーを保存しました。".to_string(),
+                        Err(e) => format!("API キーの保存に失敗しました: {e:#}"),
+                    })
+                }
             }
             "ack_plan_notice" => {
                 let _ = store.update(|c| {

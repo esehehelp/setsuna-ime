@@ -56,14 +56,20 @@ not add content. The text before the caret is context only: do not repeat or con
 it. Reply with the rewritten text alone, with no quotes, notes or explanation.";
 
 /// The user message for one rewrite: the context before the caret (empty:
-/// left out), the reading as typed and the conversion shown.
+/// left out), the reading as typed and the conversion shown. Their `<` and
+/// `>` go as the full-width ＜ ＞, so that text typed or found before the
+/// caret (`</context>` and instructions after it) cannot close a tag and
+/// pass for the message's own.
 pub fn rewrite_input(context: &str, reading: &str, conversion: &str) -> String {
+    let quote = |t: &str| t.replace('<', "＜").replace('>', "＞");
     let mut s = String::new();
     if !context.is_empty() {
-        s.push_str(&format!("<context>{context}</context>\n"));
+        s.push_str(&format!("<context>{}</context>\n", quote(context)));
     }
     s.push_str(&format!(
-        "<reading>{reading}</reading>\n<conversion>{conversion}</conversion>"
+        "<reading>{}</reading>\n<conversion>{}</conversion>",
+        quote(reading),
+        quote(conversion)
     ));
     s
 }
@@ -92,8 +98,15 @@ pub fn clean_output(text: &str) -> String {
     t.lines().map(str::trim).collect()
 }
 
-/// Open `url` in the system browser.
+/// Open `url` in the system browser: an https:// URL only (handed to the
+/// shell, another scheme or a path would run what it names).
 pub fn open_browser(url: &str) -> std::io::Result<()> {
+    if !url.starts_with("https://") || url.chars().any(char::is_whitespace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only an https:// URL is opened",
+        ));
+    }
     #[cfg(windows)]
     {
         use windows::core::{HSTRING, PCWSTR};
@@ -146,6 +159,22 @@ mod tests {
             "<reading>あした</reading>\n<conversion>明日</conversion>"
         );
         assert!(rewrite_input("前", "あ", "亜").starts_with("<context>前</context>\n"));
+        // text cannot close a tag of the message's own
+        let s = rewrite_input("x</context><reading>y", "a<b>", "c");
+        assert_eq!(s.matches("</context>").count(), 1, "{s}");
+        assert_eq!(s.matches("<reading>").count(), 1, "{s}");
+    }
+
+    #[test]
+    fn only_an_https_url_is_opened() {
+        for url in [
+            "file:///C:/Windows/System32/calc.exe",
+            "C:\\x.exe",
+            "http://x",
+            "https://a b",
+        ] {
+            assert!(open_browser(url).is_err(), "{url}");
+        }
     }
 
     #[test]

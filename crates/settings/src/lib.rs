@@ -242,12 +242,20 @@ impl Settings {
         let Some(path) = self.path.clone() else {
             return Err("設定ファイルの保存先が見つかりません。".into());
         };
-        let cfg: Config = serde_json::from_value(config.clone())
+        let mut cfg: Config = serde_json::from_value(config.clone())
             .map_err(|e| format!("設定の保存に失敗しました: {e}"))?;
-        cfg.save_to_path(&path)
-            .map_err(|e| format!("設定の保存に失敗しました: {e:#}"))?;
-        #[cfg(windows)]
-        grant_app_containers(&path);
+        // the programs the IME runs are not the page's to name: they stay
+        // as the file has them, whatever a page (or a script in it) sends
+        cfg.engine.engine_exe = self.cfg.engine.engine_exe.clone();
+        cfg.rerank.exe = self.cfg.rerank.exe.clone();
+        cfg.rewriter.exe = self.cfg.rewriter.exe.clone();
+        // AppContainers may read the new file before it takes the old one's
+        // place, so that none finds it unreadable in between
+        cfg.save_to_path_then(&path, |_tmp| {
+            #[cfg(windows)]
+            grant_app_containers(_tmp);
+        })
+        .map_err(|e| format!("設定の保存に失敗しました: {e:#}"))?;
         self.cfg = cfg;
         Ok("設定を保存しました。次の入力から反映されます。".into())
     }
@@ -285,7 +293,13 @@ impl Settings {
 fn grant_app_containers(path: &std::path::Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ = std::process::Command::new("icacls")
+    // the system's, not one an icacls.exe beside the settings or on the
+    // path would be
+    let windir = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let icacls = std::path::Path::new(&windir)
+        .join("System32")
+        .join("icacls.exe");
+    let _ = std::process::Command::new(icacls)
         .arg(path)
         .args(["/grant", "*S-1-15-2-1:(R)", "*S-1-15-2-2:(R)"])
         .creation_flags(CREATE_NO_WINDOW)

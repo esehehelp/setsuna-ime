@@ -63,13 +63,18 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// `base_url` and `api` default by provider: OpenAI's Responses API,
-    /// Chat Completions for a compatible server. Plan usage is only for
-    /// OpenAI's Responses API.
+    /// `api` defaults by provider: OpenAI's Responses API, Chat Completions
+    /// for a compatible server. Plan usage is only for OpenAI's Responses
+    /// API. OpenAI (a ChatGPT sign-in or an API key) is OpenAI's URL
+    /// whatever `base_url` a config kept from a compatible server, which
+    /// would have had the key and the text; a compatible server is the URL
+    /// given, none without one (not OpenAI's, whose key its key replaced).
     pub fn new(provider: Provider, base_url: Option<&str>, api: Option<Api>) -> Self {
-        let base_url = match (provider, base_url) {
-            (Provider::ChatGpt, _) | (_, None) => OPENAI_BASE_URL.to_string(),
-            (_, Some(u)) => u.trim().trim_end_matches('/').to_string(),
+        let base_url = match provider {
+            Provider::ChatGpt | Provider::OpenAi => OPENAI_BASE_URL.to_string(),
+            Provider::Compatible => base_url
+                .map(|u| u.trim().trim_end_matches('/').to_string())
+                .unwrap_or_default(),
         };
         let api = match (provider, api) {
             (Provider::ChatGpt, _) => Api::Responses,
@@ -137,10 +142,57 @@ pub struct Model {
     pub label: String,
 }
 
+impl Endpoint {
+    /// `path` under the base URL, which must be HTTPS, or HTTP to this
+    /// machine only: a key sent in the clear to another host is anyone's
+    /// on the way.
+    pub fn url(&self, path: &str) -> Result<String> {
+        check_base_url(&self.base_url)?;
+        Ok(format!("{}/{path}", self.base_url))
+    }
+}
+
+/// Whether `url` is one a key and text may go to (`Endpoint::url`).
+pub fn check_base_url(url: &str) -> Result<()> {
+    let refuse =
+        |why: &str| -> Result<()> { Err(Coded::new("bad_base_url", why.to_string()).into()) };
+    if url.is_empty() {
+        return refuse("no server URL is set");
+    }
+    let lower = url.to_ascii_lowercase();
+    let (secure, rest) = match (
+        lower.strip_prefix("https://"),
+        lower.strip_prefix("http://"),
+    ) {
+        (Some(r), _) => (true, r),
+        (None, Some(r)) => (false, r),
+        _ => return refuse("the server URL is neither https:// nor http://"),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    if host.is_empty() {
+        return refuse("the server URL names no host");
+    }
+    let local = host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !secure && !local {
+        return refuse("plain http:// only to this machine (localhost, 127.0.0.1, ::1)");
+    }
+    Ok(())
+}
+
 /// The models the endpoint offers this account or key.
 pub fn list_models(endpoint: &Endpoint, store: &Store, agent: &ureq::Agent) -> Result<Vec<Model>> {
+    let url = endpoint.url("models")?;
     let bearer = endpoint.bearer(store, agent)?;
-    let mut req = agent.get(format!("{}/models", endpoint.base_url));
+    let mut req = agent.get(url);
     if let Some(b) = &bearer {
         req = req.header("Authorization", format!("Bearer {b}"));
     }
@@ -237,19 +289,22 @@ fn responses(
     if let Some(effort) = req.reasoning_effort {
         body["reasoning"] = json!({ "effort": effort });
     }
-    let resp = post_json(
-        agent,
-        &format!("{}/responses", endpoint.base_url),
-        bearer,
-        &body,
-    )?;
+    let resp = post_json(agent, &endpoint.url("responses")?, bearer, &body)?;
     let status = resp.status().as_u16();
     if status != 200 {
         let body = resp.into_body().read_to_string().unwrap_or_default();
         return Err(http_error(status, &body));
     }
-    read_response_stream(BufReader::new(resp.into_body().into_reader()))
+    // a stream no rewrite takes more than this of: a server that goes on
+    // and on is cut off there, not held in memory
+    use std::io::Read;
+    read_response_stream(BufReader::new(
+        resp.into_body().into_reader().take(MAX_STREAM_BYTES),
+    ))
 }
+
+/// The most of a response stream read.
+const MAX_STREAM_BYTES: u64 = 8 << 20;
 
 /// The text of a Responses stream, which counts only once it ends in
 /// `response.completed`.
@@ -326,17 +381,13 @@ fn chat_completions(
         ],
         "stream": false,
     });
-    let resp = post_json(
-        agent,
-        &format!("{}/chat/completions", endpoint.base_url),
-        bearer,
-        &body,
-    )?;
+    let resp = post_json(agent, &endpoint.url("chat/completions")?, bearer, &body)?;
     let status = resp.status().as_u16();
-    let text = resp.into_body().read_to_string().unwrap_or_default();
+    let text = resp.into_body().read_to_string();
     if status != 200 {
-        return Err(http_error(status, &text));
+        return Err(http_error(status, &text.unwrap_or_default()));
     }
+    let text = text.map_err(|e| Coded::new("network", format!("completion: {e}")))?;
     let v: Value = serde_json::from_str(&text).context("parse the completion")?;
     v["choices"][0]["message"]["content"]
         .as_str()
@@ -427,6 +478,36 @@ mod tests {
             (e.base_url.as_str(), e.api),
             ("http://127.0.0.1:8080/v1", Api::ChatCompletions)
         );
+        // OpenAI's key goes to OpenAI whatever URL a config kept
+        let e = Endpoint::new(Provider::OpenAi, Some("https://elsewhere.example/v1"), None);
+        assert_eq!(e.base_url, OPENAI_BASE_URL);
+        // a compatible server without a URL is none, not OpenAI
+        let e = Endpoint::new(Provider::Compatible, None, None);
+        assert!(e.base_url.is_empty() && e.url("models").is_err());
+    }
+
+    #[test]
+    fn keys_go_over_https_or_to_this_machine() {
+        for ok in [
+            "https://api.openai.com/v1",
+            "https://example.com:8443/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:11434/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(check_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "http://example.com/v1",
+            "http://10.0.0.5:8080/v1",
+            "http://127.0.0.1.example.com/v1",
+            "http://localhost@example.com/v1",
+            "ftp://example.com",
+            "file:///C:/x",
+        ] {
+            assert!(check_base_url(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

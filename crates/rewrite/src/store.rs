@@ -17,8 +17,8 @@ const FILE_NAME: &str = "credentials.bin";
 const FILE_NAME: &str = "credentials.json";
 const LOCK_NAME: &str = "credentials.lock";
 
-/// What the credentials file holds.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// What the credentials file holds. Its `Debug` names no key or token.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
     /// This machine's `ext_agent_host_id` (`urn:uuid:...`), kept from the
@@ -35,9 +35,22 @@ pub struct Credentials {
     pub plan_notice_shown: bool,
 }
 
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("host_id", &self.host_id)
+            .field("chatgpt", &self.chatgpt)
+            .field("active", &self.active)
+            .field("api_keys", &self.api_keys.keys().collect::<Vec<_>>())
+            .field("plan_notice_shown", &self.plan_notice_shown)
+            .finish()
+    }
+}
+
 /// A ChatGPT registration: the client ID issued for this user and
-/// workspace, the verified identity, and the tokens while signed in.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// workspace, the verified identity, and the tokens while signed in. Its
+/// `Debug` says whether there are tokens, not what they are.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatGptAccount {
     pub client_id: String,
@@ -52,6 +65,34 @@ pub struct ChatGptAccount {
     pub expires_at: i64,
     pub scope: String,
     pub saved_at: i64,
+}
+
+impl std::fmt::Debug for ChatGptAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has = |t: &Option<String>| t.as_ref().map(|_| "<set>");
+        f.debug_struct("ChatGptAccount")
+            .field("client_id", &self.client_id)
+            .field("sub", &self.sub)
+            .field("email", &self.email)
+            .field("name", &self.name)
+            .field("id_token", &has(&self.id_token))
+            .field("access_token", &has(&self.access_token))
+            .field("refresh_token", &has(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .field("saved_at", &self.saved_at)
+            .finish()
+    }
+}
+
+/// Overwrite `buf`, which held a secret, before it is freed: writes the
+/// compiler may not leave out as dead.
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: a valid, aligned, exclusive pointer to the byte
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 impl ChatGptAccount {
@@ -115,8 +156,11 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Credentials::default()),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        let plain = unprotect(&bytes).with_context(|| format!("decrypt {}", path.display()))?;
-        serde_json::from_slice(&plain).with_context(|| format!("parse {}", path.display()))
+        let mut plain = unprotect(&bytes).with_context(|| format!("decrypt {}", path.display()))?;
+        let creds =
+            serde_json::from_slice(&plain).with_context(|| format!("parse {}", path.display()));
+        wipe(&mut plain);
+        creds
     }
 
     /// Run `f` on the credentials under the lock and save them when it
@@ -154,8 +198,10 @@ impl Store {
 
     fn save(&self, creds: &Credentials) -> Result<()> {
         let path = self.path();
-        let plain = serde_json::to_vec(creds).context("serialize credentials")?;
-        let bytes = protect(&plain).context("encrypt credentials")?;
+        let mut plain = serde_json::to_vec(creds).context("serialize credentials")?;
+        let bytes = protect(&plain).context("encrypt credentials");
+        wipe(&mut plain);
+        let bytes = bytes?;
         // write then rename, so a reader never sees half a file
         let tmp = path.with_extension("tmp");
         write_private(&tmp, &bytes)?;
@@ -226,8 +272,16 @@ mod dpapi {
         }
     }
 
+    /// The bytes DPAPI gave, its buffer wiped (it held the plaintext, for
+    /// an unprotect) and freed; none for a null buffer, which a slice may
+    /// not be made of even empty.
     unsafe fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
-        let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+        if out.pbData.is_null() {
+            return Vec::new();
+        }
+        let buf = unsafe { std::slice::from_raw_parts_mut(out.pbData, out.cbData as usize) };
+        let v = buf.to_vec();
+        super::wipe(buf);
         unsafe {
             let _ = LocalFree(HLOCAL(out.pbData as *mut core::ffi::c_void));
         }

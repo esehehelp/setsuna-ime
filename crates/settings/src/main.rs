@@ -78,9 +78,18 @@ fn main() -> wry::Result<()> {
     let builder = WebViewBuilder::new_with_web_context(&mut context);
     #[cfg(not(windows))]
     let builder = WebViewBuilder::new();
-    let builder = builder.with_html(INDEX).with_ipc_handler(move |req| {
-        let _ = proxy.send_event(UserEvent::Ipc(req.into_body()));
-    });
+    // The page is the one built in, and stays: it loads as inline HTML
+    // (about:blank or a data: URL), and no navigation goes to a page from
+    // anywhere else (one taken there would talk to the settings' IPC as the
+    // page does); nor does any window open (links go to the browser
+    // through `open_url`).
+    let builder = builder
+        .with_html(INDEX)
+        .with_navigation_handler(|url| url.starts_with("about:") || url.starts_with("data:"))
+        .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
+        .with_ipc_handler(move |req| {
+            let _ = proxy.send_event(UserEvent::Ipc(req.into_body()));
+        });
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let webview = builder.build(&window)?;
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
