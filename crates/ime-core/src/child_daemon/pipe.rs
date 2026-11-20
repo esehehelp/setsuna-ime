@@ -21,10 +21,12 @@
 //! it gives up, and the frontend tries again later.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+use crate::daemon_io::lock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -122,7 +124,7 @@ impl PipeEngineClient {
         };
         let poster = {
             let shared = shared.clone();
-            let notify: Notify = Box::new(move |id| (notify.lock().unwrap())(id));
+            let notify: Notify = Box::new(move |id| (lock(&notify))(id));
             spawn(
                 "setsuna-engine-post",
                 Box::new(move || {
@@ -228,7 +230,7 @@ impl EngineClient for PipeEngineClient {
         }
         // the fallback's lock first: the I/O thread hands the queued
         // request to the child under it
-        let child = self.fallback.child.lock().unwrap();
+        let child = lock(&self.fallback.child);
         if let Some(child) = child.as_ref() {
             return child.dispatch_more(req_id, context, reading, continue_beam);
         }
@@ -237,7 +239,7 @@ impl EngineClient for PipeEngineClient {
             super::context_field(context),
             crate::diagnostics::text_field("reading", reading)
         ));
-        self.shared.state.lock().unwrap().pending = Some(Pending {
+        lock(&self.shared.state).pending = Some(Pending {
             req_id,
             context: context.to_string(),
             reading: reading.to_string(),
@@ -250,17 +252,13 @@ impl EngineClient for PipeEngineClient {
     }
 
     fn take_latest(&self) -> Option<EngineResult> {
-        let ours = self.shared.latest.lock().ok()?.take();
-        ours.or_else(|| self.fallback.child.lock().ok()?.as_ref()?.take_latest())
+        let ours = lock(&self.shared.latest).take();
+        ours.or_else(|| lock(&self.fallback.child).as_ref()?.take_latest())
     }
 
     fn wait_latest(&self, timeout: Duration) -> bool {
         // not under the fallback's lock, which the I/O thread takes
-        let child = self
-            .fallback
-            .child
-            .lock()
-            .unwrap()
+        let child = lock(&self.fallback.child)
             .as_ref()
             .map(|c| c.shared.clone());
         child
@@ -270,21 +268,21 @@ impl EngineClient for PipeEngineClient {
     }
 
     fn analyze(&self, texts: &[String], timeout: Duration) -> Option<Vec<Vec<Word>>> {
-        if let Some(child) = self.fallback.child.lock().unwrap().as_ref() {
+        if let Some(child) = lock(&self.fallback.child).as_ref() {
             return child.analyze(texts, timeout);
         }
         self.shared.analyze(texts, timeout)
     }
 
     fn is_ready(&self) -> bool {
-        match self.fallback.child.lock().unwrap().as_ref() {
+        match lock(&self.fallback.child).as_ref() {
             Some(child) => child.is_ready(),
             None => self.shared.ready.load(Ordering::SeqCst),
         }
     }
 
     fn is_alive(&self) -> bool {
-        match self.fallback.child.lock().unwrap().as_ref() {
+        match lock(&self.fallback.child).as_ref() {
             Some(child) => child.is_alive(),
             None => self.shared.alive.load(Ordering::SeqCst),
         }
@@ -293,7 +291,7 @@ impl EngineClient for PipeEngineClient {
 
 impl Drop for PipeEngineClient {
     fn drop(&mut self) {
-        self.shared.alive.store(false, Ordering::SeqCst);
+        self.shared.stop();
         let mut io_done = true;
         if let Some(io) = self.io.take() {
             // the thread may be waiting for a request, reading a response or
@@ -320,7 +318,7 @@ impl Drop for PipeEngineClient {
             }
         }
         // the child, if any, stops with its own Drop
-        self.fallback.child.lock().unwrap().take();
+        lock(&self.fallback.child).take();
     }
 }
 
@@ -349,8 +347,15 @@ fn io_loop(
                 match connect(shared, server, target) {
                     Ok(c) => conn = Some(c),
                     Err(e) => {
-                        // what was queued since goes to the child too
-                        shared.state.lock().unwrap().pending.get_or_insert(pending);
+                        if pending.analyze.is_empty() {
+                            // what was queued since goes to the child too
+                            lock(&shared.state).pending.get_or_insert(pending);
+                        } else {
+                            // an analysis is waited for: it gets nothing,
+                            // now rather than when its wait ends
+                            *lock(&shared.analyzed) = Some((pending.req_id, None));
+                            shared.analyzed_cv.notify_all();
+                        }
                         return give_up(shared, fallback, target, &e);
                     }
                 }
@@ -380,7 +385,7 @@ fn io_loop(
             None => {
                 // nothing to post (an error, or the pipe lost twice): the
                 // next request may go
-                shared.state.lock().unwrap().in_flight = None;
+                lock(&shared.state).in_flight = None;
                 shared.cv.notify_all();
             }
         }
@@ -398,20 +403,25 @@ fn give_up(shared: &Shared, fallback: &Fallback, target: &Target, e: &io::Error)
         crate::diagnostics::log(format!(
             "engine pipe unusable: {e}; no shared engine to reach from here, kana only"
         ));
-        shared.alive.store(false, Ordering::SeqCst);
-        shared.cv.notify_all();
+        shared.stop();
+        return;
+    }
+    // under the fallback's lock, which the client's drop takes the child
+    // under after it stopped: a child started once the client is gone
+    // would be no one's
+    let mut child = lock(&fallback.child);
+    if !shared.alive.load(Ordering::SeqCst) {
         return;
     }
     crate::diagnostics::log(format!(
         "engine pipe unusable: {e}; a child of this app's own"
     ));
-    let mut child = fallback.child.lock().unwrap();
     let notify = fallback.notify.clone();
-    let notify: Notify = Box::new(move |id| (notify.lock().unwrap())(id));
+    let notify: Notify = Box::new(move |id| (lock(&notify))(id));
     match ChildDaemonClient::spawn(&fallback.manifest, &fallback.exe, notify, &fallback.cfg) {
         Ok(c) => {
             let queued = {
-                let mut st = shared.state.lock().unwrap();
+                let mut st = lock(&shared.state);
                 st.in_flight = None;
                 st.pending.take()
             };
@@ -419,12 +429,15 @@ fn give_up(shared: &Shared, fallback: &Fallback, target: &Target, e: &io::Error)
                 c.dispatch_more(p.req_id, &p.context, &p.reading, p.continue_beam);
             }
             *child = Some(c);
+            // who waits for a result of the pipe's waits for nothing now
+            drop(child);
+            shared.answered_none();
         }
         Err(e) => {
             crate::diagnostics::log(format!("engine daemon spawn failed: {e}"));
             // the frontend starts a new client on its next activation
-            shared.alive.store(false, Ordering::SeqCst);
-            shared.cv.notify_all();
+            drop(child);
+            shared.stop();
         }
     }
 }
@@ -456,7 +469,9 @@ fn connect(shared: &Shared, server: &AtomicU32, target: &Target) -> io::Result<B
                 // the server sends it once its model is up
                 let mut reader = BufReader::new(pipe);
                 let mut line = String::new();
-                if reader.read_line(&mut line)? > 0 {
+                if crate::daemon_io::read_line(&mut reader, &mut line)?
+                    == crate::daemon_io::Line::Read
+                {
                     let pid = reader.get_ref().server_pid().unwrap_or(0);
                     server.store(pid, Ordering::SeqCst);
                     shared.ready.store(true, Ordering::SeqCst);
@@ -520,9 +535,15 @@ fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<Str
     out.write_all(line.as_bytes())?;
     let mut buf = String::new();
     loop {
-        buf.clear();
-        if reader.read_line(&mut buf)? == 0 {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        match crate::daemon_io::read_line(reader, &mut buf)? {
+            crate::daemon_io::Line::Eof => {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            crate::daemon_io::Line::TooLong => {
+                crate::diagnostics::log("engine response line too long, skipped");
+                continue;
+            }
+            crate::daemon_io::Line::Read => {}
         }
         let text = buf.trim();
         if text.is_empty() {

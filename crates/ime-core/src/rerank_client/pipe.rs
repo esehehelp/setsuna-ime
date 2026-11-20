@@ -13,10 +13,12 @@
 //! sandbox, out of the other apps' reach.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+use crate::daemon_io::{lock, Line};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -157,7 +159,7 @@ impl RerankClient for PipeRerankClient {
                 .saturating_duration_since(Instant::now())
                 .as_millis()
         ));
-        self.shared.state.lock().unwrap().pending = Some(Pending {
+        lock(&self.shared.state).pending = Some(Pending {
             req_id,
             context: context.to_string(),
             candidates: candidates.to_vec(),
@@ -167,23 +169,23 @@ impl RerankClient for PipeRerankClient {
     }
 
     fn cancel(&self) {
-        if self.shared.state.lock().unwrap().pending.take().is_some() {
+        if lock(&self.shared.state).pending.take().is_some() {
             self.shared.cv.notify_all();
         }
     }
 
     fn take_latest(&self) -> Option<RerankResult> {
-        self.shared.latest.lock().ok()?.take()
+        lock(&self.shared.latest).take()
     }
 
     fn info(&self) -> Option<RerankInfo> {
-        *self.shared.info.lock().ok()?
+        *lock(&self.shared.info)
     }
 }
 
 impl Drop for PipeRerankClient {
     fn drop(&mut self) {
-        self.shared.alive.store(false, Ordering::SeqCst);
+        self.shared.stop();
         let Some(io) = self.io.take() else {
             return;
         };
@@ -222,7 +224,7 @@ fn io_loop(shared: &Shared, server: &AtomicU32, target: &Target, notify: &Notify
                     "rerank pipe connected: server pid={pid} {info:?}"
                 ));
                 if info.is_some() {
-                    *shared.info.lock().unwrap() = info;
+                    *lock(&shared.info) = info;
                 }
                 *conn = Some(reader);
                 retry_wait = RETRY_MIN;
@@ -280,7 +282,7 @@ fn io_loop(shared: &Shared, server: &AtomicU32, target: &Target, notify: &Notify
             }
             Err(_) => None,
         };
-        shared.state.lock().unwrap().in_flight = false;
+        lock(&shared.state).in_flight = false;
         shared.cv.notify_all();
         let Some(resp) = response else {
             continue;
@@ -295,7 +297,7 @@ fn io_loop(shared: &Shared, server: &AtomicU32, target: &Target, notify: &Notify
         if resp.error.is_some() {
             continue;
         }
-        *shared.latest.lock().unwrap() = Some(RerankResult {
+        *lock(&shared.latest) = Some(RerankResult {
             req_id: resp.id,
             logp: resp.logp,
             score_ms: resp.score_ms,
@@ -310,7 +312,7 @@ fn io_loop(shared: &Shared, server: &AtomicU32, target: &Target, notify: &Notify
 /// ready line: the connection and what the server reported.
 fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Option<RerankInfo>)> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let mut started = false;
+    let mut started: Option<u32> = None;
     let mut nap = Duration::from_millis(20);
     loop {
         if !shared.alive.load(Ordering::SeqCst) {
@@ -333,15 +335,15 @@ fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Opt
                 // the server sends it once its model is up
                 let mut reader = BufReader::new(pipe);
                 let mut line = String::new();
-                if reader.read_line(&mut line)? > 0 {
+                if crate::daemon_io::read_line(&mut reader, &mut line)? == Line::Read {
                     return Ok((reader, serde_json::from_str(line.trim()).ok()));
                 }
                 // it left before (exiting idle as we came): again
             }
             // no server, and this client may not start one
             Err(e) if e.kind() == io::ErrorKind::NotFound && !target.start => return Err(e),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if !started {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match started {
+                None => {
                     let cwd = target.exe.parent();
                     let args: Vec<&std::ffi::OsStr> =
                         target.args.iter().map(OsString::as_os_str).collect();
@@ -352,9 +354,17 @@ fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Opt
                         "rerank server started pid={pid} out_of_job={own_job} args={:?}",
                         target.args
                     ));
-                    started = true;
+                    started = Some(pid);
                 }
-            }
+                // gone with no pipe: it could not load (or serve) the model,
+                // and waiting out the timeout would change nothing
+                Some(pid) if !win::is_running(pid) => {
+                    return Err(io::Error::other(format!(
+                        "the rerank server (pid {pid}) exited without its pipe"
+                    )));
+                }
+                Some(_) => {}
+            },
             Err(e) if win::is_busy(&e) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -378,9 +388,13 @@ fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<Res
     out.write_all(line.as_bytes())?;
     let mut buf = String::new();
     loop {
-        buf.clear();
-        if reader.read_line(&mut buf)? == 0 {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        match crate::daemon_io::read_line(reader, &mut buf)? {
+            Line::Eof => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Line::TooLong => {
+                crate::diagnostics::log("rerank response line too long, skipped");
+                continue;
+            }
+            Line::Read => {}
         }
         let text = buf.trim();
         if text.is_empty() {

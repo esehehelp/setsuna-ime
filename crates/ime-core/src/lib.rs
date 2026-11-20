@@ -16,6 +16,7 @@ pub mod char_ngram;
 pub mod child_daemon;
 pub mod composing_text;
 pub mod config;
+mod daemon_io;
 pub mod date_time;
 pub mod diagnostics;
 pub mod emoji;

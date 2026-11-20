@@ -23,11 +23,13 @@ mod pipe;
 pub use pipe::PipeRerankClient;
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+use crate::daemon_io::{lock, Line};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -119,6 +121,19 @@ struct Shared {
     alive: AtomicBool,
 }
 
+impl Shared {
+    /// The client is gone, or its daemon failed: the writer wakes and sees
+    /// so (the flag set under the lock it checks it under, so that it does
+    /// not miss the wakeup between its check and its wait).
+    fn stop(&self) {
+        {
+            let _st = lock(&self.state);
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        self.cv.notify_all();
+    }
+}
+
 /// How the daemon is started.
 struct Launch {
     exe: PathBuf,
@@ -197,7 +212,7 @@ impl RerankClient for ChildRerankClient {
                 .saturating_duration_since(Instant::now())
                 .as_millis()
         ));
-        self.shared.state.lock().unwrap().pending = Some(Pending {
+        lock(&self.shared.state).pending = Some(Pending {
             req_id,
             context: context.to_string(),
             candidates: candidates.to_vec(),
@@ -207,17 +222,17 @@ impl RerankClient for ChildRerankClient {
     }
 
     fn cancel(&self) {
-        if self.shared.state.lock().unwrap().pending.take().is_some() {
+        if lock(&self.shared.state).pending.take().is_some() {
             self.shared.cv.notify_all();
         }
     }
 
     fn take_latest(&self) -> Option<RerankResult> {
-        self.shared.latest.lock().ok()?.take()
+        lock(&self.shared.latest).take()
     }
 
     fn info(&self) -> Option<RerankInfo> {
-        *self.shared.info.lock().ok()?
+        *lock(&self.shared.info)
     }
 
     fn is_alive(&self) -> bool {
@@ -227,8 +242,7 @@ impl RerankClient for ChildRerankClient {
 
 impl Drop for ChildRerankClient {
     fn drop(&mut self) {
-        self.shared.alive.store(false, Ordering::SeqCst);
-        self.shared.cv.notify_all();
+        self.shared.stop();
         // the writer stops the daemon on its way out
         if let Some(w) = self.writer.take() {
             let _ = w.join();
@@ -275,12 +289,20 @@ fn writer_loop(shared: &Arc<Shared>, launch: &Launch, notify: &Arc<Mutex<Notify>
     let mut last_sent = Instant::now();
     loop {
         let step = {
-            let mut st = shared.state.lock().unwrap();
+            let mut st = lock(&shared.state);
             loop {
                 let alive = shared.alive.load(Ordering::SeqCst);
                 match next_step(alive, &st, conn.is_some(), last_sent, Instant::now()) {
-                    Step::Wait(Some(wait)) => st = shared.cv.wait_timeout(st, wait).unwrap().0,
-                    Step::Wait(None) => st = shared.cv.wait(st).unwrap(),
+                    Step::Wait(Some(wait)) => {
+                        st = shared
+                            .cv
+                            .wait_timeout(st, wait)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                    Step::Wait(None) => {
+                        st = shared.cv.wait(st).unwrap_or_else(PoisonError::into_inner)
+                    }
                     Step::Send => {
                         st.in_flight = true;
                         break st.pending.take();
@@ -291,7 +313,7 @@ fn writer_loop(shared: &Arc<Shared>, launch: &Launch, notify: &Arc<Mutex<Notify>
                             Ok(c) => conn = Some(c),
                             Err(e) => {
                                 crate::diagnostics::log(format!("rerank spawn failed: {e}"));
-                                shared.alive.store(false, Ordering::SeqCst);
+                                shared.stop();
                             }
                         }
                         break None;
@@ -314,7 +336,7 @@ fn writer_loop(shared: &Arc<Shared>, launch: &Launch, notify: &Arc<Mutex<Notify>
             continue;
         };
         let Ok(line) = request_line(&pending) else {
-            shared.state.lock().unwrap().in_flight = false;
+            lock(&shared.state).in_flight = false;
             continue;
         };
         crate::diagnostics::log(format!(
@@ -325,7 +347,7 @@ fn writer_loop(shared: &Arc<Shared>, launch: &Launch, notify: &Arc<Mutex<Notify>
         last_sent = Instant::now();
         if writeln!(c.stdin, "{line}").is_err() || c.stdin.flush().is_err() {
             crate::diagnostics::log("rerank writer failed: stdin closed");
-            shared.alive.store(false, Ordering::SeqCst);
+            shared.stop();
         }
     }
 }
@@ -343,7 +365,7 @@ fn stderr_log_path() -> Option<PathBuf> {
 /// it, in flight now; `None` once the client is closing.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn next_due(shared: &Shared) -> Option<Pending> {
-    let mut st = shared.state.lock().unwrap();
+    let mut st = lock(&shared.state);
     loop {
         if !shared.alive.load(Ordering::SeqCst) {
             return None;
@@ -355,9 +377,13 @@ fn next_due(shared: &Shared) -> Option<Pending> {
                     break;
                 }
                 let wait = p.not_before - now;
-                st = shared.cv.wait_timeout(st, wait).unwrap().0;
+                st = shared
+                    .cv
+                    .wait_timeout(st, wait)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
-            _ => st = shared.cv.wait(st).unwrap(),
+            _ => st = shared.cv.wait(st).unwrap_or_else(PoisonError::into_inner),
         }
     }
     st.in_flight = true;
@@ -419,10 +445,10 @@ fn start(
             .spawn(move || {
                 reader_loop(&shared, stdout, &notify);
                 if !stopping.load(Ordering::SeqCst) {
-                    shared.alive.store(false, Ordering::SeqCst);
+                    shared.stop();
                     crate::diagnostics::log("rerank reader exit");
                 }
-                shared.state.lock().unwrap().in_flight = false;
+                lock(&shared.state).in_flight = false;
                 shared.cv.notify_all();
             })
     };
@@ -456,20 +482,35 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     let mut ready = false;
+    // a line that answers nothing: the request in flight is out of it, so
+    // that the next one goes
+    let release = || {
+        lock(&shared.state).in_flight = false;
+        shared.cv.notify_all();
+    };
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
+        match crate::daemon_io::read_line(&mut reader, &mut line) {
+            Ok(Line::Eof) | Err(_) => return,
+            Ok(Line::TooLong) => {
+                crate::diagnostics::log("rerank line too long, skipped");
+                if ready {
+                    release();
+                }
+                continue;
+            }
+            Ok(Line::Read) => {}
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         if !ready {
-            ready = true;
-            crate::diagnostics::log(format!("rerank ready: {trimmed}"));
-            *shared.info.lock().unwrap() = serde_json::from_str(trimmed).ok();
+            // what a library prints before the ready line is none
+            if crate::daemon_io::is_ready(trimmed) {
+                ready = true;
+                crate::diagnostics::log(format!("rerank ready: {trimmed}"));
+                *lock(&shared.info) = serde_json::from_str(trimmed).ok();
+            }
             continue;
         }
         let resp: Response = match serde_json::from_str(trimmed) {
@@ -479,10 +520,11 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
                     "rerank parse failed: {e}; {}",
                     crate::diagnostics::text_field("line", trimmed)
                 ));
+                release();
                 continue;
             }
         };
-        shared.state.lock().unwrap().in_flight = false;
+        lock(&shared.state).in_flight = false;
         shared.cv.notify_all();
         crate::diagnostics::log(format!(
             "rerank response id={} n={} ms={:.1} error={:?}",
@@ -494,13 +536,13 @@ fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Mutex<Notify>) {
         if resp.error.is_some() {
             continue;
         }
-        *shared.latest.lock().unwrap() = Some(RerankResult {
+        *lock(&shared.latest) = Some(RerankResult {
             req_id: resp.id,
             logp: resp.logp,
             score_ms: resp.score_ms,
         });
         if shared.alive.load(Ordering::SeqCst) {
-            (notify.lock().unwrap())(resp.id);
+            (lock(&notify))(resp.id);
         }
     }
 }

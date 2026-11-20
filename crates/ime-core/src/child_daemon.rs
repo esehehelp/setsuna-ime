@@ -18,11 +18,13 @@
 //!   - pipe: the same protocol with the login's shared `setsuna-engine
 //!     serve` (Windows), which `spawn_with_config` prefers to a child
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+use crate::daemon_io::{lock, Line};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -97,6 +99,7 @@ struct Pending {
 
 /// A request the writer has sent and is awaiting a response for.
 struct InFlight {
+    req_id: u64,
     reading: String,
     /// The context as sent (NFKC).
     context: String,
@@ -126,6 +129,9 @@ struct Shared {
     analyzed: Mutex<Option<(u64, Option<Vec<Vec<Word>>>)>>,
     analyzed_cv: Condvar,
     next_analysis: AtomicU64,
+    /// Requests answered with no result (an error, a line that did not
+    /// parse): a wait for a result ends at a change of it.
+    unanswered: AtomicU64,
 }
 
 impl Shared {
@@ -141,19 +147,52 @@ impl Shared {
             analyzed: Mutex::new(None),
             analyzed_cv: Condvar::new(),
             next_analysis: AtomicU64::new(ANALYZE_IDS),
+            unanswered: AtomicU64::new(0),
         }
     }
 
-    /// Wait until a result is in `latest`, at most `timeout`.
+    /// The client is gone, or its daemon is: every thread waiting on it
+    /// wakes and sees so. The flag is set under each lock its waiters check
+    /// it under, so that none misses the wakeup between its check and its
+    /// wait (a writer that did slept on, and its join hung the app).
+    fn stop(&self) {
+        {
+            let _st = lock(&self.state);
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        self.cv.notify_all();
+        drop(lock(&self.latest));
+        self.latest_cv.notify_all();
+        drop(lock(&self.analyzed));
+        self.analyzed_cv.notify_all();
+    }
+
+    /// A request was answered with no result: whoever waits for one stops.
+    fn answered_none(&self) {
+        self.unanswered.fetch_add(1, Ordering::SeqCst);
+        drop(lock(&self.latest));
+        self.latest_cv.notify_all();
+    }
+
+    /// Wait until a result is in `latest`, at most `timeout`; `false` too
+    /// when the daemon answers a request with none or goes.
     fn wait_latest(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut slot = self.latest.lock().unwrap();
+        let unanswered = self.unanswered.load(Ordering::SeqCst);
+        let mut slot = lock(&self.latest);
         while slot.is_none() {
             let now = Instant::now();
-            if now >= deadline || !self.alive.load(Ordering::SeqCst) {
+            if now >= deadline
+                || !self.alive.load(Ordering::SeqCst)
+                || self.unanswered.load(Ordering::SeqCst) != unanswered
+            {
                 return false;
             }
-            slot = self.latest_cv.wait_timeout(slot, deadline - now).unwrap().0;
+            slot = self
+                .latest_cv
+                .wait_timeout(slot, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
         true
     }
@@ -170,7 +209,7 @@ impl Shared {
         }
         let id = self.next_analysis.fetch_add(1, Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
-        self.state.lock().unwrap().analysis = Some(Pending {
+        lock(&self.state).analysis = Some(Pending {
             req_id: id,
             context: String::new(),
             reading: String::new(),
@@ -179,7 +218,7 @@ impl Shared {
             dispatched_at: Instant::now(),
         });
         self.cv.notify_all();
-        let mut slot = self.analyzed.lock().unwrap();
+        let mut slot = lock(&self.analyzed);
         loop {
             if let Some((answered, _)) = slot.as_ref() {
                 if *answered == id {
@@ -205,12 +244,12 @@ impl Shared {
             slot = self
                 .analyzed_cv
                 .wait_timeout(slot, deadline - now)
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
         drop(slot);
         // not sent yet: it goes no more
-        let mut st = self.state.lock().unwrap();
+        let mut st = lock(&self.state);
         if st.analysis.as_ref().is_some_and(|p| p.req_id == id) {
             st.analysis = None;
         }
@@ -262,15 +301,16 @@ impl ChildDaemonClient {
         }
         let mut child = cmd.spawn()?;
         crate::diagnostics::log(format!("engine child pid={}", child.id()));
+        // a child no thread serves is stopped, not left running
+        let kill = |mut child: Child, e: std::io::Error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            e
+        };
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("child stdin not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("child stdout not piped"))?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err(kill(child, std::io::Error::other("child stdio not piped")));
+        };
 
         let shared = Arc::new(Shared::new(engine_cfg));
 
@@ -287,7 +327,11 @@ impl ChildDaemonClient {
                         crate::diagnostics::log("writer thread panic");
                     }
                     crate::diagnostics::log("writer thread exit");
-                })?
+                })
+        };
+        let writer = match writer {
+            Ok(w) => w,
+            Err(e) => return Err(kill(child, e)),
         };
         let reader = {
             let shared = shared.clone();
@@ -302,7 +346,16 @@ impl ChildDaemonClient {
                         crate::diagnostics::log("reader thread panic");
                     }
                     crate::diagnostics::log("reader thread exit");
-                })?
+                })
+        };
+        let reader = match reader {
+            Ok(r) => r,
+            Err(e) => {
+                shared.stop();
+                let e = kill(child, e);
+                let _ = writer.join();
+                return Err(e);
+            }
         };
 
         Ok(Self {
@@ -329,7 +382,7 @@ impl EngineClient for ChildDaemonClient {
             crate::diagnostics::text_field("reading", reading)
         ));
         {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = lock(&self.shared.state);
             st.pending = Some(Pending {
                 req_id,
                 context: context.to_string(),
@@ -343,7 +396,7 @@ impl EngineClient for ChildDaemonClient {
     }
 
     fn take_latest(&self) -> Option<EngineResult> {
-        self.shared.latest.lock().ok()?.take()
+        lock(&self.shared.latest).take()
     }
 
     fn wait_latest(&self, timeout: Duration) -> bool {
@@ -365,17 +418,24 @@ impl EngineClient for ChildDaemonClient {
 
 impl Drop for ChildDaemonClient {
     fn drop(&mut self) {
-        self.shared.alive.store(false, Ordering::SeqCst);
-        self.shared.cv.notify_all();
-        // Joining the writer drops the child's stdin handle → the daemon
-        // sees EOF on stdin and exits cleanly.
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
+        self.shared.stop();
+        // The writer ending drops the child's stdin handle → the daemon
+        // sees EOF on stdin and exits cleanly. A write blocked on a daemon
+        // that reads no more (hung) ends only when the kill below closes
+        // the pipe, so the writer has a moment and no more before it.
+        if let Some(w) = &self.writer {
+            let deadline = Instant::now() + WRITER_GRACE;
+            while !w.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
         }
         if let Some(mut child) = self.child.take() {
             // Backstop: the daemon should already be exiting on stdin EOF.
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
         }
         // The daemon's stdout is now closed → the reader's read_line ends.
         if let Some(r) = self.reader.take() {
@@ -383,6 +443,10 @@ impl Drop for ChildDaemonClient {
         }
     }
 }
+
+/// How long a client's drop waits for its writer before it kills the
+/// daemon.
+const WRITER_GRACE: Duration = Duration::from_millis(500);
 
 /// The context for the log: its length, and its last 16 chars when what is
 /// typed is logged.
@@ -399,17 +463,18 @@ fn context_field(context: &str) -> String {
 /// Wait for a request to send (one queued, none in flight) and put it in
 /// flight; `None` once the client is gone.
 fn next_request(shared: &Shared) -> Option<Pending> {
-    let mut st = shared.state.lock().unwrap();
+    let mut st = lock(&shared.state);
     while shared.alive.load(Ordering::SeqCst)
         && !((st.pending.is_some() || st.analysis.is_some()) && st.in_flight.is_none())
     {
-        st = shared.cv.wait(st).unwrap();
+        st = shared.cv.wait(st).unwrap_or_else(PoisonError::into_inner);
     }
     if !shared.alive.load(Ordering::SeqCst) {
         return None;
     }
-    let p = st.analysis.take().or_else(|| st.pending.take()).unwrap();
+    let p = st.analysis.take().or_else(|| st.pending.take())?;
     st.in_flight = Some(InFlight {
+        req_id: p.req_id,
         reading: p.reading.clone(),
         context: p.context.nfkc().collect(),
         dispatched_at: p.dispatched_at,
@@ -443,7 +508,7 @@ fn request_line(shared: &Shared, pending: &Pending) -> Option<String> {
         Err(_) => {
             // Clear in_flight so the writer doesn't deadlock waiting
             // for a response that will never come.
-            shared.state.lock().unwrap().in_flight = None;
+            lock(&shared.state).in_flight = None;
             None
         }
     }
@@ -456,8 +521,7 @@ fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
         };
         if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
             crate::diagnostics::log("writer failed: stdin closed");
-            shared.alive.store(false, Ordering::SeqCst);
-            shared.cv.notify_all();
+            shared.stop();
             return;
         }
     }
@@ -473,8 +537,7 @@ fn reader_loop(shared: Arc<Shared>, stdout: ChildStdout, notify: Notify) {
     if shared.alive.load(Ordering::SeqCst) {
         tracing::warn!("Setsuna engine daemon exited unexpectedly");
     }
-    shared.alive.store(false, Ordering::SeqCst);
-    shared.cv.notify_all();
+    shared.stop();
     crate::diagnostics::log("reader loop marked client dead");
 }
 
@@ -482,11 +545,11 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
 
-    // The daemon's first non-empty stdout line is its `Ready` handshake.
+    // The daemon's `Ready` line comes first; what a library prints before
+    // it (a banner on stdout) is no handshake.
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
+        match crate::daemon_io::read_line(&mut reader, &mut line) {
+            Ok(Line::Eof) => {
                 crate::diagnostics::log("reader handshake EOF");
                 return;
             }
@@ -494,9 +557,13 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
                 crate::diagnostics::log(format!("reader handshake failed: {e}"));
                 return;
             }
-            Ok(_) => {}
+            Ok(Line::TooLong) => continue,
+            Ok(Line::Read) => {}
         }
-        if line.trim().is_empty() {
+        if !crate::daemon_io::is_ready(&line) {
+            if !line.trim().is_empty() {
+                crate::diagnostics::log("reader skipped a line before the ready line");
+            }
             continue;
         }
         shared.ready.store(true, Ordering::SeqCst);
@@ -505,9 +572,8 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
     }
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
+        match crate::daemon_io::read_line(&mut reader, &mut line) {
+            Ok(Line::Eof) => {
                 crate::diagnostics::log("reader EOF");
                 return;
             }
@@ -515,11 +581,31 @@ fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
                 crate::diagnostics::log(format!("reader failed: {e}"));
                 return;
             }
-            Ok(_) => {}
+            Ok(Line::TooLong) => {
+                crate::diagnostics::log("reader skipped a line too long");
+                unanswered(shared);
+                continue;
+            }
+            Ok(Line::Read) => {}
         }
         if let Some((resp, inflight)) = take_response(shared, &line) {
             deliver(shared, resp, inflight, notify);
         }
+    }
+}
+
+/// The request in flight is answered with nothing (a line that does not
+/// parse, or is too long, in its place): it is out of flight, so that the
+/// next one goes, and whoever waits for it stops waiting.
+fn unanswered(shared: &Shared) {
+    let inflight = lock(&shared.state).in_flight.take();
+    shared.cv.notify_all();
+    match inflight {
+        Some(f) if f.analyze => {
+            *lock(&shared.analyzed) = Some((f.req_id, None));
+            shared.analyzed_cv.notify_all();
+        }
+        _ => shared.answered_none(),
     }
 }
 
@@ -538,6 +624,7 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
                 "reader parse failed: {e}; {}",
                 crate::diagnostics::text_field("line", trimmed)
             ));
+            unanswered(shared);
             return None;
         }
     };
@@ -547,16 +634,17 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
         resp.candidates.len(),
         resp.error
     ));
-    let inflight = shared.state.lock().unwrap().in_flight.take();
+    let inflight = lock(&shared.state).in_flight.take();
     shared.cv.notify_all();
     if inflight.as_ref().is_some_and(|f| f.analyze) {
         // to its caller, not the frontend
         let words = resp.analyses.filter(|_| resp.error.is_none());
-        *shared.analyzed.lock().unwrap() = Some((resp.id, words));
+        *lock(&shared.analyzed) = Some((resp.id, words));
         shared.analyzed_cv.notify_all();
         return None;
     }
     if resp.error.is_some() {
+        shared.answered_none();
         return None;
     }
     Some((resp, inflight))
@@ -569,7 +657,7 @@ fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, no
         None => (String::new(), String::new(), Instant::now()),
     };
     {
-        let mut slot = shared.latest.lock().unwrap();
+        let mut slot = lock(&shared.latest);
         *slot = Some(EngineResult {
             req_id: resp.id,
             reading,
@@ -1035,7 +1123,7 @@ mod tests {
         };
         let shared = Arc::new(Shared::new(&cfg));
         shared.ready.store(true, Ordering::SeqCst);
-        shared.state.lock().unwrap().pending = Some(Pending {
+        lock(&shared.state).pending = Some(Pending {
             req_id: 7,
             context: String::new(),
             reading: "きょう".into(),
@@ -1049,7 +1137,7 @@ mod tests {
             thread::spawn(move || {
                 // once it is queued: a writer free before then sends what
                 // is pending (the test raced it under load)
-                while shared.state.lock().unwrap().analysis.is_none() {
+                while lock(&shared.state).analysis.is_none() {
                     thread::sleep(Duration::from_millis(1));
                 }
                 let first = next_request(&shared).unwrap();
@@ -1077,9 +1165,10 @@ mod tests {
         assert!(none
             .analyze(&["今日".to_string()], Duration::from_secs(1))
             .is_none());
-        assert!(none.state.lock().unwrap().analysis.is_none());
+        assert!(lock(&none.state).analysis.is_none());
         // unanswered in time: taken back
-        shared.state.lock().unwrap().in_flight = Some(InFlight {
+        lock(&shared.state).in_flight = Some(InFlight {
+            req_id: 0,
             reading: String::new(),
             context: String::new(),
             dispatched_at: Instant::now(),
@@ -1088,7 +1177,7 @@ mod tests {
         assert!(shared
             .analyze(&["今日".to_string()], Duration::from_millis(20))
             .is_none());
-        assert!(shared.state.lock().unwrap().analysis.is_none());
+        assert!(lock(&shared.state).analysis.is_none());
     }
 
     /// A result delivered wakes who waits for one (Enter, for the
@@ -1101,7 +1190,8 @@ mod tests {
             let shared = shared.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(30));
-                shared.state.lock().unwrap().in_flight = Some(InFlight {
+                lock(&shared.state).in_flight = Some(InFlight {
+                    req_id: 0,
                     reading: "きょう".into(),
                     context: String::new(),
                     dispatched_at: Instant::now(),
@@ -1115,11 +1205,54 @@ mod tests {
         };
         assert!(shared.wait_latest(Duration::from_secs(5)));
         engine.join().unwrap();
-        let result = shared.latest.lock().unwrap().take().unwrap();
+        let result = lock(&shared.latest).take().unwrap();
         assert_eq!(
             (result.req_id, result.candidates),
             (3, vec!["今日".to_string()])
         );
+    }
+
+    /// A request answered with an error, or with a line that does not
+    /// parse, ends the wait for its result at once and lets the next one
+    /// go; the client stopped wakes whoever waits.
+    #[test]
+    fn a_wait_ends_with_an_answer_of_nothing_or_the_client() {
+        let in_flight = |shared: &Shared| {
+            lock(&shared.state).in_flight = Some(InFlight {
+                req_id: 4,
+                reading: "きょう".into(),
+                context: String::new(),
+                dispatched_at: Instant::now(),
+                analyze: false,
+            });
+        };
+        for line in [r#"{"id":4,"error":"bad"}"#, "not json"] {
+            let shared = Arc::new(Shared::new(&EngineCfg::default()));
+            in_flight(&shared);
+            let engine = {
+                let shared = shared.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(30));
+                    assert!(take_response(&shared, line).is_none());
+                })
+            };
+            let start = Instant::now();
+            assert!(!shared.wait_latest(Duration::from_secs(5)));
+            assert!(start.elapsed() < Duration::from_secs(4), "{line}");
+            engine.join().unwrap();
+            assert!(lock(&shared.state).in_flight.is_none(), "{line}");
+        }
+        let shared = Arc::new(Shared::new(&EngineCfg::default()));
+        let waiter = {
+            let shared = shared.clone();
+            thread::spawn(move || next_request(&shared))
+        };
+        thread::sleep(Duration::from_millis(30));
+        shared.stop();
+        assert!(waiter.join().unwrap().is_none());
+        let start = Instant::now();
+        assert!(!shared.wait_latest(Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     struct TempDir(PathBuf);
