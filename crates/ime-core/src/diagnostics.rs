@@ -84,15 +84,10 @@ pub fn open_log(path: &Path) -> Option<File> {
 
 fn open_capped(path: &Path, limit: u64) -> Option<File> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::private_file::create_dir_all(parent);
     }
-    let open = || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    };
+    // the user's alone, as what is typed may be in it (`log_typed_text`)
+    let open = || crate::private_file::append(path).ok();
     let file = open()?;
     if file.metadata().is_ok_and(|m| m.len() > limit) {
         drop(file);

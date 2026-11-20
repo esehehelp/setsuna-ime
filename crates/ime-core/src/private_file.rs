@@ -37,6 +37,19 @@ fn options() -> OpenOptions {
     OpenOptions::new()
 }
 
+/// `path` made as a directory with its parents, those it makes the user's
+/// alone (0700 on unix).
+pub fn create_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(path)
+}
+
 /// `path` opened to append to, made if missing.
 pub fn append(path: &Path) -> std::io::Result<File> {
     let file = options().create(true).append(true).open(path)?;

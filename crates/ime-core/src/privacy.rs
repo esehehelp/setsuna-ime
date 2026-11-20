@@ -8,6 +8,12 @@
 //! base64), long digit runs (card and phone numbers), and the words that
 //! announce a credential (password, パスワード, 暗証番号).
 //!
+//! A token is looked at whole and in its pieces between `=`, `:`, quotes
+//! and brackets (`KEY=sk-...`, `host=10.0.0.1`, `` `ghp_...` ``), and an
+//! identifier by its parts (`OPENAI_API_KEY`, `X-API-Key`). A word that
+//! announces a credential takes the rest of its sentence with it: what
+//! follows it is the credential (`パスワードは hunter2 です`).
+//!
 //! The rewriter, which sends the context to a server, drops a context with
 //! any hit; the local model reads the text after the last one.
 
@@ -74,7 +80,7 @@ const CREDENTIAL_WORDS: &[&str] = &[
     "otp",
 ];
 
-/// The same in Japanese, matched anywhere.
+/// The same in Japanese, matched anywhere (Latin letters in any case).
 const CREDENTIAL_WORDS_JA: &[&str] = &[
     "パスワード",
     "暗証番号",
@@ -84,8 +90,8 @@ const CREDENTIAL_WORDS_JA: &[&str] = &[
     "秘密鍵",
     "秘密キー",
     "トークン",
-    "APIキー",
-    "ＡＰＩキー",
+    "apiキー",
+    "ａｐｉキー",
     "口座番号",
     "カード番号",
     "セキュリティコード",
@@ -112,7 +118,8 @@ const TLDS: &[&str] = &[
     "uk",
 ];
 
-/// Everything sensitive in `text`, in order.
+/// Everything sensitive in `text`, in order; a word announcing a
+/// credential with the rest of its sentence.
 pub fn hits(text: &str) -> Vec<Hit> {
     let mut out = Vec::new();
     // ASCII tokens: runs of printable ASCII (full-width forms folded)
@@ -126,23 +133,53 @@ pub fn hits(text: &str) -> Vec<Hit> {
         let end_here = !ascii || chars.peek().is_none();
         if let (Some(s), true) = (start, end_here) {
             let e = if ascii { i + c.len_utf8() } else { i };
-            if let Some(hit) = token_hit(text, s, e) {
-                out.push(hit);
+            match token_hit(text, s, e) {
+                Some(Found::Secret) => out.push(Hit { start: s, end: e }),
+                Some(Found::Announcer) => out.push(Hit {
+                    start: s,
+                    end: sentence_end(text, e),
+                }),
+                None => {}
             }
             start = None;
         }
     }
+    let folded = fold_case(text);
     for word in CREDENTIAL_WORDS_JA {
-        for (i, _) in text.match_indices(word) {
+        for (i, _) in folded.match_indices(word) {
             out.push(Hit {
                 start: i,
-                end: i + word.len(),
+                end: sentence_end(text, i + word.len()),
             });
         }
     }
     out.extend(digit_runs(text));
     out.sort_by_key(|h| (h.start, h.end));
     out
+}
+
+/// Where the sentence that goes on at byte `from` ends: its full stop or
+/// mark (a `.` with a space or nothing after it: `abc.def` goes on), the
+/// line's end, or the text's.
+fn sentence_end(text: &str, from: usize) -> usize {
+    let rest = &text[from..];
+    rest.char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '。' | '．' | '！' | '？' | '!' | '?' | '\n')
+                || c == '.' && rest[i + 1..].chars().next().is_none_or(char::is_whitespace)
+        })
+        .map_or(text.len(), |(i, _)| from + i)
+}
+
+/// `text` with its Latin capitals (half and full width) in lowercase, every
+/// char as long in bytes as it was.
+fn fold_case(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'Ａ'..='Ｚ' => char::from_u32(c as u32 + 0x20).unwrap_or(c),
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
 }
 
 /// Whether `text` holds anything sensitive.
@@ -167,47 +204,99 @@ fn to_ascii(c: char) -> Option<char> {
     }
 }
 
+/// What an ASCII token is when sensitive.
+enum Found {
+    /// A secret, an address, a path: the token itself.
+    Secret,
+    /// A word announcing a credential, which follows it.
+    Announcer,
+}
+
 /// Whether the ASCII token `text[s..e]` (and so where it is) is sensitive.
-fn token_hit(text: &str, s: usize, e: usize) -> Option<Hit> {
+fn token_hit(text: &str, s: usize, e: usize) -> Option<Found> {
     let token: String = text[s..e].chars().filter_map(to_ascii).collect();
-    // trailing sentence punctuation is no part of it (`example.com.`)
-    let token = token.trim_end_matches(['.', ',', ')', '!', '?', ';', ':', '"', '\'']);
-    let token = token.trim_start_matches(['(', '"', '\'']);
-    let hit = Some(Hit { start: s, end: e });
+    let token = trim_punctuation(&token);
     if token.is_empty() {
         return None;
     }
-    let lower = token.to_ascii_lowercase();
-    if lower.contains("://") || lower.starts_with("www.") || lower.starts_with("mailto:") {
-        return hit;
-    }
-    if is_email(token) || is_domain(&lower) || is_path(token) || is_ipv4(token) {
-        return hit;
-    }
-    if SECRET_PREFIXES
-        .iter()
-        .any(|p| token.starts_with(p) && token.len() > p.len() + 3)
+    // the token whole, and its pieces between `=`, `:`, quotes, brackets
+    if is_secret(token)
+        || token
+            .split([
+                '=', ':', '`', '"', '\'', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';',
+            ])
+            .any(|p| is_secret(trim_punctuation(p)))
     {
-        return hit;
+        return Some(Found::Secret);
     }
-    if aws_key(token) || jwt(token) {
-        return hit;
+    if announces(token) {
+        return Some(Found::Announcer);
     }
-    // credential words and identifier-like pieces of the token
-    for word in token.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
-        let w = word.to_ascii_lowercase();
-        if CREDENTIAL_WORDS.contains(&w.as_str()) {
-            return hit;
-        }
-    }
+    // identifier-like pieces of the token
     for piece in token.split(|c: char| {
         !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '+' | '/' | '='))
     }) {
         if secret_like(piece) {
-            return hit;
+            return Some(Found::Secret);
         }
     }
     None
+}
+
+/// `t` without the sentence punctuation around it (`example.com.`,
+/// `(foo)`).
+fn trim_punctuation(t: &str) -> &str {
+    t.trim_end_matches(['.', ',', ')', '!', '?', ';', ':', '"', '\''])
+        .trim_start_matches(['(', '"', '\''])
+}
+
+/// Whether `t` is an address, a path or a key by its shape.
+fn is_secret(t: &str) -> bool {
+    if t.is_empty() {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    lower.contains("://")
+        || lower.starts_with("www.")
+        || lower.starts_with("mailto:")
+        || is_email(t)
+        || is_domain(&lower)
+        // a domain with a path or a port (`github.com/org/repo`,
+        // `example.com:8443`)
+        || lower
+            .split(['/', ':'])
+            .next()
+            .is_some_and(|host| host.len() < lower.len() && is_domain(host))
+        || is_path(t)
+        || is_ipv4(t)
+        || is_ipv6(t.trim_start_matches('[').split(']').next().unwrap_or(t))
+        // a PEM block's header, whatever follows it
+        || t.starts_with("-----BEGIN")
+        || SECRET_PREFIXES
+            .iter()
+            .any(|p| t.starts_with(p) && t.len() > p.len() + 3)
+        || aws_key(t)
+        || jwt(t)
+}
+
+/// Whether `token` has a word announcing a credential: whole
+/// (`password`), or a part or two of an identifier (`DB_PASSWORD`,
+/// `OPENAI_API_KEY`, `X-API-Key`).
+fn announces(token: &str) -> bool {
+    let known = |w: &str| CREDENTIAL_WORDS.contains(&w);
+    token
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .any(|word| {
+            let w = word.to_ascii_lowercase();
+            let parts: Vec<&str> = w.split(['_', '-']).filter(|p| !p.is_empty()).collect();
+            known(&w)
+                || parts.len() > 1
+                    && (parts.iter().any(|p| known(p))
+                        || parts.windows(2).any(|p| {
+                            known(&format!("{}{}", p[0], p[1]))
+                                || known(&format!("{}_{}", p[0], p[1]))
+                        }))
+        })
 }
 
 fn is_email(t: &str) -> bool {
@@ -217,8 +306,8 @@ fn is_email(t: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
-/// `label.label.tld` with a known TLD (`example.com`, `foo.co.jp`), not
-/// `e.g.` or `node.js`.
+/// `label.label.tld` with a known TLD (`example.com`, `foo.co.jp`,
+/// `x.com`), not `e.g.` or `node.js`.
 fn is_domain(lower: &str) -> bool {
     let labels: Vec<&str> = lower.split('.').collect();
     labels.len() >= 2
@@ -226,7 +315,6 @@ fn is_domain(lower: &str) -> bool {
             .iter()
             .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
         && TLDS.contains(labels.last().unwrap())
-        && labels[0].len() >= 2
 }
 
 fn is_path(t: &str) -> bool {
@@ -249,6 +337,19 @@ fn is_ipv4(t: &str) -> bool {
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.len() <= 3 && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// An IPv6 address (`fe80::1`, `2001:db8::8a2e:370:7334`, a zone after
+/// `%`): hex groups, with `::` or eight of them (a time, 12:34:56, is
+/// neither).
+fn is_ipv6(t: &str) -> bool {
+    let t = t.split('%').next().unwrap_or(t);
+    let groups: Vec<&str> = t.split(':').collect();
+    t.chars().all(|c| c.is_ascii_hexdigit() || c == ':')
+        && t.chars().any(|c| c.is_ascii_hexdigit())
+        && (3..=8).contains(&groups.len())
+        && groups.iter().all(|g| g.len() <= 4)
+        && (t.contains("::") || groups.len() == 8)
 }
 
 fn aws_key(t: &str) -> bool {
@@ -321,7 +422,7 @@ fn digit_runs(text: &str) -> Vec<Hit> {
                 digits += 1;
                 run += 1;
                 longest = longest.max(run);
-            } else if matches!(c, '-' | ' ' | 'ー' | '－')
+            } else if matches!(c, '-' | ' ' | 'ー' | '－' | '(' | ')' | '（' | '）')
                 && end + 1 < chars.len()
                 && digit(chars[end + 1].1)
                 && end > start
@@ -399,8 +500,43 @@ mod tests {
     }
 
     #[test]
+    fn keys_in_assignments_identifiers_and_quotes_are_found() {
+        for t in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "OPENAI_API_KEY=abc",
+            "DB_PASSWORD=hunter2",
+            "AUTH_TOKEN: x",
+            "X-API-Key: abc",
+            "KEY=sk-projAbCdEfGh",
+            "`sk-1234567`を使う",
+            "192.168.0.1:8080に",
+            "host=10.0.0.1",
+            "fe80::1%eth0",
+            "[2001:db8::1]:443",
+            "github.com/org/private-repo",
+            "example.com:8443",
+            "x.comで見た",
+            "apiキーを",
+            "ａｐｉキー",
+            "03(1234)5678まで",
+        ] {
+            assert!(sensitive(t), "{t}");
+        }
+        for t in ["12:34:56に", "比率は16:9", "a:b"] {
+            assert!(!sensitive(t), "{t}: {:?}", hits(t));
+        }
+    }
+
+    #[test]
     fn the_local_context_starts_after_the_last_hit() {
-        assert_eq!(after_last_hit("前の文。パスワードは"), "は");
+        // what follows a word announcing a credential, to the sentence's
+        // end, is the credential
+        assert_eq!(after_last_hit("前の文。パスワードは"), "");
+        assert_eq!(
+            after_last_hit("パスワードは mypass123 です。次の文"),
+            "。次の文"
+        );
+        assert_eq!(after_last_hit("my password is hunter2. Then"), ". Then");
         assert_eq!(
             after_last_hit("https://example.com/を見て、それから"),
             "を見て、それから"

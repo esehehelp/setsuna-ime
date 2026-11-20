@@ -62,6 +62,11 @@ struct Stat {
     after: HashMap<String, u32>,
 }
 
+/// Whether a commit holds what looks like a number, a key or an address.
+fn sensitive(reading: &str, surface: &str) -> bool {
+    crate::privacy::is_sensitive(reading) || crate::privacy::is_sensitive(surface)
+}
+
 /// A prediction: the surface and the reading it was committed for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prediction {
@@ -200,8 +205,9 @@ impl Predictor {
                     self.stats.remove(&(r.r, r.s));
                     continue;
                 }
+                // nor one recorded before such commits were kept out
                 let n = r.n.unwrap_or(1);
-                if n == 0 {
+                if n == 0 || sensitive(&r.r, &r.s) {
                     continue;
                 }
                 self.seq += 1;
@@ -237,22 +243,29 @@ impl Predictor {
             && crate::postprocess::keeps_digits(reading, surface)
     }
 
-    /// Record that `surface` was committed for `reading` after `prev`.
+    /// Record that `surface` was committed for `reading` after `prev`; not
+    /// what looks like a number, a key or an address to keep from the
+    /// history (`privacy`), nor such a commit as the one before.
     pub fn record(&mut self, reading: &str, surface: &str, prev: &str) -> std::io::Result<()> {
-        if !Self::worth(reading, surface) {
+        if !Self::worth(reading, surface) || sensitive(reading, surface) {
             return Ok(());
         }
+        let prev: String = prev
+            .chars()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         self.append(&Record {
             r: reading.to_string(),
             s: surface.to_string(),
-            p: prev
-                .chars()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect(),
+            p: if crate::privacy::is_sensitive(&prev) {
+                String::new()
+            } else {
+                prev
+            },
             ..Record::default()
         })
     }
@@ -432,6 +445,21 @@ mod tests {
         }
         assert_eq!(p.stats[&key].after.len(), AFTER_CAP);
         assert!(p.stats[&key].after.contains_key("では"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
+    }
+
+    #[test]
+    fn a_number_or_a_key_is_kept_out_of_the_history() {
+        let path = temp("private");
+        let mut p = Predictor::at(path.clone());
+        p.record("ばんごう", "090-1234-5678", "").unwrap();
+        p.record("きーは", "sk-projAbCdEf123", "").unwrap();
+        p.record("よろしく", "宜しく", "パスワードは").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("090") && !text.contains("sk-"), "{text}");
+        assert!(!text.contains("パスワード"), "{text}");
+        assert_eq!(p.complete("よろし", "", 5).len(), 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
     }

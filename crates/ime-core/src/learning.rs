@@ -521,9 +521,16 @@ impl Learning {
     }
 
     /// Record that the user committed `chosen` for `reading` while `rejected`
-    /// was shown first.
+    /// was shown first; not a choice of what looks like a number, a key or
+    /// an address to keep from the log (`privacy`).
     pub fn record(&mut self, reading: &str, chosen: &str, rejected: &str) -> std::io::Result<()> {
         if reading.is_empty() || chosen.is_empty() || chosen == rejected {
+            return Ok(());
+        }
+        if [reading, chosen, rejected]
+            .iter()
+            .any(|t| crate::privacy::is_sensitive(t))
+        {
             return Ok(());
         }
         self.append(&Record {

@@ -981,8 +981,10 @@ impl ITfEditSession_Impl for ReadField_Impl {
 }
 
 /// The app's text before the caret, at most `CONTEXT_UNITS` UTF-16 units
-/// of it (`None` when the app does not let us read it), and what the field
-/// is (`field_of`).
+/// of it (`None` when the app does not let us read it, or the field is a
+/// password's, private or off at the start: its text is not read at all),
+/// and what the field is (`field_of`), also when its text cannot be read
+/// (a password field may refuse it: it is no less a password field).
 fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, Field) {
     struct ReadBefore {
         context: ITfContext,
@@ -997,19 +999,24 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, F
                 let Some(range) = selection(&self.0.context, ec)? else {
                     return Ok(());
                 };
-                self.0
-                    .field
-                    .set(field_of(&input_scopes(&self.0.context, ec, &range)));
-                range.Collapse(ec, TF_ANCHOR_START)?;
-                let mut moved = 0i32;
-                range.ShiftStart(ec, -CONTEXT_UNITS, &mut moved, core::ptr::null())?;
-                let mut buf = [0u16; CONTEXT_UNITS as usize];
-                let mut n = 0u32;
-                range.GetText(ec, 0, &mut buf, &mut n)?;
-                let text = String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]);
-                // a surrogate pair cut at the start
-                let text = text.trim_start_matches('\u{FFFD}').to_string();
-                *self.0.result.borrow_mut() = Some(text);
+                let field = field_of(&input_scopes(&self.0.context, ec, &range));
+                self.0.field.set(field);
+                if field.secret || field.private || field.starts_off {
+                    return Ok(());
+                }
+                let read = || -> Result<String> {
+                    range.Collapse(ec, TF_ANCHOR_START)?;
+                    let mut moved = 0i32;
+                    range.ShiftStart(ec, -CONTEXT_UNITS, &mut moved, core::ptr::null())?;
+                    let mut buf = [0u16; CONTEXT_UNITS as usize];
+                    let mut n = 0u32;
+                    range.GetText(ec, 0, &mut buf, &mut n)?;
+                    let text = String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]);
+                    // a surrogate pair cut at the start
+                    Ok(text.trim_start_matches('\u{FFFD}').to_string())
+                };
+                // text the app does not give: none, the field as read
+                *self.0.result.borrow_mut() = read().ok();
                 Ok(())
             })
         }
@@ -1024,7 +1031,7 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, F
     })
     .into();
     let hr = unsafe { context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READ) };
-    if !hr.is_ok_and(|hr| hr.is_ok()) {
+    if hr.is_err() {
         return (None, Field::default());
     }
     (result.take(), field.get())
