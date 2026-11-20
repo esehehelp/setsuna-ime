@@ -107,23 +107,29 @@ impl Alternates {
         );
         let (num_right, num_left, keys, entries, key_bytes, reading_bytes) =
             (h(1), h(2), h(3), h(4), h(5), h(6));
+        // the layout the header's counts make, in checked arithmetic: counts
+        // that overflow it (a damaged file) are no table
+        let too_big = || anyhow::anyhow!("{}: counts past the address space", path.display());
+        let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(too_big);
+        let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(too_big);
+        let pad = |n: usize| -> Result<usize> { Ok(pad8(add(n, 7)? - 7)) };
         let key_off = HEADER;
-        let key_blob = key_off + pad8(4 * (keys + 1));
-        let key_first = key_blob + pad8(key_bytes);
-        let entry = key_first + pad8(4 * (keys + 1));
-        let reading_blob = entry + 16 * entries;
-        let costs = reading_blob + pad8(reading_bytes);
+        let key_blob = add(key_off, pad(mul(4, add(keys, 1)?)?)?)?;
+        let key_first = add(key_blob, pad(key_bytes)?)?;
+        let entry = add(key_first, pad(mul(4, add(keys, 1)?)?)?)?;
+        let reading_blob = add(entry, mul(16, entries)?)?;
+        let costs = add(reading_blob, pad(reading_bytes)?)?;
         let (connection, end) = if version == 1 {
             (
                 Connection::Matrix(costs),
-                costs + pad8(2 * num_left * num_right),
+                add(costs, pad(mul(2, mul(num_left, num_right)?)?)?)?,
             )
         } else {
             let (templates, pairs) = (h(7), h(8));
             let right_feats = costs;
-            let left_feats = right_feats + pad8(4 * num_right * templates);
-            let pair_key = left_feats + pad8(4 * num_left * templates);
-            let pair_cost = pair_key + 8 * pairs;
+            let left_feats = add(right_feats, pad(mul(4, mul(num_right, templates)?)?)?)?;
+            let pair_key = add(left_feats, pad(mul(4, mul(num_left, templates)?)?)?)?;
+            let pair_cost = add(pair_key, mul(8, pairs)?)?;
             (
                 Connection::Features {
                     templates,
@@ -133,7 +139,7 @@ impl Alternates {
                     pair_key,
                     pair_cost,
                 },
-                pair_cost + pad8(4 * pairs),
+                add(pair_cost, pad(mul(4, pairs)?)?)?,
             )
         };
         ensure!(
@@ -141,6 +147,17 @@ impl Alternates {
             "{}: {} bytes, the header says {end}",
             path.display(),
             map.len(),
+        );
+        // the keys' offsets rise within their blob, and their first entries
+        // within the entries
+        let at = |base: usize, i: usize| u32_at(&map, base + 4 * i) as usize;
+        ensure!(
+            (0..keys).all(|i| at(key_off, i) <= at(key_off, i + 1))
+                && at(key_off, keys) <= key_bytes
+                && (0..keys).all(|i| at(key_first, i) <= at(key_first, i + 1))
+                && at(key_first, keys) <= entries,
+            "{}: key offsets out of range",
+            path.display()
         );
         Ok(Self {
             map,
@@ -327,8 +344,15 @@ fn read_bigram(dir: &Path) -> Result<Costs> {
             File::open(&p).with_context(|| format!("open {}", p.display()))?,
         ))
     };
-    let (mut right_ids, mut left_ids) = (HashMap::new(), HashMap::new());
-    let mut pairs = Vec::new();
+    // the empty feature is 0, which a sentence's ends take at every
+    // template, whatever the cost file names first (vibrato's raw
+    // connector does the same)
+    let (mut right_ids, mut left_ids) = (
+        HashMap::from([(String::new(), 0u32)]),
+        HashMap::from([(String::new(), 0u32)]),
+    );
+    // a pair named twice takes its last cost, as the connector would
+    let mut costs: HashMap<u64, i32> = HashMap::new();
     for line in open("bigram.cost")?.lines() {
         let line = line?;
         let (key, cost) = line.rsplit_once('\t').context("bigram.cost: no tab")?;
@@ -340,10 +364,10 @@ fn read_bigram(dir: &Path) -> Result<Costs> {
         let r = *right_ids.entry(r.to_string()).or_insert(n);
         let n = left_ids.len() as u32;
         let l = *left_ids.entry(l.to_string()).or_insert(n);
-        pairs.push((u64::from(r) << 32 | u64::from(l), cost.parse::<i32>()?));
+        costs.insert(u64::from(r) << 32 | u64::from(l), cost.parse::<i32>()?);
     }
+    let mut pairs: Vec<(u64, i32)> = costs.into_iter().collect();
     pairs.sort_unstable();
-    pairs.dedup_by_key(|p| p.0);
     let rows = |name: &str, ids: &HashMap<String, u32>| -> Result<Vec<Vec<u32>>> {
         let mut rows: Vec<Vec<u32>> = vec![Vec::new()];
         for line in open(name)?.lines() {

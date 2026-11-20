@@ -193,7 +193,20 @@ impl Dictionary {
             ));
         }
         let config = common::bincode_config();
-        let data = bincode::decode_from_std_read(&mut rdr, config)?;
+        let data: DictionaryInner = bincode::decode_from_std_read(&mut rdr, config)?;
+        // the ids the words take into the connector are within it, as a
+        // dictionary built here has them: one that is not (damaged or
+        // crafted) is refused, not read past the connector's tables
+        let conn = &data.connector;
+        let fits = data.system_lexicon.verify(conn)
+            && data.user_lexicon.as_ref().is_none_or(|l| l.verify(conn))
+            && data.unk_handler.verify(conn);
+        if !fits {
+            return Err(VibratoError::invalid_argument(
+                "rdr",
+                "The dictionary's connection ids exceed its connector.",
+            ));
+        }
         Ok(data)
     }
 

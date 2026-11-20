@@ -129,6 +129,14 @@ impl CharNgram {
                 && t.u32(Sec::TrigramStart, bigrams) as usize == trigrams,
             "section counts disagree"
         );
+        // what the lookups take for granted: a char's id fits a u16, and the
+        // starts rise (a range past its section was read otherwise)
+        ensure!(chars <= 1 << 16, "{chars} chars, more than ids");
+        let rising = |s: Sec, n: usize| (0..n).all(|i| t.u32(s, i) <= t.u32(s, i + 1));
+        ensure!(
+            rising(Sec::BigramStart, chars) && rising(Sec::TrigramStart, bigrams),
+            "section starts out of order"
+        );
         Ok(t)
     }
 

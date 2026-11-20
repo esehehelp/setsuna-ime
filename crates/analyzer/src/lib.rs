@@ -36,6 +36,8 @@ pub use alternates::Alternates;
 pub const MAX_GROUPING_LEN: usize = 24;
 pub const ALT_MAX_COST: i32 = 3000;
 pub const MAX_ALTS: usize = 8;
+/// The most bytes a dictionary may be once decompressed.
+const MAX_DICTIONARY_BYTES: u64 = 1 << 30;
 
 /// One word of an analysis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -99,19 +101,24 @@ impl Analyzer {
             max_alts: d.max_alts.unwrap_or(MAX_ALTS),
         };
         let read = || format!("read dictionary {}", path.display());
+        // no more than a dictionary may be once decompressed: a small file
+        // that decompresses past it (damaged or crafted) ends there
+        let unzip = |file| -> Result<_> {
+            use std::io::Read;
+            Ok(zstd::Decoder::new(file)?.take(MAX_DICTIONARY_BYTES))
+        };
         let engine = match &manifest.packed {
             // the manifest's format, checked when it loaded
             Some(codes) => Engine::Packed {
                 tokenizer: vibrato_packed::Tokenizer::new(
-                    vibrato_packed::Dictionary::read(zstd::Decoder::new(file)?)
-                        .with_context(read)?,
+                    vibrato_packed::Dictionary::read(unzip(file)?).with_context(read)?,
                 )
                 .max_grouping_len(config.max_grouping_len),
                 codes: packed::Codes::new(codes)?,
             },
             None => Engine::Vibrato {
                 tokenizer: vibrato::Tokenizer::new(
-                    vibrato::Dictionary::read(zstd::Decoder::new(file)?).with_context(read)?,
+                    vibrato::Dictionary::read(unzip(file)?).with_context(read)?,
                 )
                 .max_grouping_len(config.max_grouping_len),
                 alternates: manifest

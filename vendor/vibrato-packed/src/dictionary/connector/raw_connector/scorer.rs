@@ -205,11 +205,21 @@ impl<Context> Decode<Context> for Scorer {
                 found: costs.len(),
             });
         }
+        // what `retrieve_cost` takes for granted: a base is a U31 (the AVX2
+        // path compares signed and gathers at `base ^ key2`, which a base
+        // with bit 31 set made negative: a read before the table), and the
+        // lengths fit an i32
+        if bases.iter().any(|&b| b > U31::MAX.get()) {
+            return Err(DecodeError::Other("a scorer base past 31 bits"));
+        }
+        if i32::try_from(bases.len()).is_err() || i32::try_from(checks.len()).is_err() {
+            return Err(DecodeError::Other("a scorer table past i32::MAX entries"));
+        }
 
         #[cfg(target_feature = "avx2")]
-        let bases_len = unsafe { x86_64::_mm256_set1_epi32(i32::try_from(bases.len()).unwrap()) };
+        let bases_len = unsafe { x86_64::_mm256_set1_epi32(bases.len() as i32) };
         #[cfg(target_feature = "avx2")]
-        let checks_len = unsafe { x86_64::_mm256_set1_epi32(i32::try_from(checks.len()).unwrap()) };
+        let checks_len = unsafe { x86_64::_mm256_set1_epi32(checks.len() as i32) };
 
         Ok(Self {
             bases,

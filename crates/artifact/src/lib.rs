@@ -23,6 +23,47 @@ pub struct Envelope {
 
 /// Read a manifest file, returning its envelope and the full JSON value for
 /// family-specific parsing.
+/// The file `rel` a manifest at `manifest` names, beside it or below: a
+/// relative path of plain names (no `..`, no drive, no root, no share:
+/// `\\host\share` would send the user's credentials to the host), which
+/// stays within the manifest's directory when links are followed too.
+/// `what` names it in the errors.
+pub fn file_within(manifest: &Path, rel: &Path, what: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    anyhow::ensure!(
+        !rel.as_os_str().is_empty()
+            && rel
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir)),
+        "manifest {}: {what} {} is not a path within the manifest's directory",
+        manifest.display(),
+        rel.display()
+    );
+    let base = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let full = base.join(rel);
+    anyhow::ensure!(
+        full.is_file(),
+        "manifest {}: {what} {} not found",
+        manifest.display(),
+        full.display()
+    );
+    let canonical = std::fs::canonicalize(&full)
+        .with_context(|| format!("manifest {}: {what} {}", manifest.display(), full.display()))?;
+    let root = std::fs::canonicalize(if base.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base
+    })
+    .with_context(|| format!("manifest {}: its directory", manifest.display()))?;
+    anyhow::ensure!(
+        canonical.starts_with(&root),
+        "manifest {}: {what} {} leads out of the manifest's directory",
+        manifest.display(),
+        rel.display()
+    );
+    Ok(full)
+}
+
 pub fn read_manifest(path: &Path) -> Result<(Envelope, serde_json::Value)> {
     let bytes = std::fs::read(path).with_context(|| format!("read manifest {}", path.display()))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -248,6 +289,12 @@ pub struct ArDecoderArtifact {
     pub script: Option<ScriptLatentArtifact>,
 }
 
+/// The longest input a manifest may say its model takes (tokens), and the
+/// highest CTC-CRF rank: past them a manifest is no model's (and the
+/// buffers sized by them would not fit).
+pub const MAX_SEQ_LEN: usize = 1 << 14;
+pub const MAX_CRF_RANK: usize = 4096;
+
 /// The classes of [`ScriptLatentArtifact`], in the order of its `script_bias`.
 pub const SCRIPT_CLASSES: [&str; 4] = ["other", "kanji", "hiragana", "katakana"];
 
@@ -351,15 +398,22 @@ impl CtcNatManifest {
             path.display(),
             file.proposal.precision
         );
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        let resolve = |p: &Path, what: &str| -> Result<PathBuf> {
-            let full = base.join(p);
+        anyhow::ensure!(
+            (1..=MAX_SEQ_LEN).contains(&file.max_seq_len),
+            "manifest {}: max_seq_len {} out of 1..={MAX_SEQ_LEN}",
+            path.display(),
+            file.max_seq_len
+        );
+        if let Some(c) = &file.crf {
             anyhow::ensure!(
-                full.is_file(),
-                "manifest {}: {what} {} not found",
+                (1..=MAX_CRF_RANK).contains(&c.rank),
+                "manifest {}: CRF rank {} out of 1..={MAX_CRF_RANK}",
                 path.display(),
-                full.display()
+                c.rank
             );
+        }
+        let resolve = |p: &Path, what: &str| -> Result<PathBuf> {
+            let full = file_within(path, p, what)?;
             // absolute, without `..`: on Windows the `\\?\` form, which ONNX
             // Runtime opens past MAX_PATH (an export path of 274 chars, or a
             // shorter one through `../..`, was "File doesn't exist" to it)
@@ -413,6 +467,14 @@ impl CtcNatManifest {
                         "manifest {}: native AR step precision {:?}, expected int8",
                         path.display(),
                         n.precision
+                    );
+                }
+                if let Some(s) = &a.step {
+                    anyhow::ensure!(
+                        matches!(s.precision.as_str(), "fp32" | "fp16" | "int8" | "int4"),
+                        "manifest {}: unknown AR step precision {:?}",
+                        path.display(),
+                        s.precision
                     );
                 }
                 if let Some(s) = &a.script {
@@ -495,6 +557,12 @@ impl CtcNatManifest {
                     !c.threshold.is_nan(),
                     "manifest {}: corrector.threshold is NaN",
                     path.display()
+                );
+                anyhow::ensure!(
+                    (1..=MAX_SEQ_LEN).contains(&c.max_seq_len),
+                    "manifest {}: corrector.max_seq_len {} out of 1..={MAX_SEQ_LEN}",
+                    path.display(),
+                    c.max_seq_len
                 );
                 if let Some(ids) = &c.proposal.logit_ids {
                     check_logit_ids(ids, path, "corrector.proposal")?;
@@ -664,14 +732,7 @@ impl LmScorerManifest {
             path.display(),
             file.weights.precision
         );
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        let weights_path = base.join(&file.weights.path);
-        anyhow::ensure!(
-            weights_path.is_file(),
-            "manifest {}: weights {} not found",
-            path.display(),
-            weights_path.display()
-        );
+        let weights_path = file_within(path, &file.weights.path, "weights")?;
         let tokenizer_path = match &file.tokenizer {
             Some(t) => {
                 anyhow::ensure!(
@@ -680,14 +741,7 @@ impl LmScorerManifest {
                     path.display(),
                     t.format
                 );
-                let p = base.join(&t.path);
-                anyhow::ensure!(
-                    p.is_file(),
-                    "manifest {}: tokenizer {} not found",
-                    path.display(),
-                    p.display()
-                );
-                Some(p)
+                Some(file_within(path, &t.path, "tokenizer")?)
             }
             None => None,
         };
@@ -832,17 +886,7 @@ impl AnalyzerManifest {
                 path.display()
             ),
         }
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        let resolve = |p: &Path, what: &str| -> Result<PathBuf> {
-            let full = base.join(p);
-            anyhow::ensure!(
-                full.is_file(),
-                "manifest {}: {what} {} not found",
-                path.display(),
-                full.display()
-            );
-            Ok(full)
-        };
+        let resolve = |p: &Path, what: &str| file_within(path, p, what);
         Ok(Self {
             manifest_path: path.to_path_buf(),
             dictionary_path: resolve(&file.dictionary.path, "dictionary")?,
@@ -1421,6 +1465,33 @@ mod tests {
             .join("../../tests/fixtures/ctc_nat_manifest/model.int4.manifest.json");
         assert!(LmScorerManifest::load(&ctc).is_err());
         assert!(CtcNatManifest::load(&ok).is_err());
+        // a file out of the manifest's directory, however it is named
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let outside = write(&dir, "outside.gguf", "");
+        let outside = outside.to_string_lossy().replace('\\', "/");
+        for path in [
+            "../outside.gguf",
+            "./../outside.gguf",
+            outside.as_str(),
+            "//host/share/w.gguf",
+            "",
+        ] {
+            let weights = format!(r#"{{"path":"{path}","format":"gguf","precision":"f16"}}"#);
+            let m = write(&inner, "out.json", &body(&weights, ""));
+            assert!(LmScorerManifest::load(&m).is_err(), "{path}");
+        }
+        // one below it is fine
+        write(&inner, "sub.gguf", "");
+        let below = write(
+            &dir,
+            "below.json",
+            &body(
+                r#"{"path":"inner/sub.gguf","format":"gguf","precision":"f16"}"#,
+                "",
+            ),
+        );
+        assert!(LmScorerManifest::load(&below).is_ok());
     }
 
     #[test]

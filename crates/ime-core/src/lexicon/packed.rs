@@ -134,6 +134,25 @@ impl Bv {
         r
     }
 
+    /// Whether the superblocks count the ones before them, as `rank` and
+    /// `select` take them to (their words and counts within the file);
+    /// the ones in all.
+    fn check(&self, b: &[u8]) -> Result<usize> {
+        let mut ones = 0usize;
+        for s in 0..=self.n.div_ceil(SUPER) {
+            ensure!(
+                self.sup(b, s) == ones,
+                "lexicon: a bit vector's counts are off"
+            );
+            let w0 = s * SUPER / 64;
+            let w1 = ((s + 1) * SUPER / 64).min(self.n.div_ceil(64));
+            for w in w0..w1 {
+                ones += self.word(b, w).count_ones() as usize;
+            }
+        }
+        Ok(ones)
+    }
+
     /// Where the `k`-th one is (from 0); `n` past the last.
     fn select(&self, b: &[u8], k: usize) -> usize {
         let supers = self.n.div_ceil(SUPER) + 1;
@@ -488,11 +507,47 @@ impl Packed {
             sec(Sec::SurfAlphabet).0 == pad8(HEADER + 8 * SECTIONS),
             "lexicon of an older layout: build it again"
         );
-        let (end, len) = sec(Sec::Connection);
-        ensure!(
-            b.len() >= end + len + 8 && len * 8 >= ids * ids * CONN_BITS as usize,
-            "lexicon truncated"
-        );
+        // every section within the file, 8 bytes after it as the reads of
+        // bit-packed values take, and as long as its counts make it
+        let section = |s: Sec, bits_needed: Option<usize>| -> Result<()> {
+            let (at, len) = sec(s);
+            let end = at.checked_add(len).and_then(|e| e.checked_add(8));
+            ensure!(
+                end.is_some_and(|e| e <= b.len())
+                    && bits_needed.is_some_and(|n| len.checked_mul(8).is_some_and(|l| l >= n)),
+                "lexicon truncated"
+            );
+            Ok(())
+        };
+        let mul = |a: usize, b: usize| a.checked_mul(b);
+        let entry_width = bits(readings) + bits(triples) + COST_BITS;
+        ensure!(entry_width <= 57, "lexicon: an entry wider than 57 bits");
+        let bv_words = mul(entries.div_ceil(64), 64);
+        let bv_supers = mul(entries.div_ceil(SUPER) + 1, 32);
+        for (s, need) in [
+            (Sec::SurfAlphabet, Some(0)),
+            (Sec::SurfRanks, Some(0)),
+            (Sec::SurfBlocks, mul(keys.div_ceil(BLOCK), 32)),
+            (Sec::SurfData, Some(0)),
+            (Sec::ReadAlphabet, Some(0)),
+            (Sec::ReadRanks, Some(0)),
+            (Sec::ReadBlocks, mul(readings.div_ceil(BLOCK), 32)),
+            (Sec::ReadData, Some(0)),
+            (Sec::Triples, mul(triples, 64)),
+            (Sec::Entries, mul(entries, entry_width as usize)),
+            (Sec::KeyBits, bv_words),
+            (Sec::KeySuper, bv_supers),
+            (Sec::ByReading, mul(entries, bits(entries) as usize)),
+            (Sec::ReadBits, bv_words),
+            (Sec::ReadSuper, bv_supers),
+            (Sec::ConnBook, Some(32 << CONN_BITS)),
+            (
+                Sec::Connection,
+                mul(ids, ids).and_then(|n| n.checked_mul(CONN_BITS as usize)),
+            ),
+        ] {
+            section(s, need)?;
+        }
         let fct = |n: usize, a: Sec, r: Sec, k: Sec, d: Sec| Fct {
             n,
             alphabet: sec(a).0,
@@ -538,6 +593,48 @@ impl Packed {
             conn: sec(Sec::Connection).0,
             conn_book: sec(Sec::ConnBook).0,
         })
+        .and_then(|p| {
+            p.check(b, readings, triples)?;
+            Ok(p)
+        })
+    }
+
+    /// Whether what the lookups read is all there: every string of both
+    /// tables decodes within its data to codes of its alphabet, every
+    /// entry's reading and triple are ones there are, the list by reading
+    /// holds entries, and the bit vectors mark as many surfaces and
+    /// readings as there are, the first entry the first's. A damaged file
+    /// is refused here rather than taken down an app later.
+    fn check(&self, b: &[u8], readings: usize, triples: usize) -> Result<()> {
+        self.surf
+            .check(b, &sec_len(b, Sec::SurfRanks), &sec_len(b, Sec::SurfData))?;
+        self.read
+            .check(b, &sec_len(b, Sec::ReadRanks), &sec_len(b, Sec::ReadData))?;
+        let w = self.read_bits + self.triple_bits + COST_BITS;
+        for e in 0..self.entries {
+            let v = packed(b, self.entry_at, w, e);
+            let reading = (v >> (self.triple_bits + COST_BITS)) as usize;
+            let t = ((v >> COST_BITS) & ((1 << self.triple_bits) - 1)) as usize;
+            ensure!(
+                reading < readings && t < triples,
+                "lexicon: an entry out of range"
+            );
+            let by = packed(b, self.by_reading, self.entry_bits, e) as usize;
+            ensure!(
+                by < self.entries,
+                "lexicon: the list by reading out of range"
+            );
+        }
+        let starts = |bv: &Bv| bv.word(b, 0) & 1 == 1;
+        ensure!(
+            self.key_bv.check(b)? == self.keys && self.read_bv.check(b)? == readings,
+            "lexicon: the bit vectors mark other counts"
+        );
+        ensure!(
+            self.entries == 0 || starts(&self.key_bv) && starts(&self.read_bv),
+            "lexicon: the first entry starts no surface"
+        );
+        Ok(())
     }
 
     pub(super) fn ids(&self) -> usize {
@@ -622,6 +719,68 @@ impl Packed {
 
     pub(super) fn keys(&self) -> usize {
         self.keys
+    }
+}
+
+/// The byte length of section `s` (its offset's checked by `open`).
+fn sec_len(b: &[u8], s: Sec) -> usize {
+    u32_at(b, HEADER + 8 * s as usize + 4)
+}
+
+impl Fct {
+    /// Whether every string decodes within the data (`data` bytes) to
+    /// codes of the alphabet, by ranks within the ranks (`ranks` bytes).
+    fn check(&self, b: &[u8], ranks: &usize, data: &usize) -> Result<()> {
+        let bad = || anyhow::anyhow!("lexicon: a string table out of range");
+        let end = self.data + data;
+        let byte = |o: usize| -> Result<u8> {
+            if o < end {
+                Ok(b[o])
+            } else {
+                Err(bad())
+            }
+        };
+        let code = |o: &mut usize| -> Result<()> {
+            let c = if self.ranks == 0 {
+                *o += 1;
+                usize::from(byte(*o - 1)?)
+            } else {
+                let first = byte(*o)?;
+                let rank = if first < ONE_BYTE as u8 {
+                    *o += 1;
+                    usize::from(first)
+                } else {
+                    *o += 2;
+                    ONE_BYTE + (usize::from(first & 0x7F) << 8 | usize::from(byte(*o - 1)?))
+                };
+                ensure!(2 * rank + 2 <= *ranks, bad());
+                let at = self.ranks + 2 * rank;
+                usize::from(u16::from_le_bytes([b[at], b[at + 1]]))
+            };
+            ensure!(c < self.letters, bad());
+            Ok(())
+        };
+        for blk in 0..self.n.div_ceil(BLOCK) {
+            let mut o = self.data + u32_at(b, self.blocks + 4 * blk);
+            let mut len = 0usize;
+            for k in 0..BLOCK.min(self.n - blk * BLOCK) {
+                let rest = if k == 0 {
+                    o += 1;
+                    usize::from(byte(o - 1)?)
+                } else {
+                    let shared = usize::from(byte(o)?);
+                    ensure!(shared <= len, bad());
+                    o += 2;
+                    len = shared;
+                    usize::from(byte(o - 1)?)
+                };
+                for _ in 0..rest {
+                    code(&mut o)?;
+                }
+                len += rest;
+            }
+        }
+        Ok(())
     }
 }
 

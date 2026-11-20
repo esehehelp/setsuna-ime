@@ -1,11 +1,17 @@
 //! Common settings in Vibrato.
-use bincode::config::{self, Fixint, LittleEndian};
+use bincode::config::{self, Fixint, Limit, LittleEndian};
+
+/// The most bytes a dictionary may claim as it is read: a length past it
+/// (a damaged or crafted file) is an error, not an allocation of that size.
+pub const MAX_DICTIONARY_BYTES: usize = 1 << 30;
 
 /// Gets the common bincode configuration of serialization.
-pub const fn bincode_config() -> config::Configuration<LittleEndian, Fixint> {
+pub const fn bincode_config(
+) -> config::Configuration<LittleEndian, Fixint, Limit<MAX_DICTIONARY_BYTES>> {
     config::standard()
         .with_little_endian()
         .with_fixed_int_encoding()
+        .with_limit::<MAX_DICTIONARY_BYTES>()
 }
 
 /// The maximam length of an input sentence.
