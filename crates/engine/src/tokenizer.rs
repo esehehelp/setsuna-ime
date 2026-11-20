@@ -48,6 +48,14 @@ impl SharedCharTokenizer {
             }
         }
         anyhow::ensure!(max_id >= 0, "no tokens parsed from {}", path.display());
+        // the table is as long as the highest id: one far past the entries (a line's id of 4294967295) asked for
+        // a hundred gigabytes
+        anyhow::ensure!(
+            (max_id as usize) < token_to_id.len().saturating_mul(2).max(16),
+            "{}: id {max_id} for {} tokens",
+            path.display(),
+            token_to_id.len()
+        );
 
         let mut id_to_token = vec![String::new(); (max_id + 1) as usize];
         for (tok, id) in &token_to_id {

@@ -110,7 +110,11 @@ impl PairTable {
         let v = u32::from_le_bytes(head[8..12].try_into().unwrap()) as usize;
         let nnz = u64::from_le_bytes(head[16..24].try_into().unwrap()) as usize;
         ensure!(v <= u16::MAX as usize + 1, "{v} chars do not fit u16 ids");
-        let want = 24 + 4 * v + 4 * (v + 1) + 2 * nnz + 4 * nnz;
+        // nnz is the file's word: a count past usize wrapped this sum and could match a short file
+        let want = nnz
+            .checked_mul(6)
+            .and_then(|n| n.checked_add(24 + 4 * v + 4 * (v + 1)))
+            .with_context(|| format!("{nnz} pairs is too many"))?;
         let len = r.seek(SeekFrom::End(0))? as usize;
         ensure!(
             len == want,

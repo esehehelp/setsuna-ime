@@ -41,8 +41,14 @@ pub(crate) fn group_moe(
     (w1, s1, z1, b1): (&[u8], &[f32], &[f32], Vec<f32>),
     (w2, s2, z2, b2): (&[u8], &[f32], &[f32], Vec<f32>),
 ) -> Result<GroupMoe, String> {
-    if g == 0 || d % g != 0 || f % g != 0 {
-        return Err(format!("the group {g} must divide d {d} and f {f}"));
+    if g == 0 || d == 0 || f == 0 || d % g != 0 || f % g != 0 {
+        return Err(format!(
+            "the group {g} must divide d {d} and f {f}, none of them 0"
+        ));
+    }
+    // a row goes to its k best experts: at least one, and no more than there are
+    if k == 0 || k > e {
+        return Err(format!("top {k} of {e} experts"));
     }
     if router.len() != e * d
         || w1.len() != e * f * d / 2

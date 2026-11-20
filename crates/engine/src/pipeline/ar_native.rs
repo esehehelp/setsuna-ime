@@ -177,7 +177,12 @@ pub(crate) fn parse_safetensors(data: &[u8], format: &str) -> Result<(String, We
             body.len()
         );
         let bytes = &body[b..e];
-        let count: usize = shape.iter().product();
+        // a product past usize wrapped and could match a short tensor, whose shape the kernels then go by
+        let count = shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .and_then(|n| n.checked_mul(4).map(|_| n))
+            .with_context(|| format!("{name}: shape {shape:?} too large"))?;
         let w = match dtype {
             "I8" => {
                 anyhow::ensure!(
@@ -523,6 +528,8 @@ impl<'a> NativeSearch<'a> {
     ) -> Result<Self> {
         let c = &dec.config;
         let (l, h, dh) = (c.layers, c.heads, c.head_dim);
+        // no frame to attend to: the cross-attention's softmax over none
+        anyhow::ensure!(frames > 0, "no frames to search over");
         let n = l * h * frames * dh;
         anyhow::ensure!(
             cross_k.len() == n && cross_v.len() == n,

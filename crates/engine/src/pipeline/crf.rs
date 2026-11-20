@@ -25,7 +25,13 @@ impl CrfTables {
         ensure!(rank > 0, "CRF rank must be positive");
         let bytes =
             std::fs::read(path).with_context(|| format!("read CRF table {}", path.display()))?;
-        let want = ((vocab + 1) * rank + vocab * rank) * 4;
+        // ((V+1) + V) x r floats; a rank past usize wrapped this and could match a short file
+        let want = vocab
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(rank))
+            .and_then(|n| n.checked_mul(4))
+            .with_context(|| format!("CRF rank {rank} over {vocab} tokens is too large"))?;
         ensure!(
             bytes.len() == want,
             "CRF table {} has {} bytes; rank {rank} over {vocab} tokens needs {want}",

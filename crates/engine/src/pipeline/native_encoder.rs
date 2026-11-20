@@ -696,7 +696,7 @@ impl NativeEncoder {
         let c = &config;
         let (d, p, v) = (c.hidden, c.max_positions, c.vocab);
         anyhow::ensure!(
-            c.layers > 0 && c.heads > 0 && d % c.heads == 0 && v > 0 && p > 0,
+            c.layers > 0 && c.heads > 0 && d > 0 && d % c.heads == 0 && v > 0 && p > 0,
             "config {c:?}: sizes must be positive and hidden a multiple of heads"
         );
         let isa = detect_isa();
@@ -752,7 +752,10 @@ impl NativeEncoder {
                         && pc.multipliers.iter().all(|m| m.len() == max_order)
                         && pc.orders.iter().all(|&o| o >= 1)
                         && pc.table_sizes.iter().all(|&s| s > 0)
-                        && pc.table_sizes.iter().zip(&pc.row_offsets).all(|(&s, &o)| (s + o) as usize <= pc.rows),
+                        // a sum past the integer wrapped and passed
+                        && pc.table_sizes.iter().zip(&pc.row_offsets).all(|(&s, &o)| {
+                            s.checked_add(o).is_some_and(|end| (end as usize) <= pc.rows)
+                        }),
                     "PLE config: one order, size, offset, salt and max-order multipliers a slot, every table in the rows"
                 );
                 Some(Ple {
@@ -860,7 +863,7 @@ impl NativeEncoder {
                     .collect::<Result<Vec<_>>>()?;
                 let kv = Linear::load(isa, int8, w, "decoder.kv", true)?;
                 anyhow::ensure!(
-                    (kv.k(), kv.n()) == (d, 2 * d * dc.layers) && d % dc.heads == 0,
+                    (kv.k(), kv.n()) == (d, 2 * d * dc.layers) && dc.heads > 0 && d % dc.heads == 0,
                     "decoder.kv is ({}, {}), expected ({d}, {})",
                     kv.k(),
                     kv.n(),
@@ -1178,6 +1181,11 @@ fn load_moe(w: &Weights, name: &str, mc: &MoeConfig, d: usize) -> Result<GroupMo
         "{name}.w1 is {s1shape:?}, expected (E {e}, d / g, f, g / 2)"
     );
     let (f, g) = (s1shape[2], s1shape[3] * 2);
+    // the shapes below divide by the group
+    anyhow::ensure!(
+        g > 0 && d % g == 0 && f % g == 0,
+        "{name}: group {g} for d {d}, f {f}"
+    );
     let (w2, _) = w.u8_any(&format!("{name}.w2"))?;
     let s1 = w.f32(&format!("{name}.s1"), &[e, f, d / g])?;
     let z1 = w.f32(&format!("{name}.z1"), &[e, f, d / g])?;
