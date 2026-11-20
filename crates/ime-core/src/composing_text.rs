@@ -738,10 +738,17 @@ impl ComposingText {
     /// model sees a clean reading even if the user pressed Space before
     /// typing the final vowel.
     pub fn commit_reading(&mut self) -> String {
-        let reading = self.convert(&self.raw, true).text;
+        let read = self.convert(&self.raw, true);
         let frozen = self.frozen(&self.raw, true);
-        self.raw = frozen.text;
-        self.raw.push_str(&frozen.pending);
+        let raw = frozen.text + &frozen.pending;
+        // the input as read, unless it reads otherwise so: a word typed with
+        // Shift read up to its particle (Nandina + は) is no longer at the
+        // input's end once the particle is kana, and read finished it split
+        // elsewhere (Nand + いなは); the input stays as typed then
+        if self.convert(&raw, true) == read {
+            self.raw = raw;
+        }
+        let reading = read.text;
         self.cursor = self.raw.chars().count();
         // typing is done for this conversion: a mixed input reads as it did
         // above (`how` English, not ほ + a pending w)

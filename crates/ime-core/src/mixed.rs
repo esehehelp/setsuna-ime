@@ -423,13 +423,16 @@ impl MixedModel {
     /// `segment` with the reading lexicon, which reads the words romaji
     /// reads wholly as kana (`kana_words`).
     ///
-    /// Typing done reads only the end otherwise (`ok`: お and a pending k
-    /// while typed, OK when done): where the spans read while typing end in
-    /// Japanese with no romaji still being typed, they stand. A Latin word
-    /// read whole while it might still grow, then split before its particle
-    /// (Nandina + は of `Nandinaha`), was otherwise read again as a finished
-    /// word, dearer than another split (Nand + いなは), and Enter and Space
-    /// converted what was never shown.
+    /// Typing done, a word typed with Shift that typing read up to its
+    /// particle (`shifted_word_and_particle`) stays so where read done it is
+    /// cut inside, before kana no particle starts (`cut_inside`): read whole
+    /// while it might still grow, then split before the particle (Nandina +
+    /// は of `Nandinaha`), it was read again as a finished word, dearer than
+    /// a cut inside it (Nand + いなは), and Enter and Space converted what
+    /// was never shown. Any other reading typing done reads again (`ok`: お
+    /// and a pending k while typed, OK when done; `unde` after English, un
+    /// + で while typed, うんで when done; a name read whole, or up to a
+    /// particle, Jura + は).
     pub fn segment_with(
         &self,
         typed: &str,
@@ -437,20 +440,16 @@ impl MixedModel {
         fin: bool,
         lexicon: Option<&Lexicon>,
     ) -> Vec<Span> {
-        if fin {
+        let done = self.segment_once(typed, before, fin, lexicon);
+        if fin && typed.chars().any(|c| c.is_ascii_uppercase()) {
             let typing = self.segment_once(typed, before, false, lexicon);
-            let chars: Vec<char> = typed.chars().collect();
-            let done = typing.last().is_some_and(|last| {
-                last.lang == Lang::Ja
-                    && !romaji_units(&chars[last.start..last.end], false)
-                        .last()
-                        .is_some_and(|u| matches!(u.kind, UnitKind::Pending))
-            });
-            if done {
+            if shifted_word_and_particle(typed, &typing)
+                .is_some_and(|word| cut_inside(typed, &done, word))
+            {
                 return typing;
             }
         }
-        self.segment_once(typed, before, fin, lexicon)
+        done
     }
 
     /// `segment_with`, read once as `fin` says.
@@ -1886,6 +1885,49 @@ fn before_kana(done: &[Span], chars: &[char], span: Span) -> char {
         .unwrap_or('^')
 }
 
+/// The English word `spans` of `typed` end in, with a capital (Shift marks
+/// English), when Japanese from a particle follows it right away with no
+/// romaji still being typed: how `split_particles` reads such a word and
+/// its particle (Nandina + は).
+fn shifted_word_and_particle(typed: &str, spans: &[Span]) -> Option<Span> {
+    let [.., word, ja] = spans else {
+        return None;
+    };
+    let chars: Vec<char> = typed.chars().collect();
+    let shifted = word.lang == Lang::En
+        && ja.lang == Lang::Ja
+        && word.end == ja.start
+        && chars[word.start..word.end]
+            .iter()
+            .any(|c| c.is_ascii_uppercase())
+        && starts_with_particle(&chars, *ja)
+        && !romaji_units(&chars[ja.start..ja.end], false)
+            .last()
+            .is_some_and(|u| matches!(u.kind, UnitKind::Pending));
+    shifted.then_some(*word)
+}
+
+/// Whether `spans` of `typed` end in `word` cut inside, English up to the
+/// cut and then Japanese no particle starts (Nand + いなは of Nandina + は).
+fn cut_inside(typed: &str, spans: &[Span], word: Span) -> bool {
+    let [.., en, ja] = spans else {
+        return false;
+    };
+    let chars: Vec<char> = typed.chars().collect();
+    en.lang == Lang::En
+        && ja.lang == Lang::Ja
+        && en.start == word.start
+        && en.end == ja.start
+        && en.end < word.end
+        && !starts_with_particle(&chars, *ja)
+}
+
+/// Whether the romaji of `span` starts with a particle, typed in lowercase.
+fn starts_with_particle(chars: &[char], span: Span) -> bool {
+    let rest: String = chars[span.start..span.end].iter().collect();
+    PARTICLES.iter().any(|p| rest.starts_with(p))
+}
+
 /// Punctuation that ends or splits a sentence, typed after a word.
 fn is_sentence_punct(c: char) -> bool {
     matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
@@ -2659,25 +2701,34 @@ pub(crate) mod tests {
         );
     }
 
-    /// Typing done, a Latin word read whole while it might still grow, then
-    /// split before its particle, stands (Nandina + は; read again as a
-    /// finished word it cost more than Nand + いなは); romaji still being
-    /// typed is read again (`ok`).
+    /// Typing done, a word typed with Shift that typing read whole while it
+    /// might still grow, then split before its particle, stands (Nandina +
+    /// は; read again as a finished word it cost more than Nand + いなは).
+    /// The rest is read again: romaji still being typed (`ok`), a lowercase
+    /// word split so (`unde` after English: うんで), a name whose prefix
+    /// typing does not know.
     #[test]
     fn the_shipped_model_reads_done_what_it_showed() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
-        let m = MixedModel::load(&dir).unwrap();
-        let typing = |typed: &str| {
-            let (chars, spans) = m.cased(typed, None, false, Casing::default());
+        let mut m = MixedModel::load(&dir).unwrap();
+        m.add_names("Sardegna\t1\n");
+        let typing = |m: &MixedModel, typed: &str, before: Option<&str>| {
+            let (chars, spans) = m.cased(typed, before, false, Casing::default());
             let (text, pending) = render_parts(&chars, &spans, false, &HashMap::new());
             text + &pending
         };
         for (typed, shown) in [("Nandinaha", "Nandinaは"), ("Nandinatoha", "Nandinaとは")] {
-            assert_eq!(typing(typed), shown);
+            assert_eq!(typing(&m, typed, None), shown);
             assert_eq!(cased(&m, typed, None), shown);
         }
-        assert_eq!(typing("ok"), "おk");
-        assert_eq!(cased(&m, "ok", None), "OK");
+        for (typed, before, shown, done) in [
+            ("ok", None, "おk", "OK"),
+            ("unde", Some("luck "), "unで", "うんで"),
+            ("sardegna", None, "sarでgな", "Sardegna"),
+        ] {
+            assert_eq!(typing(&m, typed, before), shown);
+            assert_eq!(cased(&m, typed, before), done);
+        }
     }
 
     /// A letter the Japanese reading leaves, with the letters around it a
