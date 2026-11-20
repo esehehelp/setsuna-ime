@@ -37,17 +37,22 @@ pub(crate) struct ModeState {
     /// app's sandbox with no shared engine to reach) the tooltip says the
     /// IME types kana only.
     pub converts: Cell<bool>,
+    /// The menu may start the settings GUI: not on a secure desktop (the
+    /// sign-in screen, a UAC prompt) nor in an elevated app, whose token
+    /// the GUI would run with (SYSTEM's on the sign-in screen).
+    settings: bool,
     sink: RefCell<Option<ITfLangBarItemSink>>,
     /// A click on the item: the service toggles the mode.
     on_click: Box<dyn Fn()>,
 }
 
 impl ModeState {
-    pub fn new(on: bool, on_click: Box<dyn Fn()>) -> Rc<Self> {
+    pub fn new(on: bool, settings: bool, on_click: Box<dyn Fn()>) -> Rc<Self> {
         Rc::new(Self {
             on: Cell::new(on),
             rewrite: Cell::new(false),
             converts: Cell::new(true),
+            settings,
             sink: RefCell::new(None),
             on_click,
         })
@@ -196,7 +201,9 @@ impl ITfLangBarItemButton_Impl for ModeItem_Impl {
         setsuna_core::diagnostics::log(format!("mode item click {}", click.0));
         crate::guard::catch("mode item click", Err(E_FAIL.into()), || {
             if click == TF_LBI_CLK_RIGHT {
-                show_menu(*pt);
+                if self.state.settings {
+                    show_menu(*pt);
+                }
             } else {
                 (self.state.on_click)();
             }
@@ -207,7 +214,7 @@ impl ITfLangBarItemButton_Impl for ModeItem_Impl {
     /// The menu for the old floating language bar; the taskbar's input
     /// indicator never asks for it (`show_menu`).
     fn InitMenu(&self, pmenu: Option<&ITfMenu>) -> Result<()> {
-        let Some(menu) = pmenu else {
+        let Some(menu) = pmenu.filter(|_| self.state.settings) else {
             return Ok(());
         };
         let text: Vec<u16> = "設定...".encode_utf16().collect();
@@ -224,7 +231,7 @@ impl ITfLangBarItemButton_Impl for ModeItem_Impl {
     }
 
     fn OnMenuSelect(&self, wid: u32) -> Result<()> {
-        if wid == MENU_SETTINGS {
+        if wid == MENU_SETTINGS && self.state.settings {
             open_settings();
         }
         Ok(())

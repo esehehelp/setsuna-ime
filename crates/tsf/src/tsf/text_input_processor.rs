@@ -1065,8 +1065,13 @@ impl SetsunaTextService_Impl {
             Some((c, cookie))
         });
         let hwnd_raw = notify_hwnd.0 as isize;
+        // the settings GUI runs with this process's token: not from a secure
+        // desktop (the sign-in screen's is SYSTEM's) nor an elevated app
+        let settings =
+            dwflags & TF_TMF_SECUREMODE == 0 && !setsuna_core::config::process_is_elevated();
         let state = ModeState::new(
             on,
+            settings,
             Box::new(move || unsafe {
                 let _ = PostMessageW(
                     HWND(hwnd_raw as *mut core::ffi::c_void),
