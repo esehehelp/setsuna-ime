@@ -39,7 +39,8 @@ $Version = $Matches[1]
 $Name = "setsuna-ime-$Version-windows-x64"
 
 if (-not $SkipBuild) {
-    cargo build --release -p setsuna-tsf -p setsuna-engine -p setsuna-settings -p setsuna-rewrite -p setsuna-rerank
+    # the shim and setsuna-tsf-check too: the zip takes them from target\release
+    cargo build --release -p setsuna-tsf -p setsuna-tsf-shim -p setsuna-engine -p setsuna-settings -p setsuna-rewrite -p setsuna-rerank
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 }
 

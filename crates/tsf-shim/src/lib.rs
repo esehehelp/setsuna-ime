@@ -30,6 +30,60 @@
 //! `regsvr32 /n /i:test` registers it beside the IME instead, as "Setsuna
 //! (shim test)", for trying a shim; `setsuna-tsf-check` (src/bin/check.rs)
 //! tries a core through the registered shim before an install names it.
+//!
+//! An install keeps the registered shim while it is of the version the
+//! install brings ([`SetsunaShimVersion`]): the bytes of a build differ
+//! with what it is built with (cargo unifies the features of the packages
+//! built together), and a new shim reaches only the apps started after it.
 
 #[cfg(windows)]
 mod shim;
+
+/// The shim's version, where install.ps1 reads it from the DLL without
+/// loading it (the digits after `setsuna-shim-version:`). Raise it with any
+/// change to what the shim does: `src/shim.rs`, and `crates/tsf-reg`, which
+/// its registration runs (`the_version_follows_the_source`). Exported, so
+/// that the linker keeps it.
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static SetsunaShimVersion: [u8; 23] = *b"setsuna-shim-version:1\0";
+
+#[cfg(test)]
+mod tests {
+    /// The version and a digest of the sources it stands for: a change to
+    /// them fails this until the version is raised (or, for one that changes
+    /// nothing the shim does, the digest alone is recorded again).
+    #[test]
+    fn the_version_follows_the_source() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut reg: Vec<_> = std::fs::read_dir(root.join("../tsf-reg/src"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        reg.sort();
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        for file in std::iter::once(root.join("src/shim.rs")).chain(reg) {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            // LF line ends, as a checkout may have CRLF
+            let text = std::fs::read(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|&b| b != b'\r');
+            // FNV-1a
+            for b in name.bytes().chain([0]).chain(text).chain([0]) {
+                digest = (digest ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        let version: u32 = std::str::from_utf8(&super::SetsunaShimVersion)
+            .unwrap()
+            .strip_prefix("setsuna-shim-version:")
+            .and_then(|v| v.strip_suffix('\0'))
+            .and_then(|v| v.parse().ok())
+            .expect("setsuna-shim-version:<digits>\\0");
+        assert_eq!(
+            (version, format!("{digest:016x}")),
+            (1, "f1805ec50fe53076".to_string()),
+            "the shim's sources changed: raise SetsunaShimVersion if what the shim does changed, then record both"
+        );
+    }
+}

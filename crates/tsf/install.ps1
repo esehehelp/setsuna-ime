@@ -50,7 +50,8 @@
 # nothing holds it.
 #   <dir>\setsuna_tsf_shim.dll  (the DLL registered as the IME: it loads the
 #                                  IME DLL core.txt names and swaps it for a newer one in the
-#                                  apps that are running; setsuna_tsf_shim_<sha256>.dll when locked)
+#                                  apps that are running; setsuna_tsf_shim_<sha256>.dll when locked;
+#                                  the registered one kept while of the version this install brings)
 #   <dir>\setsuna_tsf_<sha256>.dll  (the IME DLL, named by its content; one an
 #                                  app still holds stays until a later install)
 #   <dir>\core.txt  (the IME DLL's name, written once setsuna-tsf-check saw it
@@ -349,6 +350,42 @@ function Copy-InstallFile {
         }
         return $fallback
     }
+}
+
+# The shim's version: the digits after "setsuna-shim-version:" in its DLL
+# (SetsunaShimVersion, crates\tsf-shim), read from the file, never loaded;
+# 0 for a shim from before it had one.
+function Get-ShimVersion {
+    param([string]$Path)
+    try {
+        # Latin-1: one character per byte, whatever the bytes are
+        $text = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path))
+    } catch {
+        return 0
+    }
+    $m = [regex]::Match($text, 'setsuna-shim-version:(\d+)\x00')
+    if ($m.Success) { [int]$m.Groups[1].Value } else { 0 }
+}
+
+# The shim registered as the IME, when it is one in $InstallDir: the
+# machine's registration (HKEY_CLASSES_ROOT puts the user's own HKCU
+# classes over it).
+function Get-RegisteredShim {
+    $key = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
+    try {
+        $path = (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).'(default)'
+    } catch {
+        return $null
+    }
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    $path = [IO.Path]::GetFullPath($path)
+    if ((Split-Path -Parent $path) -ne $InstallDir -or
+        (Split-Path -Leaf $path) -notmatch '^setsuna_tsf_shim(_[0-9a-f]{12})?\.dll$') {
+        return $null
+    }
+    $path
 }
 
 # setsuna-tsf-check: the registered shim activated in a process of its own
@@ -978,12 +1015,23 @@ try {
 } catch {
     Write-Log ERROR "copy failed $DllSrc -> $CoreInstalled`: $_"; exit 50
 }
-# The shim rarely changes: a running app holds it, and a new one goes next to
-# it under a content-addressed name, registered for the apps started after.
+# The shim rarely changes, and a running app holds it until it exits: the
+# registered one stays while it is of the version this install brings (the
+# bytes of a build differ with what it is built with); another goes next to
+# it, under a content-addressed name when locked, registered for the apps
+# started after.
 $ShimInstalled = Join-Path $InstallDir $ShimName
 $CheckInstalled = Join-Path $InstallDir $CheckExe
+$ShimVersion = Get-ShimVersion -Path $ShimSrc
+$ShimRegistered = Get-RegisteredShim
 try {
-    $ShimInstalled = Copy-InstallFile -Source $ShimSrc -Destination $ShimInstalled -AllowLockedFallback
+    if (-not $Force -and $ShimRegistered -and $ShimVersion -gt 0 -and
+        (Get-ShimVersion -Path $ShimRegistered) -eq $ShimVersion) {
+        $ShimInstalled = $ShimRegistered
+        Write-Log INFO "keep $ShimInstalled (shim version $ShimVersion)"
+    } else {
+        $ShimInstalled = Copy-InstallFile -Source $ShimSrc -Destination $ShimInstalled -AllowLockedFallback
+    }
     $CheckInstalled = Copy-InstallFile -Source $CheckSrc -Destination $CheckInstalled -AllowLockedFallback
 } catch {
     Write-Log ERROR "copy failed: $_"; exit 50
