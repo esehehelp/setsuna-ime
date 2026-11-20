@@ -42,8 +42,9 @@ typedef struct {
     const char *form;     /* F6-F10 form shown ("全角カタカナ"), "" for none */
     const char *form_key; /* its key ("F7") */
     /* Conversions of what is typed (the preedit keeps the kana), for a
-     * suggestion window; none while converting. setsuna_session_select
-     * picks one by index. */
+     * suggestion window; none while converting. By index,
+     * setsuna_session_select opens the conversion on one and
+     * setsuna_session_pick commits it (the addon's click). */
     const char *const *suggestions;
     const char *const *suggestion_comments;
     size_t n_suggestions;

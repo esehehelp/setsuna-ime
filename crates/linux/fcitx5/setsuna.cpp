@@ -263,9 +263,12 @@ public:
         const Key &key = event.rawKey();
         bool wasEnabled = setsuna_session_enabled(session_);
         bool wasRewrite = setsuna_session_rewrite_mode(session_);
+        // the text around the caret of a normal field only: a password's or
+        // a private one's is not read at all
+        uint32_t kind = field(ic);
         std::string before;
-        bool known = beforeCaret(ic, before);
-        if (setsuna_session_key(session_, key.sym(), key.code(), mods(key.states()), field(ic),
+        bool known = kind == SETSUNA_FIELD_NORMAL && beforeCaret(ic, before);
+        if (setsuna_session_key(session_, key.sym(), key.code(), mods(key.states()), kind,
                                 known ? before.c_str() : nullptr)) {
             event.filterAndAccept();
             render(ic);
@@ -309,6 +312,9 @@ public:
 
     /* The mode button was clicked. */
     void toggle(InputContext *ic) {
+        if (!ic) {
+            return;
+        }
         setsuna_session_toggle(session_);
         render(ic);
         armDeferred();
@@ -340,6 +346,9 @@ public:
     /* A click on a candidate: accept it as its digit key would (commits, or
      * while editing segments fixes the focused segment and moves to the next). */
     void select(InputContext *ic, size_t index) {
+        if (!ic) {
+            return;
+        }
         if (setsuna_session_pick(session_, index)) {
             render(ic);
             armDeferred();
@@ -395,11 +404,19 @@ private:
         }
         deferredTimer_ = instance_->eventLoop().addTimeEvent(
             CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + uint64_t(ms) * 1000, 0,
-            [this](EventSourceTime *, uint64_t) {
+            [this](EventSourceTime *source, uint64_t) {
                 if (setsuna_session_tick(session_)) {
                     if (auto *ic = ic_.get()) {
                         render(ic);
                     }
+                }
+                // armed again while the session still defers (a later
+                // deadline): it went quiet otherwise. The source is this
+                // callback's own, so it is set again, not replaced.
+                uint32_t next = setsuna_session_deferred_ms(session_);
+                if (next != 0) {
+                    source->setNextInterval(uint64_t(next) * 1000);
+                    source->setOneShot();
                 }
                 return true;
             });
@@ -458,7 +475,7 @@ private:
 
     void render(InputContext *ic, bool commit = true) {
         const SetsunaView *v = setsuna_session_view(session_);
-        if (!v) {
+        if (!v || !ic) {
             return;
         }
         for (size_t i = 0; commit && i < v->n_commits; i++) {

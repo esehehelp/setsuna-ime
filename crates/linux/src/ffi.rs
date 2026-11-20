@@ -235,10 +235,14 @@ impl SetsunaSession {
             .engine_started
             .as_ref()
             .is_none_or(|(k, _)| k != &engine_key);
-        let engine_died =
-            self.engine_started.as_ref().is_some_and(|(_, ok)| *ok) && !self.session.has_client();
-        let engine_retry =
-            !self.session.has_client() && self.engine_retry_at.is_none_or(|t| now >= t);
+        // a daemon that died is started again no sooner than a while after
+        // the last start: one that dies as it starts (a model it cannot
+        // load) was started again at every key, each start blocking it
+        let retry_due = self.engine_retry_at.is_none_or(|t| now >= t);
+        let engine_died = self.engine_started.as_ref().is_some_and(|(_, ok)| *ok)
+            && !self.session.has_client()
+            && retry_due;
+        let engine_retry = !self.session.has_client() && retry_due;
         let needs_engine = engine_changed || engine_died || engine_retry;
 
         let needs_reranker = needs_engine
@@ -277,10 +281,8 @@ impl SetsunaSession {
             let ok = client.is_some();
             if ok {
                 setsuna_core::diagnostics::log("fcitx5 engine started");
-                self.engine_retry_at = None;
-            } else {
-                self.engine_retry_at = Some(now + ENGINE_RETRY_EVERY);
             }
+            self.engine_retry_at = Some(now + ENGINE_RETRY_EVERY);
             self.engine_started = Some((engine_key, ok));
             let was_enabled = self.session.enabled();
             self.session = Session::new(&cfg, client);

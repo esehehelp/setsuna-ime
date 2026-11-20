@@ -326,6 +326,13 @@ impl Session {
     /// text before the caret is the left context.
     pub fn key_in(&mut self, key: &Key, field: Field, before_caret: Option<&str>) -> bool {
         self.view.commits.clear();
+        // in a direct field (a password) a key that types a char is the
+        // app's, an on / off key of one (`) too: the user types it there
+        let types_a_char = (0x20..=0x7e).contains(&key.sym)
+            && key.mods & (keys::MOD_CTRL | keys::MOD_ALT | keys::MOD_SUPER) == 0;
+        if field == Field::Direct && types_a_char && !self.bridge.is_active() {
+            return false;
+        }
         if let Some(role) = self.on_off.role(key) {
             let want = match role {
                 keys::OnOff::Toggle => !self.enabled,
@@ -611,6 +618,33 @@ mod tests {
 
     fn press(s: &mut Session, sym: u32, mods: u32) -> bool {
         s.key(&Key { sym, code: 0, mods })
+    }
+
+    /// In a direct field (a password) a toggle key that types a char (the
+    /// bare ` where it is one) is typed there; one that types none still
+    /// toggles.
+    #[test]
+    fn a_toggle_key_that_types_goes_to_a_direct_field() {
+        let (mut s, _) = session_with(|c| {
+            c.frontend.toggle_keys = vec!["`".into(), "Zenkaku".into()];
+        });
+        let on = s.enabled();
+        let grave = Key {
+            sym: 0x60,
+            code: 0,
+            mods: 0,
+        };
+        assert!(!s.key_in(&grave, Field::Direct, None));
+        assert_eq!(s.enabled(), on);
+        assert!(s.key_in(&grave, Field::Normal, None));
+        assert_ne!(s.enabled(), on);
+        let zenkaku = Key {
+            sym: 0xff2a,
+            code: 0,
+            mods: 0,
+        };
+        assert!(s.key_in(&zenkaku, Field::Direct, None));
+        assert_eq!(s.enabled(), on);
     }
 
     fn type_str(s: &mut Session, text: &str) {

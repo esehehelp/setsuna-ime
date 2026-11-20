@@ -496,9 +496,12 @@ if [[ -f $src/bin/setsuna-settings ]]; then
     fi
 fi
 if [[ -n $rerank_manifest ]]; then
-    # one LM: the reranker reads the only manifest there
+    # one LM: the reranker reads the only manifest there. The one given is
+    # kept aside first: it may be the installed one the old ones' removal
+    # takes (an install again with its own --rerank-manifest)
+    cp -- "$rerank_manifest" "$work/rerank.manifest.json"
     rm -f -- "$root$module"/models/rerank/*manifest.json
-    put "$rerank_manifest" "$module/models/rerank/$(basename "$rerank_manifest")" 644
+    put "$work/rerank.manifest.json" "$module/models/rerank/$(basename "$rerank_manifest")" 644
     for f in "${rerank_files[@]}"; do
         put "$(dirname "$rerank_manifest")/$f" "$module/models/rerank/$f" 644
     done
@@ -597,12 +600,13 @@ register_user() {
     pid=$(pgrep -u "$uid" -x fcitx5 | head -1 || true)
     if [[ -z $pid ]]; then
         # Not running: the profile is safe to edit; fcitx5 reads it when it starts.
+        # read as the user, as kwinrc is below
         local profile=$home/.config/fcitx5/profile n next
-        if [[ -f $profile ]]; then
-            if grep -qx 'Name=setsuna' "$profile"; then
+        if as_user test -f "$profile"; then
+            if as_user grep -qx 'Name=setsuna' "$profile"; then
                 log "Setsuna is already in $user's fcitx5 input methods"
             else
-                n=$(sed -n 's/^\[Groups\/0\/Items\/\([0-9][0-9]*\)\]$/\1/p' "$profile" | sort -n | tail -1)
+                n=$(as_user sed -n 's/^\[Groups\/0\/Items\/\([0-9][0-9]*\)\]$/\1/p' "$profile" | sort -n | tail -1)
                 if [[ -n $n ]]; then
                     next=$((10#$n + 1))
                 else
@@ -638,9 +642,12 @@ register_user() {
         sleep 0.25
     done
     if [[ -n $kwin_im ]]; then
-        local kwinrc=$home/.config/kwinrc orig_line= tmp_rc=
-        if [[ -f $kwinrc ]]; then
-            orig_line=$(awk '/^\[/{g=$0; next} g=="[Wayland]" && /^InputMethod(\[[^]]*\])?=/{print; exit}' "$kwinrc" || true)
+        # kwinrc is the user's: it is read and written as the user only (as
+        # root, a link the user put in its place, or in the temporary
+        # file's, would be followed to a file of root's)
+        local kwinrc=$home/.config/kwinrc orig_line=
+        if as_user test -f "$kwinrc"; then
+            orig_line=$(as_user awk '/^\[/{g=$0; next} g=="[Wayland]" && /^InputMethod(\[[^]]*\])?=/{print; exit}' "$kwinrc" || true)
             kwinrc_backup=$(as_user mktemp "$kwinrc.setsuna-install.XXXXXX")
             as_user cp -p "$kwinrc" "$kwinrc_backup"
             kwinrc_orig=$kwinrc
@@ -654,21 +661,27 @@ register_user() {
         as_user kwriteconfig6 --file kwinrc --group Wayland --key InputMethod --notify "$kwin_im" || true
         # Restore the key's original flags (e.g. InputMethod[$e]=...) without
         # overwriting unrelated keys KWin may have written meanwhile.
-        if [[ -n $orig_line && -f $kwinrc && $orig_line == InputMethod\[* ]]; then
-            tmp_rc=$(as_user mktemp "$kwinrc.setsuna-fix.XXXXXX")
-            if SETSUNA_LINE=$orig_line awk '
+        if [[ -n $orig_line && $orig_line == InputMethod\[* ]]; then
+            local fix='
                 /^\[/ { in_w = ($0 == "[Wayland]") }
                 in_w && !done && /^InputMethod(\[[^]]*\])?=/ { print ENVIRON["SETSUNA_LINE"]; done = 1; next }
                 { print }
-            ' "$kwinrc" >"$tmp_rc"; then
-                chmod --reference="$kwinrc" "$tmp_rc" 2>/dev/null || true
-                as_user mv -f "$tmp_rc" "$kwinrc" || rm -f -- "$tmp_rc"
-            else
-                rm -f -- "$tmp_rc"
-            fi
+            '
+            # shellcheck disable=SC2016 # expanded by the user's shell
+            as_user env SETSUNA_LINE="$orig_line" SETSUNA_AWK="$fix" sh -c '
+                rc=$1
+                [ -f "$rc" ] || exit 0
+                tmp=$(mktemp "$rc.setsuna-fix.XXXXXX") || exit 0
+                if awk "$SETSUNA_AWK" "$rc" >"$tmp"; then
+                    chmod --reference="$rc" "$tmp" 2>/dev/null || true
+                    mv -f "$tmp" "$rc" || rm -f -- "$tmp"
+                else
+                    rm -f -- "$tmp"
+                fi
+            ' sh "$kwinrc" || true
         fi
         if [[ -n $kwinrc_backup ]]; then
-            rm -f -- "$kwinrc_backup"
+            as_user rm -f -- "$kwinrc_backup"
             kwinrc_backup=
         fi
     elif [[ ! -f /usr/share/dbus-1/services/org.fcitx.Fcitx5.service ]]; then
