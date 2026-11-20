@@ -118,11 +118,27 @@ fn file_stamp(path: &Path) -> Stamp {
         .and_then(|m| Some((m.len(), m.modified().ok()?)))
 }
 
-/// [`CORE_ENV`]'s core. In an elevated process too: the name can only be one
-/// of a core in the shim's directory (`core_hash`: no separator, no `..`),
-/// checked against its hash, and that directory is Program Files, which
-/// only administrators can write; the installer's check runs elevated.
+/// [`CORE_ENV`]'s core, in setsuna-tsf-check's process only (beside the
+/// shim; the installer runs it elevated). The name can only be one of a core
+/// in the shim's directory (`core_hash`: no separator, no `..`), checked
+/// against its hash; in another process, which takes the user's
+/// environment, the variable could have held an elevated app on an older
+/// core still there.
 fn core_override() -> Option<String> {
+    static CHECK: OnceLock<bool> = OnceLock::new();
+    let check = *CHECK.get_or_init(|| {
+        let exe = std::env::current_exe().ok();
+        let dir = shim_dir().ok();
+        exe.zip(dir).is_some_and(|(exe, dir)| {
+            let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+            let name = exe.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            exe.parent().map(lower) == Some(lower(&dir))
+                && name.is_some_and(|n| n.starts_with("setsuna-tsf-check") && n.ends_with(".exe"))
+        })
+    });
+    if !check {
+        return None;
+    }
     std::env::var(CORE_ENV).ok().filter(|n| !n.is_empty())
 }
 
@@ -227,7 +243,13 @@ impl Core {
     fn load() -> Result<Core> {
         let (path, stamp) = named_core()?;
         unsafe {
-            let module = LoadLibraryW(&HSTRING::from(path.as_os_str()))?;
+            // what the core imports from its own directory and System32 only,
+            // never the app's directory, the current one or the PATH
+            let module = LoadLibraryExW(
+                &HSTRING::from(path.as_os_str()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )?;
             let create = GetProcAddress(module, s!("SetsunaCoreCreate"))
                 .ok_or_else(|| Error::new(E_NOINTERFACE, "no SetsunaCoreCreate"))?;
             let create: CreateFn = std::mem::transmute::<Proc, CreateFn>(create);

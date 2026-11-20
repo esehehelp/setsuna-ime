@@ -51,7 +51,10 @@ foreach ($p in @(Join-Path $InstallDir 'setsuna_tsf.dll')) {
 # the machine's registration: HKEY_CLASSES_ROOT puts the user's own
 # HKCU\Software\Classes, which the user may write, over it
 $ClsidReg   = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
-$UninstReg  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
+# Apps & Features' entry: the machine's (install.ps1's), and the user's of
+# the installs before
+$UninstRegs = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime',
+                'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime')
 $LogFile    = Join-Path $env:LOCALAPPDATA 'setsuna-ime\uninstall.log'
 
 function Write-Log {
@@ -85,6 +88,46 @@ function Revoke-AppContainerRead {
 # escape the closing quote (a path holds no quote).
 function Format-Argument([string]$Value) {
     '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
+function Test-ReparsePoint([System.IO.FileSystemInfo]$Item) {
+    ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+}
+
+# $Path and what it holds gone, as this one deletes them elevated: a junction
+# or a link inside goes itself, never what it points at (Windows PowerShell's
+# Remove-Item -Recurse went through a junction and deleted where it led).
+function Remove-Tree([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -and -not (Test-ReparsePoint $item)) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+            Remove-Tree $child.FullName
+        }
+    }
+    if ($item.PSIsContainer) {
+        # a directory, or the link of one (removing it leaves its target)
+        [IO.Directory]::Delete($item.FullName, $false)
+    } else {
+        $item.Attributes = $item.Attributes -band -bnot [IO.FileAttributes]::ReadOnly
+        [IO.File]::Delete($item.FullName)
+    }
+}
+
+# Whether $Dir is an install of install.ps1's to delete: a directory of its
+# own (no drive's root, no link) that holds what an install leaves there.
+# -InstallDir is the caller's to give (Apps & Features' entry of an install
+# before was the user's to change), and this runs elevated.
+function Test-InstallDir([string]$Dir) {
+    try {
+        $item = Get-Item -LiteralPath $Dir -Force -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    if (-not $item.PSIsContainer -or (Test-ReparsePoint $item) -or -not $item.Parent) { return $false }
+    $marks = @('installed.toml', 'core.txt', 'uninstall.ps1') |
+        Where-Object { Test-Path -LiteralPath (Join-Path $Dir $_) -PathType Leaf }
+    $dlls = @(Get-ChildItem -LiteralPath $Dir -Filter 'setsuna_tsf*.dll' -File -Force -ErrorAction SilentlyContinue)
+    return (@($marks).Count -gt 0 -and $dlls.Count -gt 0)
 }
 
 function Get-RegisteredDllPath {
@@ -140,12 +183,15 @@ Get-Process -Name 'setsuna-engine*', 'setsuna-rewrite*', 'setsuna-rerank' -Error
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
 }
 
-# 4. Remove install dir (ctfmon may briefly hold the DLL — retry).
-if (Test-Path -LiteralPath $InstallDir) {
+# 4. Remove install dir (ctfmon may briefly hold the DLL — retry), when it is
+# one of install.ps1's.
+if ((Test-Path -LiteralPath $InstallDir) -and -not (Test-InstallDir $InstallDir)) {
+    Write-Log WARN "not an install of Setsuna's (no installed.toml, core.txt or uninstall.ps1 with its DLL, or a link or a drive's root): left as it is: $InstallDir"
+} elseif (Test-Path -LiteralPath $InstallDir) {
     $removed = $false
     for ($i = 0; $i -lt 10; $i++) {
         try {
-            Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
+            Remove-Tree $InstallDir
             $removed = $true
             break
         } catch {
@@ -166,15 +212,17 @@ if ((Test-Path -LiteralPath $UserDir) -and ($UserDir -ne $InstallDir)) {
     Get-ChildItem -LiteralPath $UserDir -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notmatch '^(install|uninstall)\.log$' } |
         ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            try { Remove-Tree $_.FullName } catch { }
         }
     Revoke-AppContainerRead -Path $UserDir
 }
 
-# 5. Remove HKCU Uninstall entry.
-if (Test-Path -LiteralPath $UninstReg) {
-    Remove-Item -LiteralPath $UninstReg -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Log INFO "removed registry entry: $UninstReg"
+# 5. Remove the Uninstall entries (the machine's needs an administrator).
+foreach ($reg in $UninstRegs) {
+    if (Test-Path -LiteralPath $reg) {
+        Remove-Item -LiteralPath $reg -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log INFO "removed registry entry: $reg"
+    }
 }
 
 # 6. Optionally remove user config (keep by default).
@@ -192,7 +240,7 @@ if ($KeepConfig) {
         }
     }
     if ($doDelete) {
-        Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-Tree $ConfigDir } catch { Write-Log WARN "could not remove all of $ConfigDir`: $_" }
         Write-Log INFO "removed config dir: $ConfigDir"
     } else {
         Write-Log INFO "config preserved (user opt-out)"

@@ -54,8 +54,23 @@ mod run {
             return 1;
         }
 
-        let work = std::env::temp_dir().join(format!("setsuna-tsf-check-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
+        // The work directory (the core's config, logs and learning, kept from
+        // the user's) beside the shim, where only administrators write: an
+        // install runs this elevated, and in the user's %TEMP% another
+        // process of the user could have put a junction where it goes. One a
+        // check before left (it crashed) goes after a while.
+        let Some(dir) = shim.parent() else {
+            return 1;
+        };
+        remove_old_work(dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let work = dir.join(format!("check-{}-{stamp}", std::process::id()));
+        if std::fs::create_dir(&work).is_err() {
+            println!("failed: no work directory {}", work.display());
+            return 1;
+        }
         let appdata = work.join("appdata");
         let _ = std::fs::create_dir_all(&appdata);
         let _ = std::fs::create_dir_all(work.join("localappdata"));
@@ -87,14 +102,39 @@ mod run {
         code
     }
 
-    /// The DLL registered as `service`'s server.
+    /// The work directories of checks before (`check-*` in the shim's
+    /// directory) an hour old: what a check that crashed left.
+    fn remove_old_work(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok());
+            if entry.file_name().to_string_lossy().starts_with("check-")
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+                && old.is_some_and(|age| age > std::time::Duration::from_secs(3600))
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    /// The DLL registered as `service`'s server: the machine's registration
+    /// (HKEY_CLASSES_ROOT puts the user's own HKCU classes over it).
     fn registered(service: &TextService) -> Option<PathBuf> {
-        let key = HSTRING::from(format!("CLSID\\{{{:?}}}\\InProcServer32", service.clsid));
+        let key = HSTRING::from(format!(
+            "SOFTWARE\\Classes\\CLSID\\{{{:?}}}\\InProcServer32",
+            service.clsid
+        ));
         let mut buf = [0u16; 1024];
         let mut len = (buf.len() * 2) as u32;
         unsafe {
             RegGetValueW(
-                HKEY_CLASSES_ROOT,
+                HKEY_LOCAL_MACHINE,
                 &key,
                 PCWSTR::null(),
                 RRF_RT_REG_SZ,

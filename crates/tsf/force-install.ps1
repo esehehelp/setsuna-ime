@@ -68,12 +68,37 @@ function Restart-AsAdmin {
     $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Format-Argument $PSCommandPath))
     $argv += @('-Manifest', (Format-Argument $Manifest))
     if ($RerankManifest) { $argv += @('-RerankManifest', (Format-Argument $RerankManifest)) }
-    if ($SkipBuild) { $argv += '-SkipBuild' }
+    # built already, as the user (Invoke-Build)
+    $argv += '-SkipBuild'
     if ($KeepHostsRunning) { $argv += '-KeepHostsRunning' }
     if ($NoSmoke) { $argv += '-NoSmoke' }
     if ($PinActiveProfile) { $argv += '-PinActiveProfile' }
-    $p = Start-Process pwsh -ArgumentList $argv -Verb RunAs -Wait -PassThru
+    # on the PowerShell running this: pwsh may not be installed
+    $p = Start-Process (Get-Process -Id $PID).Path -ArgumentList $argv -Verb RunAs -Wait -PassThru
     exit $p.ExitCode
+}
+
+# The release build of what install.ps1 installs: the IME DLL, the shim and
+# setsuna-tsf-check, the daemons and the settings GUI.
+function Invoke-Build {
+    $packages = @('-p', 'setsuna-tsf', '-p', 'setsuna-tsf-shim', '-p', 'setsuna-engine', '-p', 'setsuna-settings',
+                  '-p', 'setsuna-rewrite')
+    if ($RerankManifest) {
+        $packages += @('-p', 'setsuna-rerank')
+        # bindgen (llama.cpp's bindings) needs libclang
+        if (-not $env:LIBCLANG_PATH) {
+            $clang = Get-Command clang -ErrorAction SilentlyContinue
+            if ($clang) { $env:LIBCLANG_PATH = Split-Path -Parent $clang.Source }
+        }
+    }
+    Write-Log INFO "cargo build $($packages -join ' ') --release"
+    Push-Location $RepoRoot
+    try {
+        cargo build @packages --release
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    } finally {
+        Pop-Location
+    }
 }
 
 function Stop-InputHosts {
@@ -186,22 +211,25 @@ function Quote-TomlPath {
     '"' + ($Path.Replace('\', '/').Replace('"', '\"')) + '"'
 }
 
+# The manifest installed, as config.toml's model. engine_exe stays as
+# install.ps1 wrote it: the engine it installed under a content-addressed name
+# when a running one held setsuna-engine.exe (set here to the plain name, the
+# IME ran the old engine).
 function Pin-BestConfig {
     $manifestDst = Join-Path (Join-Path $InstallDir 'models\onnx') (Split-Path -Leaf $Manifest)
-    $engineExe = Join-Path $InstallDir 'setsuna-engine.exe'
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ConfigPath) | Out-Null
     if (Test-Path -LiteralPath $ConfigPath) {
-        $lines = @(Get-Content -LiteralPath $ConfigPath)
+        $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8)
     } else {
         $lines = @('[engine]')
     }
 
     $lines = Remove-ConfigValue -Lines $lines -Section 'engine' -Key 'model_dir'
     $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'model_manifest' -Value (Quote-TomlPath $manifestDst)
-    $lines = Set-OrAppendConfigValue -Lines $lines -Section 'engine' -Key 'engine_exe' -Value (Quote-TomlPath $engineExe)
 
-    Set-Content -LiteralPath $ConfigPath -Value $lines -Encoding utf8
+    # UTF-8 without a BOM whichever PowerShell writes it (Windows PowerShell's -Encoding utf8 adds one)
+    [IO.File]::WriteAllLines($ConfigPath, [string[]]$lines, (New-Object Text.UTF8Encoding $false))
     Write-Log INFO "pinned best config: $ConfigPath"
 }
 
@@ -290,6 +318,9 @@ function Report-LoadedTsfModules {
 }
 
 if (-not (Test-IsAdmin)) {
+    # the build as the user, before the elevation: cargo runs the crates'
+    # build scripts, which an elevated build ran as an administrator
+    if (-not $SkipBuild) { Invoke-Build }
     Restart-AsAdmin
 }
 
@@ -300,24 +331,9 @@ if (-not (Test-Path -LiteralPath $Manifest)) {
     exit 30
 }
 
+# started elevated (an administrator's shell): built here
 if (-not $SkipBuild) {
-    $packages = @('-p', 'setsuna-tsf', '-p', 'setsuna-engine', '-p', 'setsuna-settings', '-p', 'setsuna-rewrite')
-    if ($RerankManifest) {
-        $packages += @('-p', 'setsuna-rerank')
-        # bindgen (llama.cpp's bindings) needs libclang
-        if (-not $env:LIBCLANG_PATH) {
-            $clang = Get-Command clang -ErrorAction SilentlyContinue
-            if ($clang) { $env:LIBCLANG_PATH = Split-Path -Parent $clang.Source }
-        }
-    }
-    Write-Log INFO "cargo build $($packages -join ' ') --release"
-    Push-Location $RepoRoot
-    try {
-        cargo build @packages --release
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    } finally {
-        Pop-Location
-    }
+    Invoke-Build
 }
 
 if (-not $KeepHostsRunning) {
@@ -330,7 +346,7 @@ $install = Join-Path $PSScriptRoot 'install.ps1'
 Write-Log INFO "running install.ps1 with manifest $Manifest"
 $installArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $install, '-Force', '-Manifest', $Manifest)
 if ($RerankManifest) { $installArgs += @('-RerankManifest', $RerankManifest) }
-& pwsh @installArgs
+& (Get-Process -Id $PID).Path @installArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Log ERROR "install.ps1 failed with exit code $LASTEXITCODE"
     exit $LASTEXITCODE

@@ -78,7 +78,8 @@
 #   %LOCALAPPDATA%\setsuna-ime\cache\models\<repository>\<revision>\  (fetch-model.ps1's downloads while
 #                                  installing: the files are copied from it, the cache removed)
 #   %APPDATA%\setsuna-ime\config.toml   (user-editable runtime config)
-#   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime
+#   HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime  (Apps & Features; the
+#                                  user's HKCU one with -NoElevate, and of installs before)
 #
 # AppContainers (the Start menu's search, Store apps: ALL APPLICATION
 # PACKAGES and ALL RESTRICTED APPLICATION PACKAGES) may read and run what is
@@ -93,10 +94,9 @@
 # goes at a later install). The next install takes the installed model and
 # dictionaries back when models.json pins them still, instead of downloading.
 #
-# Idempotent: re-running converges to the desired state. Per-user file layout
-# under %LOCALAPPDATA%; regsvr32 still requires admin because registration.rs
-# writes HKEY_CLASSES_ROOT (admin-mapped); registering under
-# HKCU\Software\Classes instead would allow a no-elevation install.
+# Idempotent: re-running converges to the desired state. regsvr32 requires
+# admin: the shim's registration (crates/tsf-reg) writes the COM class to
+# HKLM\SOFTWARE\Classes.
 
 #Requires -Version 5.1
 [CmdletBinding(DefaultParameterSetName = 'Download')]
@@ -173,7 +173,9 @@ $EngineExe  = 'setsuna-engine.exe'
 $SettingsExe = 'setsuna-settings.exe'
 $RewriteExe = 'setsuna-rewrite.exe'
 $RerankExe  = 'setsuna-rerank.exe'
-$UninstReg  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
+$MachineUninstReg = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
+$UserUninstReg    = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
+$UninstReg  = $UserUninstReg
 # The PowerShell running this (pwsh or Windows PowerShell): the elevated
 # install runs on it too.
 $PsExe      = (Get-Process -Id $PID).Path
@@ -491,23 +493,23 @@ function Install-ArtifactFile {
     if (-not (Test-InCache $Source)) {
         return Copy-InstallFile -Source $Source -Destination $Destination -AllowLockedFallback:$AllowLockedFallback
     }
-    if (Test-HardLinked -Source $Source -Destination $Destination) {
-        Write-Log INFO "skip (linked) $Destination"
-        return $Destination
-    }
+    # one an install before linked to the cache is the cache's file, which the
+    # user may write: it is replaced by a copy like any other
     $target = $Destination
     if (Test-Path -LiteralPath $Destination) {
         try {
             Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
         } catch {
-            if (Test-SameContent -Source $Source -Destination $Destination) {
+            if (-not (Test-HardLinked -Source $Source -Destination $Destination) -and
+                (Test-SameContent -Source $Source -Destination $Destination)) {
                 Write-Log INFO "skip (unchanged, in use) $Destination"
                 return $Destination
             }
             if (-not $AllowLockedFallback) { throw }
             $target = Join-Path (Split-Path -Parent $Destination) (Get-ContentAddressedName -Source $Source -Destination $Destination)
-            if (Test-HardLinked -Source $Source -Destination $target) {
-                Write-Log WARN "$Destination was locked; using linked $target"
+            if (-not (Test-HardLinked -Source $Source -Destination $target) -and
+                (Test-SameContent -Source $Source -Destination $target)) {
+                Write-Log WARN "$Destination was locked; using $target"
                 return $target
             }
             Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
@@ -1319,7 +1321,17 @@ try {
     Write-Log ERROR "core.txt not written: $_"; exit 50
 }
 
-# ---- Apps & Features entry (HKCU) ----
+# ---- Apps & Features entry ----
+# The machine's, as the install is (an administrator's to change: the
+# uninstaller it runs is given its -InstallDir there, and deletes it
+# elevated); the user's of an install before goes. A files-only install
+# (-NoElevate) has the user's.
+if (-not $NoElevate) {
+    if (Test-Path -LiteralPath $UserUninstReg) {
+        Remove-Item -LiteralPath $UserUninstReg -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $UninstReg = $MachineUninstReg
+}
 New-Item -Path $UninstReg -Force | Out-Null
 Set-ItemProperty $UninstReg DisplayName     'Setsuna Japanese IME'
 Set-ItemProperty $UninstReg DisplayVersion  (Get-SetsunaVersion)
@@ -1327,11 +1339,11 @@ Set-ItemProperty $UninstReg Publisher       'Setsuna'
 Set-ItemProperty $UninstReg InstallLocation $InstallDir
 Set-ItemProperty $UninstReg InstallDate     (Get-Date -Format 'yyyyMMdd')
 # Windows PowerShell: always there, whichever PowerShell installed this.
-$WinPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$WinPs = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
 Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`" -InstallDir `"$InstallDir`""
 Set-ItemProperty $UninstReg NoModify        1 -Type DWord
 Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
-Write-Log INFO "registered HKCU Uninstall entry: $UninstReg"
+Write-Log INFO "registered Uninstall entry: $UninstReg"
 
 # ---- the engines this install replaced ----
 # An app's IME reads config.toml again at its next key or focus change and

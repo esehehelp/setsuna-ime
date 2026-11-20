@@ -80,24 +80,28 @@ fn set_string(key: HKEY, name: PCWSTR, value: &str) -> Result<()> {
     }
 }
 
+/// The COM class's key under `SOFTWARE\Classes` (HKLM's, or a user's).
 fn clsid_key(service: &TextService) -> String {
-    format!("CLSID\\{{{:?}}}", service.clsid)
+    format!("SOFTWARE\\Classes\\CLSID\\{{{:?}}}", service.clsid)
 }
 
 /// `service`'s COM class with `dll_path` its server, its profile and its
-/// categories (the HKCR / HKLM entries: an administrator's).
+/// categories (HKLM's: an administrator's). The class goes to
+/// HKLM\SOFTWARE\Classes itself, not through HKEY_CLASSES_ROOT, which puts
+/// the user's own HKCU\Software\Classes first: a key the user made there
+/// would have taken the elevated registration.
 pub fn register(service: &TextService, dll_path: &str) -> Result<()> {
     let key_path = clsid_key(service);
     unsafe {
         let mut key = HKEY::default();
-        RegCreateKeyW(HKEY_CLASSES_ROOT, &HSTRING::from(&key_path), &mut key).ok()?;
+        RegCreateKeyW(HKEY_LOCAL_MACHINE, &HSTRING::from(&key_path), &mut key).ok()?;
         let set = set_string(key, PCWSTR::null(), service.description);
         let _ = RegCloseKey(key);
         set?;
 
         let mut inproc = HKEY::default();
         RegCreateKeyW(
-            HKEY_CLASSES_ROOT,
+            HKEY_LOCAL_MACHINE,
             &HSTRING::from(format!("{key_path}\\InProcServer32")),
             &mut inproc,
         )
@@ -183,11 +187,12 @@ pub fn unregister(service: &TextService) -> Result<()> {
                 let _ = categories.UnregisterCategory(&service.clsid, &cat, &service.clsid);
             }
         }
-        let _ = RegDeleteKeyW(
-            HKEY_CLASSES_ROOT,
-            &HSTRING::from(format!("{key_path}\\InProcServer32")),
-        );
-        let _ = RegDeleteKeyW(HKEY_CLASSES_ROOT, &HSTRING::from(&key_path));
+        // HKLM's, and one of the user's own under its name (an install of
+        // the user's before, or one made to come first): the class gone
+        for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+            let _ = RegDeleteKeyW(root, &HSTRING::from(format!("{key_path}\\InProcServer32")));
+            let _ = RegDeleteKeyW(root, &HSTRING::from(&key_path));
+        }
     }
     Ok(())
 }
@@ -195,8 +200,18 @@ pub fn unregister(service: &TextService) -> Result<()> {
 /// Let AppContainers (ALL APPLICATION PACKAGES, S-1-15-2-1) and less
 /// privileged ones (ALL RESTRICTED APPLICATION PACKAGES, S-1-15-2-2) load
 /// the DLL. Best effort: install.ps1 grants the install directory as well.
+/// icacls from the system directory: regsvr32 runs elevated, and a bare
+/// name is looked for in the current directory and the PATH first.
 fn grant_appcontainers(dll_path: &str) {
-    let _ = std::process::Command::new("icacls")
+    let mut dir = [0u16; 260];
+    let len =
+        unsafe { windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut dir)) }
+            as usize;
+    if len == 0 || len >= dir.len() {
+        return;
+    }
+    let icacls = std::path::PathBuf::from(String::from_utf16_lossy(&dir[..len])).join("icacls.exe");
+    let _ = std::process::Command::new(icacls)
         .arg(dll_path)
         .arg("/grant")
         .arg("*S-1-15-2-1:(RX)")
