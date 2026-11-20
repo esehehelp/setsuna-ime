@@ -10,16 +10,26 @@ analyses.
 Changes (the rest is upstream's):
 
 - `src/dictionary/lexicon/feature.rs`: the words' features in one string, with
-  a byte for each word's length and the offset of every 64th word, instead of
-  a `String` per word (whose allocations were most of the memory). A word's
-  features are at most 255 bytes.
+  the offset (u32) of every 64th word and each word's end from its block's
+  offset in two bytes (u16), instead of a `String` per word (whose
+  allocations were most of the memory). The features of 64 words in a row
+  are at most 64 KiB, and all of them at most 4 GiB.
 - `src/dictionary/lexicon/map.rs`: the surfaces in an FST (the `fst` crate)
   instead of a double-array trie (`crawdad`, dropped) with a posting list for
   every surface; a surface's word ids that follow one another are the FST's
   value, others are in the postings. A lexicon sorted by surface has no
   postings.
 - `src/dictionary.rs`: its own magic, `VibratoPacked 0.5.3 v1`: upstream's
-  dictionaries are not read, nor are these by upstream.
+  dictionaries are not read, nor are these by upstream. A dictionary read is
+  refused when a word's or an unknown word's connection ids are past its
+  connector (upstream checks that only as it builds one).
+- `src/common.rs`: bincode reads with a limit (`MAX_DICTIONARY_BYTES`), so
+  that a length in a damaged or crafted file is an error, not an
+  allocation of that size.
+- `src/dictionary/connector/raw_connector/scorer.rs`: decoding refuses a base
+  past 31 bits and a table past `i32::MAX` entries, which the AVX2 path's
+  signed compares and gathers take for granted (upstream reads before the
+  table with such a base, or panics).
 - `Cargo.toml`: the package `vibrato-packed`, the library `vibrato_packed`.
 
 setsuna-ime's dictionaries in this layout carry `"format":

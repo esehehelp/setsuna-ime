@@ -119,9 +119,12 @@ pub fn load_config(path: &std::path::Path) -> Result<Config> {
 }
 
 /// `text` with each `${NAME}` replaced by `var(NAME)`, backslashes made
-/// forward slashes (the value goes into a TOML string). Only `KAIRO_*`
-/// names, and each must be set: a path left as written would be read as a
-/// relative one.
+/// forward slashes (the value goes into a TOML string). Only the
+/// directories Kairo hands a task (`KAIRO_INPUT_*`, `KAIRO_DATA_*`,
+/// `KAIRO_OUTPUT_DIR`, `KAIRO_SCRATCH`, `KAIRO_CACHE_DIR`): no other
+/// variable (a token Kairo or the shell holds) goes into a config, whose
+/// values may end up in a log; and each must be set: a path left as written
+/// would be read as a relative one.
 pub fn expand_kairo(text: &str, var: impl Fn(&str) -> Option<String>) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -132,12 +135,23 @@ pub fn expand_kairo(text: &str, var: impl Fn(&str) -> Option<String>) -> Result<
             .find('}')
             .ok_or_else(|| anyhow::anyhow!("unclosed ${{ in the config"))?;
         let name = &after[..end];
+        let suffix = |prefix: &str| {
+            name.strip_prefix(prefix).is_some_and(|s| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            })
+        };
         ensure!(
-            name.starts_with("KAIRO_")
-                && name[6..]
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
-            "only ${{KAIRO_*}} is expanded, not ${{{name}}}"
+            suffix("KAIRO_INPUT_")
+                || suffix("KAIRO_DATA_")
+                || matches!(
+                    name,
+                    "KAIRO_OUTPUT_DIR" | "KAIRO_SCRATCH" | "KAIRO_CACHE_DIR"
+                ),
+            "only Kairo's directories (${{KAIRO_INPUT_*}}, ${{KAIRO_DATA_*}}, \
+             ${{KAIRO_OUTPUT_DIR}}, ${{KAIRO_SCRATCH}}, ${{KAIRO_CACHE_DIR}}) are expanded, \
+             not ${{{name}}}"
         );
         let value = var(name).ok_or_else(|| anyhow::anyhow!("{name} is not set"))?;
         out.push_str(&value.replace('\\', "/"));
@@ -166,8 +180,12 @@ impl Harness {
             .engine
             .model_manifest
             .clone()
-            .expect("[engine] model_manifest");
-        let exe = cfg.engine.engine_exe.clone().expect("[engine] engine_exe");
+            .ok_or_else(|| anyhow::anyhow!("the config names no [engine] model_manifest"))?;
+        let exe = cfg
+            .engine
+            .engine_exe
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the config names no [engine] engine_exe"))?;
         let sent: Arc<Mutex<HashMap<u64, Instant>>> = Arc::default();
         let engine_ms: Arc<Mutex<Vec<f64>>> = Arc::default();
         let notify = {
@@ -339,6 +357,11 @@ mod tests {
         // unset, not KAIRO_*, unclosed: refused rather than read as a path
         assert!(expand_kairo("${KAIRO_INPUT_MODEL}", var).is_err());
         assert!(expand_kairo("${HOME}", var).is_err());
+        // Kairo's other variables (a token) are no directory
+        let token = |_: &str| Some("secret".to_string());
+        assert!(expand_kairo("${KAIRO_TOKEN}", token).is_err());
+        assert!(expand_kairo("${KAIRO_INPUT_}", token).is_err());
+        assert!(expand_kairo("${KAIRO_OUTPUT_DIR}", token).is_ok());
         assert!(expand_kairo("${KAIRO_INPUT_BUILD", var).is_err());
         assert_eq!(expand_kairo("no variables", var).unwrap(), "no variables");
     }

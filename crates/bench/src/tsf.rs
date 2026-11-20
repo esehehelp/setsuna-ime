@@ -421,14 +421,18 @@ impl Field {
             let n = ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0);
             let mut s = String::new();
             if n > 0 {
-                let mut buf = vec![0u16; n as usize / 2];
-                ImmGetCompositionStringW(
+                // bytes, which an odd count (an IME's mistake) would leave
+                // one past a buffer of n / 2 units: room for all of them,
+                // and the call told the buffer's size in bytes as it is
+                let mut buf = vec![0u16; (n as usize).div_ceil(2)];
+                let got = ImmGetCompositionStringW(
                     himc,
                     GCS_COMPSTR,
                     Some(buf.as_mut_ptr() as *mut _),
-                    n as u32,
+                    (buf.len() * 2) as u32,
                 );
-                s = String::from_utf16_lossy(&buf);
+                let units = (got.max(0) as usize / 2).min(buf.len());
+                s = String::from_utf16_lossy(&buf[..units]);
             }
             let _ = ImmReleaseContext(self.hwnd, himc);
             s
@@ -522,9 +526,13 @@ fn transitory() -> Option<bool> {
         let tm: ITfThreadMgr =
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).ok()?;
         let _ = tm.Activate().ok()?;
-        let st = tm.GetFocus().ok()?.GetTop().ok()?.GetStatus().ok()?;
+        // deactivated whether the focus can be read or not
+        let st = tm
+            .GetFocus()
+            .and_then(|d| d.GetTop())
+            .and_then(|c| c.GetStatus());
         let _ = tm.Deactivate();
-        Some(st.dwStaticFlags & TS_SS_TRANSITORY != 0)
+        Some(st.ok()?.dwStaticFlags & TS_SS_TRANSITORY != 0)
     }
 }
 

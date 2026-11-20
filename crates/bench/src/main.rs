@@ -145,14 +145,22 @@ fn main() -> Result<()> {
             let n = rows.len().min(limit);
             let t0 = std::time::Instant::now();
             let mut k = 0;
+            // a row that cannot be written (a full disk) is no row of the
+            // run: the first such error ends it, reported
+            let mut written: std::io::Result<()> = Ok(());
             let typed = h.run(&rows, |t| {
-                let _ = writeln!(f, "{}", serde_json::to_string(t).unwrap_or_default());
-                let _ = f.flush();
+                if written.is_ok() {
+                    written = serde_json::to_string(t)
+                        .map_err(std::io::Error::other)
+                        .and_then(|line| writeln!(f, "{line}"))
+                        .and_then(|()| f.flush());
+                }
                 k += 1;
                 if k % 50 == 0 {
                     eprintln!("{k}/{n} in {:.1} min", t0.elapsed().as_secs_f64() / 60.0);
                 }
             })?;
+            written.with_context(|| format!("write {}", out.display()))?;
             let mut engine = h.engine_ms.lock().unwrap().clone();
             let mut space: Vec<f64> = typed.iter().map(|t| t.space_ms).collect();
             eprintln!(
@@ -456,7 +464,15 @@ fn check(sets: &std::path::Path, analyze: bool) -> Result<()> {
         Box::new(|_| {}),
         &cfg.engine,
     )?;
+    // the daemon up, or gone (a model it cannot load): not a wait forever
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !client.is_ready() {
+        if !client.is_alive() {
+            bail!("the engine exited before it was ready (its stderr log says why)");
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("the engine was not ready in 120 s");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     // hiragana only: katakana folded, everything else dropped
