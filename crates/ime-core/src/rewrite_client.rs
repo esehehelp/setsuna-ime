@@ -407,6 +407,12 @@ pub fn spawn_with_config(
     if !c.enabled {
         return None;
     }
+    // what is typed in an elevated app goes to no server the user's
+    // config.toml names, with no credentials from the user's profile
+    if crate::config::process_is_elevated() {
+        crate::diagnostics::log("rewrite disabled: elevated");
+        return None;
+    }
     let Some(dir) = crate::config::config_dir() else {
         crate::diagnostics::log("rewrite disabled: no config directory");
         return None;

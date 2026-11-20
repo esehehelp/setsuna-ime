@@ -705,7 +705,7 @@ pub fn spawn_with_config(
     #[cfg(windows)]
     let notify = {
         use setsuna_pipe::win;
-        if win::is_elevated().unwrap_or(false) {
+        if crate::config::process_is_elevated() {
             crate::diagnostics::log("engine: elevated, a child of this app's own");
             notify
         } else if win::is_app_container().unwrap_or(false) {
@@ -852,14 +852,19 @@ fn resolve_manifest(
         return Ok(None);
     };
     let root = dir.join("..").join("..");
-    let dirs = [
+    let mut dirs = vec![
         // Installed layout (the installer puts models alongside the module).
         dir.join("models").join("onnx"),
         dir.join("onnx"),
-        // Dev/cargo layout (the module in `target/release`, models in `repo/local/models/onnx`).
-        root.join("local").join("models").join("onnx"),
-        root.join("models").join("onnx"),
     ];
+    // Dev/cargo layout (the module in `target/release`, models in
+    // `repo/local/models/onnx`); not for an elevated process, for which two
+    // levels above an install in Program Files is C:\, where any user may
+    // make a folder
+    if !crate::config::process_is_elevated() {
+        dirs.push(root.join("local").join("models").join("onnx"));
+        dirs.push(root.join("models").join("onnx"));
+    }
     for d in &dirs {
         if let Some(p) = manifest_in_dir(d)? {
             return Ok(Some(p));

@@ -547,9 +547,16 @@ fn config_for_process(cfg: &Config, secure: bool) -> (Config, Option<AppCfg>) {
         .unwrap_or_default();
     let (mut cfg, app) = cfg.for_app(&process);
     // elevated, the files the IME runs and loads come from the installer's
-    // list only: config.toml is the user's to change, from any process
+    // list only: config.toml is the user's to change, from any process.
+    // Nor does what is typed there go where that file says or into the
+    // user's profile: no rewriter, no learning or prediction written to
+    // files the user's processes can redirect, no typed text in a log
     if setsuna_core::config::process_is_elevated() {
         cfg = cfg.with_installed_files(&installed_files());
+        cfg.learning.enabled = false;
+        cfg.frontend.prediction = false;
+        cfg.rewriter.enabled = false;
+        cfg.diagnostics.log_typed_text = false;
         setsuna_core::diagnostics::log("elevated: the IME's files as installed.toml names them");
     }
     if secure {

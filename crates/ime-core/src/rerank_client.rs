@@ -580,7 +580,7 @@ pub fn spawn_with_config(
         return None;
     };
     #[cfg(windows)]
-    let client = if setsuna_pipe::win::is_elevated().unwrap_or(false) {
+    let client = if crate::config::process_is_elevated() {
         crate::diagnostics::log("rerank: elevated, a child of this app's own");
         ChildRerankClient::spawn(manifest, &exe, notify, c)
             .map(|c| Box::new(c) as Box<dyn RerankClient>)

@@ -228,15 +228,22 @@ impl Config {
                 *mine = theirs.clone();
             }
         }
+        // "" is the feature turned off, which stays off
         let empty = |s: &String| s.is_empty();
-        let never = |_: &PathBuf| false;
+        let no_path = |p: &PathBuf| p.as_os_str().is_empty();
         let (e, i) = (&mut self.engine, &installed.engine);
         e.model_manifest = i.model_manifest.clone();
         e.model_dir = i.model_dir.clone();
         e.engine_exe = i.engine_exe.clone();
-        on(&mut e.analyzer_manifest, &i.analyzer_manifest, never);
-        on(&mut e.corrector_manifest, &i.corrector_manifest, never);
+        on(&mut e.analyzer_manifest, &i.analyzer_manifest, no_path);
+        on(&mut e.corrector_manifest, &i.corrector_manifest, no_path);
         let (f, i) = (&mut self.frontend, &installed.frontend);
+        // a built-in romaji table by its name; a file is the installer's
+        // (one the user names could be a share's path, a device, a file
+        // only an administrator should read)
+        if !crate::romaji_table::is_builtin(&f.romaji_table) {
+            f.romaji_table = i.romaji_table.clone();
+        }
         on(
             &mut f.symbol_dictionary_file,
             &i.symbol_dictionary_file,
@@ -245,7 +252,11 @@ impl Config {
         // "" is mixed input turned off
         on(&mut f.mixed_model, &i.mixed_model, empty);
         on(&mut f.name_dictionary_file, &i.name_dictionary_file, empty);
-        on(&mut self.rerank.manifest, &installed.rerank.manifest, never);
+        on(
+            &mut self.rerank.manifest,
+            &installed.rerank.manifest,
+            no_path,
+        );
         self.rerank.exe = installed.rerank.exe.clone();
         on(&mut self.ngram.table, &installed.ngram.table, empty);
         on(&mut self.lexicon.file, &installed.lexicon.file, empty);
@@ -1533,6 +1544,33 @@ mixed_model = \"C:/p/mixed\"
         // on in mine, none installed: off
         assert_eq!(c.frontend.name_dictionary_file, None);
         assert_eq!(c.lexicon.file, None);
+        // a feature turned off by "" stays off, though one is installed
+        let off = Config::load_from_str(
+            "[engine]\nanalyzer_manifest = \"\"\ncorrector_manifest = \"\"\n[rerank]\nmanifest = \"\"\n",
+        )
+        .unwrap();
+        let installed = Config::load_from_str(
+            "[engine]\nanalyzer_manifest = \"C:/p/a.json\"\ncorrector_manifest = \"C:/p/c.json\"\n\
+             [rerank]\nmanifest = \"C:/p/r.json\"\n",
+        )
+        .unwrap();
+        let c = off.with_installed_files(&installed);
+        assert_eq!(c.engine.analyzer_manifest, Some(PathBuf::new()));
+        assert_eq!(c.engine.corrector_manifest, Some(PathBuf::new()));
+        assert_eq!(c.rerank.manifest, Some(PathBuf::new()));
+        // a romaji table is a built-in one, never a file the user names
+        for (mine, want) in [
+            ("azik", "azik"),
+            ("kana_jis", "kana_jis"),
+            ("", ""),
+            ("\\\\\\\\host\\\\share\\\\t.txt", "standard"),
+            ("C:/u/table.txt", "standard"),
+        ] {
+            let c = Config::load_from_str(&format!("[frontend]\nromaji_table = \"{mine}\"\n"))
+                .unwrap()
+                .with_installed_files(&Config::default());
+            assert_eq!(c.frontend.romaji_table, want, "{mine}");
+        }
     }
 
     /// `[diagnostics]` is read, and written only when something in it is

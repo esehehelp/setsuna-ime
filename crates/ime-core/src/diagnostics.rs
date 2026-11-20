@@ -102,7 +102,15 @@ fn open_capped(path: &Path, limit: u64) -> Option<File> {
     Some(file)
 }
 
+/// Where log `name` goes; none in an elevated process (Windows: an
+/// administrator's full token), which writes nothing into the user's
+/// profile: the user's other processes can change what is there (a
+/// junction put in the log's place), and the helpers it starts log nothing
+/// either (their stderr goes nowhere).
 pub fn log_path(name: &str) -> Option<PathBuf> {
+    if crate::config::process_is_elevated() {
+        return None;
+    }
     if let Some(dirs) = crate::config::app_dirs() {
         return Some(dirs.state_home.join("setsuna-ime").join(name));
     }

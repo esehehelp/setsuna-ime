@@ -203,6 +203,13 @@ pub fn active() -> Option<Arc<RomajiTable>> {
     ACTIVE.read().ok()?.clone()
 }
 
+/// Whether `spec` names a table this build has ("standard", "", a
+/// preset), not a file.
+pub fn is_builtin(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.is_empty() || spec == "standard" || PRESETS.iter().any(|(name, _)| *name == spec)
+}
+
 /// The text of `spec`: a preset's name, or a file's path ("standard" and ""
 /// are the built-in table: `None`).
 pub fn text_of(spec: &str) -> Result<Option<String>, String> {
