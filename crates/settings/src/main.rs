@@ -42,6 +42,20 @@ pub enum UserEvent {
     Reply(Value),
 }
 
+/// The webview's profile: in the user's local app data, under the name
+/// WebView2 gave it next to the exe of an install in the user's directory
+/// (`%LOCALAPPDATA%\setsuna-ime`), which keeps it.
+#[cfg(windows)]
+fn webview_data_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            std::path::PathBuf::from(d)
+                .join("setsuna-ime")
+                .join("setsuna-settings.exe.WebView2")
+        })
+}
+
 fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
@@ -54,11 +68,19 @@ fn main() -> wry::Result<()> {
     // The page's messages go through the event loop, which owns the webview
     // the replies are evaluated in.
     let proxy = event_loop.create_proxy();
-    let builder = WebViewBuilder::new()
-        .with_html(INDEX)
-        .with_ipc_handler(move |req| {
-            let _ = proxy.send_event(UserEvent::Ipc(req.into_body()));
-        });
+    // WebView2 keeps its profile next to the exe unless given a folder, and
+    // an install in Program Files may not write there (E_ACCESSDENIED: the
+    // window never came up). The context lives as long as `main`, which the
+    // event loop never returns to.
+    #[cfg(windows)]
+    let mut context = wry::WebContext::new(webview_data_dir());
+    #[cfg(windows)]
+    let builder = WebViewBuilder::new_with_web_context(&mut context);
+    #[cfg(not(windows))]
+    let builder = WebViewBuilder::new();
+    let builder = builder.with_html(INDEX).with_ipc_handler(move |req| {
+        let _ = proxy.send_event(UserEvent::Ipc(req.into_body()));
+    });
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let webview = builder.build(&window)?;
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
