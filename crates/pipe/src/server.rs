@@ -144,13 +144,29 @@ pub fn serve<S: Service + 'static>(
         let (idle_after, exit_after) = (opts.idle_after, opts.exit_after);
         thread::Builder::new()
             .name("setsuna-serve-worker".into())
-            .spawn(move || match load() {
-                Ok((service, line)) => {
-                    let _ = up.send(Ok(line));
-                    work(service, &queue, &clients, idle_after, exit_after);
+            .spawn(move || {
+                // A panic in the service ends the server: left up without its
+                // worker, it took every client's first request and answered
+                // none, and its clients never started another (the pipe still
+                // stood). Gone, the next client starts a new one.
+                struct ExitOnPanic;
+                impl Drop for ExitOnPanic {
+                    fn drop(&mut self) {
+                        if thread::panicking() {
+                            say("the worker panicked, exiting");
+                            std::process::exit(1);
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = up.send(Err(e));
+                let _exit = ExitOnPanic;
+                match load() {
+                    Ok((service, line)) => {
+                        let _ = up.send(Ok(line));
+                        work(service, &queue, &clients, idle_after, exit_after);
+                    }
+                    Err(e) => {
+                        let _ = up.send(Err(e));
+                    }
                 }
             })?;
     }
@@ -162,31 +178,14 @@ pub fn serve<S: Service + 'static>(
         }
     };
     say(format!("{} up: {ready}", opts.pipe_name));
+    let user: Arc<str> = opts.user_sid.as_str().into();
     loop {
-        match instance.accept() {
-            Ok(()) if lock(&clients).connected >= MAX_CLIENTS => {
-                say(format!("{MAX_CLIENTS} clients connected, one let go"));
-                drop(instance);
-            }
-            Ok(()) => {
-                lock(&clients).connected += 1;
-                let (clients, jobs, ready) = (clients.clone(), jobs.clone(), ready.clone());
-                thread::Builder::new()
-                    .name("setsuna-serve-client".into())
-                    .spawn(move || {
-                        if let Err(e) = serve_client(&instance, &ready, &jobs) {
-                            say(format!("client: {e}"));
-                        }
-                        drop(instance);
-                        let mut c = lock(&clients);
-                        c.connected -= 1;
-                        c.since = Instant::now();
-                    })?;
-            }
-            Err(e) => say(format!("accept: {e}")),
-        }
-        // the next client's instance; the name stays ours while one is open
-        instance = loop {
+        let accepted = instance.accept();
+        // The next client's instance before this one goes anywhere: the name
+        // stays ours while one is open, and a client that came and went at
+        // once could close the last one (the name then free for another
+        // server, two serving).
+        let next = loop {
             match Pipe::create(&opts.pipe_name, false, &opts.user_sid) {
                 Ok(p) => break p,
                 Err(e) => {
@@ -195,16 +194,56 @@ pub fn serve<S: Service + 'static>(
                 }
             }
         };
+        let this = std::mem::replace(&mut instance, next);
+        match accepted {
+            Ok(()) if lock(&clients).connected >= MAX_CLIENTS => {
+                say(format!("{MAX_CLIENTS} clients connected, one let go"));
+                drop(this);
+            }
+            Ok(()) => {
+                lock(&clients).connected += 1;
+                let (clients, jobs, ready, user) =
+                    (clients.clone(), jobs.clone(), ready.clone(), user.clone());
+                let left = clients.clone();
+                let spawned = thread::Builder::new()
+                    .name("setsuna-serve-client".into())
+                    .spawn(move || {
+                        if let Err(e) = serve_client(&this, &ready, &user, &jobs) {
+                            say(format!("client: {e}"));
+                        }
+                        drop(this);
+                        let mut c = lock(&clients);
+                        c.connected -= 1;
+                        c.since = Instant::now();
+                    });
+                // no thread for it (the system out of them): that client is
+                // let go, the server goes on
+                if let Err(e) = spawned {
+                    say(format!("a client's thread: {e}"));
+                    let mut c = lock(&left);
+                    c.connected -= 1;
+                    c.since = Instant::now();
+                }
+            }
+            Err(e) => say(format!("accept: {e}")),
+        }
     }
 }
 
 /// The ready line, then a response to each request line until the client
-/// leaves.
-fn serve_client(pipe: &Pipe, ready: &str, jobs: &mpsc::Sender<Job>) -> std::io::Result<()> {
+/// leaves. The client's first request is answered only when it is `user`'s:
+/// the pipe lets every AppContainer of the machine in, another login's too.
+fn serve_client(
+    pipe: &Pipe,
+    ready: &str,
+    user: &str,
+    jobs: &mpsc::Sender<Job>,
+) -> std::io::Result<()> {
     let mut out = pipe;
     out.write_all(format!("{ready}\n").as_bytes())?;
     let mut reader = BufReader::new(pipe);
     let mut line = String::new();
+    let mut checked = false;
     loop {
         line.clear();
         if (&mut reader)
@@ -221,6 +260,17 @@ fn serve_client(pipe: &Pipe, ready: &str, jobs: &mpsc::Sender<Job>) -> std::io::
         }
         if line.trim().is_empty() {
             continue;
+        }
+        // who wrote it, now that something was read
+        if !checked {
+            let client = pipe.client_user_sid()?;
+            if client != user {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("a client of another user ({client})"),
+                ));
+            }
+            checked = true;
         }
         let (reply, response) = mpsc::channel();
         let job = Job {

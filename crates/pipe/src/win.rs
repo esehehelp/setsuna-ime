@@ -20,7 +20,7 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
     TokenIntegrityLevel, TokenIsAppContainer, TokenUser, OWNER_SECURITY_INFORMATION,
     PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TOKEN_USER,
@@ -30,14 +30,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, WaitNamedPipeW,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
+    WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-    QueryFullProcessImageNameW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
-    CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION,
+    CreateProcessW, GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, OpenProcess,
+    OpenProcessToken, OpenThreadToken, QueryFullProcessImageNameW, CREATE_BREAKAWAY_FROM_JOB,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 
@@ -85,18 +85,25 @@ pub fn user_sid() -> io::Result<String> {
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut len = 0u32;
-        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
-        // u64s keep TOKEN_USER aligned
-        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
-        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
-        let err = io::Error::last_os_error();
+        let sid = token_user(token);
         CloseHandle(token);
-        if ok == 0 {
-            return Err(err);
-        }
-        sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid)
+        sid
     }
+}
+
+/// The user of `token`.
+///
+/// # Safety
+/// `token` is a token handle open for TOKEN_QUERY.
+unsafe fn token_user(token: HANDLE) -> io::Result<String> {
+    let mut len = 0u32;
+    GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+    // u64s keep TOKEN_USER aligned
+    let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+    if GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid)
 }
 
 /// Whether this process runs elevated (an administrator's full token).
@@ -381,6 +388,34 @@ impl Pipe {
             // left already, which its first read or write finds
             Some(e) if e == ERROR_PIPE_CONNECTED as i32 || e == ERROR_NO_DATA as i32 => Ok(()),
             _ => Err(err),
+        }
+    }
+
+    /// The user of the client connected to this server instance, as its
+    /// token says (taken by impersonating it at the identification level its
+    /// `open` allows, after a read: the pipe impersonates the writer of what
+    /// was read last). The pipe is open to every AppContainer of the machine
+    /// (the `AC` entry is no one user's), so the server asks.
+    pub fn client_user_sid(&self) -> io::Result<String> {
+        unsafe {
+            if ImpersonateNamedPipeClient(self.0) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            // as this process (the impersonated client could not open its own thread's token for the server)
+            let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token);
+            let err = io::Error::last_os_error();
+            // the thread is the server's again before anything else runs on it
+            if RevertToSelf() == 0 {
+                // a thread left impersonating must not go on: nothing it does is the server's
+                std::process::abort();
+            }
+            if opened == 0 {
+                return Err(err);
+            }
+            let sid = token_user(token);
+            CloseHandle(token);
+            sid
         }
     }
 

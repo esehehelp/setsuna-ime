@@ -18,7 +18,13 @@ struct Scoring(Reranker);
 
 impl Service for Scoring {
     fn handle(&mut self, line: &str) -> String {
-        let response = protocol::handle(&mut self.0, line);
+        let mut response = protocol::handle(&mut self.0, line);
+        // The cache is the clients' together (the last context any app sent):
+        // how much of a request it held would tell one app how much of its
+        // context another's shared, a char at a time. The shared server says
+        // nothing of it.
+        response.cached = None;
+        response.decoded = None;
         serde_json::to_string(&response).unwrap_or_else(|e| {
             serde_json::json!({ "id": response.id, "error": e.to_string() }).to_string()
         })
