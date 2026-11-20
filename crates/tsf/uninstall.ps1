@@ -75,6 +75,13 @@ function Revoke-AppContainerRead {
     }
 }
 
+# One argument for Start-Process -ArgumentList, which joins them with spaces
+# as they are: quoted, and a trailing backslash doubled so that it does not
+# escape the closing quote (a path holds no quote).
+function Format-Argument([string]$Value) {
+    '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
 function Get-RegisteredDllPath {
     try {
         $registered = (Get-ItemProperty -LiteralPath $ClsidReg -ErrorAction Stop).'(default)'
@@ -94,11 +101,11 @@ $RegisteredDllPath = Get-RegisteredDllPath
 if (((Test-Path -LiteralPath $RegisteredDllPath) -or (Test-Path -LiteralPath $InstallDir)) -and
     -not (Test-IsAdmin) -and -not $NoElevate) {
     Write-Log INFO 'elevating for regsvr32 /u'
-    $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath)
+    $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Format-Argument $PSCommandPath))
     if ($Yes)        { $argv += '-Yes' }
     if ($KeepConfig) { $argv += '-KeepConfig' }
     # the directory found here, whoever the elevated one runs as
-    $argv += @('-InstallDir', ("`"$InstallDir`""))
+    $argv += @('-InstallDir', (Format-Argument $InstallDir))
     try {
         # on the PowerShell running this: pwsh may not be installed
         $p = Start-Process (Get-Process -Id $PID).Path -ArgumentList $argv -Verb RunAs -Wait -PassThru

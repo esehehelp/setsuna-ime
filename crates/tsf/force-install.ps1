@@ -55,10 +55,17 @@ function Test-IsAdmin {
     $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# One argument for Start-Process -ArgumentList, which joins them with spaces
+# as they are: quoted, and a trailing backslash doubled so that it does not
+# escape the closing quote (a path holds no quote).
+function Format-Argument([string]$Value) {
+    '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
 function Restart-AsAdmin {
-    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
-    $argv += @('-Manifest', "`"$Manifest`"")
-    if ($RerankManifest) { $argv += @('-RerankManifest', "`"$RerankManifest`"") }
+    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Format-Argument $PSCommandPath))
+    $argv += @('-Manifest', (Format-Argument $Manifest))
+    if ($RerankManifest) { $argv += @('-RerankManifest', (Format-Argument $RerankManifest)) }
     if ($SkipBuild) { $argv += '-SkipBuild' }
     if ($KeepHostsRunning) { $argv += '-KeepHostsRunning' }
     if ($NoSmoke) { $argv += '-NoSmoke' }

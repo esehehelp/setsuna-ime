@@ -899,22 +899,29 @@ if ($Corrector) {
     Write-Log INFO "using reading corrector: $Corrector"
 }
 
+# One argument for Start-Process -ArgumentList, which joins them with spaces
+# as they are: quoted, and a trailing backslash doubled so that it does not
+# escape the closing quote (a path holds no quote).
+function Format-Argument([string]$Value) {
+    '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
 # ---- elevate when regsvr32 needed ----
 if (-not (Test-IsAdmin) -and -not $NoElevate) {
     Write-Log INFO 'elevating for regsvr32'
     $argv = @(
-        '-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
-        '-SourceDir',("`"$SourceDir`""),'-Manifest',("`"$Manifest`"")
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',(Format-Argument $PSCommandPath),
+        '-SourceDir',(Format-Argument $SourceDir),'-Manifest',(Format-Argument $Manifest)
     )
-    if ($RerankManifest) { $argv += @('-RerankManifest', ("`"$RerankManifest`"")) }
+    if ($RerankManifest) { $argv += @('-RerankManifest', (Format-Argument $RerankManifest)) }
     # always: "" (none) would be the default again
-    $argv += @('-MixedModel', ("`"$MixedModel`""))
-    if ($NameDictionary) { $argv += @('-NameDictionary', ("`"$NameDictionary`"")) }
-    if ($Lexicon) { $argv += @('-Lexicon', ("`"$Lexicon`"")) }
-    if ($Analyzer) { $argv += @('-Analyzer', ("`"$Analyzer`"")) }
-    if ($Corrector) { $argv += @('-Corrector', ("`"$Corrector`"")) }
+    $argv += @('-MixedModel', (Format-Argument $MixedModel))
+    if ($NameDictionary) { $argv += @('-NameDictionary', (Format-Argument $NameDictionary)) }
+    if ($Lexicon) { $argv += @('-Lexicon', (Format-Argument $Lexicon)) }
+    if ($Analyzer) { $argv += @('-Analyzer', (Format-Argument $Analyzer)) }
+    if ($Corrector) { $argv += @('-Corrector', (Format-Argument $Corrector)) }
     if ($Force) { $argv += '-Force' }
-    if ($PSBoundParameters.ContainsKey('InstallDir')) { $argv += @('-InstallDir', ("`"$InstallDir`"")) }
+    if ($PSBoundParameters.ContainsKey('InstallDir')) { $argv += @('-InstallDir', (Format-Argument $InstallDir)) }
     try {
         $p = Start-Process $PsExe -ArgumentList $argv -Verb RunAs -Wait -PassThru
         Write-Log INFO "elevated install exit code: $($p.ExitCode)"
