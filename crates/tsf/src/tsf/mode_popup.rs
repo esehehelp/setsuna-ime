@@ -13,7 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::placement::{place_on_screen, Rect};
 use crate::tsf::candidate_window::{
-    dpi_scale, draw_text, font, gradient, palette, sc, text_width, Palette, ACCENT, RADIUS,
+    dpi_scale, draw_text, font, gradient, move_to_monitor_at, palette, sc, text_width, Palette,
+    ACCENT, RADIUS,
 };
 
 const CLASS_NAME: PCWSTR = w!("SetsunaModePopup");
@@ -26,6 +27,9 @@ const GAP: i32 = 10;
 struct PopupData {
     glyph: String,
     label: String,
+    /// The theme it was made with: "auto" follows Windows' app mode at each
+    /// show, as the candidate window does.
+    theme: String,
     palette: Palette,
     font_face: Vec<u16>,
     font_px: i32,
@@ -63,6 +67,7 @@ impl ModePopup {
             let data = Box::new(PopupData {
                 glyph: String::new(),
                 label: String::new(),
+                theme: cfg.theme.clone(),
                 palette: palette(cfg),
                 font_face: face,
                 font_px: cfg.font_pt.clamp(8, 48) as i32,
@@ -85,6 +90,9 @@ impl ModePopup {
         if hwnd.0 as usize == 0 {
             return;
         }
+        if let Some(caret) = at {
+            move_to_monitor_at(hwnd, caret.left, caret.bottom);
+        }
         let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut PopupData;
         let Some(d) = (unsafe { ptr.as_mut() }) else {
             return;
@@ -96,6 +104,13 @@ impl ModePopup {
         };
         d.glyph = glyph.to_string();
         d.label = label.to_string();
+        if d.theme == "auto" {
+            // Windows' app mode may have changed since
+            d.palette = palette(&CandidateWindowCfg {
+                theme: d.theme.clone(),
+                ..Default::default()
+            });
+        }
         let s = dpi_scale(hwnd);
         unsafe {
             let hdc = GetDC(hwnd);
@@ -144,7 +159,10 @@ impl ModePopup {
         };
         unsafe {
             let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, sc(RADIUS * 2, s), sc(RADIUS * 2, s));
-            SetWindowRgn(hwnd, rgn, false);
+            // the window owns the region once set, else it is ours to free
+            if SetWindowRgn(hwnd, rgn, false) == 0 {
+                let _ = DeleteObject(rgn);
+            }
             let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
             let _ = InvalidateRect(hwnd, None, false);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);

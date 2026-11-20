@@ -243,6 +243,9 @@ impl CandidateWindow {
 
     fn render(&mut self, candidates: &[String], selected: usize) {
         let (hwnd, anchor) = (self.hwnd, self.anchor);
+        if let Some(caret) = anchor {
+            move_to_monitor_at(hwnd, caret.left, caret.bottom);
+        }
         let Some(d) = self.data() else {
             return;
         };
@@ -274,7 +277,10 @@ impl CandidateWindow {
                 sc(radius * 2, s),
                 sc(radius * 2, s),
             );
-            SetWindowRgn(hwnd, rgn, false);
+            // the window owns the region once set, else it is ours to free
+            if SetWindowRgn(hwnd, rgn, false) == 0 {
+                let _ = DeleteObject(rgn);
+            }
             // placed by its size before it shows, inside the screen
             let (x, y, keep) = match anchor {
                 Some(caret) => {
@@ -373,6 +379,28 @@ fn create_window() -> HWND {
             None,
         )
         .unwrap_or_default()
+    }
+}
+
+/// When the point `(x, y)` is on another monitor than the window, the
+/// window goes there first, unresized and undrawn: it takes that monitor's
+/// DPI ([`dpi_scale`]), which its size is then laid out by (laid out where
+/// it was, it came up sized for the other monitor).
+pub(crate) fn move_to_monitor_at(hwnd: HWND, x: i32, y: i32) {
+    use windows::Win32::Foundation::POINT;
+    unsafe {
+        let target = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if target != MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
+        }
     }
 }
 

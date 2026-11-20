@@ -74,29 +74,6 @@ pub fn dll_hinstance() -> windows::Win32::Foundation::HINSTANCE {
     windows::Win32::Foundation::HINSTANCE(DLL_INSTANCE.get().map(|s| s.0 .0).unwrap_or_default())
 }
 
-#[cfg(target_os = "windows")]
-pub static DLL_REF_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(target_os = "windows")]
-pub fn dll_add_ref() {
-    DLL_REF_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(target_os = "windows")]
-pub fn dll_release() {
-    let prev = DLL_REF_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-    if prev == 0 {
-        tracing::error!("dll_release underflow");
-        return;
-    }
-    DLL_REF_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(target_os = "windows")]
-pub fn dll_can_unload() -> bool {
-    DLL_REF_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0
-}
-
 /// Message posted to the service's notify HWND when a conversion result is
 /// ready. `wparam` carries the request id; `lparam` is unused.
 #[cfg(target_os = "windows")]
@@ -123,15 +100,26 @@ pub const WM_APP_FIELD: u32 = 0x8000 + 4;
 /// looked for last.
 #[cfg(target_os = "windows")]
 pub fn dll_dir() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
     let hmodule = DLL_INSTANCE.get().map(|s| s.0).unwrap_or_default();
-    let mut buf = [0u16; 260];
-    let len = unsafe { GetModuleFileNameW(hmodule, &mut buf) } as usize;
-    if len == 0 {
-        return None;
+    // MAX_PATH first, more for a longer path (a full buffer is a cut one)
+    let mut buf = vec![0u16; 260];
+    loop {
+        let len = unsafe { GetModuleFileNameW(hmodule, &mut buf) } as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buf.len() {
+            buf.truncate(len);
+            break;
+        }
+        if buf.len() >= 1 << 15 {
+            return None;
+        }
+        buf.resize(buf.len() * 2, 0);
     }
-    let full = String::from_utf16_lossy(&buf[..len]);
-    std::path::PathBuf::from(full)
+    std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf))
         .parent()
         .map(|p| p.to_path_buf())
 }

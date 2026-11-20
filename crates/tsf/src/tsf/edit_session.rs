@@ -162,17 +162,26 @@ impl ActionEditSession {
                 // Put the caret at the end of the composition.
                 let caret_range = range.Clone()?;
                 caret_range.Collapse(ec, TF_ANCHOR_END)?;
-                let sel = TF_SELECTION {
-                    range: core::mem::ManuallyDrop::new(Some(caret_range)),
-                    style: TF_SELECTIONSTYLE {
-                        ase: TF_AE_END,
-                        fInterimChar: FALSE,
-                    },
-                };
-                self.context.SetSelection(ec, &[sel])?;
+                self.select(ec, caret_range)?;
             }
         }
         Ok(())
+    }
+
+    /// Put the selection at `caret`. TF_SELECTION holds its range in a
+    /// ManuallyDrop, released here once SetSelection took its own (left
+    /// there, one range stayed behind at each preedit update).
+    unsafe fn select(&self, ec: u32, caret: ITfRange) -> Result<()> {
+        let mut sel = [TF_SELECTION {
+            range: core::mem::ManuallyDrop::new(Some(caret)),
+            style: TF_SELECTIONSTYLE {
+                ase: TF_AE_END,
+                fInterimChar: FALSE,
+            },
+        }];
+        let result = unsafe { self.context.SetSelection(ec, &sel) };
+        unsafe { core::mem::ManuallyDrop::drop(&mut sel[0].range) };
+        result
     }
 
     /// Put the caret `chars` chars into the preedit `text` (the user moved
@@ -187,14 +196,7 @@ impl ActionEditSession {
                 let mut moved = 0i32;
                 caret.ShiftEnd(ec, offset as i32, &mut moved, core::ptr::null())?;
                 caret.Collapse(ec, TF_ANCHOR_END)?;
-                let sel = TF_SELECTION {
-                    range: core::mem::ManuallyDrop::new(Some(caret)),
-                    style: TF_SELECTIONSTYLE {
-                        ase: TF_AE_END,
-                        fInterimChar: FALSE,
-                    },
-                };
-                self.context.SetSelection(ec, &[sel])?;
+                self.select(ec, caret)?;
             }
         }
         Ok(())
@@ -259,14 +261,7 @@ impl ActionEditSession {
 
                     let caret = range.Clone()?;
                     caret.Collapse(ec, TF_ANCHOR_END)?;
-                    let sel = TF_SELECTION {
-                        range: core::mem::ManuallyDrop::new(Some(caret)),
-                        style: TF_SELECTIONSTYLE {
-                            ase: TF_AE_END,
-                            fInterimChar: FALSE,
-                        },
-                    };
-                    self.context.SetSelection(ec, &[sel])?;
+                    self.select(ec, caret)?;
                 }
             }
         }

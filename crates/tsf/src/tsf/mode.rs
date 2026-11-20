@@ -217,29 +217,33 @@ impl ITfLangBarItemButton_Impl for ModeItem_Impl {
         let Some(menu) = pmenu.filter(|_| self.state.settings) else {
             return Ok(());
         };
-        let text: Vec<u16> = "設定...".encode_utf16().collect();
-        unsafe {
-            menu.AddMenuItem(
-                MENU_SETTINGS,
-                0,
-                HBITMAP::default(),
-                HBITMAP::default(),
-                &text,
-                std::ptr::null_mut(),
-            )
-        }
+        crate::guard::catch("mode item menu", Err(E_FAIL.into()), || {
+            let text: Vec<u16> = "設定...".encode_utf16().collect();
+            unsafe {
+                menu.AddMenuItem(
+                    MENU_SETTINGS,
+                    0,
+                    HBITMAP::default(),
+                    HBITMAP::default(),
+                    &text,
+                    std::ptr::null_mut(),
+                )
+            }
+        })
     }
 
     fn OnMenuSelect(&self, wid: u32) -> Result<()> {
         if wid == MENU_SETTINGS && self.state.settings {
-            open_settings();
+            crate::guard::catch("mode item menu select", (), open_settings);
         }
         Ok(())
     }
 
     fn GetIcon(&self) -> Result<HICON> {
         // the caller destroys it
-        mode_icon(self.state.glyph()).ok_or_else(|| E_FAIL.into())
+        crate::guard::catch("mode item icon", Err(E_FAIL.into()), || {
+            mode_icon(self.state.glyph()).ok_or_else(|| E_FAIL.into())
+        })
     }
 
     fn GetText(&self) -> Result<BSTR> {

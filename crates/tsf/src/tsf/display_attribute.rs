@@ -156,6 +156,9 @@ impl IEnumTfDisplayAttributeInfo_Impl for DisplayAttributeEnum_Impl {
         rginfo: *mut Option<ITfDisplayAttributeInfo>,
         pcfetched: *mut u32,
     ) -> Result<()> {
+        if rginfo.is_null() && celt > 0 {
+            return Err(E_POINTER.into());
+        }
         let mut fetched = 0u32;
         let idx = self.index.get();
         for i in 0..celt as usize {

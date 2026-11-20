@@ -7,7 +7,6 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 
-use crate::globals::{dll_add_ref, dll_release};
 use crate::tsf::text_input_processor::SetsunaTextService;
 
 #[implement(IClassFactory)]
@@ -32,14 +31,7 @@ pub unsafe fn create_service(riid: *const GUID, ppv: *mut *mut core::ffi::c_void
 #[allow(clippy::new_without_default)]
 impl SetsunaClassFactory {
     pub fn new() -> Self {
-        dll_add_ref();
         Self
-    }
-}
-
-impl Drop for SetsunaClassFactory {
-    fn drop(&mut self) {
-        dll_release();
     }
 }
 
@@ -53,7 +45,7 @@ impl IClassFactory_Impl for SetsunaClassFactory_Impl {
     ) -> Result<()> {
         setsuna_core::diagnostics::log("ClassFactory::CreateInstance");
         unsafe {
-            if ppvobject.is_null() {
+            if ppvobject.is_null() || riid.is_null() {
                 setsuna_core::diagnostics::log("ClassFactory::CreateInstance E_POINTER");
                 return Err(E_POINTER.into());
             }
@@ -72,12 +64,8 @@ impl IClassFactory_Impl for SetsunaClassFactory_Impl {
         }
     }
 
-    fn LockServer(&self, flock: BOOL) -> Result<()> {
-        if flock.as_bool() {
-            dll_add_ref();
-        } else {
-            dll_release();
-        }
+    /// Nothing to hold: the DLL is never unloaded (`DllCanUnloadNow`).
+    fn LockServer(&self, _flock: BOOL) -> Result<()> {
         Ok(())
     }
 }

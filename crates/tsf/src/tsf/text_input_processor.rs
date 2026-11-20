@@ -27,9 +27,8 @@ use windows::Win32::UI::TextServices::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::globals::{
-    dll_add_ref, dll_dir, dll_release, GUID_PRESERVED_KEY_OFF, GUID_PRESERVED_KEY_ON,
-    GUID_PRESERVED_KEY_ONOFF, WM_APP_CANDIDATE_CLICK, WM_APP_CONVERT_DONE, WM_APP_FIELD,
-    WM_APP_TOGGLE,
+    dll_dir, GUID_PRESERVED_KEY_OFF, GUID_PRESERVED_KEY_ON, GUID_PRESERVED_KEY_ONOFF,
+    WM_APP_CANDIDATE_CLICK, WM_APP_CONVERT_DONE, WM_APP_FIELD, WM_APP_TOGGLE,
 };
 use crate::keymap::{OnOff, OnOffKeys};
 use crate::tsf::mode::{self, ModeItem, ModeState};
@@ -187,7 +186,6 @@ const ENGINE_RETRY: Duration = Duration::from_secs(30);
 impl SetsunaTextService {
     pub fn new() -> Self {
         setsuna_core::diagnostics::log("SetsunaTextService::new");
-        dll_add_ref();
         Self {
             inner: RefCell::new(Inner {
                 thread_mgr: None,
@@ -238,10 +236,10 @@ fn create_notify_window(service_ptr: *const core::ffi::c_void) -> HWND {
         .get()
         .map(|s| HINSTANCE(s.0 .0))
         .unwrap_or_default();
-    let class_name = format!(
-        "SetsunaAsyncNotify_{:x}_{:x}",
-        hinstance.0 as usize, service_ptr as usize
-    );
+    // One class for this DLL's services, registered once: a class of each
+    // service's own stayed registered after it, one more in a long-running
+    // app (explorer) at each service, out of the session's atoms.
+    let class_name = format!("SetsunaAsyncNotify_{:x}", hinstance.0 as usize);
     let class_w: Vec<u16> = class_name
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -249,19 +247,21 @@ fn create_notify_window(service_ptr: *const core::ffi::c_void) -> HWND {
     let class_pcw = PCWSTR(class_w.as_ptr());
 
     unsafe {
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(notify_wnd_proc),
-            hInstance: hinstance,
-            lpszClassName: class_pcw,
-            ..Default::default()
-        };
-        let atom = RegisterClassW(&wc);
-        if atom == 0 {
-            setsuna_core::diagnostics::log(format!(
-                "RegisterClassW failed class={class_name} err={:?}",
-                GetLastError()
-            ));
-        }
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        REGISTERED.call_once(|| {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(notify_wnd_proc),
+                hInstance: hinstance,
+                lpszClassName: class_pcw,
+                ..Default::default()
+            };
+            if RegisterClassW(&wc) == 0 {
+                setsuna_core::diagnostics::log(format!(
+                    "RegisterClassW failed class={class_name} err={:?}",
+                    GetLastError()
+                ));
+            }
+        });
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_pcw,
@@ -273,7 +273,7 @@ fn create_notify_window(service_ptr: *const core::ffi::c_void) -> HWND {
             0,
             HWND(-3isize as *mut _), // HWND_MESSAGE
             None,
-            None,
+            hinstance,
             None,
         )
         .unwrap_or_default();
@@ -313,10 +313,12 @@ unsafe extern "system" fn notify_wnd_proc(
     if ptr.is_null() {
         return LRESULT(0);
     }
-    // Safety: the service outlives its notify HWND — Deactivate / Drop tear
-    // the HWND down (and clear USERDATA) BEFORE letting COM release the
-    // service.
+    // Safety: the service outlives its notify HWND — Drop tears the HWND
+    // down (and clears USERDATA) before the service goes.
     let svc = unsafe { &*ptr };
+    // A reference of the message's own: what it runs (an edit session, a
+    // toggle) may call into the app, which may let the service go meanwhile.
+    let _held: Option<windows::core::IUnknown> = svc.cast_interface().ok();
     svc.guarded("notify window", None, (), || match msg {
         WM_APP_CONVERT_DONE => {
             setsuna_core::diagnostics::log(format!(
@@ -803,6 +805,9 @@ impl SetsunaTextService_Impl {
         if !bad_keys.is_empty() {
             setsuna_core::diagnostics::log(format!("on / off keys not understood: {bad_keys:?}"));
         }
+        // What this replaces goes after the borrow: the old bridge's threads
+        // are joined and the old windows destroyed, which may call back in.
+        let mut gone = (None, None, None);
         {
             let mut inner = self.inner.borrow_mut();
             let inner = &mut *inner;
@@ -811,7 +816,10 @@ impl SetsunaTextService_Impl {
                 // a client that goes (no shared engine to reach) is
                 // started again no sooner than this
                 inner.engine_retry_at = Some(Instant::now() + ENGINE_RETRY);
-                inner.engine = EngineBridge::with_frontend(client, &cfg.frontend);
+                gone.0 = Some(std::mem::replace(
+                    &mut inner.engine,
+                    EngineBridge::with_frontend(client, &cfg.frontend),
+                ));
             } else {
                 inner.engine.reset_preserving_client(&cfg.frontend);
             }
@@ -836,14 +844,17 @@ impl SetsunaTextService_Impl {
                 .engine
                 .set_candidate_paging(crate::tsf::candidate_window::page_size(&cfg), true);
             if let Some(w) = window {
-                inner.candidate_window = Some(w);
+                gone.1 = inner.candidate_window.replace(w);
                 inner.window_made = Some(window_key);
             }
             inner.symbols = cfg.frontend.symbols.clone();
             inner.on_off_keys = on_off_keys;
-            inner.mode_popup = Some(ModePopup::new(&cfg.ui.candidate_window));
+            gone.2 = inner
+                .mode_popup
+                .replace(ModePopup::new(&cfg.ui.candidate_window));
             inner.last_preedit.clear();
         }
+        drop(gone);
         // The rewriter: started when on, again when its settings changed;
         // with it, the conversion key also asks for a rewrite.
         let needs_rewriter = cfg.rewriter.enabled && {
@@ -1129,15 +1140,10 @@ impl SetsunaTextService_Impl {
         // churn, and the int4b16 daemon has a noticeable cold-start. Keeping
         // it alive for the COM object's lifetime lets the reader reach Ready
         // instead of losing every in-flight startup to a transient Deactivate.
-        let (thread_mgr, client_id, advised, preserved) = {
+        let (thread_mgr, client_id, advised, preserved, window) = {
             let mut inner = self.inner.borrow_mut();
             inner.composition = None;
-            if let Some(ref cw) = inner.candidate_window {
-                if let Ok(mut cw) = cw.try_borrow_mut() {
-                    cw.hide();
-                }
-            }
-            inner.candidate_window = None;
+            let window = inner.candidate_window.take();
             inner.window_made = None;
             let advised = inner.keystroke_advised;
             inner.keystroke_advised = false;
@@ -1145,8 +1151,21 @@ impl SetsunaTextService_Impl {
             let cid = inner.client_id;
             inner.client_id = 0;
             inner.activate_flags = 0;
-            (tm, cid, advised, std::mem::take(&mut inner.preserved))
+            (
+                tm,
+                cid,
+                advised,
+                std::mem::take(&mut inner.preserved),
+                window,
+            )
         };
+        // hidden and destroyed with no borrow held (a window call may call
+        // back in)
+        if let Some(cw) = window {
+            if let Ok(mut cw) = cw.try_borrow_mut() {
+                cw.hide();
+            }
+        }
         let sink_cookie = self.inner.borrow_mut().thread_mgr_sink_cookie.take();
         if let (Some(tm), Some(cookie)) = (&thread_mgr, sink_cookie) {
             unsafe {
@@ -1156,11 +1175,15 @@ impl SetsunaTextService_Impl {
             }
         }
         // the mode: off the taskbar, no more compartment changes
-        let (mode, open_close) = {
+        let (mode, open_close, popup) = {
             let mut inner = self.inner.borrow_mut();
-            inner.mode_popup = None;
-            (inner.mode.take(), inner.open_close.take())
+            (
+                inner.mode.take(),
+                inner.open_close.take(),
+                inner.mode_popup.take(),
+            )
         };
+        drop(popup);
         if let (Some(tm), Some((_, item))) = (&thread_mgr, mode) {
             unsafe {
                 if let Ok(mgr) = tm.cast::<ITfLangBarItemMgr>() {
@@ -1226,7 +1249,6 @@ impl Drop for SetsunaTextService {
                 inner.candidate_window = None;
             }
         });
-        dll_release();
     }
 }
 

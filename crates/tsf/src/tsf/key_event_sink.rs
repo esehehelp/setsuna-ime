@@ -467,8 +467,15 @@ impl SetsunaTextService_Impl {
             let at = context
                 .as_ref()
                 .and_then(|c| selection_screen_rect(c, client_id));
-            if let Some(popup) = self.inner.borrow_mut().mode_popup.as_mut() {
+            // shown with no borrow held (a window call may call back in),
+            // then put back unless a new one took its place meanwhile
+            let popup = self.inner.borrow_mut().mode_popup.take();
+            if let Some(mut popup) = popup {
                 popup.show(on, converts, at);
+                let mut inner = self.inner.borrow_mut();
+                if inner.mode_popup.is_none() {
+                    inner.mode_popup = Some(popup);
+                }
             }
         }
     }
@@ -580,6 +587,9 @@ pub(crate) fn apply_actions(
 
     let session_actions_snapshot: Vec<Action> = edit_actions.clone();
     let mut panicked = false;
+    // whether the session ran: a preedit it never drew is no reason to skip
+    // the same one next time
+    let mut rendered = true;
     if !edit_actions.is_empty() {
         let session = ActionEditSession::new(
             context.clone(),
@@ -599,6 +609,7 @@ pub(crate) fn apply_actions(
                 TF_ES_SYNC | TF_ES_READWRITE,
             )?;
             if hr.is_err() {
+                rendered = false;
                 tracing::warn!("RequestEditSession failed: {:?}", hr);
                 setsuna_core::diagnostics::log(format!("RequestEditSession failed: {hr:?}"));
             } else {
@@ -614,7 +625,10 @@ pub(crate) fn apply_actions(
         // Track the last-rendered preedit so the next apply_actions call
         // can dedup no-op SetText. Walk session_actions in order so the
         // latest UpdatePreedit / Commit wins.
-        for a in &session_actions_snapshot {
+        if !rendered {
+            inner.last_preedit.clear();
+        }
+        for a in session_actions_snapshot.iter().filter(|_| rendered) {
             match a {
                 Action::UpdatePreedit { text } => inner.last_preedit = preedit_key(text),
                 Action::UpdateSegments { segments, focus } => {

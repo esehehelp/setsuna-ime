@@ -26,6 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const CORE_ABI: u32 = 1;
 /// Posted to the shim's window to swap the core outside TSF's call.
 const WM_APP_SWAP: u32 = WM_APP + 1;
+/// Posted by the directory's watch on a change: it waits for the next one
+/// again ([`Watch::rearm`]), then swaps.
+const WM_APP_CHANGED: u32 = WM_APP + 2;
 /// Looks at core.txt now and then where the directory cannot be watched.
 const TIMER_POLL: usize = 2;
 const POLL_MS: u32 = 10_000;
@@ -285,8 +288,11 @@ impl Core {
     }
 }
 
-/// The shim's directory watched: a change in it (core.txt written) posts a
-/// swap to the shim's window from the thread pool.
+/// The shim's directory watched: a change in it (core.txt written) posts
+/// `WM_APP_CHANGED` to the shim's window from the thread pool, once; the
+/// window waits for the next change again. (A wait left armed fired again
+/// and again while the change handle could not be reset, as when the
+/// directory goes.)
 struct Watch {
     change: HANDLE,
     wait: HANDLE,
@@ -294,7 +300,6 @@ struct Watch {
 }
 
 struct WatchTarget {
-    change: HANDLE,
     hwnd: isize,
 }
 
@@ -308,38 +313,57 @@ impl Watch {
             )
             .ok()?;
             let target = Box::into_raw(Box::new(WatchTarget {
-                change,
                 hwnd: hwnd.0 as isize,
             }));
-            let mut wait = HANDLE::default();
-            if RegisterWaitForSingleObject(
-                &mut wait,
+            let mut watch = Watch {
                 change,
-                Some(on_change),
-                Some(target as *const c_void),
-                INFINITE,
-                WT_EXECUTEDEFAULT,
-            )
-            .is_err()
-            {
-                drop(Box::from_raw(target));
-                let _ = FindCloseChangeNotification(change);
-                return None;
-            }
-            Some(Watch {
-                change,
-                wait,
+                wait: HANDLE::default(),
                 target,
-            })
+            };
+            // (dropped, it lets the handle and the target go)
+            watch.arm().then_some(watch)
+        }
+    }
+
+    /// Wait for the next change, once.
+    fn arm(&mut self) -> bool {
+        let mut wait = HANDLE::default();
+        let armed = unsafe {
+            RegisterWaitForSingleObject(
+                &mut wait,
+                self.change,
+                Some(on_change),
+                Some(self.target as *const c_void),
+                INFINITE,
+                WT_EXECUTEONLYONCE,
+            )
+        }
+        .is_ok();
+        self.wait = if armed { wait } else { HANDLE::default() };
+        armed
+    }
+
+    /// After a change: the wait that saw it let go, the change handle reset
+    /// and the next change waited for. False when the directory can be
+    /// watched no more.
+    fn rearm(&mut self) -> bool {
+        self.unregister();
+        unsafe { FindNextChangeNotification(self.change) }.is_ok() && self.arm()
+    }
+
+    fn unregister(&mut self) {
+        if !self.wait.0.is_null() {
+            // returns once a callback running has
+            let _ = unsafe { UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE) };
+            self.wait = HANDLE::default();
         }
     }
 }
 
 impl Drop for Watch {
     fn drop(&mut self) {
+        self.unregister();
         unsafe {
-            // returns once a callback running has
-            let _ = UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE);
             let _ = FindCloseChangeNotification(self.change);
             drop(Box::from_raw(self.target));
         }
@@ -350,11 +374,10 @@ unsafe extern "system" fn on_change(target: *mut c_void, _timed_out: BOOLEAN) {
     let target = &*(target as *const WatchTarget);
     let _ = PostMessageW(
         HWND(target.hwnd as *mut c_void),
-        WM_APP_SWAP,
+        WM_APP_CHANGED,
         WPARAM(0),
         LPARAM(0),
     );
-    let _ = FindNextChangeNotification(target.change);
 }
 
 /// Where the text service is active: its thread manager, client id and
@@ -379,6 +402,9 @@ struct State {
     /// In a swap (between the old core's deactivation and the new one's
     /// activation).
     swapping: bool,
+    /// A swap runs ([`ShimTip_Impl::swap`]): one asked for from inside it
+    /// comes after.
+    in_swap: bool,
 }
 
 #[implement(
@@ -412,6 +438,19 @@ impl ShimTip_Impl {
     fn activate(&self, thread_mgr: &ITfThreadMgr, tid: u32, flags: u32) -> Result<()> {
         let core = self.core()?;
         unsafe { core.tip.ActivateEx(thread_mgr, tid, flags)? };
+        // activated again with no deactivation between: the focus sink of
+        // the activation before let go
+        let before = self.state.borrow_mut().active.take();
+        if let Some(Active {
+            thread_mgr: before_mgr,
+            sink_cookie: Some(cookie),
+            ..
+        }) = before
+        {
+            if let Ok(source) = before_mgr.cast::<ITfSource>() {
+                let _ = unsafe { source.UnadviseSink(cookie) };
+            }
+        }
         let sink: ITfThreadMgrEventSink = unsafe { self.cast()? };
         let sink_cookie = thread_mgr
             .cast::<ITfSource>()
@@ -492,7 +531,36 @@ impl ShimTip_Impl {
     /// when it names another and no composition is open (else in a while).
     /// The new one takes the old one's state (the mode as the user left it)
     /// and is activated on the same thread manager, client id and flags.
+    /// A swap asked for from inside one (a message the cores' calls let
+    /// through) comes after it, retried in a while.
     fn swap(&self) {
+        let hwnd = {
+            let mut st = self.state.borrow_mut();
+            if !st.in_swap {
+                st.in_swap = true;
+                None
+            } else {
+                Some(st.hwnd)
+            }
+        };
+        if let Some(hwnd) = hwnd {
+            unsafe { SetTimer(hwnd, TIMER_RETRY, RETRY_MS, None) };
+            return;
+        }
+        /// `in_swap` cleared however the swap ends (a panic included).
+        struct Done<'a>(&'a ShimTip_Impl);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut st) = self.0.state.try_borrow_mut() {
+                    st.in_swap = false;
+                }
+            }
+        }
+        let _done = Done(self);
+        self.swap_now();
+    }
+
+    fn swap_now(&self) {
         let (old, thread_mgr, tid, flags, hwnd, failed) = {
             let st = self.state.borrow();
             let (Some(old), Some(active)) = (st.core.clone(), st.active.as_ref()) else {
@@ -561,6 +629,27 @@ impl ShimTip_Impl {
                 let _ = unsafe { old.tip.ActivateEx(&thread_mgr, tid, flags) };
                 self.state.borrow_mut().failed = now;
             }
+        }
+    }
+
+    /// After the directory's watch saw a change: it waits for the next
+    /// one, or, when the directory can be watched no more, core.txt is
+    /// looked at now and then instead.
+    fn rearm_watch(&self) {
+        let (lost, hwnd) = {
+            let mut st = self.state.borrow_mut();
+            let rearmed = st.watch.as_mut().map(Watch::rearm);
+            let lost = if rearmed == Some(false) {
+                st.watch.take()
+            } else {
+                None
+            };
+            (lost, st.hwnd)
+        };
+        if lost.is_some() {
+            drop(lost);
+            log("watch lost: core.txt looked at now and then");
+            unsafe { SetTimer(hwnd, TIMER_POLL, POLL_MS, None) };
         }
     }
 
@@ -739,12 +828,21 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let timer = |id| msg == WM_TIMER && wparam.0 == id;
-    if msg == WM_APP_SWAP || timer(TIMER_RETRY) || timer(TIMER_POLL) {
+    let changed = msg == WM_APP_CHANGED;
+    if changed || msg == WM_APP_SWAP || timer(TIMER_RETRY) || timer(TIMER_POLL) {
         if timer(TIMER_RETRY) {
             let _ = KillTimer(hwnd, TIMER_RETRY);
         }
         let tip = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ShimTip_Impl;
         if let Some(tip) = tip.as_ref() {
+            // A reference of the swap's own: TSF may deactivate the shim
+            // from inside the old core's deactivation and let it go, and
+            // the swap goes on with it after (its Drop clears the window's
+            // pointer, so a message after finds none).
+            let _held: Option<IUnknown> = tip.cast().ok();
+            if changed {
+                guard("watch", (), || tip.rearm_watch());
+            }
             guard("swap", (), || tip.swap());
         }
         return LRESULT(0);

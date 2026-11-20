@@ -35,6 +35,8 @@ mod dll_exports {
 
     const DLL_PROCESS_ATTACH: u32 = 1;
 
+    /// The instance only: DllMain runs under the loader lock, so the log,
+    /// the panic hook and tracing start at the first call in ([`init`]).
     #[unsafe(no_mangle)]
     extern "system" fn DllMain(
         hinstance: HMODULE,
@@ -43,6 +45,16 @@ mod dll_exports {
     ) -> BOOL {
         if reason == DLL_PROCESS_ATTACH {
             let _ = DLL_INSTANCE.set(SyncHmodule(hinstance));
+        }
+        TRUE
+    }
+
+    /// The log, the panic hook and tracing, once: at each way in from
+    /// outside (TSF's class object, the shim's `SetsunaCoreCreate`,
+    /// regsvr32), before anything else.
+    fn init() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
             setsuna_core::diagnostics::init("tsf.log");
             crate::guard::install_hook();
             let _ = tracing_subscriber::fmt()
@@ -52,12 +64,22 @@ mod dll_exports {
                 )
                 .with_writer(std::io::stderr)
                 .try_init();
-        }
-        TRUE
+        });
     }
 
     #[unsafe(no_mangle)]
     extern "system" fn DllGetClassObject(
+        rclsid: *const GUID,
+        riid: *const GUID,
+        ppv: *mut *mut core::ffi::c_void,
+    ) -> HRESULT {
+        init();
+        crate::guard::catch("DllGetClassObject", E_FAIL, || unsafe {
+            get_class_object(rclsid, riid, ppv)
+        })
+    }
+
+    unsafe fn get_class_object(
         rclsid: *const GUID,
         riid: *const GUID,
         ppv: *mut *mut core::ffi::c_void,
@@ -83,31 +105,37 @@ mod dll_exports {
         }
     }
 
+    /// Never: the engine's threads, the windows and their classes outlive
+    /// any count of the COM objects made here (TSF's display attributes and
+    /// the taskbar's item among them), and a shim keeps an old core loaded
+    /// anyway.
     #[unsafe(no_mangle)]
     extern "system" fn DllCanUnloadNow() -> HRESULT {
-        if dll_can_unload() {
-            S_OK
-        } else {
-            S_FALSE
-        }
+        S_FALSE
     }
 
     #[unsafe(no_mangle)]
     extern "system" fn DllRegisterServer() -> HRESULT {
+        init();
         setsuna_core::diagnostics::log("DllRegisterServer");
-        match crate::registration::register_server() {
-            Ok(()) => S_OK,
-            Err(e) => e.code(),
-        }
+        crate::guard::catch("DllRegisterServer", E_FAIL, || {
+            match crate::registration::register_server() {
+                Ok(()) => S_OK,
+                Err(e) => e.code(),
+            }
+        })
     }
 
     #[unsafe(no_mangle)]
     extern "system" fn DllUnregisterServer() -> HRESULT {
+        init();
         setsuna_core::diagnostics::log("DllUnregisterServer");
-        match crate::registration::unregister_server() {
-            Ok(()) => S_OK,
-            Err(e) => e.code(),
-        }
+        crate::guard::catch("DllUnregisterServer", E_FAIL, || {
+            match crate::registration::unregister_server() {
+                Ok(()) => S_OK,
+                Err(e) => e.code(),
+            }
+        })
     }
 
     /// The version of the calls below, the shim's way in (`crates/tsf-shim`,
@@ -124,6 +152,7 @@ mod dll_exports {
         riid: *const GUID,
         ppv: *mut *mut core::ffi::c_void,
     ) -> HRESULT {
+        init();
         setsuna_core::diagnostics::log(format!("SetsunaCoreCreate abi={abi}"));
         if ppv.is_null() || riid.is_null() {
             return E_POINTER;
@@ -132,10 +161,12 @@ mod dll_exports {
         if abi != CORE_ABI {
             return CLASS_E_CLASSNOTAVAILABLE;
         }
-        match unsafe { crate::tsf::class_factory::create_service(riid, ppv) } {
-            Ok(()) => S_OK,
-            Err(e) => e.code(),
-        }
+        crate::guard::catch("SetsunaCoreCreate", E_FAIL, || {
+            match unsafe { crate::tsf::class_factory::create_service(riid, ppv) } {
+                Ok(()) => S_OK,
+                Err(e) => e.code(),
+            }
+        })
     }
 
     /// Whether `tip`, an `ITfTextInputProcessorEx` `SetsunaCoreCreate` made,
@@ -143,17 +174,19 @@ mod dll_exports {
     #[unsafe(no_mangle)]
     extern "system" fn SetsunaCoreComposing(tip: *mut core::ffi::c_void) -> BOOL {
         use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
-        let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
-            return TRUE;
-        };
-        let service: &crate::tsf::text_input_processor::SetsunaTextService =
-            unsafe { tip.as_impl() };
-        BOOL::from(
-            service
-                .inner
-                .try_borrow()
-                .map_or(true, |inner| inner.composition.is_some()),
-        )
+        crate::guard::catch("SetsunaCoreComposing", TRUE, || {
+            let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
+                return TRUE;
+            };
+            let service: &crate::tsf::text_input_processor::SetsunaTextService =
+                unsafe { tip.as_impl() };
+            BOOL::from(
+                service
+                    .inner
+                    .try_borrow()
+                    .map_or(true, |inner| inner.composition.is_some()),
+            )
+        })
     }
 
     /// The text service `tip` (`SetsunaCoreCreate`'s, active) as the next
@@ -167,24 +200,26 @@ mod dll_exports {
     ) -> usize {
         use crate::tsf::text_input_processor::{SetsunaTextService, SwapState};
         use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
-        let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
-            return 0;
-        };
-        let service: &SetsunaTextService = unsafe { tip.as_impl() };
-        let Ok(inner) = service.inner.try_borrow() else {
-            return 0;
-        };
-        let json = SwapState {
-            enabled: inner.enabled,
-            auto_off: inner.auto_off,
-            focused: inner.focused,
-            switched_in: inner.switched_in,
-        }
-        .to_json();
-        if !buf.is_null() && json.len() <= cap {
-            unsafe { core::ptr::copy_nonoverlapping(json.as_ptr(), buf, json.len()) };
-        }
-        json.len()
+        crate::guard::catch("SetsunaCoreState", 0, || {
+            let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
+                return 0;
+            };
+            let service: &SetsunaTextService = unsafe { tip.as_impl() };
+            let Ok(inner) = service.inner.try_borrow() else {
+                return 0;
+            };
+            let json = SwapState {
+                enabled: inner.enabled,
+                auto_off: inner.auto_off,
+                focused: inner.focused,
+                switched_in: inner.switched_in,
+            }
+            .to_json();
+            if !buf.is_null() && json.len() <= cap {
+                unsafe { core::ptr::copy_nonoverlapping(json.as_ptr(), buf, json.len()) };
+            }
+            json.len()
+        })
     }
 
     /// `tip`'s next activation is a swap: it takes `state` (`len` bytes,
@@ -199,26 +234,28 @@ mod dll_exports {
     ) -> HRESULT {
         use crate::tsf::text_input_processor::{SetsunaTextService, SwapState};
         use windows::Win32::UI::TextServices::ITfTextInputProcessorEx;
-        let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
-            return E_POINTER;
-        };
-        let service: &SetsunaTextService = unsafe { tip.as_impl() };
-        let json = if state.is_null() {
-            &[][..]
-        } else {
-            unsafe { core::slice::from_raw_parts(state, len) }
-        };
-        let swap = SwapState::from_json(json);
-        setsuna_core::diagnostics::log(format!(
-            "SetsunaCoreSwapIn enabled={} auto_off={}",
-            swap.enabled, swap.auto_off
-        ));
-        match service.inner.try_borrow_mut() {
-            Ok(mut inner) => {
-                inner.swap_in = Some(swap);
-                S_OK
+        crate::guard::catch("SetsunaCoreSwapIn", E_FAIL, || {
+            let Some(tip) = (unsafe { ITfTextInputProcessorEx::from_raw_borrowed(&tip) }) else {
+                return E_POINTER;
+            };
+            let service: &SetsunaTextService = unsafe { tip.as_impl() };
+            let json = if state.is_null() {
+                &[][..]
+            } else {
+                unsafe { core::slice::from_raw_parts(state, len) }
+            };
+            let swap = SwapState::from_json(json);
+            setsuna_core::diagnostics::log(format!(
+                "SetsunaCoreSwapIn enabled={} auto_off={}",
+                swap.enabled, swap.auto_off
+            ));
+            match service.inner.try_borrow_mut() {
+                Ok(mut inner) => {
+                    inner.swap_in = Some(swap);
+                    S_OK
+                }
+                Err(_) => E_FAIL,
             }
-            Err(_) => E_FAIL,
-        }
+        })
     }
 }
