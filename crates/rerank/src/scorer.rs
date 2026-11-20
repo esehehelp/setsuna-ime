@@ -119,6 +119,15 @@ impl TreeScorer {
             seqs.len()
         );
         anyhow::ensure!(start >= 1, "the scored part starts after BOS");
+        // a token outside the model's vocabulary would index past a logit row
+        // (and go to llama.cpp as it is)
+        anyhow::ensure!(
+            seqs.iter()
+                .flatten()
+                .all(|&t| t >= 0 && (t as usize) < self.n_vocab),
+            "a token outside the vocabulary of {}",
+            self.n_vocab
+        );
         let extends = self.last.as_ref().is_some_and(|l| {
             l.start == start && seqs.len() >= l.seqs.len() && seqs[..l.seqs.len()] == l.seqs[..]
         });
@@ -145,8 +154,14 @@ impl TreeScorer {
     /// last trie needs logits that were not kept.
     fn decode(&mut self, seqs: &[Vec<i32>], start: usize) -> Result<Option<(Vec<f64>, Stats)>> {
         let trie = Trie::build(seqs);
-        let owners = trie.owners();
         let n = trie.nodes.len();
+        // every node takes a cell of the cache: a trie past it would fail in
+        // the middle of decoding, the cache cleared for nothing
+        anyhow::ensure!(
+            n <= N_CTX as usize,
+            "{n} tokens, more than the cache's {N_CTX}"
+        );
+        let owners = trie.owners();
         // the node whose output scores the first candidate token
         let fresh = start - 1;
         let mut last = self.last.take();

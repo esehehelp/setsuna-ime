@@ -186,8 +186,13 @@ impl RuntimeEnv {
                 Ok(s) if matches!(s.trim(), "off" | "none") => None,
                 Ok(s) => Some(
                     s.trim()
-                        .parse()
-                        .with_context(|| format!("SETSUNA_AR_MARGIN={s}: nats, or off"))?,
+                        .parse::<f32>()
+                        .ok()
+                        // a margin is nats behind the best: none below 0, no NaN
+                        .filter(|m| m.is_finite() && *m >= 0.0)
+                        .with_context(|| {
+                            format!("SETSUNA_AR_MARGIN={s}: nats (0 or more), or off")
+                        })?,
                 ),
             },
             script_bias,
@@ -269,8 +274,8 @@ impl DecodeConfig {
             top_k_per_step: explicit
                 .top_k_per_step
                 .or(d.top_k_per_step)
-                .map(|tk| tk.max(1))
-                .unwrap_or(env.top_k_per_step),
+                .unwrap_or(env.top_k_per_step)
+                .max(1),
             max_candidates: explicit.top_k.or(d.top_k).unwrap_or(5).max(1),
             max_context: explicit.max_context.or(d.max_context).unwrap_or(64),
             vocab_blacklist: explicit
@@ -1109,9 +1114,18 @@ impl EngineSession {
                 .zip(ctc)
                 .map(|(mut h, ctc)| {
                     let p = ScoreParts { ar: h.score, ctc };
-                    // weight 0: the AR order (0 * -inf would be NaN)
+                    // weight 0: the AR order (0 * -inf would be NaN); a hypothesis
+                    // the CTC model cannot align (-inf) goes last whatever the
+                    // weight's sign (a negative one made it +inf, first)
                     if f.weight != 0.0 {
-                        h.score += f.weight * ctc;
+                        h.score = if ctc.is_finite() {
+                            h.score + f.weight * ctc
+                        } else {
+                            f32::NEG_INFINITY
+                        };
+                    }
+                    if h.score.is_nan() {
+                        h.score = f32::NEG_INFINITY;
                     }
                     (h, p)
                 })

@@ -961,7 +961,14 @@ impl NativeEncoder {
             self.config.output
         );
         let mut prof = self.profile.take();
-        let (seg, mut s) = self.encode(ids, &mut prof)?;
+        let (seg, mut s) = match self.encode(ids, &mut prof) {
+            Ok(x) => x,
+            Err(e) => {
+                // the profile kept: a refused request does not end it
+                self.profile = prof;
+                return Err(e);
+            }
+        };
         let t = ids.len();
         let Output::Ctc { decoder, head } = &self.output else {
             unreachable!()
@@ -993,7 +1000,13 @@ impl NativeEncoder {
             self.config.output
         );
         let mut prof = self.profile.take();
-        let (_, mut s) = self.encode(ids, &mut prof)?;
+        let (_, mut s) = match self.encode(ids, &mut prof) {
+            Ok(x) => x,
+            Err(e) => {
+                self.profile = prof;
+                return Err(e);
+            }
+        };
         let t = ids.len();
         let Output::ArCross { c, kv } = &self.output else {
             unreachable!()

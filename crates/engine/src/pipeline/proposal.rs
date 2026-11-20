@@ -710,16 +710,18 @@ pub fn log_probs_with(
         // Insertion top-k over the log-probs: an equal value goes after the
         // ones already kept, so ties keep the lower id first (as a strict
         // argmax does). Once k are kept, a chunk of the row none of whose
-        // log-probs would be kept (each `lp <= the k-th`, NaN counted as
-        // kept, as the per-value test has it) is skipped whole by one
+        // log-probs would be kept (each `lp <= the k-th`; a NaN stops the
+        // skip, and the per-value test drops it) is skipped whole by one
         // vectorized test; the chunks with one go value by value as before,
         // so the result is the same.
         let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
         let keep = |v: usize, x: f32, top: &mut Vec<(u32, f32)>| {
-            if is_blacklisted[v] {
+            let lp = x - lse;
+            // a NaN (a broken model's output) is no log-prob: kept, it broke
+            // the order the list is searched by and the beam sorted by
+            if is_blacklisted[v] || lp.is_nan() {
                 return;
             }
-            let lp = x - lse;
             if top.len() == k && lp <= top[k - 1].1 {
                 return;
             }
@@ -875,10 +877,10 @@ mod tests {
     fn top_k_per_value(row: &[f32], lse: f32, blacklist: &[bool], k: usize) -> Vec<(u32, f32)> {
         let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
         for (v, &x) in row.iter().enumerate() {
-            if blacklist[v] {
+            let lp = x - lse;
+            if blacklist[v] || lp.is_nan() {
                 continue;
             }
-            let lp = x - lse;
             if top.len() == k && lp <= top[k - 1].1 {
                 continue;
             }
@@ -929,7 +931,24 @@ mod tests {
                 }
             }
         }
-        // a row with a NaN and one with an infinity: the per-value order holds
+        // a row with a NaN (no log-prob: dropped) and one with an infinity:
+        // the per-value order holds, and no NaN is kept
+        assert!(log_probs_from_logits(
+            &{
+                let mut r = flat[..vocab].to_vec();
+                r[5] = f32::NAN;
+                r
+            },
+            1,
+            vocab,
+            &[],
+            4,
+            16
+        )
+        .steps[0]
+            .top
+            .iter()
+            .all(|&(_, lp)| !lp.is_nan()));
         let mut odd = flat[..2 * vocab].to_vec();
         odd[100] = f32::NAN;
         odd[vocab + 200] = f32::INFINITY;

@@ -55,6 +55,15 @@ pub fn load(manifest: &CtcNatManifest) -> Result<(SharedCharTokenizer, Model)> {
         tokenizer.vocab_size(),
         tokenizer.sep_id
     );
+    // the requests are cut to max_seq_len tokens ([CLS] and [SEP] among them): none the encoder's positions do
+    // not reach (each such request would fail), and room for a char
+    anyhow::ensure!(
+        (3..=c.max_positions).contains(&manifest.max_seq_len),
+        "manifest {}: max_seq_len {} outside 3 to the encoder's {} positions",
+        manifest.manifest_path.display(),
+        manifest.max_seq_len,
+        c.max_positions
+    );
     // the logits: every token's, or the manifest's columns (a reading corrector's cut head)
     let columns = manifest
         .logit_ids

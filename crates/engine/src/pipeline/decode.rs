@@ -363,9 +363,8 @@ pub fn prefix_beam_search_crf(
         }
 
         let by_rank = |a: &State, b: &State| {
-            b.rank
-                .partial_cmp(&a.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            order_key(b.rank)
+                .total_cmp(&order_key(a.rank))
                 .then_with(|| trie.tokens(a.node).cmp(&trie.tokens(b.node)))
         };
         if next.states.len() > beam_width {
@@ -396,12 +395,22 @@ pub fn prefix_beam_search_crf(
         })
         .collect();
     hyps.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        order_key(b.score)
+            .total_cmp(&order_key(a.score))
             .then_with(|| a.tokens.cmp(&b.tokens))
     });
     hyps
+}
+
+/// A score as the beam orders by it: a NaN as the worst, so that the order
+/// is a total one (with NaN taken as equal to all, the sort's comparison
+/// was no order, which a sort may panic on).
+fn order_key(score: f32) -> f32 {
+    if score.is_nan() {
+        f32::NEG_INFINITY
+    } else {
+        score
+    }
 }
 
 /// CTC greedy collapse: drop blanks, drop consecutive non-blank repeats.
@@ -452,6 +461,29 @@ pub fn hypotheses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NaN score is the worst in the beam's order, which stays a total
+    /// one: a sort over NaN and finite scores neither panics nor puts a NaN
+    /// before a score.
+    #[test]
+    fn a_nan_score_orders_last() {
+        let mut scores = vec![
+            -1.0f32,
+            f32::NAN,
+            -0.5,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -3.0,
+            0.0,
+        ];
+        for _ in 0..50 {
+            scores.sort_by(|a, b| order_key(*b).total_cmp(&order_key(*a)));
+        }
+        assert_eq!(&scores[..4], &[0.0, -0.5, -1.0, -3.0]);
+        assert!(scores[4..]
+            .iter()
+            .all(|s| s.is_nan() || *s == f32::NEG_INFINITY));
+    }
 
     /// `logsumexp` with its early return gives the bits of the plain formula: random pairs over the scores' range,
     /// pairs whose gap sits around the early return's bound, powers of two, zero, subnormals and infinities.

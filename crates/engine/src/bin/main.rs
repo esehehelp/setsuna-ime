@@ -8,7 +8,7 @@
 //! requests (text -> words with their readings, `setsuna_analyzer`), so the
 //! one process a login shares holds the analyzer's dictionary once.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -393,7 +393,10 @@ impl<'a> Response<'a> {
         let candidate_meta = meta.then(|| cands.iter().map(CandidateMetaJson::from).collect());
         let candidate_reading_pos =
             alignment.then(|| cands.iter().map(|c| c.reading_pos.clone()).collect());
-        let (candidates, candidate_scores) = cands.into_iter().map(|c| (c.text, c.score)).unzip();
+        let (candidates, candidate_scores) = cands
+            .into_iter()
+            .map(|c| (c.text, finite_score(c.score)))
+            .unzip();
         Self {
             id,
             candidates,
@@ -433,9 +436,23 @@ struct CandidateMetaJson {
 impl From<&Candidate> for CandidateMetaJson {
     fn from(c: &Candidate) -> Self {
         Self {
-            score: c.score,
+            score: finite_score(c.score),
             source: c.source.as_str(),
         }
+    }
+}
+
+/// A score as JSON has numbers: JSON has no infinity or NaN, and serde
+/// writes them as `null`, which no client takes for an `f32` (the whole
+/// response was lost). Minus infinity and NaN (a hypothesis nothing could
+/// score) as the lowest finite score, plus infinity as the highest.
+fn finite_score(score: f32) -> f32 {
+    if score.is_nan() || score == f32::NEG_INFINITY {
+        f32::MIN
+    } else if score == f32::INFINITY {
+        f32::MAX
+    } else {
+        score
     }
 }
 
@@ -700,6 +717,10 @@ impl AnalyzerSlot {
 /// model reads (its 64 tokens). The IME converts readings of 80 chars at
 /// most in one go, and analyzes a conversion at a time.
 const MAX_READING_CHARS: usize = 1024;
+
+/// The longest request line the daemon reads from stdin, as the shared
+/// engine's pipe takes (`setsuna_pipe::server::MAX_LINE`).
+const MAX_REQUEST_LINE: usize = 256 << 10;
 const MAX_CONTEXT_CHARS: usize = 4096;
 const MAX_CONTINUE_BEAM: usize = 32;
 const MAX_ANALYZE_TEXTS: usize = 16;
@@ -835,12 +856,32 @@ fn run_daemon(args: EngineArgs) -> Result<()> {
     writeln!(out, "{ready}")?;
     out.flush()?;
     let stdin = std::io::stdin();
-    for line in BufReader::new(stdin.lock()).lines() {
-        let line = line.context("read stdin line")?;
+    let mut input = BufReader::new(stdin.lock());
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // a line no longer than a request may be (the shared engine's limit):
+        // one that goes on is read no further and ends the daemon, whose
+        // client starts another
+        let n = (&mut input)
+            .take(MAX_REQUEST_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .context("read stdin line")?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() > MAX_REQUEST_LINE {
+            anyhow::bail!("a request line over {MAX_REQUEST_LINE} bytes");
+        }
+        let line = std::str::from_utf8(&buf).context("read stdin line")?;
         if line.trim().is_empty() {
             continue;
         }
-        writeln!(out, "{}", daemon.respond(&line))?;
+        writeln!(
+            out,
+            "{}",
+            daemon.respond(line.trim_end_matches(['\r', '\n']))
+        )?;
         out.flush()?;
     }
     // stdin closed: the client is gone. Leave without running exit's
@@ -979,6 +1020,16 @@ mod tests {
     }
 
     use super::*;
+
+    /// A score JSON cannot hold goes out as a number all the same (serde
+    /// wrote `null`, and the client lost the whole response).
+    #[test]
+    fn every_score_is_a_json_number() {
+        let scores = [f32::NEG_INFINITY, f32::NAN, f32::INFINITY, -1.5];
+        let json = serde_json::to_string(&scores.map(finite_score)).unwrap();
+        let back: Vec<f32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, vec![f32::MIN, f32::MIN, f32::MAX, -1.5]);
+    }
 
     #[test]
     fn backend_manifest_declares_protocol_v1() {

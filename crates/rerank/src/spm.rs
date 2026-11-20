@@ -37,6 +37,8 @@ pub struct SentencePiece {
     /// byte -> its piece `<0xXX>`, with byte fallback
     bytes: Option<[u32; 256]>,
     escape_whitespaces: bool,
+    /// The model's pieces, of ids 0.. (each piece's id is its place).
+    size: u32,
 }
 
 /// A protobuf reader for the few fields of `ModelProto` read here.
@@ -73,20 +75,22 @@ impl<'a> Reader<'a> {
         let key = self.varint()?;
         let value = match key & 7 {
             0 => Value::Varint(self.varint()?),
+            // what is left after `at` (never past the end), so that a length
+            // near usize::MAX cannot wrap the sum and pass
             1 => {
-                ensure!(self.at + 8 <= self.buf.len(), "truncated fixed64");
+                ensure!(8 <= self.buf.len() - self.at, "truncated fixed64");
                 self.at += 8;
                 Value::Fixed64
             }
             2 => {
-                let n = self.varint()? as usize;
-                ensure!(self.at + n <= self.buf.len(), "truncated field");
+                let n = usize::try_from(self.varint()?).context("field length")?;
+                ensure!(n <= self.buf.len() - self.at, "truncated field");
                 let b = &self.buf[self.at..self.at + n];
                 self.at += n;
                 Value::Bytes(b)
             }
             5 => {
-                ensure!(self.at + 4 <= self.buf.len(), "truncated fixed32");
+                ensure!(4 <= self.buf.len() - self.at, "truncated fixed32");
                 let b = &self.buf[self.at..self.at + 4];
                 self.at += 4;
                 Value::Fixed32(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -210,7 +214,13 @@ impl SentencePiece {
             max_score,
             bytes: byte_fallback.then_some(bytes),
             escape_whitespaces: escape,
+            size: u32::try_from(list.len()).context("too many pieces")?,
         })
+    }
+
+    /// The highest id a piece has (none without pieces).
+    pub fn max_id(&self) -> Option<u32> {
+        self.size.checked_sub(1)
     }
 
     /// The ids of `text`, no BOS / EOS.

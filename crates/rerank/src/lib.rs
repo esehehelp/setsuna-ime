@@ -106,6 +106,11 @@ impl Reranker {
                 .clamp(1, MAX_SEQ),
             lambda: options.lambda.or(d.lambda).unwrap_or(0.3),
         };
+        // the tokenizer before the model: a bad one costs no model load
+        let spm = match &manifest.tokenizer_path {
+            Some(p) => Some(spm::SentencePiece::load(p)?),
+            None => None,
+        };
         load_backends();
         let backend: &'static LlamaBackend =
             Box::leak(Box::new(LlamaBackend::init().context("init llama.cpp")?));
@@ -117,11 +122,25 @@ impl Reranker {
         .with_context(|| format!("load {}", manifest.weights_path.display()))?;
         // the daemon keeps one model for its whole life
         let model: &'static LlamaModel = Box::leak(Box::new(model));
-        let bos = manifest.special_ids.bos as i32;
-        let spm = match &manifest.tokenizer_path {
-            Some(p) => Some(spm::SentencePiece::load(p)?),
-            None => None,
-        };
+        // the manifest's BOS and the tokenizer's ids are the model's: one past
+        // its vocabulary would go to llama.cpp as it is
+        let n_vocab = model.n_vocab();
+        anyhow::ensure!(n_vocab > 0, "the model has no vocabulary");
+        let bos = i32::try_from(manifest.special_ids.bos)
+            .ok()
+            .filter(|b| (0..n_vocab).contains(b))
+            .with_context(|| {
+                format!(
+                    "BOS {} outside the model's vocabulary of {n_vocab}",
+                    manifest.special_ids.bos
+                )
+            })?;
+        if let Some(sp) = &spm {
+            anyhow::ensure!(
+                sp.max_id().is_none_or(|m| (m as i64) < i64::from(n_vocab)),
+                "the tokenizer's ids go past the model's vocabulary of {n_vocab}"
+            );
+        }
         let n_ubatch = options.n_ubatch.unwrap_or(scorer::N_UBATCH);
         let scorer = scorer::TreeScorer::new(model, backend, config.threads, n_ubatch)?;
         Ok(Self {

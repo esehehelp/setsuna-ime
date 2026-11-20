@@ -43,6 +43,9 @@ use crate::candidate::{Candidate, CandidateSource};
 pub const FLOOR: f64 = -60.0;
 /// Longest table word a step takes.
 pub const MAX_WORD: usize = 8;
+/// The longest text or reading (chars after NFKC) [`WordTable::prior`]
+/// scores; longer gets [`FLOOR`].
+pub const MAX_PRIOR_CHARS: usize = 1024;
 /// Smoothing of the word table's counts.
 const E: f64 = 0.01;
 /// Stored two-character terms are in units of 1/PMI_UNIT.
@@ -566,8 +569,14 @@ impl WordTable {
     /// [`FLOOR`].
     pub fn prior(&self, text: &str, rd: &Reading) -> f64 {
         let sc: Vec<char> = text.nfkc().collect();
-        let (s, sb) = self.word_code.encode_chars(&sc);
         let (n, m) = (sc.len(), rd.chars.len());
+        // the path's table is (n + 1) * (m + 1) cells: NFKC makes one char up
+        // to 18 (U+FDFA), and a reading at the request's limit of such chars
+        // asked for gigabytes; no prior past what any conversion is
+        if n > MAX_PRIOR_CHARS || m > MAX_PRIOR_CHARS {
+            return FLOOR;
+        }
+        let (s, sb) = self.word_code.encode_chars(&sc);
         let w = m + 1;
         let mut best = vec![f64::NEG_INFINITY; (n + 1) * w];
         best[0] = 0.0;
