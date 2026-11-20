@@ -243,9 +243,19 @@ impl RerankClient for ChildRerankClient {
 impl Drop for ChildRerankClient {
     fn drop(&mut self) {
         self.shared.stop();
-        // the writer stops the daemon on its way out
+        // the writer stops the daemon on its way out; one blocked writing to
+        // a daemon that reads no more never gets there, and is left (with
+        // the daemon it holds) rather than waited for by the app
         if let Some(w) = self.writer.take() {
-            let _ = w.join();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !w.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if w.is_finished() {
+                let _ = w.join();
+            } else {
+                crate::diagnostics::log("rerank writer blocked, left behind");
+            }
         }
     }
 }

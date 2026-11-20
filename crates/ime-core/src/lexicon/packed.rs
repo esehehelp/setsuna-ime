@@ -138,6 +138,15 @@ impl Bv {
     /// `select` take them to (their words and counts within the file);
     /// the ones in all.
     fn check(&self, b: &[u8]) -> Result<usize> {
+        // no bit past the last: `select` would find a one there, an entry
+        // past the entries
+        if self.n % 64 != 0 {
+            let last = self.word(b, self.n / 64);
+            ensure!(
+                last >> (self.n % 64) == 0,
+                "lexicon: a bit vector marks past its end"
+            );
+        }
         let mut ones = 0usize;
         for s in 0..=self.n.div_ceil(SUPER) {
             ensure!(

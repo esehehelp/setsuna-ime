@@ -416,23 +416,34 @@ fn digit_runs(text: &str) -> Vec<Hit> {
         let start = k;
         let (mut digits, mut run, mut longest) = (0, 0, 0);
         let mut end = k;
+        let sep = |c: char| matches!(c, '-' | ' ' | 'ー' | '－' | '(' | ')' | '（' | '）');
         while end < chars.len() {
             let c = chars[end].1;
             if digit(c) {
                 digits += 1;
                 run += 1;
                 longest = longest.max(run);
-            } else if matches!(c, '-' | ' ' | 'ー' | '－' | '(' | ')' | '（' | '）')
-                && end + 1 < chars.len()
-                && digit(chars[end + 1].1)
+                end += 1;
+                continue;
+            }
+            // one or two separators between digits (090-1234, (090) 1234)
+            let seps = chars[end..]
+                .iter()
+                .take(3)
+                .take_while(|&&(_, c)| sep(c))
+                .count();
+            let after = end + seps;
+            if (1..=2).contains(&seps)
+                && after < chars.len()
+                && digit(chars[after].1)
                 && end > start
                 && digit(chars[end - 1].1)
             {
                 run = 0;
+                end = after;
             } else {
                 break;
             }
-            end += 1;
         }
         if digits >= 10 || longest >= 8 {
             let to = chars.get(end).map_or(text.len(), |c| c.0);
@@ -519,6 +530,7 @@ mod tests {
             "apiキーを",
             "ａｐｉキー",
             "03(1234)5678まで",
+            "(090) 1234-5678まで",
         ] {
             assert!(sensitive(t), "{t}");
         }

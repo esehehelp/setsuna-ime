@@ -198,7 +198,8 @@ impl Dictionary {
         // dictionary built here has them: one that is not (damaged or
         // crafted) is refused, not read past the connector's tables
         let conn = &data.connector;
-        let fits = data.system_lexicon.verify(conn)
+        let fits = conn.is_sound()
+            && data.system_lexicon.verify(conn)
             && data.user_lexicon.as_ref().is_none_or(|l| l.verify(conn))
             && data.unk_handler.verify(conn);
         if !fits {

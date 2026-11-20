@@ -634,7 +634,22 @@ fn take_response(shared: &Shared, line: &str) -> Option<(DaemonResponse, Option<
         resp.candidates.len(),
         resp.error
     ));
-    let inflight = lock(&shared.state).in_flight.take();
+    // the reply to the request in flight only (id 0: the daemon could not
+    // read it): one to a request given up on before (a stray line took its
+    // reply's place, and the next went) is stale, not the next one's
+    let inflight = {
+        let mut st = lock(&shared.state);
+        if !st
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| resp.id == f.req_id || resp.id == 0)
+        {
+            drop(st);
+            crate::diagnostics::log(format!("reader stale response id={}", resp.id));
+            return None;
+        }
+        st.in_flight.take()
+    };
     shared.cv.notify_all();
     if inflight.as_ref().is_some_and(|f| f.analyze) {
         // to its caller, not the frontend
@@ -1196,7 +1211,7 @@ mod tests {
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(30));
                 lock(&shared.state).in_flight = Some(InFlight {
-                    req_id: 0,
+                    req_id: 3,
                     reading: "きょう".into(),
                     context: String::new(),
                     dispatched_at: Instant::now(),
@@ -1247,6 +1262,16 @@ mod tests {
             engine.join().unwrap();
             assert!(lock(&shared.state).in_flight.is_none(), "{line}");
         }
+        // the late reply to a request given up on is not the next one's
+        let shared = Arc::new(Shared::new(&EngineCfg::default()));
+        in_flight(&shared);
+        lock(&shared.state).in_flight.as_mut().unwrap().req_id = 5;
+        let late = r#"{"id":4,"candidates":["今日"],"engine_ms":0.1}"#;
+        assert!(take_response(&shared, late).is_none());
+        assert_eq!(
+            lock(&shared.state).in_flight.as_ref().map(|f| f.req_id),
+            Some(5)
+        );
         let shared = Arc::new(Shared::new(&EngineCfg::default()));
         let waiter = {
             let shared = shared.clone();

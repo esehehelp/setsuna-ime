@@ -250,22 +250,23 @@ impl Predictor {
         if !Self::worth(reading, surface) || sensitive(reading, surface) {
             return Ok(());
         }
-        let prev: String = prev
-            .chars()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        // the commit before as a whole is judged, not the end kept of it
+        // (`Password: the value is hunter2` ends in no announcing word)
+        let prev: String = if crate::privacy::is_sensitive(prev) {
+            String::new()
+        } else {
+            prev.chars()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
         self.append(&Record {
             r: reading.to_string(),
             s: surface.to_string(),
-            p: if crate::privacy::is_sensitive(&prev) {
-                String::new()
-            } else {
-                prev
-            },
+            p: prev,
             ..Record::default()
         })
     }
@@ -456,9 +457,14 @@ mod tests {
         p.record("ばんごう", "090-1234-5678", "").unwrap();
         p.record("きーは", "sk-projAbCdEf123", "").unwrap();
         p.record("よろしく", "宜しく", "パスワードは").unwrap();
+        p.record("よろしく", "宜しく", "Password: the value is hunter2")
+            .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("090") && !text.contains("sk-"), "{text}");
-        assert!(!text.contains("パスワード"), "{text}");
+        assert!(
+            !text.contains("パスワード") && !text.contains("hunter2"),
+            "{text}"
+        );
         assert_eq!(p.complete("よろし", "", 5).len(), 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));

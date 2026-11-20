@@ -27,6 +27,12 @@ pub struct RawConnector {
 }
 
 impl RawConnector {
+    /// Whether a decoded connector can be asked its sizes: a template of
+    /// no features divides them by zero (setsuna-ime).
+    pub fn is_sound(&self) -> bool {
+        self.feat_template_size > 0
+    }
+
     pub const fn new(
         right_feat_ids: Vec<U31x8>,
         left_feat_ids: Vec<U31x8>,

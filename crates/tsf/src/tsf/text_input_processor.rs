@@ -841,9 +841,17 @@ impl SetsunaTextService_Impl {
                 .set_learning(setsuna_core::learning::Learning::open(&cfg.learning));
             inner.engine.set_ngram(&cfg.ngram);
             inner.engine.set_lexicon(&cfg.lexicon);
-            inner
-                .engine
-                .set_hidden(setsuna_core::hidden::Hidden::open());
+            // the candidates hidden with Ctrl+Delete are a file of the
+            // user's profile written with what was typed: none on a secure
+            // desktop, nor in an elevated app, which writes nothing there
+            // (a link put in its place would take the write elsewhere)
+            let keeps_history = inner.activate_flags & TF_TMF_SECUREMODE == 0
+                && !setsuna_core::config::process_is_elevated();
+            inner.engine.set_hidden(
+                keeps_history
+                    .then(setsuna_core::hidden::Hidden::open)
+                    .flatten(),
+            );
             inner.engine.use_user_dictionary_file();
             inner.engine.open_predictor(&cfg.frontend);
             // the GDI window shows 10 per page, labelled 1–9, 0

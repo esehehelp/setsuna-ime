@@ -168,31 +168,54 @@ pub fn check_base_url(url: &str) -> Result<()> {
         (None, Some(r)) => (false, r),
         _ => return refuse("the server URL is neither https:// nor http://"),
     };
+    let Some(host) = host_of(rest) else {
+        return refuse("the server URL names no host");
+    };
+    if !secure && !is_loopback(host) {
+        return refuse("plain http:// only to this machine (localhost, 127.0.0.1, ::1)");
+    }
+    Ok(())
+}
+
+/// The host of a URL's part after its scheme (lowercase), none when empty.
+fn host_of(rest: &str) -> Option<&str> {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let host = authority.rsplit('@').next().unwrap_or_default();
     let host = match host.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or_default(),
         None => host.split(':').next().unwrap_or_default(),
     };
-    if host.is_empty() {
-        return refuse("the server URL names no host");
-    }
-    let local = host == "localhost"
+    (!host.is_empty()).then_some(host)
+}
+
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
         || host == "::1"
         || host
             .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    if !secure && !local {
-        return refuse("plain http:// only to this machine (localhost, 127.0.0.1, ::1)");
-    }
-    Ok(())
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether `url` is of this machine: a request to it goes straight there,
+/// through no proxy the environment names (an http:// one would read the
+/// key and the text on the way).
+fn is_local_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    rest.and_then(host_of).is_some_and(is_loopback)
 }
 
 /// The models the endpoint offers this account or key.
 pub fn list_models(endpoint: &Endpoint, store: &Store, agent: &ureq::Agent) -> Result<Vec<Model>> {
     let url = endpoint.url("models")?;
     let bearer = endpoint.bearer(store, agent)?;
+    let local = is_local_url(&url);
     let mut req = agent.get(url);
+    if local {
+        req = req.config().proxy(None).build();
+    }
     if let Some(b) = &bearer {
         req = req.header("Authorization", format!("Bearer {b}"));
     }
@@ -266,6 +289,9 @@ fn post_json(
     body: &Value,
 ) -> Result<ureq::http::Response<ureq::Body>> {
     let mut r = agent.post(url).header("Content-Type", "application/json");
+    if is_local_url(url) {
+        r = r.config().proxy(None).build();
+    }
     if let Some(b) = bearer {
         r = r.header("Authorization", format!("Bearer {b}"));
     }

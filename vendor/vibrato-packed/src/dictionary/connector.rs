@@ -34,6 +34,16 @@ pub enum ConnectorWrapper {
     Dual(DualConnector),
 }
 
+impl ConnectorWrapper {
+    /// Whether a decoded connector can be asked its sizes (setsuna-ime).
+    pub fn is_sound(&self) -> bool {
+        match self {
+            Self::Raw(c) => c.is_sound(),
+            Self::Matrix(_) | Self::Dual(_) => true,
+        }
+    }
+}
+
 impl Connector for ConnectorWrapper {
     #[inline(always)]
     fn num_left(&self) -> usize {

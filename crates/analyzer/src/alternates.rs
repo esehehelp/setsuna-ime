@@ -159,6 +159,16 @@ impl Alternates {
             "{}: key offsets out of range",
             path.display()
         );
+        // and every entry's reading within the readings
+        let reading_end = |i: usize| {
+            let at = |k: usize| u32_at(&map, entry + 16 * i + 4 * k) as usize;
+            at(2).checked_add(at(3))
+        };
+        ensure!(
+            (0..entries).all(|i| reading_end(i).is_some_and(|end| end <= reading_bytes)),
+            "{}: an entry's reading out of range",
+            path.display()
+        );
         Ok(Self {
             map,
             num_right,

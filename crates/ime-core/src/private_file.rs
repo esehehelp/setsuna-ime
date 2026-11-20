@@ -69,13 +69,32 @@ fn lock_file(path: &Path) -> std::io::Result<File> {
         .open(path.with_file_name(name))
 }
 
+/// How long an append waits for the lock: it runs on the app's thread as a
+/// commit is made, and a process that holds the lock and does not go on
+/// (suspended, hung) must not hold the app up.
+const APPEND_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// `line` appended to `path` (made if missing) under its lock, so that no
-/// compaction replaces the file between another's check and its move.
+/// compaction replaces the file between another's check and its move. The
+/// lock not had within `APPEND_WAIT`, the line is appended without it: one
+/// append-mode write keeps it whole, and only a compaction that moves its
+/// file over it at that very moment would lose it.
 pub fn append_locked(path: &Path, line: &[u8]) -> std::io::Result<()> {
     let lock = lock_file(path)?;
-    lock.lock()?;
+    let deadline = std::time::Instant::now() + APPEND_WAIT;
+    let locked = loop {
+        match lock.try_lock() {
+            Ok(()) => break true,
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => break false,
+        }
+    };
     let written = append(path).and_then(|mut f| f.write_all(line));
-    let _ = lock.unlock();
+    if locked {
+        let _ = lock.unlock();
+    }
     written
 }
 
