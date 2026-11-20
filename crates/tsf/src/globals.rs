@@ -64,6 +64,16 @@ unsafe impl Sync for SyncHmodule {}
 #[cfg(target_os = "windows")]
 pub static DLL_INSTANCE: OnceCell<SyncHmodule> = OnceCell::new();
 
+/// This DLL's instance, which its window classes are registered with: a
+/// class is the pair of its name and instance, so the classes of a core the
+/// shim swapped in are its own, not the core's before (the same name with
+/// no instance is the host's, and the first core's procedure got the next
+/// core's windows).
+#[cfg(target_os = "windows")]
+pub fn dll_hinstance() -> windows::Win32::Foundation::HINSTANCE {
+    windows::Win32::Foundation::HINSTANCE(DLL_INSTANCE.get().map(|s| s.0 .0).unwrap_or_default())
+}
+
 #[cfg(target_os = "windows")]
 pub static DLL_REF_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

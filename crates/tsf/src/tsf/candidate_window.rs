@@ -348,6 +348,7 @@ fn register_class() {
             style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
             lpfnWndProc: Some(wnd_proc),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hInstance: crate::globals::dll_hinstance(),
             lpszClassName: CLASS_NAME,
             ..Default::default()
         };
@@ -368,7 +369,7 @@ fn create_window() -> HWND {
             100,
             None,
             None,
-            None,
+            crate::globals::dll_hinstance(),
             None,
         )
         .unwrap_or_default()
