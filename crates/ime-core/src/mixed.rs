@@ -422,7 +422,39 @@ impl MixedModel {
 
     /// `segment` with the reading lexicon, which reads the words romaji
     /// reads wholly as kana (`kana_words`).
+    ///
+    /// Typing done reads only the end otherwise (`ok`: お and a pending k
+    /// while typed, OK when done): where the spans read while typing end in
+    /// Japanese with no romaji still being typed, they stand. A Latin word
+    /// read whole while it might still grow, then split before its particle
+    /// (Nandina + は of `Nandinaha`), was otherwise read again as a finished
+    /// word, dearer than another split (Nand + いなは), and Enter and Space
+    /// converted what was never shown.
     pub fn segment_with(
+        &self,
+        typed: &str,
+        before: Option<&str>,
+        fin: bool,
+        lexicon: Option<&Lexicon>,
+    ) -> Vec<Span> {
+        if fin {
+            let typing = self.segment_once(typed, before, false, lexicon);
+            let chars: Vec<char> = typed.chars().collect();
+            let done = typing.last().is_some_and(|last| {
+                last.lang == Lang::Ja
+                    && !romaji_units(&chars[last.start..last.end], false)
+                        .last()
+                        .is_some_and(|u| matches!(u.kind, UnitKind::Pending))
+            });
+            if done {
+                return typing;
+            }
+        }
+        self.segment_once(typed, before, fin, lexicon)
+    }
+
+    /// `segment_with`, read once as `fin` says.
+    fn segment_once(
         &self,
         typed: &str,
         before: Option<&str>,
@@ -2625,6 +2657,27 @@ pub(crate) mod tests {
             cased(&m, "kyouhaiitenkidesune", None),
             "きょうはいいてんきですね"
         );
+    }
+
+    /// Typing done, a Latin word read whole while it might still grow, then
+    /// split before its particle, stands (Nandina + は; read again as a
+    /// finished word it cost more than Nand + いなは); romaji still being
+    /// typed is read again (`ok`).
+    #[test]
+    fn the_shipped_model_reads_done_what_it_showed() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        let typing = |typed: &str| {
+            let (chars, spans) = m.cased(typed, None, false, Casing::default());
+            let (text, pending) = render_parts(&chars, &spans, false, &HashMap::new());
+            text + &pending
+        };
+        for (typed, shown) in [("Nandinaha", "Nandinaは"), ("Nandinatoha", "Nandinaとは")] {
+            assert_eq!(typing(typed), shown);
+            assert_eq!(cased(&m, typed, None), shown);
+        }
+        assert_eq!(typing("ok"), "おk");
+        assert_eq!(cased(&m, "ok", None), "OK");
     }
 
     /// A letter the Japanese reading leaves, with the letters around it a

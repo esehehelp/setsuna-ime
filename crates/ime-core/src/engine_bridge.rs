@@ -5342,6 +5342,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_enter_and_space_convert_the_reading_shown() {
+        // the shipped model shows Nandinaha as Nandina + は; read again when
+        // done it was Nand + いなは, and Enter committed Nand否は
+        let (mut bridge, mock) = bridge_with_mock();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        bridge.set_mixed(
+            Some(std::sync::Arc::new(
+                crate::mixed::MixedModel::load(&dir).unwrap(),
+            )),
+            &crate::config::default_symbol_map(),
+            crate::mixed::Casing::default(),
+        );
+        bridge.live_conversion = true;
+        for (reading, text) in [("Nandinaは", "Nandinaは"), ("Nandいなは", "Nand否は")] {
+            mock.state
+                .answers
+                .borrow_mut()
+                .insert(reading.into(), vec![text.into()]);
+        }
+        type_str(&mut bridge, "Nandinaha");
+        assert_eq!(bridge.composing.preedit(), "Nandinaは");
+        assert_eq!(commits(&bridge.handle_enter().actions), vec!["Nandinaは"]);
+        type_str(&mut bridge, "Nandinaha");
+        bridge.handle_space();
+        assert_eq!(mock.dispatched_readings().last().unwrap(), "Nandinaは");
+    }
+
+    #[test]
     fn mixed_a_slip_shown_as_english_reads_again_when_deleted() {
         // the shipped model reads sp as an acronym; deleting the p leaves
         // the s typed, which reads as romaji again (frozen as SP, the
