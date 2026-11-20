@@ -145,7 +145,15 @@ pub fn parse(text: &str) -> (Vec<Entry>, Vec<String>) {
     let mut seen = HashSet::new();
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() || line.starts_with('#') || line.starts_with('!') {
+        // a comment or a header (`# ...`, `!Microsoft IME ...`, `!!ATOK`,
+        // the header `to_text` writes); a line whose first column is a
+        // typed reading starting so (`#` for ＃, `!important`) is an entry,
+        // as it was saved
+        let comment = (line.starts_with('#') || line.starts_with('!'))
+            && !line
+                .split_once('\t')
+                .is_some_and(|(first, _)| is_typed_reading(first.trim()));
+        if line.trim().is_empty() || comment {
             continue;
         }
         let cols: Vec<&str> = if line.contains('\t') {
@@ -397,22 +405,30 @@ pub fn save(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
     crate::private_file::write(path, to_text(entries).as_bytes())
 }
 
-type Cached = Option<(PathBuf, Option<SystemTime>, Arc<UserDict>)>;
+/// What tells one version of the file from another: its time and length
+/// (two saves within the clock's tick of each other differ in length, or
+/// in nothing that matters).
+type Stamp = Option<(SystemTime, u64)>;
+type Cached = Option<(PathBuf, Stamp, Arc<UserDict>)>;
 static SHARED: Mutex<Cached> = Mutex::new(None);
 
 /// The user dictionary of the default config directory, read again when
 /// the file changed (the settings GUI saves it while the IME runs).
 pub fn shared() -> Option<Arc<UserDict>> {
     let path = path()?;
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let mut cache = SHARED.lock().ok()?;
+    let stamp = std::fs::metadata(&path)
+        .and_then(|m| Ok((m.modified()?, m.len())))
+        .ok();
+    let mut cache = SHARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((p, t, d)) = cache.as_ref() {
-        if *p == path && *t == mtime {
+        if *p == path && *t == stamp {
             return Some(d.clone());
         }
     }
     let dict = Arc::new(UserDict::new(&load(&path)));
-    *cache = Some((path, mtime, dict.clone()));
+    *cache = Some((path, stamp, dict.clone()));
     Some(dict)
 }
 
@@ -451,6 +467,27 @@ mod tests {
         // a reading that is no reading
         let (e, skipped) = parse("漢字\t語\t名詞\n");
         assert!(e.is_empty() && skipped.len() == 1);
+        // typed readings starting as a comment does are read back as saved
+        let saved = [
+            Entry {
+                reading: normalize_reading("#").unwrap(),
+                word: "＃".into(),
+                pos: DEFAULT_POS.into(),
+                comment: String::new(),
+            },
+            Entry {
+                reading: normalize_reading("!important").unwrap(),
+                word: "重要".into(),
+                pos: DEFAULT_POS.into(),
+                comment: String::new(),
+            },
+        ];
+        let (e, skipped) = parse(&to_text(&saved));
+        assert_eq!(e.len(), 2, "{skipped:?}");
+        assert_eq!(
+            (e[0].reading.as_str(), e[1].reading.as_str()),
+            ("#", "!important")
+        );
     }
 
     #[test]

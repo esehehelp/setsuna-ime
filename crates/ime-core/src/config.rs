@@ -580,13 +580,15 @@ pub enum PunctuationStyle {
     /// Leave the candidates' punctuation as the engine wrote it.
     #[default]
     AsIs,
-    /// `、` `。`
+    /// `、` `。` (`touten_kuten` too, as the template once named it)
+    #[serde(alias = "touten_kuten")]
     TotenKuten,
     /// `，` `．`
     CommaPeriod,
     /// `，` `。`
     CommaKuten,
     /// `、` `．`
+    #[serde(alias = "touten_period")]
     TotenPeriod,
 }
 
@@ -1108,8 +1110,14 @@ impl Config {
 
     /// Write this config to `path`, keeping the comments and layout of the
     /// file already there (or of the default template when there is none).
-    /// Every key this config serializes is written; keys it leaves out (an
-    /// unset engine knob, a removed key) are left as they are in the file.
+    /// Every key this config serializes is written, and a key it leaves out
+    /// goes from the file: an option cleared (the rewriter's URL, its
+    /// instructions), `[diagnostics]` turned off, a key under an old name.
+    /// Left in the file, the old value came back on the next read (the
+    /// typed text logged on after it was turned off). The tables stay, with
+    /// their comments. The engine's knobs are not the settings page's and
+    /// stay as the file has them, set or not, but for the corrector's
+    /// threshold, which the page takes back to the corrector's own.
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
         let existing = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -1124,13 +1132,11 @@ impl Config {
             .parse()
             .context("reparse serialized config")?;
         merge_table(doc.as_table_mut(), new.as_table());
+        prune_table(doc.as_table_mut(), new.as_table(), &["engine"]);
         // every application's entry removed
         if self.apps.is_empty() {
             doc.remove("apps");
         }
-        // the corrector's threshold unset again: its line goes, which is the
-        // settings page's way back to the corrector's own (the other engine
-        // knobs are not the page's, and stay as the file has them)
         if self.engine.corrector_threshold.is_none() {
             if let Some(engine) = doc.get_mut("engine").and_then(|e| e.as_table_like_mut()) {
                 engine.remove("corrector_threshold");
@@ -1140,11 +1146,20 @@ impl Config {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        // Write then rename, so a reader never sees a half-written file.
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, doc.to_string())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+        // Write then rename, so a reader never sees a half-written file; a
+        // name of this save's own, so that two saves at once do not write
+        // into one file
+        static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("toml.{}-{n}.tmp", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, doc.to_string()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("write {}", tmp.display()));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("replace {}", path.display()));
+        }
         Ok(())
     }
 
@@ -1208,8 +1223,8 @@ impl Config {
              # caret writes them).\n\
              symbol_width = \"as_typed\"\n\
              # Touten / kuten of the candidates: as_is (as converted),\n\
-             # touten_kuten (、。), comma_period (，．), comma_kuten (，。),\n\
-             # touten_period (、．).\n\
+             # toten_kuten (、。), comma_period (，．), comma_kuten (，。),\n\
+             # toten_period (、．).\n\
              punctuation = \"as_is\"\n\
              # Write every middle-dot variant (･ · ‧ ⋅ ∙) as ・.\n\
              normalize_middle_dot = false\n\
@@ -1428,6 +1443,16 @@ fn merge_table(doc: &mut toml_edit::Table, new: &toml_edit::Table) {
     for (key, item) in new.iter() {
         match (doc.get_mut(key), item) {
             (Some(toml_edit::Item::Table(old)), toml_edit::Item::Table(t)) => merge_table(old, t),
+            // a table the file writes inline (`symbols = { ... }`) stays
+            // inline, its decoration kept
+            (
+                Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(old))),
+                toml_edit::Item::Table(t),
+            ) => {
+                let decor = old.decor().clone();
+                *old = t.clone().into_inline_table();
+                *old.decor_mut() = decor;
+            }
             (Some(toml_edit::Item::Value(old)), toml_edit::Item::Value(v)) => {
                 let decor = old.decor().clone();
                 *old = v.clone();
@@ -1436,6 +1461,32 @@ fn merge_table(doc: &mut toml_edit::Table, new: &toml_edit::Table) {
             _ => {
                 doc.insert(key, item.clone());
             }
+        }
+    }
+}
+
+/// Drop from `doc` every value `new` has no key for; a table `new` has
+/// none of is emptied, its header and comments kept. The keys `keep` (of
+/// this level) are left as they are.
+fn prune_table(doc: &mut toml_edit::Table, new: &toml_edit::Table, keep: &[&str]) {
+    let empty = toml_edit::Table::new();
+    let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+    for key in keys.into_iter().filter(|k| !keep.contains(&k.as_str())) {
+        let theirs = new.get(&key);
+        match doc.get_mut(&key) {
+            Some(toml_edit::Item::Table(old)) => {
+                prune_table(
+                    old,
+                    theirs.and_then(|t| t.as_table()).unwrap_or(&empty),
+                    &[],
+                );
+            }
+            // whole arrays of tables (`[[apps]]`) are the caller's
+            Some(toml_edit::Item::ArrayOfTables(_)) => {}
+            _ if theirs.is_none() => {
+                doc.remove(&key);
+            }
+            _ => {}
         }
     }
 }
@@ -1557,6 +1608,63 @@ mixed_model = \"C:/p/mixed\"
         assert_eq!(back.frontend.replacements, cfg.frontend.replacements);
         assert_eq!(back.learning.strength, 0.5);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the settings page clears goes from the file: an option unset,
+    /// `[diagnostics]` turned off; an inline table stays inline.
+    #[test]
+    fn save_drops_what_was_cleared() {
+        let dir = std::env::temp_dir().join(format!("setsuna-config-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "[rewriter]\n# where it is\nbase_url = \"http://example.invalid/v1\"\n\
+             instructions = \"be brief\"\n\n\
+             [frontend]\nsymbols = { tilde = \"〜\" }\n\n\
+             # what the logs hold\n[diagnostics]\nlog_typed_text = true\n",
+        )
+        .unwrap();
+        let mut cfg = Config::load_from_path(&path).unwrap();
+        assert!(cfg.diagnostics.log_typed_text);
+        cfg.rewriter.base_url = None;
+        cfg.rewriter.instructions = None;
+        cfg.diagnostics.log_typed_text = false;
+        cfg.save_to_path(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = Config::load_from_path(&path).unwrap();
+        assert_eq!(back.rewriter.base_url, None, "{text}");
+        assert_eq!(back.rewriter.instructions, None, "{text}");
+        assert!(!back.diagnostics.log_typed_text, "{text}");
+        assert!(
+            text.contains("# what the logs hold\n[diagnostics]"),
+            "{text}"
+        );
+        assert!(text.contains("symbols = {"), "{text}");
+        assert_eq!(back.frontend.symbols, cfg.frontend.symbols);
+        // no temporary file left
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(left.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_punctuation_styles_the_template_names_are_read() {
+        let template = Config::emit_default_toml();
+        for name in ["toten_kuten", "comma_period", "comma_kuten", "toten_period"] {
+            assert!(template.contains(name), "{name}");
+        }
+        // and the names it gave before
+        for name in [
+            "as_is",
+            "toten_kuten",
+            "toten_period",
+            "touten_kuten",
+            "touten_period",
+        ] {
+            Config::load_from_str(&format!("[frontend]\npunctuation = \"{name}\"\n")).unwrap();
+        }
     }
 
     #[test]

@@ -9,6 +9,11 @@
 //! Ctrl+Delete on a prediction appends the same with `"d": true`: its
 //! commits are forgotten.
 //!
+//! A log that grew to many times the entries it holds is compacted to them
+//! (`{"r", "s", "n": count, "a": {commit before: count}}` after a first
+//! line of its own, which tells other processes to read it again), as the
+//! learning's is; every append and the compaction take the file's lock.
+//!
 //! As Mozc's IsValidSuggestion, a surface committed once is offered from
 //! three chars typed, one committed again or after the same commit as
 //! before from two. Live conversion commits whole sentences, which are
@@ -18,14 +23,14 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// One line of `prediction.jsonl`: a commit, or (`d`) that the commits of
 /// `s` for `r` are forgotten (Ctrl+Delete on the prediction).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Record {
     r: String,
     s: String,
@@ -33,6 +38,19 @@ struct Record {
     p: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     d: bool,
+    /// Commits it stands for (a compacted log's), 1 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<u32>,
+    /// The commits before it, with their counts (a compacted log's).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    a: HashMap<String, u32>,
+}
+
+/// A compacted log's first line: when, so that it differs from the head
+/// any process read before.
+#[derive(Serialize)]
+struct Compacted {
+    compacted: u128,
 }
 
 #[derive(Default)]
@@ -53,9 +71,39 @@ pub struct Prediction {
 
 pub struct Predictor {
     path: PathBuf,
+    /// Bytes of the file applied, its time of change then, its first bytes
+    /// (up to `HEAD`) and its lines.
     offset: u64,
+    stamp: Option<std::time::SystemTime>,
+    head: Vec<u8>,
+    lines: usize,
     seq: u64,
     stats: HashMap<(String, String), Stat>,
+}
+
+/// Bytes of the file's start kept to tell a file replaced (compacted).
+const HEAD: usize = 256;
+/// Commits before a surface kept for it, the most frequent.
+const AFTER_CAP: usize = 16;
+/// Lines from which a log may be compacted (when most are no longer in
+/// effect).
+const COMPACT_LINES: usize = 2 * CAP;
+
+impl Stat {
+    fn add_after(&mut self, prev: String, n: u32) {
+        let c = self.after.entry(prev).or_default();
+        *c = c.saturating_add(n);
+        if self.after.len() > AFTER_CAP {
+            if let Some(least) = self
+                .after
+                .iter()
+                .min_by_key(|&(p, &c)| (c, std::cmp::Reverse(p.clone())))
+                .map(|(p, _)| p.clone())
+            {
+                self.after.remove(&least);
+            }
+        }
+    }
 }
 
 /// Readings shorter than this are not predicted from (too many surfaces).
@@ -79,6 +127,9 @@ impl Predictor {
         let mut p = Self {
             path,
             offset: 0,
+            stamp: None,
+            head: Vec::new(),
+            lines: 0,
             seq: 0,
             stats: HashMap::new(),
         };
@@ -86,49 +137,82 @@ impl Predictor {
         p
     }
 
+    fn reset(&mut self) {
+        self.offset = 0;
+        self.stamp = None;
+        self.head.clear();
+        self.lines = 0;
+        self.seq = 0;
+        self.stats.clear();
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Apply the lines appended since the last sync. A file that shrank or
+    /// went away was cleared, and one that starts otherwise than it did was
+    /// compacted (by another process): start over.
     fn sync(&mut self) {
-        let len = match std::fs::metadata(&self.path) {
-            Ok(m) => m.len(),
+        let (len, stamp) = match std::fs::metadata(&self.path) {
+            Ok(m) => (m.len(), m.modified().ok()),
             Err(_) => {
-                self.offset = 0;
-                self.stats.clear();
+                self.reset();
                 return;
             }
         };
         if len < self.offset {
-            self.offset = 0;
-            self.stats.clear();
+            self.reset();
         }
-        if len == self.offset {
+        if len == self.offset && stamp == self.stamp {
             return;
         }
+        let Ok(mut f) = File::open(&self.path) else {
+            return;
+        };
+        if self.offset > 0 {
+            let mut head = vec![0; self.head.len()];
+            if f.read_exact(&mut head).is_err() || head != self.head {
+                self.reset();
+            }
+        }
+        self.stamp = stamp;
         let mut buf = Vec::new();
-        let read = File::open(&self.path).and_then(|mut f| {
-            f.seek(SeekFrom::Start(self.offset))?;
-            f.read_to_end(&mut buf)
-        });
+        let read = f
+            .seek(SeekFrom::Start(self.offset))
+            .and_then(|_| f.read_to_end(&mut buf));
         if read.is_err() {
             return;
         }
         let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
             return;
         };
+        if self.offset == 0 {
+            self.head = buf[..(end + 1).min(HEAD)].to_vec();
+        }
         for line in buf[..end].split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            self.lines += 1;
             if let Ok(r) = serde_json::from_slice::<Record>(line) {
                 if r.d {
                     self.stats.remove(&(r.r, r.s));
                     continue;
                 }
+                let n = r.n.unwrap_or(1);
+                if n == 0 {
+                    continue;
+                }
                 self.seq += 1;
                 let s = self.stats.entry((r.r, r.s)).or_default();
-                s.count += 1;
+                s.count = s.count.saturating_add(n);
                 s.last = self.seq;
                 if !r.p.is_empty() {
-                    *s.after.entry(r.p).or_default() += 1;
+                    s.add_after(r.p, 1);
+                }
+                for (p, c) in r.a {
+                    s.add_after(p, c);
                 }
             }
         }
@@ -169,7 +253,7 @@ impl Predictor {
                 .into_iter()
                 .rev()
                 .collect(),
-            d: false,
+            ..Record::default()
         })
     }
 
@@ -187,8 +271,8 @@ impl Predictor {
         self.append(&Record {
             r: reading.to_string(),
             s: surface.to_string(),
-            p: String::new(),
             d: true,
+            ..Record::default()
         })?;
         Ok(true)
     }
@@ -199,9 +283,52 @@ impl Predictor {
         }
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
-        crate::private_file::append(&self.path)?.write_all(&line)?;
+        crate::private_file::append_locked(&self.path, &line)?;
         self.sync();
+        if self.lines > COMPACT_LINES && self.lines > 2 * self.stats.len() + 1 {
+            // a failure leaves the log as it was
+            let _ = self.compact();
+        }
         Ok(())
+    }
+
+    /// Write what is in effect as a compacted file and move it over the
+    /// log, under the lock every append takes; false when the log changed
+    /// since it was read, or another process holds the lock.
+    fn compact(&mut self) -> std::io::Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut out = serde_json::to_vec(&Compacted { compacted: now })?;
+        out.push(b'\n');
+        let mut entries: Vec<(&(String, String), &Stat)> = self.stats.iter().collect();
+        entries.sort_unstable_by_key(|&(_, s)| s.last);
+        for ((r, s), stat) in entries {
+            serde_json::to_writer(
+                &mut out,
+                &Record {
+                    r: r.clone(),
+                    s: s.clone(),
+                    n: (stat.count != 1).then_some(stat.count),
+                    a: stat.after.clone(),
+                    ..Record::default()
+                },
+            )?;
+            out.push(b'\n');
+        }
+        let (offset, path) = (self.offset, self.path.clone());
+        let moved = crate::private_file::try_locked(&self.path, || {
+            if std::fs::metadata(&path)?.len() != offset {
+                return Ok(false);
+            }
+            crate::private_file::write(&path, &out).map(|()| true)
+        })?;
+        if moved == Some(true) {
+            self.reset();
+            self.sync();
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Up to `n` predictions for `prefix` typed after `prev`: surfaces
@@ -209,7 +336,7 @@ impl Predictor {
     pub fn complete(&mut self, prefix: &str, prev: &str, n: usize) -> Vec<Prediction> {
         self.sync();
         let typed = prefix.chars().count();
-        if typed < MIN_PREFIX {
+        if typed < MIN_PREFIX || n == 0 {
             return Vec::new();
         }
         let prev: String = prev
@@ -274,6 +401,39 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// A log of many lines for few entries is compacted to them, read again
+    /// by a process that read it before; the commits before a surface are
+    /// kept for it up to a few.
+    #[test]
+    fn a_long_log_is_compacted_and_read_again_elsewhere() {
+        let path = temp("compact");
+        let line = "{\"r\":\"よろしく\",\"s\":\"宜しく\",\"p\":\"では\"}\n";
+        std::fs::write(&path, line.repeat(COMPACT_LINES)).unwrap();
+        let mut other = Predictor::at(path.clone());
+        let mut p = Predictor::at(path.clone());
+        p.record("よろこび", "喜び", "").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("{\"compacted\":"), "{text}");
+        assert_eq!(text.lines().count(), 3, "{text}");
+        let key = ("よろしく".to_string(), "宜しく".to_string());
+        for q in [&mut p, &mut other] {
+            q.sync();
+            assert_eq!(q.stats[&key].count, COMPACT_LINES as u32);
+            assert_eq!(q.stats[&key].after["では"], COMPACT_LINES as u32);
+            assert!(q
+                .stats
+                .contains_key(&("よろこび".to_string(), "喜び".to_string())));
+        }
+        assert!(p.complete("よろし", "", 0).is_empty());
+        for i in 0..AFTER_CAP + 4 {
+            p.record("よろしく", "宜しく", &format!("前{i}")).unwrap();
+        }
+        assert_eq!(p.stats[&key].after.len(), AFTER_CAP);
+        assert!(p.stats[&key].after.contains_key("では"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
     }
 
     #[test]

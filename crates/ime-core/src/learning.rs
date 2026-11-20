@@ -62,7 +62,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,9 @@ pub struct Learning {
     use_words: bool,
     /// Bytes of the file already applied.
     offset: u64,
+    /// Its time of change when last read: a compaction by another process
+    /// may leave it as long as it was.
+    stamp: Option<std::time::SystemTime>,
     /// Its first bytes (up to `HEAD`) and lines, as read.
     head: Vec<u8>,
     lines: usize,
@@ -223,6 +226,7 @@ impl Learning {
             threshold: cfg.similarity_threshold,
             use_words: cfg.words,
             offset: 0,
+            stamp: None,
             head: Vec::new(),
             lines: 0,
             entries: Vec::new(),
@@ -251,6 +255,7 @@ impl Learning {
 
     fn reset(&mut self) {
         self.offset = 0;
+        self.stamp = None;
         self.head.clear();
         self.lines = 0;
         self.entries.clear();
@@ -264,8 +269,8 @@ impl Learning {
     /// shrank or disappeared was cleared, and one that starts otherwise than
     /// it did was compacted (by another process): start over.
     fn sync(&mut self) {
-        let len = match std::fs::metadata(&self.path) {
-            Ok(m) => m.len(),
+        let (len, stamp) = match std::fs::metadata(&self.path) {
+            Ok(m) => (m.len(), m.modified().ok()),
             Err(_) => {
                 self.reset();
                 return;
@@ -274,7 +279,7 @@ impl Learning {
         if len < self.offset {
             self.reset();
         }
-        if len == self.offset {
+        if len == self.offset && stamp == self.stamp {
             return;
         }
         let Ok(mut f) = File::open(&self.path) else {
@@ -286,6 +291,7 @@ impl Learning {
                 self.reset();
             }
         }
+        self.stamp = stamp;
         let mut buf = Vec::new();
         let read = f
             .seek(SeekFrom::Start(self.offset))
@@ -316,8 +322,7 @@ impl Learning {
     /// move it over the log; false when the log changed meanwhile (another
     /// process appended a line) and was left as it is.
     fn compact(&mut self) -> std::io::Result<bool> {
-        let len = std::fs::metadata(&self.path)?.len();
-        if len != self.offset {
+        if std::fs::metadata(&self.path)?.len() != self.offset {
             // a line being appended
             return Ok(false);
         }
@@ -358,25 +363,19 @@ impl Learning {
                 ..Record::default()
             })?;
         }
-        let name = self
-            .path
-            .file_name()
-            .map_or("learning.jsonl".into(), |n| n.to_string_lossy());
-        let tmp = self
-            .path
-            .with_file_name(format!("{name}.{}.{now}.tmp", std::process::id()));
-        let moved = crate::private_file::write(&tmp, &out).and_then(|()| {
-            // another process appended meanwhile: its line stays, compacted
-            // another time
-            if std::fs::metadata(&self.path)?.len() != len {
+        // under the lock every append takes: another process's line comes
+        // after the file is replaced, or before the check that finds it
+        // (and is compacted another time); with the lock held elsewhere,
+        // another time too
+        let offset = self.offset;
+        let path = self.path.clone();
+        let moved = crate::private_file::try_locked(&self.path, || {
+            if std::fs::metadata(&path)?.len() != offset {
                 return Ok(false);
             }
-            std::fs::rename(&tmp, &self.path).map(|()| true)
-        });
-        if !matches!(moved, Ok(true)) {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        if moved? {
+            crate::private_file::write(&path, &out).map(|()| true)
+        })?;
+        if moved == Some(true) {
             self.reset();
             self.sync();
             return Ok(true);
@@ -424,7 +423,7 @@ impl Learning {
             self.words[i].count = 0;
         }
         if let Some(&i) = self.word_key.get(&w) {
-            self.words[i].count += n;
+            self.words[i].count = self.words[i].count.saturating_add(n);
             return;
         }
         self.word_key.insert(w.clone(), self.words.len());
@@ -440,7 +439,7 @@ impl Learning {
         }
         let key = (r.reading, r.chosen, r.rejected);
         if let Some(&i) = self.by_key.get(&key) {
-            self.entries[i].count += n;
+            self.entries[i].count = self.entries[i].count.saturating_add(n);
             return;
         }
         let reading = bigrams(&key.0);
@@ -542,8 +541,8 @@ impl Learning {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         // One append-mode write per line keeps lines from different
-        // processes whole.
-        crate::private_file::append(&self.path)?.write_all(&line)?;
+        // processes whole; the lock keeps them out of a compaction's way.
+        crate::private_file::append_locked(&self.path, &line)?;
         self.sync();
         Ok(())
     }
@@ -685,6 +684,7 @@ fn word_bonuses(
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Write;
 
     struct TempFile(PathBuf);
 
@@ -1028,9 +1028,13 @@ mod tests {
         // and reranks as before
         let cands = list(&["髪を切っておく", "紙を切っておく"]);
         assert_eq!(l.rerank("かみをきっておく", cands)[0], "紙を切っておく");
-        // no file of its own is left
-        let files = std::fs::read_dir(t.0.parent().unwrap()).unwrap().count();
-        assert_eq!(files, 1);
+        // no file of its own is left but the lock every writer takes
+        let files: Vec<String> = std::fs::read_dir(t.0.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".lock"))
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
     }
 
     #[test]
