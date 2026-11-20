@@ -40,12 +40,17 @@ if ($InstallDir.Length -gt 3) { $InstallDir = $InstallDir.TrimEnd('\', '/') }
 $UserDir    = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
 $ConfigDir  = Join-Path $env:APPDATA      'setsuna-ime'
 # what regsvr32 /u is run on when the registry names nothing there: the shim
-# registered as the IME, else the IME DLL itself (an install before the shim)
+# registered as the IME, else the IME DLL itself (an install before the shim),
+# in the install directory only: regsvr32 runs elevated and loads what it is
+# given, and the user's directory is the user's to write (an install before
+# 0.3.0 there is unregistered as the machine's registration names it)
 $DllPath    = Join-Path $InstallDir 'setsuna_tsf_shim.dll'
-foreach ($p in (Join-Path $InstallDir 'setsuna_tsf.dll'), (Join-Path $UserDir 'setsuna_tsf_shim.dll'), (Join-Path $UserDir 'setsuna_tsf.dll')) {
+foreach ($p in @(Join-Path $InstallDir 'setsuna_tsf.dll')) {
     if (-not (Test-Path -LiteralPath $DllPath)) { $DllPath = $p }
 }
-$ClsidReg   = 'Registry::HKEY_CLASSES_ROOT\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
+# the machine's registration: HKEY_CLASSES_ROOT puts the user's own
+# HKCU\Software\Classes, which the user may write, over it
+$ClsidReg   = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
 $UninstReg  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\setsuna-ime'
 $LogFile    = Join-Path $env:LOCALAPPDATA 'setsuna-ime\uninstall.log'
 

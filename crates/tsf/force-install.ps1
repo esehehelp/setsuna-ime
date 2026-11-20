@@ -38,7 +38,9 @@ $DllName = 'setsuna_tsf.dll'
 $TextServiceClsid = '{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}'
 $ProfileGuid = '{ACEB29C0-964E-4FF1-8BDC-B507AAB78873}'
 $KeyboardTipCategory = '{34745C63-B2F0-4784-8B67-5E12C8701A31}'
-$ClsidReg = 'Registry::HKEY_CLASSES_ROOT\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
+# the machine's registration, which the elevated regsvr32 /u is run on:
+# HKEY_CLASSES_ROOT puts the user's own HKCU\Software\Classes over it
+$ClsidReg = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
 $LogFile = Join-Path $UserDir 'force-install.log'
 
 function Write-Log {
