@@ -32,7 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// setsuna, msime, shunti or none (the US keyboard: the runner's own cost).
+    /// setsuna, msime, shunti, zeroconvert, fumiori, copilot or none (the US
+    /// keyboard: the runner's own cost).
     #[arg(long)]
     ime: String,
     /// edit (a Win32 EDIT, through CUAS) or richedit (RichEdit with TSF on).
@@ -74,7 +75,9 @@ struct Profile {
     profile: GUID,
     /// Virtual keys that put it in Japanese input.
     on_keys: &'static [u16],
-    /// Its own processes (executable names starting with these).
+    /// Its own processes: executable names starting with these, or, for an
+    /// entry with a backslash, executables under that folder (environment
+    /// variables as in `storage`).
     processes: &'static [&'static str],
     /// Its files: installed, models and dictionaries, the user's data.
     storage: &'static [&'static str],
@@ -110,9 +113,54 @@ fn profile(name: &str) -> Result<Option<Profile>> {
             processes: &[],
             storage: &["%ProgramFiles%\\shunti IME", "%APPDATA%\\shunti IME"],
         },
+        // ZeroConvert IME (azooKey for Windows with the ZeroCon model): its
+        // conversion server, its llama-server and the other helpers run from
+        // the install folder (a llama-server elsewhere is not its own).
+        "zeroconvert" => Profile {
+            clsid: GUID::from_u128(0xffde_fe79_2fc2_11ef_b16b_94e7_0b2c_378c),
+            profile: GUID::from_u128(0xffde_fe7a_2fc2_11ef_b16b_94e7_0b2c_378c),
+            on_keys: &[0x16],
+            processes: &["%ProgramFiles%\\ZeroConvert IME\\"],
+            storage: &[
+                "%ProgramFiles%\\ZeroConvert IME",
+                "%LOCALAPPDATA%\\Azookey",
+                "%APPDATA%\\Azookey",
+            ],
+        },
+        // Fumiori AI IME: Mozc and a local reranker (YamatanaAIIME.exe).
+        "fumiori" => Profile {
+            clsid: GUID::from_u128(0x10a6_7bc8_22fa_4a59_90dc_2546_652c_56bf),
+            profile: GUID::from_u128(0x186f_700c_71cf_43fe_a00e_aacb_1d9e_6d3d),
+            on_keys: &[0x16],
+            processes: &["%ProgramFiles(x86)%\\Yamatana AI IME\\"],
+            storage: &[
+                "%ProgramFiles(x86)%\\Yamatana AI IME",
+                "%LOCALAPPDATA%\\YamatanaAIIME",
+                "%USERPROFILE%\\AppData\\LocalLow\\Mozc",
+            ],
+        },
+        "copilot" => Profile {
+            clsid: GUID::from_u128(0xd4e1_a2b3_5f6c_4d7e_8a9b_0c1d_2e3f_4a5b),
+            profile: GUID::from_u128(0xa1b2_c3d4_e5f6_7890_1234_5678_9abc_def0),
+            on_keys: &[0x16],
+            processes: &["%ProgramFiles%\\CopilotKeyboard\\"],
+            storage: &["%ProgramFiles%\\CopilotKeyboard"],
+        },
         "none" => return Ok(None),
-        _ => bail!("unknown input method {name} (setsuna, msime, shunti, none)"),
+        _ => bail!(
+            "unknown input method {name} (setsuna, msime, shunti, zeroconvert, fumiori, copilot, none)"
+        ),
     }))
+}
+
+/// A key of a latency row (latency.jsonl): the key's place in the row's
+/// keys, and the key to the field's first and last change.
+#[derive(Serialize)]
+struct KeyOut {
+    id: String,
+    key: usize,
+    first_ms: f64,
+    last_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -192,8 +240,17 @@ fn usage(prefixes: &[&str]) -> Snapshot {
         .ok()
         .map(|_| String::from_utf16_lossy(&buf[..n as usize]));
         if let Some(name) = name {
-            let exe = name.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
-            if prefixes.iter().any(|p| exe.starts_with(p)) {
+            let path = name.to_lowercase();
+            let exe = path.rsplit('\\').next().unwrap_or("");
+            let own = |p: &&str| {
+                if p.contains('\\') {
+                    let dir = expand(p).to_string_lossy().to_lowercase();
+                    path.starts_with(&dir)
+                } else {
+                    exe.starts_with(&p.to_ascii_lowercase())
+                }
+            };
+            if prefixes.iter().any(own) {
                 others.insert(pid, read_usage(h));
             }
         }
@@ -219,7 +276,14 @@ fn sum(snap: &Snapshot, pids: &[u32]) -> Usage {
 
 fn expand(path: &str) -> PathBuf {
     let mut out = path.to_string();
-    for var in ["LOCALAPPDATA", "APPDATA", "WINDIR", "ProgramFiles"] {
+    for var in [
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "WINDIR",
+        "ProgramFiles(x86)",
+        "ProgramFiles",
+    ] {
         if let Ok(v) = std::env::var(var) {
             out = out.replace(&format!("%{var}%"), &v);
         }
@@ -562,19 +626,24 @@ struct Meta {
     /// A row's keys sent to the field still (`RowOut::burst_ms`).
     burst_ms_p50: f64,
     burst_ms_p95: f64,
+    burst_ms_p99: f64,
     /// Rows whose field changed after Space, and Space to the first and
     /// last change in them.
     space_changed: usize,
     space_first_ms_p50: f64,
     space_first_ms_p95: f64,
+    space_first_ms_p99: f64,
     space_last_ms_p50: f64,
     space_last_ms_p95: f64,
+    space_last_ms_p99: f64,
     /// Latency rows, a key at a time: a key to the field's first change
     /// (the key shown) and to its last (the conversion in).
     key_first_ms_p50: f64,
     key_first_ms_p95: f64,
+    key_first_ms_p99: f64,
     key_last_ms_p50: f64,
     key_last_ms_p95: f64,
+    key_last_ms_p99: f64,
     latency_keys: usize,
 }
 
@@ -792,6 +861,7 @@ pub fn run(args: Args) -> Result<()> {
         // still: a key to the field's first change (the key shown) and to
         // its last (its conversion in)
         let (mut key_first, mut key_last) = (Vec::new(), Vec::new());
+        let mut key_rows = Vec::new();
         if args.latency_rows > 0 {
             let step = (rows.len() / args.latency_rows).max(1);
             let pause = Duration::from_millis(args.latency_quiet_ms);
@@ -800,12 +870,18 @@ pub fn run(args: Args) -> Result<()> {
                 let f = new_field(top, rich, &row.context)?;
                 pump(10);
                 on(&prof);
-                for c in keys.chars() {
+                for (i, c) in keys.chars().enumerate() {
                     type_char(c);
                     let (first, last) = f.settle(pause, Duration::from_secs(2));
                     if !first.is_zero() {
                         key_first.push(ms(first));
                         key_last.push(ms(last));
+                        key_rows.push(KeyOut {
+                            id: row.id.clone(),
+                            key: i,
+                            first_ms: ms(first),
+                            last_ms: ms(last),
+                        });
                     }
                 }
                 press(0x20, false);
@@ -845,17 +921,28 @@ pub fn run(args: Args) -> Result<()> {
             storage_mb: storage as f64 / 1048576.0,
             burst_ms_p50: pct(&burst, 0.5),
             burst_ms_p95: pct(&burst, 0.95),
+            burst_ms_p99: pct(&burst, 0.99),
             space_changed: space_first.len(),
             space_first_ms_p50: pct(&space_first, 0.5),
             space_first_ms_p95: pct(&space_first, 0.95),
+            space_first_ms_p99: pct(&space_first, 0.99),
             space_last_ms_p50: pct(&space_last, 0.5),
             space_last_ms_p95: pct(&space_last, 0.95),
+            space_last_ms_p99: pct(&space_last, 0.99),
             key_first_ms_p50: pct(&key_first, 0.5),
             key_first_ms_p95: pct(&key_first, 0.95),
+            key_first_ms_p99: pct(&key_first, 0.99),
             key_last_ms_p50: pct(&key_last, 0.5),
             key_last_ms_p95: pct(&key_last, 0.95),
+            key_last_ms_p99: pct(&key_last, 0.99),
             latency_keys: key_first.len(),
         };
+        let mut lat = String::new();
+        for k in &key_rows {
+            lat.push_str(&serde_json::to_string(k)?);
+            lat.push('\n');
+        }
+        std::fs::write(args.out.join("latency.jsonl"), lat).context("write latency.jsonl")?;
         std::fs::write(
             args.out.join("meta.json"),
             serde_json::to_string_pretty(&meta)?,
