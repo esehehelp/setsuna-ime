@@ -92,20 +92,50 @@ function Test-ReparsePoint([System.IO.FileSystemInfo]$Item) {
 # $Path and what it holds gone, as this one deletes them elevated: a junction
 # or a link inside goes itself, never what it points at (Windows PowerShell's
 # Remove-Item -Recurse went through a junction and deleted where it led).
+# What cannot go (a DLL a running app still has loaded) is passed over and
+# the rest goes; the paths left are written out, each before its directory.
 function Remove-Tree([string]$Path) {
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch {
+        return $Path
+    }
     if ($item.PSIsContainer -and -not (Test-ReparsePoint $item)) {
-        foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+        $children = @()
+        try {
+            $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+        } catch { }
+        foreach ($child in $children) {
             Remove-Tree $child.FullName
         }
     }
-    if ($item.PSIsContainer) {
-        # a directory, or the link of one (removing it leaves its target)
-        [IO.Directory]::Delete($item.FullName, $false)
-    } else {
-        $item.Attributes = $item.Attributes -band -bnot [IO.FileAttributes]::ReadOnly
-        [IO.File]::Delete($item.FullName)
+    try {
+        if ($item.PSIsContainer) {
+            # a directory, or the link of one (removing it leaves its target)
+            [IO.Directory]::Delete($item.FullName, $false)
+        } else {
+            $item.Attributes = $item.Attributes -band -bnot [IO.FileAttributes]::ReadOnly
+            [IO.File]::Delete($item.FullName)
+        }
+    } catch {
+        $item.FullName
     }
+}
+
+# $Path deleted when Windows next starts (MOVEFILE_DELAY_UNTIL_REBOOT, an
+# administrator's): only under Program Files, where no user can put a link
+# for the start to delete through.
+function Remove-AtRestart([string]$Path) {
+    $programFiles = [IO.Path]::Combine([Environment]::GetFolderPath('ProgramFiles'), 'x').TrimEnd('x')
+    if (-not $Path.StartsWith($programFiles, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not ('Setsuna.Uninstall.Native' -as [type])) {
+        Add-Type -Namespace Setsuna.Uninstall -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool MoveFileEx(string existing, string replacement, int flags);
+'@
+    }
+    return [Setsuna.Uninstall.Native]::MoveFileEx($Path, $null, 4)
 }
 
 # Whether $Dir is an install of install.ps1's to delete: a directory of its
@@ -184,20 +214,18 @@ Get-Process -Name 'setsuna-engine*', 'setsuna-rewrite*', 'setsuna-rerank' -Error
 if ((Test-Path -LiteralPath $InstallDir) -and -not (Test-InstallDir $InstallDir)) {
     Write-Log WARN "not an install of Setsuna's (no installed.toml, core.txt or uninstall.ps1 with its DLL, or a link or a drive's root): left as it is: $InstallDir"
 } elseif (Test-Path -LiteralPath $InstallDir) {
-    $removed = $false
+    $left = @()
     for ($i = 0; $i -lt 10; $i++) {
-        try {
-            Remove-Tree $InstallDir
-            $removed = $true
-            break
-        } catch {
-            Start-Sleep -Milliseconds 500
-        }
+        $left = @(Remove-Tree $InstallDir)
+        if ($left.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 500
     }
-    if ($removed) {
+    if ($left.Count -eq 0) {
         Write-Log INFO "removed install dir: $InstallDir"
     } else {
-        Write-Log WARN "could not remove install dir after retries: $InstallDir"
+        # the DLLs apps still have loaded (until they exit): gone at the next restart
+        $later = @($left | Where-Object { Remove-AtRestart $_ })
+        Write-Log WARN "$($left.Count) in use in $InstallDir, $($later.Count) of them to be deleted at the next restart: $($left -join ', ')"
         Revoke-AppContainerRead -Path $InstallDir
     }
 }
@@ -212,7 +240,7 @@ if ($userDirItem -and (Test-ReparsePoint $userDirItem)) {
     Get-ChildItem -LiteralPath $UserDir -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notmatch '^(install|uninstall)\.log$' } |
         ForEach-Object {
-            try { Remove-Tree $_.FullName } catch { }
+            $null = @(Remove-Tree $_.FullName)
         }
     Revoke-AppContainerRead -Path $UserDir
 }
@@ -240,7 +268,8 @@ if ($KeepConfig) {
         }
     }
     if ($doDelete) {
-        try { Remove-Tree $ConfigDir } catch { Write-Log WARN "could not remove all of $ConfigDir`: $_" }
+        $left = @(Remove-Tree $ConfigDir)
+        if ($left.Count -gt 0) { Write-Log WARN "could not remove all of $ConfigDir`: $($left -join ', ')" }
         Write-Log INFO "removed config dir: $ConfigDir"
     } else {
         Write-Log INFO "config preserved (user opt-out)"
