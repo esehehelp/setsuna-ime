@@ -2,3 +2,5 @@ target/
 /local/
 /_scratch/
 /demo/
+/kairo/
+/kairo.toml
