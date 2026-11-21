@@ -22,12 +22,32 @@ use setsuna_artifact::PackedCodes;
 pub const CODE_CHARS: &str =
     "!#$%&'()+-./0123456789:;<>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}";
 
+const CODE_INDEX: [u8; 128] = {
+    let mut lut = [u8::MAX; 128];
+    let bytes = CODE_CHARS.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        lut[bytes[i] as usize] = i as u8;
+        i += 1;
+    }
+    lut
+};
+
+#[inline(always)]
 fn code_index(c: char) -> Option<usize> {
-    CODE_CHARS.find(c)
+    let b = c as u32;
+    if b < 128 {
+        let idx = CODE_INDEX[b as usize];
+        if idx != u8::MAX {
+            return Some(idx as usize);
+        }
+    }
+    None
 }
 
+#[inline(always)]
 fn code_char(i: usize) -> Option<char> {
-    CODE_CHARS.chars().nth(i)
+    CODE_CHARS.as_bytes().get(i).map(|&b| b as char)
 }
 
 /// Katakana as hiragana, the rest as it is.
@@ -377,8 +397,9 @@ pub fn count_usage<'a>(
     out: &Path,
 ) -> Result<usize> {
     let mut count: HashMap<(String, String, String, String), u64> = HashMap::new();
+    let mut worker = analyzer.worker();
     for text in texts {
-        for t in analyzer.analyze(text) {
+        for t in worker.analyze(text) {
             let reading = t.reading.unwrap_or_else(|| "*".to_string());
             *count
                 .entry((t.surface, t.pos, t.pos2, reading))
@@ -403,6 +424,15 @@ mod tests {
     fn code_chars_leave_out_the_markers_and_csv_chars() {
         assert_eq!(CODE_CHARS.chars().count(), 89);
         assert!(!CODE_CHARS.contains(['"', ',', '=', '*', '~', ' ']));
+        for b in 0u8..128 {
+            let c = b as char;
+            assert_eq!(code_index(c), CODE_CHARS.find(c), "char {c:?}");
+        }
+        assert_eq!(code_index('あ'), None);
+        for (i, c) in CODE_CHARS.chars().enumerate() {
+            assert_eq!(code_char(i), Some(c));
+        }
+        assert_eq!(code_char(CODE_CHARS.len()), None);
         let codes = Codes::new(&PackedCodes {
             pos: vec![
                 ["名詞".into(), "普通名詞".into()],
@@ -411,7 +441,7 @@ mod tests {
             kana: "きょう".into(),
         })
         .unwrap();
-        let p = |s: &str| (s.to_string());
+        let p = |s: &str| s.to_string();
         assert_eq!(
             codes.read("今日", "!!#$"),
             (p("名詞"), p("普通名詞"), Some(p("きょう")))

@@ -144,72 +144,34 @@ impl Analyzer {
         Self::load(&manifest)
     }
 
+    /// A reusable worker holding the lattice scratch buffers for repeated
+    /// [`AnalyzeWorker::analyze`] calls without per-sentence allocation.
+    pub fn worker(&self) -> AnalyzeWorker<'_> {
+        let inner = match &self.engine {
+            Engine::Vibrato { tokenizer, .. } => WorkerInner::Vibrato(tokenizer.new_worker()),
+            Engine::Packed { tokenizer, .. } => WorkerInner::Packed(tokenizer.new_worker()),
+        };
+        AnalyzeWorker {
+            analyzer: self,
+            inner,
+        }
+    }
+
     /// The words of `text`, in order.
     pub fn analyze(&self, text: &str) -> Vec<Token> {
         if text.is_empty() {
             return Vec::new();
         }
-        match &self.engine {
-            Engine::Vibrato {
-                tokenizer,
-                alternates,
-                reading_col,
-                pos_cols,
-            } => {
-                let mut worker = tokenizer.new_worker();
-                worker.reset_sentence(text);
-                worker.tokenize();
-                (0..worker.num_tokens())
-                    .map(|i| {
-                        let t = worker.token(i);
-                        let features: Vec<&str> = t.feature().split(',').collect();
-                        let reading = features
-                            .get(*reading_col)
-                            .filter(|r| **r != "*" && !r.is_empty())
-                            .map(|r| r.to_string());
-                        // a symbol the analysis took as an unknown word can be
-                        // one the dictionary reads (/ as すらっしゅ)
-                        let alts = match alternates {
-                            Some(a) => self.alts(a, &worker, i, reading.as_deref().unwrap_or("*")),
-                            None => Vec::new(),
-                        };
-                        let range = t.range_char();
-                        Token {
-                            surface: t.surface().to_string(),
-                            start: range.start,
-                            end: range.end,
-                            reading,
-                            pos: features.get(pos_cols.0).unwrap_or(&"").to_string(),
-                            pos2: features.get(pos_cols.1).unwrap_or(&"*").to_string(),
-                            alts,
-                            cost: t.total_cost(),
-                        }
-                    })
-                    .collect()
-            }
-            Engine::Packed { tokenizer, codes } => {
-                let mut worker = tokenizer.new_worker();
-                worker.reset_sentence(text);
-                worker.tokenize();
-                (0..worker.num_tokens())
-                    .map(|i| {
-                        let t = worker.token(i);
-                        let (pos, pos2, reading) = codes.read(t.surface(), t.feature());
-                        let range = t.range_char();
-                        Token {
-                            surface: t.surface().to_string(),
-                            start: range.start,
-                            end: range.end,
-                            reading,
-                            pos,
-                            pos2,
-                            alts: Vec::new(),
-                            cost: t.total_cost(),
-                        }
-                    })
-                    .collect()
-            }
+        self.worker().analyze(text)
+    }
+
+    /// Analyze a batch of texts reusing one worker across the whole batch.
+    pub fn analyze_many<S: AsRef<str>>(&self, texts: &[S]) -> Vec<Vec<Token>> {
+        if texts.is_empty() {
+            return Vec::new();
         }
+        let mut worker = self.worker();
+        texts.iter().map(|t| worker.analyze(t.as_ref())).collect()
     }
 
     /// Token `i`'s other readings: each reading's cheapest entry, what the
@@ -251,6 +213,106 @@ impl Analyzer {
         out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         out.truncate(self.config.max_alts);
         out
+    }
+}
+
+enum WorkerInner<'a> {
+    Vibrato(vibrato::tokenizer::worker::Worker<'a>),
+    Packed(vibrato_packed::tokenizer::worker::Worker<'a>),
+}
+
+/// Reusable analysis worker tied to an [`Analyzer`] (`Analyzer::worker`).
+pub struct AnalyzeWorker<'a> {
+    analyzer: &'a Analyzer,
+    inner: WorkerInner<'a>,
+}
+
+impl AnalyzeWorker<'_> {
+    /// The words of `text`, in order, reusing the worker's lattice buffers.
+    pub fn analyze(&mut self, text: &str) -> Vec<Token> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        match (&self.analyzer.engine, &mut self.inner) {
+            (
+                Engine::Vibrato {
+                    alternates,
+                    reading_col,
+                    pos_cols,
+                    ..
+                },
+                WorkerInner::Vibrato(worker),
+            ) => {
+                worker.reset_sentence(text);
+                worker.tokenize();
+                let max_col = (*reading_col).max(pos_cols.0).max(pos_cols.1);
+                (0..worker.num_tokens())
+                    .map(|i| {
+                        let t = worker.token(i);
+                        let (mut rd, mut p1, mut p2) = (None, "", "*");
+                        for (idx, col) in t.feature().split(',').enumerate() {
+                            if idx == *reading_col {
+                                rd = Some(col);
+                            }
+                            if idx == pos_cols.0 {
+                                p1 = col;
+                            }
+                            if idx == pos_cols.1 {
+                                p2 = col;
+                            }
+                            if idx >= max_col {
+                                break;
+                            }
+                        }
+                        let reading = rd
+                            .filter(|r| *r != "*" && !r.is_empty())
+                            .map(|r| r.to_string());
+                        // a symbol the analysis took as an unknown word can be
+                        // one the dictionary reads (/ as すらっしゅ)
+                        let alts = match alternates {
+                            Some(a) => {
+                                self.analyzer
+                                    .alts(a, worker, i, reading.as_deref().unwrap_or("*"))
+                            }
+                            None => Vec::new(),
+                        };
+                        let range = t.range_char();
+                        Token {
+                            surface: t.surface().to_string(),
+                            start: range.start,
+                            end: range.end,
+                            reading,
+                            pos: p1.to_string(),
+                            pos2: p2.to_string(),
+                            alts,
+                            cost: t.total_cost(),
+                        }
+                    })
+                    .collect()
+            }
+            (Engine::Packed { codes, .. }, WorkerInner::Packed(worker)) => {
+                worker.reset_sentence(text);
+                worker.tokenize();
+                (0..worker.num_tokens())
+                    .map(|i| {
+                        let t = worker.token(i);
+                        let (pos, pos2, reading) = codes.read(t.surface(), t.feature());
+                        let range = t.range_char();
+                        Token {
+                            surface: t.surface().to_string(),
+                            start: range.start,
+                            end: range.end,
+                            reading,
+                            pos,
+                            pos2,
+                            alts: Vec::new(),
+                            cost: t.total_cost(),
+                        }
+                    })
+                    .collect()
+            }
+            _ => unreachable!("worker engine matches analyzer engine"),
+        }
     }
 }
 
@@ -386,9 +448,18 @@ mod tests {
                 })
                 .collect()
         };
-        for text in ["今日は晴れ", "雨", "今日", "はれ"] {
+        let texts = ["今日は晴れ", "", "雨", "今日", "はれ"];
+        for text in texts {
             assert_eq!(strip(plain.analyze(text)), a.analyze(text), "{text}");
         }
+        assert_eq!(
+            plain.analyze_many(&texts),
+            texts.iter().map(|t| plain.analyze(t)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            a.analyze_many(&texts),
+            texts.iter().map(|t| a.analyze(t)).collect::<Vec<_>>()
+        );
         let t = a.analyze("1,000はハレ");
         assert_eq!(t[0].reading.as_deref(), Some("せん"));
         assert_eq!((t[0].pos.as_str(), t[0].pos2.as_str()), ("名詞", "数詞"));

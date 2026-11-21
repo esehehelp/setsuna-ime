@@ -15,9 +15,9 @@ pub struct Postings {
 
 impl Postings {
     #[inline(always)]
-    pub fn ids(&'_ self, i: usize) -> impl Iterator<Item = u32> + '_ {
+    pub fn slice(&self, i: usize) -> &[u32] {
         let len = usize::from_u32(self.data[i]);
-        self.data[i + 1..i + 1 + len].iter().cloned()
+        &self.data[i + 1..i + 1 + len]
     }
 
     #[cfg(test)]

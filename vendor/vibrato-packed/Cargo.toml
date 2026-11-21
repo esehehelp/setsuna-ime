@@ -42,7 +42,7 @@ repository = "https://github.com/daac-tools/vibrato"
 resolver = "1"
 
 [features]
-default = ["train"]
+default = []
 train = ["rucrf"]
 
 [lib]

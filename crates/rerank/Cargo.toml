@@ -16,9 +16,6 @@ path = "src/bin/main.rs"
 
 [dependencies]
 setsuna-artifact = { path = "../artifact" }
-# The pipe of `serve`: its name and the Win32 calls, shared with the client
-# in setsuna-core.
-setsuna-pipe = { path = "../pipe" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
@@ -29,3 +26,8 @@ llama-cpp-2 = { version = "=0.1.158", default-features = false, features = ["ope
 # Only for its build metadata (DEP_LLAMA_BACKENDS_DIR): build.rs puts the
 # shared libraries next to the executable.
 llama-cpp-sys-2 = { version = "=0.1.158", default-features = false }
+
+# The pipe of `serve`: its name and the Win32 calls, shared with the client
+# in setsuna-core.
+[target.'cfg(windows)'.dependencies]
+setsuna-pipe = { path = "../pipe" }

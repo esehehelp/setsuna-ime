@@ -79,34 +79,89 @@ impl WordMap {
         &'a self,
         input: &'a [char],
     ) -> impl Iterator<Item = (u32, usize)> + 'a {
-        let mut found: Vec<(u32, usize)> = Vec::new();
-        let mut node = self.fst.root();
-        let mut acc = fst::raw::Output::zero();
-        let mut buf = [0u8; 4];
-        'chars: for (i, c) in input.iter().enumerate() {
-            for &b in c.encode_utf8(&mut buf).as_bytes() {
-                match node.find_input(b) {
-                    Some(t) => {
-                        let tr = node.transition(t);
-                        acc = acc.cat(tr.out);
-                        node = self.fst.node(tr.addr);
+        CommonPrefixIter {
+            map: self,
+            input,
+            pos: 0,
+            node: self.fst.root(),
+            acc: fst::raw::Output::zero(),
+            done: false,
+            pending: PendingIds::Empty,
+            pending_end: 0,
+        }
+    }
+}
+
+enum PendingIds<'a> {
+    Empty,
+    Run(std::ops::Range<u32>),
+    Posted(std::slice::Iter<'a, u32>),
+}
+
+struct CommonPrefixIter<'a> {
+    map: &'a WordMap,
+    input: &'a [char],
+    pos: usize,
+    node: fst::raw::Node<'a>,
+    acc: fst::raw::Output,
+    done: bool,
+    pending: PendingIds<'a>,
+    pending_end: usize,
+}
+
+impl<'a> Iterator for CommonPrefixIter<'a> {
+    type Item = (u32, usize);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<(u32, usize)> {
+        loop {
+            match &mut self.pending {
+                PendingIds::Empty => {}
+                PendingIds::Run(r) => {
+                    if let Some(id) = r.next() {
+                        return Some((id, self.pending_end));
                     }
-                    None => break 'chars,
+                    self.pending = PendingIds::Empty;
+                }
+                PendingIds::Posted(it) => {
+                    if let Some(&id) = it.next() {
+                        return Some((id, self.pending_end));
+                    }
+                    self.pending = PendingIds::Empty;
                 }
             }
-            if node.is_final() {
-                let v = acc.cat(node.final_output()).value();
+            if self.done || self.pos >= self.input.len() {
+                return None;
+            }
+            let c = self.input[self.pos];
+            self.pos += 1;
+            let mut buf = [0u8; 4];
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                match self.node.find_input(b) {
+                    Some(t) => {
+                        let tr = self.node.transition(t);
+                        self.acc = self.acc.cat(tr.out);
+                        self.node = self.map.fst.node(tr.addr);
+                    }
+                    None => {
+                        self.done = true;
+                        return None;
+                    }
+                }
+            }
+            if self.node.is_final() {
+                let v = self.acc.cat(self.node.final_output()).value();
+                self.pending_end = self.pos;
                 if v & POSTED != 0 {
                     let at = usize::try_from(v & !POSTED).unwrap();
-                    found.extend(self.postings.ids(at).map(|id| (id, i + 1)));
+                    self.pending = PendingIds::Posted(self.map.postings.slice(at).iter());
                 } else {
                     let first = u32::try_from(v >> 8).unwrap();
                     let n = u32::try_from(v & 0xff).unwrap();
-                    found.extend((first..first + n).map(|id| (id, i + 1)));
+                    self.pending = PendingIds::Run(first..first + n);
                 }
             }
         }
-        found.into_iter()
     }
 }
 

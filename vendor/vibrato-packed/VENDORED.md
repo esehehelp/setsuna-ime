@@ -18,7 +18,8 @@ Changes (the rest is upstream's):
   instead of a double-array trie (`crawdad`, dropped) with a posting list for
   every surface; a surface's word ids that follow one another are the FST's
   value, others are in the postings. A lexicon sorted by surface has no
-  postings.
+  postings. `common_prefix_iterator` walks the FST lazily without allocating a
+  per-position `Vec`.
 - `src/dictionary.rs`: its own magic, `VibratoPacked 0.5.3 v1`: upstream's
   dictionaries are not read, nor are these by upstream. A dictionary read is
   refused when a word's or an unknown word's connection ids are past its
@@ -30,7 +31,9 @@ Changes (the rest is upstream's):
   past 31 bits and a table past `i32::MAX` entries, which the AVX2 path's
   signed compares and gathers take for granted (upstream reads before the
   table with such a base, or panics).
-- `Cargo.toml`: the package `vibrato-packed`, the library `vibrato_packed`.
+- `Cargo.toml`: the package `vibrato-packed`, the library `vibrato_packed`,
+  and `default = []` so the optional `train` feature (`rucrf`) is not pulled
+  into inference builds by default.
 
 setsuna-ime's dictionaries in this layout carry `"format":
 "vibrato-packed-zstd"` in their analyzer manifest; `"vibrato-zstd"` ones are

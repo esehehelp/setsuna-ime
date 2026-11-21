@@ -289,22 +289,29 @@ impl TreeScorer {
                 .context("llama.cpp decode")?;
             let t1 = Instant::now();
 
-            // log-sum-exp of each new row, the rows split across the threads
+            // log-sum-exp of each new row, directly on the current thread when
+            // running single-threaded (the default) or for a single row
             let logits: Vec<&[f32]> = with_logits
                 .iter()
                 .map(|&(_, r)| self.ctx.get_logits_ith(r))
                 .collect();
             let mut lse = vec![0.0f64; logits.len()];
-            let per = logits.len().div_ceil(self.threads).max(1);
-            std::thread::scope(|s| {
-                for (rows, out) in logits.chunks(per).zip(lse.chunks_mut(per)) {
-                    s.spawn(move || {
-                        for (r, o) in rows.iter().zip(out) {
-                            *o = log_sum_exp(r);
-                        }
-                    });
+            if self.threads <= 1 || logits.len() <= 1 {
+                for (r, o) in logits.iter().zip(&mut lse) {
+                    *o = log_sum_exp(r);
                 }
-            });
+            } else {
+                let per = logits.len().div_ceil(self.threads).max(1);
+                std::thread::scope(|s| {
+                    for (rows, out) in logits.chunks(per).zip(lse.chunks_mut(per)) {
+                        s.spawn(move || {
+                            for (r, o) in rows.iter().zip(out) {
+                                *o = log_sum_exp(r);
+                            }
+                        });
+                    }
+                });
+            }
             for ((&(i, _), r), &s) in with_logits.iter().zip(&logits).zip(&lse) {
                 for &j in below.get(&i).into_iter().flatten() {
                     l.logp

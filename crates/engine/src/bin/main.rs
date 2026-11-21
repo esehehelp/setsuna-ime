@@ -828,7 +828,7 @@ impl Daemon {
             None => Err("no analyzer (--analyzer)".to_string()),
         };
         let (analyses, error) = match &analyzer {
-            Ok(a) => (texts.iter().map(|t| a.analyze(t)).collect(), None),
+            Ok(a) => (a.analyze_many(texts), None),
             Err(e) => (Vec::new(), Some(e.as_str())),
         };
         let response = AnalyzeResponse {
