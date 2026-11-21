@@ -71,6 +71,12 @@ class ClipHistory(context: Context) {
         return items.firstOrNull()?.takeIf { System.currentTimeMillis() - it.time < ms }
     }
 
+    /** Whether `clip` is still kept (an open panel's row may have outlived its hour). */
+    fun has(clip: Clip): Boolean {
+        prune()
+        return items.any { it === clip }
+    }
+
     fun remove(clip: Clip) {
         items.remove(clip)
         onChange()

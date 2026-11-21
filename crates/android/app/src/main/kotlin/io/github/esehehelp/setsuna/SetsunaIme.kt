@@ -56,9 +56,10 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
 
     /**
      * The focused field is private (no personalized learning) or a password: nothing copied
-     * meanwhile is kept, and no recent copy is offered on the toolbar.
+     * meanwhile is kept, and no clipboard history is offered. True until the first field says
+     * otherwise: a clip on the clipboard as the keyboard starts is not kept.
      */
-    private var secret = false
+    private var secret = true
 
     /** The app holds a composing text of ours. */
     private var composing = false
@@ -78,6 +79,9 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     private var before: String? = null
     private var beforeAt = -1
     private var beforeAsked = -1
+
+    /** Counts the fields focused: a read of the text before the caret answers for its own field only. */
+    private var fieldCount = 0
     private val reader = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "setsuna-before").apply { isDaemon = true }
     }
@@ -149,7 +153,8 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         stack.addView(keyboard, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         val clipPanel = ClipboardPanel(
             this,
-            onPaste = { paste(it) },
+            // a row kept past its hour (the panel open since) pastes nothing: the panel shows what is left
+            onPaste = { if (clips.has(it)) paste(it.text) else this@SetsunaIme.clipPanel?.show(clips.list()) },
             onRemove = { clips.remove(it) },
             onClear = { clips.clear() },
             onKeyboard = { showPanel(null) },
@@ -192,7 +197,9 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         selStart = selectionStart(attribute.initialSelStart, attribute.initialSelEnd).coerceAtLeast(0)
         editorInfo = attribute
         field = fieldOf(attribute)
-        secret = field == Native.FIELD_PRIVATE || isPassword(attribute)
+        // a field of no personalized learning is one whatever its kind (an email field marked so is direct too)
+        secret = field == Native.FIELD_PRIVATE || isPassword(attribute) ||
+            (attribute.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
         // the field's text before the caret comes with it (API 30): nothing to ask the app;
         // never read from a password, a private field or another the IME leaves alone
         before = if (Build.VERSION.SDK_INT >= 30 && field == Native.FIELD_NORMAL) {
@@ -202,6 +209,7 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         }
         beforeAt = if (before != null) selStart else -1
         beforeAsked = -1
+        fieldCount++
         if (h != 0L) timed("configure") { Native.configure(h, attribute.packageName ?: "") }
     }
 
@@ -229,9 +237,10 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
 
     private fun onTool(tool: CandidateBar.Tool) {
         when (tool) {
-            CandidateBar.Tool.CLIPBOARD, CandidateBar.Tool.EDIT ->
-                showPanel(if (open == tool) null else tool)
-            CandidateBar.Tool.PASTE_RECENT -> clips.recent(recentMs)?.let { paste(it.text) }
+            // no clipboard history in a password or a private field
+            CandidateBar.Tool.CLIPBOARD -> if (!secret) showPanel(if (open == tool) null else tool)
+            CandidateBar.Tool.EDIT -> showPanel(if (open == tool) null else tool)
+            CandidateBar.Tool.PASTE_RECENT -> if (!secret) clips.recent(recentMs)?.let { paste(it.text) }
             CandidateBar.Tool.SETTINGS -> {
                 showPanel(null)
                 startActivity(
@@ -506,11 +515,14 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         if (field != Native.FIELD_NORMAL) return
         val ic = currentInputConnection ?: return
         val at = selStart
+        val asked = fieldCount
         if (beforeAsked == at) return
         beforeAsked = at
         reader.execute {
             val text = runCatching { ic.getTextBeforeCursor(BEFORE, 0)?.toString() }.getOrNull()
             main.post {
+                // another field focused since (at the same caret offset): its text is not this one's
+                if (asked != fieldCount) return@post
                 if (beforeAsked == at) beforeAsked = -1
                 if (text != null && selStart == at && !composing) {
                     before = text

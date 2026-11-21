@@ -196,11 +196,28 @@ object Downloads {
             for ((tmp, _) in got) tmp.delete()
             throw e
         }
-        // all in: the new files take their places, each manifest after the files it names (an
-        // engine starting meanwhile finds the old manifest or the whole new model), then what
-        // the directories held before goes
-        for ((tmp, to) in got.sortedBy { it.second.name.endsWith("manifest.json") }) {
-            if (!tmp.renameTo(to)) throw IOException("cannot put ${to.name} in place")
+        // all in: first the old manifests of what changes go (an engine starting meanwhile finds
+        // none, and the next field tries again: never two, nor an old one naming files replaced),
+        // then the new files take their places, each manifest after the files it names, then
+        // what the directories held before goes
+        val targets = got.map { it.second.canonicalFile }.toSet()
+        for (p in parts) {
+            val root = p.root.canonicalFile
+            if (targets.none { it.startsWith(root) }) continue
+            val keep = p.pins.map { it.to.canonicalFile }.toSet()
+            p.root.walk()
+                .filter { it.isFile && it.name.endsWith("manifest.json") }
+                .filter { it.canonicalFile in targets || it.canonicalFile !in keep }
+                .forEach { it.delete() }
+        }
+        val order = got.sortedBy { it.second.name.endsWith("manifest.json") }
+        for ((i, move) in order.withIndex()) {
+            val (tmp, to) = move
+            if (!tmp.renameTo(to)) {
+                // what is left of it goes: the next download fetches it again
+                for ((t, _) in order.drop(i)) t.delete()
+                throw IOException("cannot put ${to.name} in place")
+            }
         }
         for (p in parts) {
             val keep = p.pins.map { it.to.canonicalFile }.toSet()

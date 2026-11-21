@@ -140,36 +140,38 @@ pub struct Host {
 /// their size and time: the model is found there, not named in `[engine]`,
 /// and a download replaces it (or the corrector, or the analyzer) in place.
 fn engine_key(cfg: &Config, data: &Path) -> String {
-    let mut manifests = Vec::new();
-    for kind in ["onnx", "corrector", "analyzer"] {
-        let dir = data.join("models").join(kind);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    // every file of the models, not their manifests only: a dictionary put back under a manifest
+    // that stayed (a daemon that failed to load it keeps the error) starts another daemon too;
+    // a `.part` being downloaded is none of them yet
+    fn walk(dir: &Path, depth: usize, files: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let inner: Vec<PathBuf> = if path.is_dir() {
-                std::fs::read_dir(&path)
-                    .map(|e| e.flatten().map(|e| e.path()).collect())
-                    .unwrap_or_default()
-            } else {
-                vec![path]
+            let Ok(meta) = entry.metadata() else {
+                continue;
             };
-            for p in inner {
-                if p.to_string_lossy().ends_with("manifest.json") {
-                    let meta = std::fs::metadata(&p).ok();
-                    manifests.push(format!(
-                        "{} {:?} {:?}",
-                        p.display(),
-                        meta.as_ref().map(|m| m.len()),
-                        meta.and_then(|m| m.modified().ok())
-                    ));
+            if meta.is_dir() {
+                if depth > 0 {
+                    walk(&path, depth - 1, files);
                 }
+            } else if !path.to_string_lossy().ends_with(".part") {
+                files.push(format!(
+                    "{} {} {:?}",
+                    path.display(),
+                    meta.len(),
+                    meta.modified().ok()
+                ));
             }
         }
     }
-    manifests.sort();
-    format!("{:?} {manifests:?}", cfg.engine)
+    let mut files = Vec::new();
+    for kind in ["onnx", "corrector", "analyzer"] {
+        walk(&data.join("models").join(kind), 3, &mut files);
+    }
+    files.sort();
+    format!("{:?} {files:?}", cfg.engine)
 }
 
 /// The daemon the warm-up thread starts: not yet, there to take, or taken
@@ -201,12 +203,15 @@ impl Host {
                     let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
                     if matches!(*state, Started::Pending) {
                         let notify: Notify = Box::new(move |_req_id| waker());
+                        // the files' key before the daemon reads them: a model published while it
+                        // starts makes the next field start another, never pass for the new one
+                        let key = engine_key(&cfg, &warm.data);
                         *state = match child_daemon::spawn_child_with_config(
                             &cfg,
                             Some(&warm.data),
                             notify,
                         ) {
-                            Some(c) => Started::Ready(c, engine_key(&cfg, &warm.data)),
+                            Some(c) => Started::Ready(c, key),
                             None => Started::Taken,
                         };
                     }

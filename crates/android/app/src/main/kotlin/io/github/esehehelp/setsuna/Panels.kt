@@ -148,7 +148,7 @@ class EditPanel(context: Context, private val onOp: (Op) -> Unit) : LinearLayout
 @SuppressLint("ViewConstructor")
 class ClipboardPanel(
     context: Context,
-    private val onPaste: (String) -> Unit,
+    private val onPaste: (ClipHistory.Clip) -> Unit,
     private val onRemove: (ClipHistory.Clip) -> Unit,
     private val onClear: () -> Unit,
     private val onKeyboard: () -> Unit,
@@ -206,7 +206,7 @@ class ClipboardPanel(
                 gravity = Gravity.CENTER_VERTICAL
                 background = keyLike(context, palette, false)
                 isClickable = true
-                setOnClickListener { onPaste(clip.text) }
+                setOnClickListener { onPaste(clip) }
             }
             row.addView(TextView(context).apply {
                 text = clip.text

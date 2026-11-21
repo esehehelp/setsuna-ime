@@ -111,10 +111,17 @@ class SettingsActivity : Activity() {
         picking = null
     }
 
+    /** This page's own listener: another page's (one resumed before this one went) is left in place. */
+    private val downloadsChanged: () -> Unit = { pushApp() }
+
+    private fun stopListening() {
+        if (Downloads.onChange === downloadsChanged) Downloads.onChange = null
+    }
+
     override fun onDestroy() {
         picking?.onReceiveValue(null)
         picking = null
-        Downloads.onChange = null
+        stopListening()
         destroyed = true
         (web.parent as? ViewGroup)?.removeView(web)
         web.destroy()
@@ -132,12 +139,12 @@ class SettingsActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        Downloads.onChange = { pushApp() }
+        Downloads.onChange = downloadsChanged
         pushApp()
     }
 
     override fun onPause() {
-        Downloads.onChange = null
+        stopListening()
         super.onPause()
     }
 
