@@ -538,6 +538,10 @@ if [[ -f $root$module/installed-files ]]; then
         rm -f -- "$root$f"
     done <"$root$module/installed-files"
 fi
+# and the directories of the module directory that files gone left empty
+# (licenses/onnxruntime after 0.2, by this install or an earlier one): no
+# install has an empty one
+find "$root$module" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 printf '%s\n' "${installed[@]}" "$module/installed-files" >"$root$module/installed-files"
 # The download cache: what this install needed is installed (one copy each),
 # and what earlier installs left there (other revisions, other models) no

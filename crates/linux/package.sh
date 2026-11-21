@@ -10,8 +10,8 @@
 #
 # The archive holds the fcitx5 addon (its module dir compiled in as
 # /usr/lib/setsuna-ime), the engine, reranker (with llama.cpp) and rewriter
-# daemons, ONNX Runtime, the mixed input model, the settings GUI and
-# models.tsv, the conversion model, reading lexicon and analyzer pins of
+# daemons, the mixed input model, the settings GUI and models.tsv, the
+# conversion model, reading lexicon, analyzer and corrector pins of
 # crates/tsf/models.json (install.sh downloads them). Needs what the build needs (cargo, cmake, fcitx5 and
 # WebKitGTK 4.1 development files, and for llama.cpp a C/C++ compiler with
 # OpenMP), curl and jq.

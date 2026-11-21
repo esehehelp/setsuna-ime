@@ -26,8 +26,10 @@ pub const SETSUNA_APP_START_OFF: c_int = 2;
 
 /// Minimum interval between `stat(config.toml)` checks on idle key presses.
 const CONFIG_CHECK_EVERY: Duration = Duration::from_secs(1);
-/// Cooldown before retrying an engine spawn that failed (no model, bad path).
-const ENGINE_RETRY_EVERY: Duration = Duration::from_secs(30);
+/// No daemon (the engine, the reranker, the rewriter) is started again sooner
+/// than this after its last start: one that is not there (no model, a bad
+/// path) or that dies as it starts is not tried at every key.
+const DAEMON_RETRY_EVERY: Duration = Duration::from_secs(30);
 
 fn config_stamp(path: Option<&Path>) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path?).ok()?;
@@ -123,8 +125,10 @@ pub struct SetsunaSession {
     engine_retry_at: Option<Instant>,
     /// `(reranker launch key, spawn succeeded)` of the last reranker attempt.
     reranker_started: Option<(String, bool)>,
+    reranker_retry_at: Option<Instant>,
     /// `(rewriter cfg, spawn succeeded)` of the last rewriter attempt.
     rewriter_started: Option<(RewriterCfg, bool)>,
+    rewriter_retry_at: Option<Instant>,
     commits: CList,
     preedit: CList,
     candidates: CList,
@@ -245,58 +249,75 @@ impl SetsunaSession {
         let engine_retry = !self.session.has_client() && retry_due;
         let needs_engine = engine_changed || engine_died || engine_retry;
 
-        let needs_reranker = needs_engine
-            || match (&rerank_key, &self.reranker_started) {
-                (None, Some(_)) => true,
-                (None, None) => self.session.has_reranker(),
-                (Some(k), Some((prev, ok))) => {
-                    k != prev || ((*ok || file_changed) && !self.session.has_reranker())
+        // the reranker and the rewriter for their own sake (a session made
+        // again below starts both whatever these say)
+        let reranker_due = match (&rerank_key, &self.reranker_started) {
+            (None, Some(_)) => true,
+            (None, None) => self.session.has_reranker(),
+            (Some(k), Some((prev, ok))) => {
+                k != prev
+                    || (!self.session.has_reranker()
+                        && start_again(*ok, file_changed, self.reranker_retry_at, now))
+            }
+            (Some(_), None) => true,
+        };
+        let rewriter_due = if cfg.rewriter.enabled {
+            match &self.rewriter_started {
+                Some((prev, ok)) => {
+                    prev != &cfg.rewriter
+                        || (!self.session.has_rewriter()
+                            && start_again(*ok, file_changed, self.rewriter_retry_at, now))
                 }
-                (Some(_), None) => true,
-            };
-
-        let needs_rewriter = needs_engine
-            || if cfg.rewriter.enabled {
-                match &self.rewriter_started {
-                    Some((prev, ok)) => {
-                        prev != &cfg.rewriter
-                            || ((*ok || file_changed) && !self.session.has_rewriter())
-                    }
-                    None => true,
-                }
-            } else {
-                self.session.has_rewriter() || self.rewriter_started.is_some()
-            };
+                None => true,
+            }
+        } else {
+            self.session.has_rewriter() || self.rewriter_started.is_some()
+        };
 
         let cfg_changed = file_changed || self.applied_key.as_ref() != Some(&effective_key);
         self.last_program = program.to_string();
-        if !cfg_changed && !needs_engine && !needs_reranker && !needs_rewriter {
+        if !cfg_changed && !needs_engine && !reranker_due && !rewriter_due {
             return start;
         }
 
         let module_dir = self.module_dir.clone();
         let module_dir = module_dir.as_deref();
+        let mut session_made = false;
         if needs_engine {
             let client = child_daemon::spawn_with_config(&cfg, module_dir, self.wake());
             let ok = client.is_some();
             if ok {
                 setsuna_core::diagnostics::log("fcitx5 engine started");
             }
-            self.engine_retry_at = Some(now + ENGINE_RETRY_EVERY);
+            self.engine_retry_at = Some(now + DAEMON_RETRY_EVERY);
             self.engine_started = Some((engine_key, ok));
-            let was_enabled = self.session.enabled();
-            self.session = Session::new(&cfg, client);
-            self.session.set_enabled(was_enabled);
-            self.reranker_started = None;
-            self.rewriter_started = None;
-        } else if cfg_changed {
-            self.session.configure(&cfg);
+            // A try that found no engine again (no model yet) under the
+            // same settings keeps the session: a new one would drop the
+            // left context and start the reranker and the rewriter again,
+            // at every retry.
+            if ok || engine_changed {
+                let was_enabled = self.session.enabled();
+                self.session = Session::new(&cfg, client);
+                self.session.set_enabled(was_enabled);
+                self.reranker_started = None;
+                self.rewriter_started = None;
+                session_made = true;
+            }
+        }
+        if !session_made {
+            if !cfg_changed && !reranker_due && !rewriter_due {
+                return start;
+            }
+            if cfg_changed {
+                self.session.configure(&cfg);
+            }
         }
 
-        if needs_reranker {
+        if session_made || reranker_due {
             if let Some(key) = rerank_key {
                 let reranker = rerank_client::spawn_with_config(&cfg, module_dir, self.wake());
                 self.reranker_started = Some((key, reranker.is_some()));
+                self.reranker_retry_at = Some(now + DAEMON_RETRY_EVERY);
                 self.session.set_reranker(reranker, &cfg);
             } else {
                 self.reranker_started = None;
@@ -306,10 +327,11 @@ impl SetsunaSession {
             self.session.set_rerank_config(&cfg);
         }
 
-        if needs_rewriter {
+        if session_made || rewriter_due {
             if cfg.rewriter.enabled {
                 let rewriter = rewrite_client::spawn_with_config(&cfg, module_dir, self.wake());
                 self.rewriter_started = Some((cfg.rewriter.clone(), rewriter.is_some()));
+                self.rewriter_retry_at = Some(now + DAEMON_RETRY_EVERY);
                 self.session
                     .set_rewriter(rewriter.map(|c| Box::new(c) as Box<dyn RewriteClient>));
             } else {
@@ -328,6 +350,15 @@ impl SetsunaSession {
         ));
         start
     }
+}
+
+/// Whether the reranker or the rewriter, not running, is started again now:
+/// at once when config.toml changed (what kept it from starting may be
+/// mended), else only one that had started (it died), and no sooner than
+/// `retry_at`. One that dies as it starts (a model it cannot load) was
+/// started again at every key.
+fn start_again(started: bool, file_changed: bool, retry_at: Option<Instant>, now: Instant) -> bool {
+    file_changed || (started && retry_at.is_none_or(|t| now >= t))
 }
 
 /// The addon's `user` pointer, carried to the reader threads. The addon
@@ -395,7 +426,9 @@ impl SetsunaSession {
             engine_started: None,
             engine_retry_at: None,
             reranker_started: None,
+            reranker_retry_at: None,
             rewriter_started: None,
+            rewriter_retry_at: None,
             commits: CList::default(),
             preedit: CList::default(),
             candidates: CList::default(),
@@ -965,5 +998,90 @@ mod tests {
         let second_engine_key = s.engine_started.clone().unwrap().0;
         assert_ne!(first_engine_key, second_engine_key);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retry_that_finds_no_engine_keeps_the_session() {
+        let mut s = SetsunaSession::empty(None, None, no_wake, std::ptr::null_mut());
+        s.sync_config("", true);
+        assert!(!s.session.has_client());
+        assert!(s.session.key(&Key {
+            sym: 'a' as u32,
+            code: 0,
+            mods: 0
+        }));
+        // the retry's time has come, and there is still no engine
+        let due = Instant::now() - Duration::from_secs(1);
+        s.engine_retry_at = Some(due);
+        s.sync_config("", true);
+        assert_eq!(s.session.view().preedit, vec!["あ"]);
+        assert!(s.engine_retry_at.is_some_and(|t| t > due));
+    }
+
+    struct DeadReranker;
+    impl RerankClient for DeadReranker {
+        fn dispatch(&self, _: u64, _: &str, _: &[String], _: Instant) {}
+        fn cancel(&self) {}
+        fn take_latest(&self) -> Option<RerankResult> {
+            None
+        }
+        fn info(&self) -> Option<RerankInfo> {
+            None
+        }
+        fn is_alive(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_reranker_that_died_is_started_again_no_sooner_than_its_retry_time() {
+        let dir = std::env::temp_dir().join(format!("setsuna-ffi-rrdead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        // a manifest that is not there: a start is seen by its failing
+        let manifest = dir.join("none.manifest.json");
+        std::fs::write(&cfg_path, format!("[rerank]\nmanifest = {manifest:?}\n")).unwrap();
+
+        let mut s =
+            SetsunaSession::empty(None, Some(cfg_path.clone()), no_wake, std::ptr::null_mut());
+        s.sync_config("", true);
+        let key = s.reranker_started.clone().expect("a reranker was tried").0;
+        // one that started and has died since
+        let died = |s: &mut SetsunaSession, retry_at: Instant| {
+            s.session
+                .set_reranker(Some(Box::new(DeadReranker)), &Config::default());
+            s.reranker_started = Some((key.clone(), true));
+            s.reranker_retry_at = Some(retry_at);
+        };
+        let now = Instant::now();
+        died(&mut s, now + Duration::from_secs(60));
+        for _ in 0..3 {
+            s.sync_config("", false);
+        }
+        assert_eq!(s.reranker_started, Some((key.clone(), true)), "left alone");
+        died(&mut s, now - Duration::from_secs(1));
+        s.sync_config("", false);
+        assert_eq!(
+            s.reranker_started,
+            Some((key.clone(), false)),
+            "tried again"
+        );
+        assert!(s.reranker_retry_at.is_some_and(|t| t > now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_helper_not_running_starts_again_at_a_config_change_or_after_its_retry_time() {
+        let now = Instant::now();
+        let later = Some(now + Duration::from_secs(1));
+        let before = Some(now - Duration::from_secs(1));
+        // it died: once the time has come
+        assert!(!start_again(true, false, later, now));
+        assert!(start_again(true, false, before, now));
+        assert!(start_again(true, false, None, now));
+        // it never started: only a changed config.toml tries it again
+        assert!(!start_again(false, false, before, now));
+        assert!(start_again(false, true, later, now));
     }
 }

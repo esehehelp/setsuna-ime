@@ -331,6 +331,10 @@ impl Session {
         let types_a_char = (0x20..=0x7e).contains(&key.sym)
             && key.mods & (keys::MOD_CTRL | keys::MOD_ALT | keys::MOD_SUPER) == 0;
         if field == Field::Direct && types_a_char && !self.bridge.is_active() {
+            // Space among them: the text before the caret changes
+            if keys::breaks_context(key) {
+                self.bridge.forget_context();
+            }
             return false;
         }
         if let Some(role) = self.on_off.role(key) {
@@ -997,6 +1001,21 @@ mod tests {
         type_str(&mut s, "a");
         press(&mut s, RETURN, 0);
         assert!(!press(&mut s, RETURN, 0)); // a newline in the app
+        type_str(&mut s, "desuyo");
+        assert_eq!(echo.context(), "");
+    }
+
+    #[test]
+    fn a_space_typed_into_a_direct_field_forgets_the_context() {
+        let (mut s, echo) = session();
+        type_str(&mut s, "a");
+        press(&mut s, RETURN, 0);
+        // letters the app gets leave it, as in a normal field with the IME off
+        assert!(!type_in(&mut s, "x", Field::Direct, None));
+        type_str(&mut s, "desuyo");
+        assert_eq!(echo.context(), "あ");
+        press(&mut s, RETURN, 0);
+        assert!(!type_in(&mut s, " ", Field::Direct, None));
         type_str(&mut s, "desuyo");
         assert_eq!(echo.context(), "");
     }

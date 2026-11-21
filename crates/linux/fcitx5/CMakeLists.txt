@@ -101,7 +101,7 @@ install(FILES icons/setsuna.svg icons/setsuna-hiragana.svg icons/setsuna-direct.
 # The mixed input model, used when config.toml sets no [frontend] mixed_model.
 install(DIRECTORY ../../ime-core/data/mixed/ DESTINATION "${SETSUNA_MODULE_DIR}/mixed")
 
-# --- the daemons, ONNX Runtime and the model ---------------------------------
+# --- the daemons and the model ------------------------------------------------
 
 install(PROGRAMS ${SETSUNA_DAEMONS} DESTINATION "${SETSUNA_MODULE_DIR}")
 if(SETSUNA_BUILD_SETTINGS)
