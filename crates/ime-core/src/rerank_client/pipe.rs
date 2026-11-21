@@ -13,17 +13,18 @@
 //! sandbox, out of the other apps' reach.
 
 use std::ffi::OsString;
-use std::io::{self, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufReader};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-
-use crate::daemon_io::{lock, Line};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use setsuna_pipe::win::{self, Pipe};
 use setsuna_pipe::{exe_identity, rerank_pipe_name, RerankKey};
+
+use crate::daemon_io::lock;
+use crate::daemon_io::pipe::{self as shared_pipe, PipeTarget};
 
 use super::{
     next_due, request_line, stderr_log_path, Pending, RerankClient, RerankInfo, RerankResult,
@@ -31,21 +32,9 @@ use super::{
 };
 use crate::engine_client::Notify;
 
-/// How long a connection may take, the server's start and model load included.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Wait after a failed connection before the next try, doubling up to the max.
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
-
-/// The server to connect to, and how to start it.
-struct Target {
-    name: String,
-    user: String,
-    exe: PathBuf,
-    args: Vec<OsString>,
-    /// Start the server when there is none (false: connect only).
-    start: bool,
-}
 
 pub struct PipeRerankClient {
     shared: Arc<Shared>,
@@ -110,12 +99,13 @@ impl PipeRerankClient {
             args.push(log.into_os_string());
         }
         crate::diagnostics::log(format!("rerank pipe={name} exe={}", exe.display()));
-        let target = Target {
+        let target = PipeTarget {
             name,
             user,
             exe: exe.to_path_buf(),
             args,
             start,
+            label: "rerank",
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -186,27 +176,20 @@ impl RerankClient for PipeRerankClient {
 impl Drop for PipeRerankClient {
     fn drop(&mut self) {
         self.shared.stop();
-        let Some(io) = self.io.take() else {
-            return;
-        };
-        // the thread may be waiting for a request, reading a response or
-        // waiting for the server to come up: wake it and abort its read
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !io.is_finished() && Instant::now() < deadline {
-            drop(self.shared.state.lock());
-            self.shared.cv.notify_all();
-            win::cancel_io(&io);
-            thread::sleep(Duration::from_millis(5));
-        }
-        if io.is_finished() {
-            let _ = io.join();
-        } else {
-            crate::diagnostics::log("rerank pipe thread still busy, left behind");
+        if let Some(io) = self.io.take() {
+            shared_pipe::stop_io_thread(
+                io,
+                || {
+                    drop(self.shared.state.lock());
+                    self.shared.cv.notify_all();
+                },
+                "rerank",
+            );
         }
     }
 }
 
-fn io_loop(shared: &Shared, server: &AtomicU32, target: &Target, notify: &Notify) {
+fn io_loop(shared: &Shared, server: &AtomicU32, target: &PipeTarget, notify: &Notify) {
     let mut conn = None;
     let mut retry_at = Instant::now();
     let mut retry_wait = RETRY_MIN;
@@ -310,116 +293,40 @@ fn io_loop(shared: &Shared, server: &AtomicU32, target: &Target, notify: &Notify
 
 /// Open the pipe, starting the server when it does not exist, and read its
 /// ready line: the connection and what the server reported.
-fn connect(shared: &Shared, target: &Target) -> io::Result<(BufReader<Pipe>, Option<RerankInfo>)> {
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let mut started: Option<u32> = None;
-    let mut nap = Duration::from_millis(20);
-    loop {
-        if !shared.alive.load(Ordering::SeqCst) {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
-        }
-        match Pipe::open(&target.name) {
-            Ok(pipe) => {
-                // a pipe of this name owned by someone else is not our server
-                let owner = pipe.owner_sid()?;
-                if owner != target.user {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("{} is owned by {owner}", target.name),
-                    ));
-                }
-                // any process of the user can add an instance of the name:
-                // the server must be the exe this client starts, not a
-                // low-integrity one
-                win::trust_server(&pipe, &target.exe)?;
-                // the server sends it once its model is up
-                let mut reader = BufReader::new(pipe);
-                let mut line = String::new();
-                if crate::daemon_io::read_line(&mut reader, &mut line)? == Line::Read {
-                    return Ok((reader, serde_json::from_str(line.trim()).ok()));
-                }
-                // it left before (exiting idle as we came): again
-            }
-            // no server, and this client may not start one
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !target.start => return Err(e),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => match started {
-                None => {
-                    let cwd = target.exe.parent();
-                    let args: Vec<&std::ffi::OsStr> =
-                        target.args.iter().map(OsString::as_os_str).collect();
-                    let env = crate::config::helper_env();
-                    let (pid, own_job) =
-                        win::spawn_detached(&target.exe, &args, cwd, env.as_deref())?;
-                    crate::diagnostics::log(format!(
-                        "rerank server started pid={pid} out_of_job={own_job} args={:?}",
-                        target.args
-                    ));
-                    started = Some(pid);
-                }
-                // gone with no pipe: it could not load (or serve) the model,
-                // and waiting out the timeout would change nothing
-                Some(pid) if !win::is_running(pid) => {
-                    return Err(io::Error::other(format!(
-                        "the rerank server (pid {pid}) exited without its pipe"
-                    )));
-                }
-                Some(_) => {}
-            },
-            Err(e) if win::is_busy(&e) => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::from(io::ErrorKind::TimedOut));
-                }
-                win::wait(&target.name, 250);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::from(io::ErrorKind::TimedOut));
-        }
-        thread::sleep(nap);
-        nap = (nap * 2).min(Duration::from_millis(250));
-    }
+fn connect(
+    shared: &Shared,
+    target: &PipeTarget,
+) -> io::Result<(BufReader<Pipe>, Option<RerankInfo>)> {
+    let (reader, line) = shared_pipe::connect(&shared.alive, target)?;
+    Ok((reader, serde_json::from_str(line.trim()).ok()))
 }
 
 /// Send one request line and read its response.
 fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<Response> {
-    let mut out: &Pipe = reader.get_ref();
-    out.write_all(line.as_bytes())?;
-    let mut buf = String::new();
-    loop {
-        match crate::daemon_io::read_line(reader, &mut buf)? {
-            Line::Eof => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Line::TooLong => {
-                crate::diagnostics::log("rerank response line too long, skipped");
-                continue;
-            }
-            Line::Read => {}
-        }
-        let text = buf.trim();
-        if text.is_empty() {
-            continue;
-        }
+    shared_pipe::exchange(reader, line, "rerank", |text| {
         match serde_json::from_str::<Response>(text) {
             // id 0: the server could not read the request
-            Ok(resp) if resp.id == id || resp.id == 0 => return Ok(resp),
+            Ok(resp) if resp.id == id || resp.id == 0 => Some(resp),
             Ok(resp) => {
                 crate::diagnostics::log(format!("rerank stale response id={}", resp.id));
+                None
             }
             Err(e) => {
                 crate::diagnostics::log(format!(
                     "rerank parse failed: {e}; {}",
                     crate::diagnostics::text_field("line", text)
                 ));
+                None
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::ChildRerankClient;
     use super::*;
+    use std::path::PathBuf;
     use std::sync::mpsc;
 
     fn waiting_client(

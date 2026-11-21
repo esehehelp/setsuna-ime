@@ -18,14 +18,14 @@
 //!   - pipe: the same protocol with the login's shared `setsuna-engine
 //!     serve` (Windows), which `spawn_with_config` prefers to a child
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use crate::daemon_io::{lock, Line};
-use std::thread::{self, JoinHandle};
+use crate::daemon_io::{self, lock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -274,85 +274,64 @@ impl ChildDaemonClient {
         notify: Notify,
         engine_cfg: &crate::config::EngineCfg,
     ) -> std::io::Result<Self> {
-        let mut cmd = Command::new(engine_exe);
-        crate::config::scrub_env(&mut cmd);
         let args = daemon_args(manifest, engine_cfg);
         crate::diagnostics::log(format!(
             "spawn engine={} args={:?}",
             engine_exe.display(),
             args
         ));
-        cmd.args(args);
-
-        let stderr = crate::diagnostics::log_path("engine-stderr.log")
-            .and_then(|path| crate::diagnostics::open_log(&path))
-            .map(Stdio::from)
-            .unwrap_or_else(Stdio::null);
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW: keep the daemon console off-screen.
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = cmd.spawn()?;
-        crate::diagnostics::log(format!("engine child pid={}", child.id()));
-        // a child no thread serves is stopped, not left running
-        let kill = |mut child: Child, e: std::io::Error| {
-            let _ = child.kill();
-            let _ = child.wait();
-            e
-        };
-
-        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            return Err(kill(child, std::io::Error::other("child stdio not piped")));
-        };
+        let daemon_io::SpawnedChild {
+            mut child,
+            stdin,
+            stdout,
+        } = daemon_io::spawn_child(engine_exe, &args, "engine-stderr.log", "engine")?;
 
         let shared = Arc::new(Shared::new(engine_cfg));
 
         let writer = {
             let shared = shared.clone();
-            thread::Builder::new()
-                .name("setsuna-writer".into())
-                .spawn(move || {
+            let on_exit = shared.clone();
+            daemon_io::spawn_guarded(
+                "setsuna-writer",
+                "writer thread",
+                move || {
                     crate::diagnostics::log("writer thread start");
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        writer_loop(shared, stdin)
-                    }));
-                    if result.is_err() {
-                        crate::diagnostics::log("writer thread panic");
-                    }
+                    writer_loop(shared, stdin);
+                },
+                move || {
+                    on_exit.stop();
                     crate::diagnostics::log("writer thread exit");
-                })
+                },
+            )
         };
         let writer = match writer {
             Ok(w) => w,
-            Err(e) => return Err(kill(child, e)),
+            Err(e) => {
+                daemon_io::kill_and_wait(&mut child);
+                return Err(e);
+            }
         };
         let reader = {
             let shared = shared.clone();
-            thread::Builder::new()
-                .name("setsuna-reader".into())
-                .spawn(move || {
+            let on_exit = shared.clone();
+            daemon_io::spawn_guarded(
+                "setsuna-reader",
+                "reader thread",
+                move || {
                     crate::diagnostics::log("reader thread start");
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        reader_loop(shared, stdout, notify)
-                    }));
-                    if result.is_err() {
-                        crate::diagnostics::log("reader thread panic");
-                    }
+                    reader_loop(shared, stdout, notify);
+                },
+                move || {
+                    on_exit.stop();
                     crate::diagnostics::log("reader thread exit");
-                })
+                },
+            )
         };
         let reader = match reader {
             Ok(r) => r,
             Err(e) => {
                 shared.stop();
-                let e = kill(child, e);
+                daemon_io::kill_and_wait(&mut child);
                 let _ = writer.join();
                 return Err(e);
             }
@@ -419,34 +398,9 @@ impl EngineClient for ChildDaemonClient {
 impl Drop for ChildDaemonClient {
     fn drop(&mut self) {
         self.shared.stop();
-        // The writer ending drops the child's stdin handle → the daemon
-        // sees EOF on stdin and exits cleanly. A write blocked on a daemon
-        // that reads no more (hung) ends only when the kill below closes
-        // the pipe, so the writer has a moment and no more before it.
-        if let Some(w) = &self.writer {
-            let deadline = Instant::now() + WRITER_GRACE;
-            while !w.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-        if let Some(mut child) = self.child.take() {
-            // Backstop: the daemon should already be exiting on stdin EOF.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
-        // The daemon's stdout is now closed → the reader's read_line ends.
-        if let Some(r) = self.reader.take() {
-            let _ = r.join();
-        }
+        daemon_io::stop_stdio_child(&mut self.writer, &mut self.child, &mut self.reader);
     }
 }
-
-/// How long a client's drop waits for its writer before it kills the
-/// daemon.
-const WRITER_GRACE: Duration = Duration::from_millis(500);
 
 /// The context for the log: its length, and its last 16 chars when what is
 /// typed is logged.
@@ -519,7 +473,7 @@ fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
         let Some(line) = request_line(&shared, &pending) else {
             continue;
         };
-        if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
+        if !daemon_io::write_json_line(&mut stdin, &line) {
             crate::diagnostics::log("writer failed: stdin closed");
             shared.stop();
             return;
@@ -543,55 +497,17 @@ fn reader_loop(shared: Arc<Shared>, stdout: ChildStdout, notify: Notify) {
 
 fn reader_pump(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-
-    // The daemon's `Ready` line comes first; what a library prints before
-    // it (a banner on stdout) is no handshake.
-    loop {
-        match crate::daemon_io::read_line(&mut reader, &mut line) {
-            Ok(Line::Eof) => {
-                crate::diagnostics::log("reader handshake EOF");
-                return;
+    daemon_io::read_json_stream(
+        &mut reader,
+        "reader",
+        |_| shared.ready.store(true, Ordering::SeqCst),
+        || unanswered(shared),
+        |trimmed| {
+            if let Some((resp, inflight)) = take_response(shared, trimmed) {
+                deliver(shared, resp, inflight, notify);
             }
-            Err(e) => {
-                crate::diagnostics::log(format!("reader handshake failed: {e}"));
-                return;
-            }
-            Ok(Line::TooLong) => continue,
-            Ok(Line::Read) => {}
-        }
-        if !crate::daemon_io::is_ready(&line) {
-            if !line.trim().is_empty() {
-                crate::diagnostics::log("reader skipped a line before the ready line");
-            }
-            continue;
-        }
-        shared.ready.store(true, Ordering::SeqCst);
-        crate::diagnostics::log(format!("reader ready: {}", line.trim()));
-        break;
-    }
-
-    loop {
-        match crate::daemon_io::read_line(&mut reader, &mut line) {
-            Ok(Line::Eof) => {
-                crate::diagnostics::log("reader EOF");
-                return;
-            }
-            Err(e) => {
-                crate::diagnostics::log(format!("reader failed: {e}"));
-                return;
-            }
-            Ok(Line::TooLong) => {
-                crate::diagnostics::log("reader skipped a line too long");
-                unanswered(shared);
-                continue;
-            }
-            Ok(Line::Read) => {}
-        }
-        if let Some((resp, inflight)) = take_response(shared, &line) {
-            deliver(shared, resp, inflight, notify);
-        }
-    }
+        },
+    );
 }
 
 /// The request in flight is answered with nothing (a line that does not
@@ -927,14 +843,7 @@ fn manifest_in_dir(dir: &Path) -> Result<Option<PathBuf>, String> {
 /// frontend module (the TSF DLL in the cargo target dir);
 /// `SETSUNA_ENGINE_EXE` overrides.
 fn find_engine_exe(module_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = crate::config::env_path("SETSUNA_ENGINE_EXE") {
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    module_dir
-        .map(|d| d.join(ENGINE_EXE))
-        .filter(|p| p.is_file())
+    daemon_io::find_exe("SETSUNA_ENGINE_EXE", module_dir, ENGINE_EXE)
 }
 
 /// Daemon command line derived from the engine config. Only knobs the
@@ -1023,6 +932,7 @@ fn decode_flags(engine_cfg: &crate::config::EngineCfg) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::EngineCfg;
+    use std::thread;
 
     fn args_of(cfg: &EngineCfg) -> Vec<String> {
         daemon_args(Path::new("m.manifest.json"), cfg)

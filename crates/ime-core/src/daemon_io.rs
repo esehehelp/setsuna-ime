@@ -1,12 +1,24 @@
-//! What the clients of the helper daemons (engine, reranker, rewriter) share
-//! in reading their JSON lines and in holding their state across threads.
+//! Shared transport, process, thread and framing helpers for the helper
+//! daemon clients (engine, reranker, rewriter).
 
-use std::io::{self, BufRead, Read};
+#[cfg(windows)]
+pub(crate) mod pipe;
+
+use std::ffi::OsString;
+use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// The longest line read from a daemon: a longer one (a daemon gone wrong)
 /// is skipped, not held whole in memory.
 pub(crate) const MAX_LINE: usize = 16 << 20;
+
+/// How long a client's drop waits for its writer before killing the child
+/// (or leaving a blocked writer behind).
+pub(crate) const WRITER_GRACE: Duration = Duration::from_millis(500);
 
 /// A line read from a daemon.
 #[derive(Debug, PartialEq)]
@@ -63,6 +75,191 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Locate a helper executable via `env_var` first, then next to `module_dir`.
+pub(crate) fn find_exe(
+    env_var: &str,
+    module_dir: Option<&Path>,
+    exe_name: &str,
+) -> Option<PathBuf> {
+    if let Some(p) = crate::config::env_path(env_var) {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    module_dir.map(|d| d.join(exe_name)).filter(|p| p.is_file())
+}
+
+/// Log path for a helper daemon's stderr, ensuring its parent directory exists.
+pub(crate) fn stderr_log_path(name: &str) -> Option<PathBuf> {
+    let path = crate::diagnostics::log_path(name)?;
+    if let Some(parent) = path.parent() {
+        let _ = crate::private_file::create_dir_all(parent);
+    }
+    Some(path)
+}
+
+/// A spawned helper daemon with its piped stdin/stdout extracted.
+pub(crate) struct SpawnedChild {
+    pub child: Child,
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+}
+
+/// Spawn a helper daemon with scrubbed environment, piped stdio, appended
+/// stderr log, and hidden console window on Windows. Kills and reaps the child
+/// if its pipes cannot be acquired.
+pub(crate) fn spawn_child(
+    exe: &Path,
+    args: &[OsString],
+    stderr_log: &str,
+    label: &str,
+) -> io::Result<SpawnedChild> {
+    let mut cmd = Command::new(exe);
+    crate::config::scrub_env(&mut cmd);
+    cmd.args(args);
+    let stderr = crate::diagnostics::log_path(stderr_log)
+        .and_then(|path| crate::diagnostics::open_log(&path))
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(stderr);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: keep the daemon console off-screen.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
+    crate::diagnostics::log(format!("{label} child pid={}", child.id()));
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        kill_and_wait(&mut child);
+        return Err(io::Error::other("child stdio not piped"));
+    };
+    Ok(SpawnedChild {
+        child,
+        stdin,
+        stdout,
+    })
+}
+
+/// Kill `child` and wait for it to exit, ignoring already-exited errors.
+pub(crate) fn kill_and_wait(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Spawn a named worker thread wrapped in `catch_unwind` so panics are logged
+/// and `on_exit` always runs to unblock waiters.
+pub(crate) fn spawn_guarded(
+    thread_name: &str,
+    label: &'static str,
+    body: impl FnOnce() + Send + 'static,
+    on_exit: impl FnOnce() + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            if res.is_err() {
+                crate::diagnostics::log(format!("{label} panic"));
+            }
+            on_exit();
+        })
+}
+
+/// Wait up to `grace` for `handle` to finish, returning whether it finished.
+pub(crate) fn wait_for_thread(handle: &JoinHandle<()>, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    handle.is_finished()
+}
+
+/// Gracefully stop a stdio child daemon after signalling its `alive` flag off:
+/// wait up to [`WRITER_GRACE`] for the writer to drop stdin, then kill/wait the
+/// child and join both I/O threads.
+pub(crate) fn stop_stdio_child(
+    writer: &mut Option<JoinHandle<()>>,
+    child: &mut Option<Child>,
+    reader: &mut Option<JoinHandle<()>>,
+) {
+    if let Some(w) = writer.as_ref() {
+        wait_for_thread(w, WRITER_GRACE);
+    }
+    if let Some(mut c) = child.take() {
+        kill_and_wait(&mut c);
+    }
+    if let Some(w) = writer.take() {
+        let _ = w.join();
+    }
+    if let Some(r) = reader.take() {
+        let _ = r.join();
+    }
+}
+
+/// Write one JSONL request line and flush `stdin`.
+pub(crate) fn write_json_line(stdin: &mut ChildStdin, line: &str) -> bool {
+    writeln!(stdin, "{line}").is_ok() && stdin.flush().is_ok()
+}
+
+/// Read a JSONL daemon stdout stream: wait for the ready line (`is_ready`),
+/// then feed each non-empty response line to `on_line`, notifying `on_too_long`
+/// when an over-length post-ready line is skipped.
+pub(crate) fn read_json_stream<R: BufRead>(
+    reader: &mut R,
+    label: &str,
+    mut on_ready: impl FnMut(&str),
+    mut on_too_long: impl FnMut(),
+    mut on_line: impl FnMut(&str),
+) {
+    let mut line = String::new();
+    let mut ready = false;
+    loop {
+        match read_line(reader, &mut line) {
+            Ok(Line::Eof) => {
+                crate::diagnostics::log(format!(
+                    "{label} {}",
+                    if ready { "EOF" } else { "handshake EOF" }
+                ));
+                return;
+            }
+            Err(e) => {
+                crate::diagnostics::log(format!(
+                    "{label} {} failed: {e}",
+                    if ready { "read" } else { "handshake" }
+                ));
+                return;
+            }
+            Ok(Line::TooLong) => {
+                crate::diagnostics::log(format!("{label} line too long, skipped"));
+                if ready {
+                    on_too_long();
+                }
+                continue;
+            }
+            Ok(Line::Read) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !ready {
+            if is_ready(trimmed) {
+                ready = true;
+                crate::diagnostics::log(format!("{label} ready: {trimmed}"));
+                on_ready(trimmed);
+            } else {
+                crate::diagnostics::log(format!("{label} skipped a line before the ready line"));
+            }
+            continue;
+        }
+        on_line(trimmed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +287,22 @@ mod tests {
         assert!(!is_ready("OpenMP: 16 threads\n"));
         assert!(!is_ready("{\"ready\":false}"));
         assert!(!is_ready("{\"id\":1}"));
+    }
+
+    #[test]
+    fn json_stream_skips_banner_until_ready_then_delivers_lines() {
+        let input = "OpenMP banner\n\n{\"ready\":true,\"v\":1}\n{\"id\":1}\n{\"id\":2}\n";
+        let mut reader = io::BufReader::new(input.as_bytes());
+        let mut ready_line = String::new();
+        let mut lines = Vec::new();
+        read_json_stream(
+            &mut reader,
+            "test",
+            |r| ready_line = r.to_string(),
+            || {},
+            |l| lines.push(l.to_string()),
+        );
+        assert_eq!(ready_line, "{\"ready\":true,\"v\":1}");
+        assert_eq!(lines, ["{\"id\":1}", "{\"id\":2}"]);
     }
 }

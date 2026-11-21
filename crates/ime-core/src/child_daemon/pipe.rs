@@ -21,37 +21,24 @@
 //! it gives up, and the frontend tries again later.
 
 use std::ffi::OsString;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-
-use crate::daemon_io::lock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use setsuna_pipe::win::{self, Pipe};
 use setsuna_pipe::{engine_pipe_name, exe_identity};
 
+use crate::daemon_io::lock;
+use crate::daemon_io::pipe::{self as shared_pipe, PipeTarget};
+
 use super::{
     decode_flags, deliver, next_request, request_line, take_response, ChildDaemonClient,
     DaemonResponse, InFlight, Pending, Shared,
 };
 use crate::engine_client::{EngineClient, EngineResult, Notify, Word};
-
-/// How long a connection may take, the server's start and model load included.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The server to connect to, and how to start it.
-struct Target {
-    name: String,
-    user: String,
-    exe: PathBuf,
-    args: Vec<OsString>,
-    /// Start the server when there is none, and a child when it cannot be
-    /// had (false: connect only).
-    start: bool,
-}
 
 /// What the I/O thread needs to start the child it falls back to.
 struct Fallback {
@@ -189,7 +176,7 @@ fn target(
     exe: &Path,
     cfg: &crate::config::EngineCfg,
     start: bool,
-) -> io::Result<Target> {
+) -> io::Result<PipeTarget> {
     let user = win::user_sid()?;
     let flags = decode_flags(cfg);
     let name = engine_pipe_name(
@@ -210,12 +197,13 @@ fn target(
         args.push("--log".into());
         args.push(log.into_os_string());
     }
-    Ok(Target {
+    Ok(PipeTarget {
         name,
         user,
         exe: exe.to_path_buf(),
         args,
         start,
+        label: "engine",
     })
 }
 
@@ -292,24 +280,17 @@ impl EngineClient for PipeEngineClient {
 impl Drop for PipeEngineClient {
     fn drop(&mut self) {
         self.shared.stop();
-        let mut io_done = true;
-        if let Some(io) = self.io.take() {
-            // the thread may be waiting for a request, reading a response or
-            // waiting for the server to come up: wake it and abort its read
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !io.is_finished() && Instant::now() < deadline {
-                drop(self.shared.state.lock());
-                self.shared.cv.notify_all();
-                win::cancel_io(&io);
-                thread::sleep(Duration::from_millis(5));
-            }
-            io_done = io.is_finished();
-            if io_done {
-                let _ = io.join();
-            } else {
-                crate::diagnostics::log("engine pipe thread still busy, left behind");
-            }
-        }
+        let io_done = match self.io.take() {
+            Some(io) => shared_pipe::stop_io_thread(
+                io,
+                || {
+                    drop(self.shared.state.lock());
+                    self.shared.cv.notify_all();
+                },
+                "engine",
+            ),
+            None => true,
+        };
         // the I/O thread gone, the channel is closed: the poster ends after
         // the result it is posting, if any
         if let Some(poster) = self.poster.take() {
@@ -325,7 +306,7 @@ impl Drop for PipeEngineClient {
 fn io_loop(
     shared: &Shared,
     server: &AtomicU32,
-    target: &Target,
+    target: &PipeTarget,
     post: &mpsc::Sender<(DaemonResponse, Option<InFlight>)>,
     fallback: &Fallback,
 ) {
@@ -395,7 +376,7 @@ fn io_loop(
 /// The server cannot be had: start a child of this app's own and pass it
 /// the queued request; every call goes to it from then on. Connecting only,
 /// the client is no longer alive instead.
-fn give_up(shared: &Shared, fallback: &Fallback, target: &Target, e: &io::Error) {
+fn give_up(shared: &Shared, fallback: &Fallback, target: &PipeTarget, e: &io::Error) {
     if !shared.alive.load(Ordering::SeqCst) {
         return;
     }
@@ -444,121 +425,41 @@ fn give_up(shared: &Shared, fallback: &Fallback, target: &Target, e: &io::Error)
 
 /// Open the pipe, starting the server when it does not exist, and read its
 /// ready line.
-fn connect(shared: &Shared, server: &AtomicU32, target: &Target) -> io::Result<BufReader<Pipe>> {
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let mut started = None;
-    let mut nap = Duration::from_millis(20);
-    loop {
-        if !shared.alive.load(Ordering::SeqCst) {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
-        }
-        match Pipe::open(&target.name) {
-            Ok(pipe) => {
-                // a pipe of this name owned by someone else is not our server
-                let owner = pipe.owner_sid()?;
-                if owner != target.user {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("{} is owned by {owner}", target.name),
-                    ));
-                }
-                // any process of the user can add an instance of the name:
-                // the server must be the exe this client starts, not a
-                // low-integrity one
-                win::trust_server(&pipe, &target.exe)?;
-                // the server sends it once its model is up
-                let mut reader = BufReader::new(pipe);
-                let mut line = String::new();
-                if crate::daemon_io::read_line(&mut reader, &mut line)?
-                    == crate::daemon_io::Line::Read
-                {
-                    let pid = reader.get_ref().server_pid().unwrap_or(0);
-                    server.store(pid, Ordering::SeqCst);
-                    shared.ready.store(true, Ordering::SeqCst);
-                    crate::diagnostics::log(format!(
-                        "engine pipe connected: server pid={pid} {}",
-                        line.trim()
-                    ));
-                    return Ok(reader);
-                }
-                // it left before (exiting idle as we came): again
-            }
-            // no server, and this client may not start one
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !target.start => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no server on {}", target.name),
-                ));
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => match started {
-                None => {
-                    let cwd = target.exe.parent();
-                    let args: Vec<&std::ffi::OsStr> =
-                        target.args.iter().map(OsString::as_os_str).collect();
-                    let env = crate::config::helper_env();
-                    let (pid, own_job) =
-                        win::spawn_detached(&target.exe, &args, cwd, env.as_deref())?;
-                    crate::diagnostics::log(format!(
-                        "engine server started pid={pid} out_of_job={own_job} args={:?}",
-                        target.args
-                    ));
-                    started = Some(pid);
-                }
-                // gone with no pipe: it could not load (or serve) the model
-                Some(pid) if !win::is_running(pid) => {
-                    return Err(io::Error::other(format!(
-                        "the server (pid {pid}) exited without its pipe"
-                    )));
-                }
-                Some(_) => {}
-            },
-            Err(e) if win::is_busy(&e) => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::from(io::ErrorKind::TimedOut));
-                }
-                win::wait(&target.name, 250);
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::from(io::ErrorKind::TimedOut));
-        }
-        thread::sleep(nap);
-        nap = (nap * 2).min(Duration::from_millis(250));
-    }
+fn connect(
+    shared: &Shared,
+    server: &AtomicU32,
+    target: &PipeTarget,
+) -> io::Result<BufReader<Pipe>> {
+    let (reader, line) = shared_pipe::connect(&shared.alive, target)?;
+    let pid = reader.get_ref().server_pid().unwrap_or(0);
+    server.store(pid, Ordering::SeqCst);
+    shared.ready.store(true, Ordering::SeqCst);
+    crate::diagnostics::log(format!(
+        "engine pipe connected: server pid={pid} {}",
+        line.trim()
+    ));
+    Ok(reader)
 }
 
 /// Send one request line and read its response line.
 fn exchange(reader: &mut BufReader<Pipe>, line: &str, id: u64) -> io::Result<String> {
-    let mut out: &Pipe = reader.get_ref();
-    out.write_all(line.as_bytes())?;
-    let mut buf = String::new();
-    loop {
-        match crate::daemon_io::read_line(reader, &mut buf)? {
-            crate::daemon_io::Line::Eof => {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-            }
-            crate::daemon_io::Line::TooLong => {
-                crate::diagnostics::log("engine response line too long, skipped");
-                continue;
-            }
-            crate::daemon_io::Line::Read => {}
-        }
-        let text = buf.trim();
-        if text.is_empty() {
-            continue;
-        }
+    shared_pipe::exchange(reader, line, "engine", |text| {
         // id 0: the server could not read the request
         match serde_json::from_str::<serde_json::Value>(text) {
-            Ok(v) if v["id"] == id || v["id"] == 0 => return Ok(buf),
-            Ok(v) => crate::diagnostics::log(format!("engine stale response id={}", v["id"])),
-            Err(e) => crate::diagnostics::log(format!(
-                "engine parse failed: {e}; {}",
-                crate::diagnostics::text_field("line", text)
-            )),
+            Ok(v) if v["id"] == id || v["id"] == 0 => Some(text.to_string()),
+            Ok(v) => {
+                crate::diagnostics::log(format!("engine stale response id={}", v["id"]));
+                None
+            }
+            Err(e) => {
+                crate::diagnostics::log(format!(
+                    "engine parse failed: {e}; {}",
+                    crate::diagnostics::text_field("line", text)
+                ));
+                None
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]

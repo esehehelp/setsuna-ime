@@ -5,19 +5,17 @@
 //! newer request replaces one not sent yet) and a reader thread delivers
 //! results, failures included, through the frontend's [`Notify`].
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-
-use crate::daemon_io::{lock, Line};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::RewriterCfg;
+use crate::daemon_io::{self, lock};
 use crate::engine_client::Notify;
 
 /// File name of the rewriter binary on this platform.
@@ -148,8 +146,6 @@ impl ChildRewriteClient {
         credentials_dir: &Path,
         notify: Notify,
     ) -> std::io::Result<Self> {
-        let mut cmd = Command::new(exe);
-        crate::config::scrub_env(&mut cmd);
         let args = daemon_args(cfg, credentials_dir);
         crate::diagnostics::log(format!(
             "spawn rewrite={} provider={} model={}",
@@ -157,31 +153,11 @@ impl ChildRewriteClient {
             cfg.provider.as_str(),
             cfg.model
         ));
-        cmd.args(args);
-        let stderr = crate::diagnostics::log_path("rewrite-stderr.log")
-            .and_then(|path| crate::diagnostics::open_log(&path))
-            .map(Stdio::from)
-            .unwrap_or_else(Stdio::null);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = cmd.spawn()?;
-        crate::diagnostics::log(format!("rewrite child pid={}", child.id()));
-        // a child no thread serves is stopped, not left running
-        let kill = |mut child: Child, e: std::io::Error| {
-            let _ = child.kill();
-            let _ = child.wait();
-            e
-        };
-        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            return Err(kill(child, std::io::Error::other("child stdio not piped")));
-        };
+        let daemon_io::SpawnedChild {
+            mut child,
+            stdin,
+            stdout,
+        } = daemon_io::spawn_child(exe, &args, "rewrite-stderr.log", "rewrite")?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
@@ -190,39 +166,39 @@ impl ChildRewriteClient {
         });
         let writer = {
             let shared = shared.clone();
-            thread::Builder::new()
-                .name("setsuna-rewrite-writer".into())
-                .spawn(move || {
-                    let run = std::panic::AssertUnwindSafe(|| writer_loop(shared.clone(), stdin));
-                    if std::panic::catch_unwind(run).is_err() {
-                        crate::diagnostics::log("rewrite writer panic");
-                        shared.stop();
-                    }
-                })
+            let on_exit = shared.clone();
+            daemon_io::spawn_guarded(
+                "setsuna-rewrite-writer",
+                "rewrite writer",
+                move || writer_loop(shared, stdin),
+                move || on_exit.stop(),
+            )
         };
         let writer = match writer {
             Ok(w) => w,
-            Err(e) => return Err(kill(child, e)),
+            Err(e) => {
+                daemon_io::kill_and_wait(&mut child);
+                return Err(e);
+            }
         };
         let reader = {
             let shared = shared.clone();
-            thread::Builder::new()
-                .name("setsuna-rewrite-reader".into())
-                .spawn(move || {
-                    let run =
-                        std::panic::AssertUnwindSafe(|| reader_loop(&shared, stdout, &notify));
-                    if std::panic::catch_unwind(run).is_err() {
-                        crate::diagnostics::log("rewrite reader panic");
-                    }
-                    shared.stop();
+            let on_exit = shared.clone();
+            daemon_io::spawn_guarded(
+                "setsuna-rewrite-reader",
+                "rewrite reader",
+                move || reader_loop(&shared, stdout, &notify),
+                move || {
+                    on_exit.stop();
                     crate::diagnostics::log("rewrite reader exit");
-                })
+                },
+            )
         };
         let reader = match reader {
             Ok(r) => r,
             Err(e) => {
                 shared.stop();
-                let e = kill(child, e);
+                daemon_io::kill_and_wait(&mut child);
                 let _ = writer.join();
                 return Err(e);
             }
@@ -274,24 +250,7 @@ impl RewriteClient for ChildRewriteClient {
 impl Drop for ChildRewriteClient {
     fn drop(&mut self) {
         self.shared.stop();
-        // a write blocked on a daemon that reads no more ends only when the
-        // kill closes the pipe: the writer has a moment and no more
-        if let Some(w) = &self.writer {
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while !w.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
-        if let Some(r) = self.reader.take() {
-            let _ = r.join();
-        }
+        daemon_io::stop_stdio_child(&mut self.writer, &mut self.child, &mut self.reader);
     }
 }
 
@@ -322,7 +281,7 @@ fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
             lock(&shared.state).in_flight = false;
             continue;
         };
-        if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
+        if !daemon_io::write_json_line(&mut stdin, &line) {
             crate::diagnostics::log("rewrite writer failed: stdin closed");
             shared.stop();
             return;
@@ -332,67 +291,47 @@ fn writer_loop(shared: Arc<Shared>, mut stdin: ChildStdin) {
 
 fn reader_loop(shared: &Shared, stdout: ChildStdout, notify: &Notify) {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let mut ready = false;
     // a line that answers nothing: the request in flight is out of it, so
     // that the next one goes
     let release = || {
         lock(&shared.state).in_flight = false;
         shared.cv.notify_all();
     };
-    loop {
-        match crate::daemon_io::read_line(&mut reader, &mut line) {
-            Ok(Line::Eof) | Err(_) => return,
-            Ok(Line::TooLong) => {
-                crate::diagnostics::log("rewrite line too long, skipped");
-                if ready {
+    daemon_io::read_json_stream(
+        &mut reader,
+        "rewrite",
+        |_| {},
+        release,
+        |trimmed| {
+            let resp: Response = match serde_json::from_str(trimmed) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::diagnostics::log(format!("rewrite parse failed: {e}"));
                     release();
+                    return;
                 }
-                continue;
+            };
+            release();
+            // the text is the user's: only the outcome goes to the log
+            crate::diagnostics::log(format!(
+                "rewrite response id={} ms={:.0} code={:?} error={:?}",
+                resp.id, resp.ms, resp.code, resp.error
+            ));
+            let code = match (&resp.text, resp.code) {
+                (Some(_), _) => None,
+                (None, c) => Some(c.unwrap_or_else(|| "error".into())),
+            };
+            *lock(&shared.latest) = Some(RewriteResult {
+                req_id: resp.id,
+                text: resp.text,
+                code,
+                ms: resp.ms,
+            });
+            if shared.alive.load(Ordering::SeqCst) {
+                notify(resp.id);
             }
-            Ok(Line::Read) => {}
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !ready {
-            // what a library prints before the ready line is none
-            if crate::daemon_io::is_ready(trimmed) {
-                ready = true;
-                crate::diagnostics::log(format!("rewrite ready: {trimmed}"));
-            }
-            continue;
-        }
-        let resp: Response = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::diagnostics::log(format!("rewrite parse failed: {e}"));
-                release();
-                continue;
-            }
-        };
-        lock(&shared.state).in_flight = false;
-        shared.cv.notify_all();
-        // the text is the user's: only the outcome goes to the log
-        crate::diagnostics::log(format!(
-            "rewrite response id={} ms={:.0} code={:?} error={:?}",
-            resp.id, resp.ms, resp.code, resp.error
-        ));
-        let code = match (&resp.text, resp.code) {
-            (Some(_), _) => None,
-            (None, c) => Some(c.unwrap_or_else(|| "error".into())),
-        };
-        *lock(&shared.latest) = Some(RewriteResult {
-            req_id: resp.id,
-            text: resp.text,
-            code,
-            ms: resp.ms,
-        });
-        if shared.alive.load(Ordering::SeqCst) {
-            notify(resp.id);
-        }
-    }
+        },
+    );
 }
 
 /// Spawn the rewriter `cfg` describes, or `None` when it is off, the binary
@@ -436,14 +375,7 @@ pub fn spawn_with_config(
 }
 
 fn find_exe(module_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = crate::config::env_path("SETSUNA_REWRITE_EXE") {
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    module_dir
-        .map(|d| d.join(REWRITE_EXE))
-        .filter(|p| p.is_file())
+    daemon_io::find_exe("SETSUNA_REWRITE_EXE", module_dir, REWRITE_EXE)
 }
 
 /// What the IME shows for a failed rewrite's `code`.
