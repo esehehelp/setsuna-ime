@@ -846,6 +846,15 @@ impl EngineBridge {
         matches!(self.phase, Phase::Converting { .. })
     }
 
+    /// The pending romaji the next letter typed is read after, while typing
+    /// (`ComposingText::romaji_context`); None while converting.
+    pub fn romaji_context(&self) -> Option<&str> {
+        if self.is_converting() {
+            return None;
+        }
+        self.composing.romaji_context()
+    }
+
     /// The caret as a char offset into the preedit while typing with the
     /// caret moved off the end (the preedit is then plain kana); `None` for
     /// the end.

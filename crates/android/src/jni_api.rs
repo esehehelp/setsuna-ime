@@ -254,6 +254,25 @@ pub unsafe extern "system" fn Java_io_github_esehehelp_setsuna_Native_view<'l>(
     }
 }
 
+/// The letters a-z that keep what is being typed romaji next
+/// (`Session::romaji_next`); null for no preference or no session.
+///
+/// # Safety
+/// `h` is a live session.
+#[no_mangle]
+pub unsafe extern "system" fn Java_io_github_esehehelp_setsuna_Native_romajiNext<'l>(
+    env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    h: jlong,
+) -> jstring {
+    match with(h, None, |host| host.session.romaji_next()) {
+        Some(letters) => env
+            .new_string(letters)
+            .map_or(std::ptr::null_mut(), |s| s.into_raw()),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// A message of the settings page (JSON) for the config under the app's
 /// files directory: the reply as JSON, null for none (`settings::handle`).
 /// Called on the WebView's bridge thread, not the service's.

@@ -415,6 +415,9 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         ic.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_Z, 0, meta))
     }
 
+    override fun romajiNext(): String? =
+        if (h != 0L && field != Native.FIELD_DIRECT) Native.romajiNext(h) else null
+
     override fun onPreview(label: String?, rect: RectF?) {
         val p = preview ?: return
         val k = keyboard ?: return

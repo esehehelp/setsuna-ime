@@ -53,6 +53,9 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
         /** The bubble over a pressed key: its label and rect (this view's coordinates); null hides it. */
         fun onPreview(label: String?, rect: RectF?)
+
+        /** The letters that keep what is being typed romaji next; null for no preference. */
+        fun romajiNext(): String?
     }
 
     enum class Mode { JA, EN, NUM }
@@ -363,6 +366,39 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         return k?.let { shown(it) }
     }
 
+    /**
+     * The letter a tap at (x, y) means, on the romaji keyboard: of the letter keys around it, the one
+     * most likely, by how near the tap is to each key's middle (a normal spread of a third of a key)
+     * times how well the letter continues what is being typed (a letter that leaves no romaji, `d`
+     * after `k`, a quarter as likely). A tap well inside a key stays its own; one near the edge between
+     * two keys goes to the one that keeps the romaji, as a keyboard that reads the word does. The key
+     * under the tap otherwise ([hit], a key not a letter, Shift on, another page or mode, the IME
+     * preferring none).
+     */
+    private fun romajiKey(hit: Key, x: Float, y: Float): Key {
+        if (!letter(hit) || mode != Mode.JA || page != Page.KEYS || shift || capsLock) return hit
+        val next = listener.romajiNext() ?: return hit
+        if (next.isEmpty() || next.length == 26) return hit
+        val sigma = 0.35f
+        var best = hit
+        var bestScore = -1f
+        for (k in layout().rows.flatten()) {
+            if (!letter(k)) continue
+            // the key's cell: the key and half the gaps around it
+            val dx = (x - k.rect.centerX()) / (k.rect.width() + 2 * hGap)
+            val dy = (y - k.rect.centerY()) / (k.rect.height() + 2 * vGap)
+            val d2 = dx * dx + dy * dy
+            if (d2 > 1f) continue
+            val prior = if (k.label[0] in next) 1f else 0.25f
+            val score = kotlin.math.exp(-d2 / (2 * sigma * sigma)) * prior
+            if (score > bestScore) {
+                best = k
+                bestScore = score
+            }
+        }
+        return best
+    }
+
     /** A key as it is now: the globe is ? while something is composed. */
     private fun shown(k: Key): Key =
         if (k.type == Type.GLOBE && composing) question.also { it.rect.set(k.rect) } else k
@@ -571,9 +607,9 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 val i = e.actionIndex
                 val x = e.getX(i)
                 val y = e.getY(i)
-                val k = keyAt(x, y) ?: return true
                 // typing with two thumbs: the key held by the other goes now,
-                // so that the keys go out in the order they were touched
+                // so that the keys go out in the order they were touched (and
+                // this one is read after it)
                 for (j in 0 until presses.size()) {
                     val p = presses.valueAt(j)
                     if (!p.fired && (p.key.type == Type.CHAR || p.key.type == Type.TEXT)) {
@@ -581,6 +617,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                         p.fired = true
                     }
                 }
+                val k = romajiKey(keyAt(x, y) ?: return true, x, y)
                 val index = if (k.type == Type.COLUMN) {
                     ((y - k.rect.top) / k.rect.height() * k.more.size).toInt().coerceIn(0, k.more.size - 1)
                 } else {

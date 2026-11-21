@@ -66,6 +66,14 @@ object Native {
     external fun view(h: Long): String?
 
     /**
+     * The letters a-z that, typed next, keep what is being typed romaji (a tap between two keys goes to
+     * the one of them that does); null when no letter is preferred (the IME off, converting, an English
+     * word being typed).
+     */
+    @JvmStatic
+    external fun romajiNext(h: Long): String?
+
+    /**
      * A message of the settings page (JSON) for the config under [files]
      * (the app's files directory): the reply as JSON, null for none. Any
      * thread; no session needed.

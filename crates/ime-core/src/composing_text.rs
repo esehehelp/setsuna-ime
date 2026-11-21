@@ -346,6 +346,22 @@ impl ComposingText {
         &self.pending
     }
 
+    /// What the next letter would be read after as romaji: the pending romaji,
+    /// when the next letter goes at the end and the letters being typed are no
+    /// English word (none of them a capital). None otherwise.
+    pub fn romaji_context(&self) -> Option<&str> {
+        if self.cursor != self.raw.chars().count() {
+            return None;
+        }
+        let english = self
+            .raw
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .any(|c| c.is_ascii_uppercase());
+        (!english).then_some(self.pending.as_str())
+    }
+
     /// The reading live conversion converts: the kana typed and a pending
     /// `n` as ん (`kekkon` is けっこん, not けっこ: a word typed to its end
     /// ends in ん, and a vowel after it converts again).
@@ -992,6 +1008,16 @@ pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUni
     units
 }
 
+/// Whether the letter `c` typed after the pending romaji `pending` still
+/// reads as romaji (a kana, or the start of one), no letter left as it is:
+/// after `k` a vowel, `y` or `k`, not `d`.
+pub fn continues_romaji(pending: &str, c: char) -> bool {
+    let chars: Vec<char> = pending.chars().chain(std::iter::once(c)).collect();
+    romaji_units(&chars, false)
+        .iter()
+        .all(|u| !matches!(u.kind, UnitKind::Char(_)))
+}
+
 fn matches_at(chars: &[char], start: usize, key: &str) -> bool {
     let key_len = key.chars().count();
     if start + key_len > chars.len() {
@@ -1395,6 +1421,29 @@ mod tests {
         assert_eq!(c.preedit(), "かk");
         backspace(&mut c, 1);
         assert_eq!(c.preedit(), "か");
+    }
+
+    #[test]
+    fn the_next_letter_continues_romaji_or_not() {
+        // after k: a vowel, y, k (っ); not a consonant that leaves k as it is
+        for c in ['a', 'i', 'u', 'e', 'o', 'y', 'k'] {
+            assert!(continues_romaji("k", c), "k{c}");
+        }
+        // (kw is くぁ's)
+        for c in ['d', 'f', 'g', 'j', 'l', 'p'] {
+            assert!(!continues_romaji("k", c), "k{c}");
+        }
+        // after n: anything (n before a consonant is ん); after ts, u
+        assert!(continues_romaji("n", 'k') && continues_romaji("n", 'a'));
+        assert!(continues_romaji("ts", 'u') && !continues_romaji("ts", 'k'));
+        // nothing pending: any letter that starts a kana
+        assert!(continues_romaji("", 'k') && continues_romaji("", 'a'));
+
+        let mut c = ComposingText::new();
+        for ch in "kak".chars() {
+            c.input_char(ch);
+        }
+        assert_eq!(c.romaji_context(), Some("k"));
     }
 
     #[test]

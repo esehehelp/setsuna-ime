@@ -287,6 +287,22 @@ impl Session {
         self.enabled
     }
 
+    /// The letters a-z that, typed next, keep what is being typed romaji (a
+    /// touch keyboard gives a tap between two keys to the one of them that
+    /// does); None when no letter is preferred: the IME off, converting, the
+    /// caret inside the text, or an English word being typed.
+    pub fn romaji_next(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let pending = self.bridge.romaji_context()?;
+        Some(
+            ('a'..='z')
+                .filter(|&c| crate::composing_text::continues_romaji(pending, c))
+                .collect(),
+        )
+    }
+
     pub fn is_active(&self) -> bool {
         self.bridge.is_active()
     }
