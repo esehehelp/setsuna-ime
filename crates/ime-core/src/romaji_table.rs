@@ -9,8 +9,10 @@
 //! still become a longer one waits (`Pending`) at the end of what is typed;
 //! a rule's pending text (`kk	っ	k`) is read again.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::composing_text::{RomajiUnit, UnitKind};
 
@@ -22,7 +24,7 @@ pub const PRESETS: &[(&str, &str)] = &[
 
 pub struct RomajiTable {
     /// Input -> (output, chars of the input read again).
-    rules: HashMap<String, (&'static str, usize)>,
+    rules: HashMap<String, (String, usize)>,
     /// Every proper prefix of an input.
     prefixes: HashSet<String>,
     max_len: usize,
@@ -74,7 +76,7 @@ impl RomajiTable {
                     ));
                     continue;
                 };
-            let output: &'static str = Box::leak(cols[1].to_string().into_boxed_str());
+            let output = cols[1].to_string();
             t.case_sensitive |= input.chars().any(|c| c.is_ascii_uppercase());
             t.chars.extend(input.chars());
             let chars: Vec<char> = input.chars().collect();
@@ -151,14 +153,14 @@ impl RomajiTable {
             }
             let best = (1..=reach)
                 .rev()
-                .find_map(|len| self.rules.get(&key(i, i + len)).map(|r| (len, *r)));
+                .find_map(|len| self.rules.get(&key(i, i + len)).map(|r| (len, r)));
             match best {
                 Some((len, (out, again))) => {
-                    let used = len - again;
+                    let used = len - *again;
                     units.push(RomajiUnit {
                         start: i,
                         end: i + used,
-                        kind: UnitKind::Kana(out),
+                        kind: UnitKind::Kana(Cow::Owned(out.clone())),
                     });
                     i += used;
                 }
@@ -194,13 +196,19 @@ impl RomajiTable {
     }
 }
 
-static ACTIVE: RwLock<Option<Arc<RomajiTable>>> = RwLock::new(None);
-/// Tables read so far, by their text (their outputs are leaked: read each once).
-static LOADED: Mutex<Option<HashMap<String, Arc<RomajiTable>>>> = Mutex::new(None);
+/// Active table together with its source text so repeated `configure` calls
+/// with identical text reuse the parsed table without retaining old ones forever.
+static ACTIVE: RwLock<Option<(String, Arc<RomajiTable>)>> = RwLock::new(None);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic generation incremented whenever the active romaji table changes.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
 
 /// The table in effect (`None`: the built-in romaji).
 pub fn active() -> Option<Arc<RomajiTable>> {
-    ACTIVE.read().ok()?.clone()
+    ACTIVE.read().ok()?.as_ref().map(|(_, t)| t.clone())
 }
 
 /// Whether `spec` names a table this build has ("standard", "", a
@@ -227,32 +235,31 @@ pub fn text_of(spec: &str) -> Result<Option<String>, String> {
 
 /// Make `spec` the table in effect; on an error the built-in table is.
 pub fn configure(spec: &str) -> Result<(), String> {
-    let table = match text_of(spec) {
+    let parsed = match text_of(spec) {
         Ok(Some(text)) => {
-            let mut loaded = LOADED.lock().map_err(|e| e.to_string())?;
-            let cache = loaded.get_or_insert_with(HashMap::new);
-            match cache.get(&text) {
-                Some(t) => Ok(Some(t.clone())),
-                None => match RomajiTable::parse(&text) {
-                    Ok(t) => {
-                        let t = Arc::new(t);
-                        cache.insert(text, t.clone());
-                        Ok(Some(t))
-                    }
-                    Err(errors) => Err(errors.join("; ")),
-                },
+            if ACTIVE
+                .read()
+                .ok()
+                .is_some_and(|a| a.as_ref().is_some_and(|(cur, _)| *cur == text))
+            {
+                return Ok(());
+            }
+            match RomajiTable::parse(&text) {
+                Ok(t) => Ok(Some((text, Arc::new(t)))),
+                Err(errors) => Err(errors.join("; ")),
             }
         }
         Ok(None) => Ok(None),
         Err(e) => Err(e),
     };
-    let (table, result) = match table {
+    let (table, result) = match parsed {
         Ok(t) => (t, Ok(())),
         Err(e) => (None, Err(e)),
     };
     if let Ok(mut a) = ACTIVE.write() {
         *a = table;
     }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
     result
 }
 
@@ -264,7 +271,7 @@ mod tests {
         let chars: Vec<char> = typed.chars().collect();
         t.units(&chars, flush)
             .iter()
-            .map(|u| match u.kind {
+            .map(|u| match &u.kind {
                 UnitKind::Kana(k) => k.to_string(),
                 UnitKind::Char(c) => c.to_string(),
                 UnitKind::Pending => {

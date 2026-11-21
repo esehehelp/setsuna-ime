@@ -43,6 +43,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -189,7 +190,10 @@ impl Entry<'_> {
     }
 }
 
+static NEXT_LEXICON_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct Lexicon {
+    id: u64,
     bytes: Bytes,
     keys: usize,
     entries: usize,
@@ -247,9 +251,11 @@ impl Lexicon {
             "lexicon version {version} (this IME reads 2, {VERSION} and {})",
             packed::VERSION
         );
+        let id = NEXT_LEXICON_ID.fetch_add(1, Ordering::Relaxed);
         if version == packed::VERSION {
             let p = packed::Packed::open(&bytes)?;
             return Ok(Self {
+                id,
                 keys: p.keys(),
                 entries: p.len(),
                 ids: p.ids(),
@@ -283,6 +289,7 @@ impl Lexicon {
         }
         ensure!(bytes.len() >= o, "lexicon truncated");
         Ok(Self {
+            id,
             bytes,
             keys,
             entries,
@@ -292,6 +299,11 @@ impl Lexicon {
             at,
             packed: None,
         })
+    }
+
+    /// Monotonic identifier unique to this loaded `Lexicon` instance (safe as a cache key without pointer ABA).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Whether the lexicon holds the commoner words only (`build_partial`):

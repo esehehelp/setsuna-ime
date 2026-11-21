@@ -229,9 +229,15 @@ pub struct MixedModel {
     names: FastMap<String, (String, f64, bool)>,
     pub params: MixedParams,
     /// The reading lexicon's cost of kana `kana_words` asked for, by the
-    /// lexicon (its address) and the kana: typing asks again for the same
+    /// lexicon's monotonic id and the kana: typing asks again for the same
     /// at each key.
-    lexicon_costs: Mutex<HashMap<(usize, String), f64>>,
+    lexicon_costs: Mutex<LexiconCostCache>,
+}
+
+#[derive(Default)]
+struct LexiconCostCache {
+    by_lexicon: HashMap<u64, HashMap<String, f64>>,
+    len: usize,
 }
 
 /// Kana costs `MixedModel::lexicon_costs` keeps before it starts over.
@@ -494,9 +500,9 @@ impl MixedModel {
             let mut at: Vec<usize> = Vec::with_capacity(units.len() + 1);
             for u in &units {
                 at.push(kana.len());
-                match u.kind {
+                match &u.kind {
                     UnitKind::Kana(k) => kana.extend(k.chars()),
-                    UnitKind::Char(c) => kana.push(c),
+                    UnitKind::Char(c) => kana.push(*c),
                     UnitKind::Pending => {}
                 }
             }
@@ -527,7 +533,7 @@ impl MixedModel {
                     let alone = romaji_units(&chars[a..b], true);
                     let mut spelled = String::new();
                     for u in &alone {
-                        match u.kind {
+                        match &u.kind {
                             UnitKind::Kana(k) => spelled.push_str(k),
                             _ => spelled.push('#'),
                         }
@@ -621,12 +627,14 @@ impl MixedModel {
         if kana.is_empty() {
             return 0.0;
         }
-        let key = (lexicon as *const Lexicon as usize, kana.to_string());
+        let id = lexicon.id();
         if let Some(&c) = self
             .lexicon_costs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+            .by_lexicon
+            .get(&id)
+            .and_then(|m| m.get(kana))
         {
             return c;
         }
@@ -634,11 +642,20 @@ impl MixedModel {
             f64::from(crate::lexicon::KANA_COST) * kana.chars().count() as f64,
             |c| f64::from(c.1),
         );
-        let mut costs = self.lexicon_costs.lock().unwrap_or_else(|e| e.into_inner());
-        if costs.len() >= LEXICON_COSTS {
-            costs.clear();
+        let mut cache = self.lexicon_costs.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len >= LEXICON_COSTS {
+            cache.by_lexicon.clear();
+            cache.len = 0;
         }
-        costs.insert(key, cost);
+        if cache
+            .by_lexicon
+            .entry(id)
+            .or_default()
+            .insert(kana.to_string(), cost)
+            .is_none()
+        {
+            cache.len += 1;
+        }
         cost
     }
 
@@ -1060,7 +1077,7 @@ impl MixedModel {
             let units = romaji_units(&chars[from..rest_end], rest_fin);
             let mut kana = String::new();
             for (i, u) in units.iter().enumerate() {
-                match u.kind {
+                match &u.kind {
                     UnitKind::Kana(k) => kana.push_str(k),
                     UnitKind::Pending
                         if !rest_fin && i + 1 == units.len() && rest_end == chars.len() => {}
@@ -1880,7 +1897,7 @@ fn before_kana(done: &[Span], chars: &[char], span: Span) -> char {
             romaji_units(&chars[s.start..s.end], true)
                 .iter()
                 .rev()
-                .find_map(|u| match u.kind {
+                .find_map(|u| match &u.kind {
                     UnitKind::Kana(k) => k.chars().last(),
                     _ => None,
                 })
@@ -2225,27 +2242,27 @@ pub fn render_parts(
                         text.extend(&part[unit.start..unit.end]);
                         continue;
                     }
-                    match unit.kind {
+                    match &unit.kind {
                         // a hyphen after a digit or a Latin letter is one
                         // (3-5-2, NEWS-), not ー (らーめん)
-                        UnitKind::Kana("ー") if after_latin => text.push('-'),
+                        UnitKind::Kana(k) if k == "ー" && after_latin => text.push('-'),
                         UnitKind::Kana(kana) => text.push_str(kana),
                         UnitKind::Char(c) if !c.is_ascii_punctuation() => {
-                            text.push(c);
+                            text.push(*c);
                             latin_end = c.is_ascii_digit();
                         }
-                        UnitKind::Char(c) if is_decimal_point(part, unit.start) => text.push(c),
+                        UnitKind::Char(c) if is_decimal_point(part, unit.start) => text.push(*c),
                         UnitKind::Char('.')
                             if period_as_typed(part, unit.start, &text, after_latin) =>
                         {
                             text.push('.')
                         }
-                        UnitKind::Char(c) => match symbols.get(&c) {
+                        UnitKind::Char(c) => match symbols.get(c) {
                             Some(s) => text.push_str(s),
-                            None => text.push(match c {
+                            None => text.push(match *c {
                                 ',' => '、',
                                 '.' => '。',
-                                _ => char::from_u32(c as u32 - 0x21 + 0xff01).unwrap_or(c),
+                                ch => char::from_u32(ch as u32 - 0x21 + 0xff01).unwrap_or(ch),
                             }),
                         },
                         UnitKind::Pending if done => text.extend(&part[unit.start..unit.end]),

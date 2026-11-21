@@ -59,7 +59,7 @@ fn reads(typed: &[char]) -> Option<String> {
     let mut out = String::new();
     for u in romaji_units(typed, true) {
         match u.kind {
-            UnitKind::Kana(k) => out.push_str(k),
+            UnitKind::Kana(k) => out.push_str(&k),
             UnitKind::Char(c) if c.is_ascii_alphabetic() => return None,
             UnitKind::Char(c) => out.push(c),
             UnitKind::Pending => return None,
@@ -177,7 +177,7 @@ pub fn shift_slips(typed: &str) -> Option<String> {
         // the capital starts a kana of two letters or more
         let starts = romaji_units(&word, true)
             .first()
-            .is_some_and(|u| u.end >= 2 && !matches!(u.kind, UnitKind::Kana("ん")));
+            .is_some_and(|u| u.end >= 2 && !matches!(&u.kind, UnitKind::Kana(k) if k == "ん"));
         if starts && reads(&word).is_some() {
             chars[at] = word[0];
             found = true;

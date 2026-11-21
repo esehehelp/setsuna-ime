@@ -14,6 +14,8 @@
 //! their case and typed ASCII symbols are shown per span (`.` in
 //! `example.com`, 。 after Japanese).
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -319,7 +321,20 @@ struct MixedInput {
     symbols: HashMap<char, String>,
     before: String,
     casing: crate::mixed::Casing,
+    cache: RefCell<MixedCache>,
 }
+
+/// Memoized `MixedModel::cased_with` outputs for the current `(before, lexicon,
+/// casing, romaji_table)` so repeated queries on one Space / Enter (`ends_in_english`,
+/// `full_reading`, `reads_otherwise_when_done`, `commit_reading`, `voicing_alt`, etc.)
+/// avoid re-running the O(N²) DP.
+#[derive(Debug, Clone, Default)]
+struct MixedCache {
+    romaji_gen: u64,
+    entries: Vec<(String, bool, Vec<char>, Vec<Span>)>,
+}
+
+const MIXED_CACHE_CAP: usize = 8;
 
 /// Chars of the text before the caret the mixed model looks at.
 const MIXED_BEFORE: usize = 32;
@@ -414,6 +429,7 @@ impl ComposingText {
                 .collect(),
             before: String::new(),
             casing,
+            cache: RefCell::default(),
         });
         self.recompute(false);
     }
@@ -421,6 +437,7 @@ impl ComposingText {
     /// The reading lexicon for the mixed model (`None`: none).
     pub fn set_lexicon(&mut self, lexicon: Option<Arc<crate::lexicon::Lexicon>>) {
         self.lexicon = lexicon;
+        self.clear_mixed_cache();
         if self.mixed.is_some() {
             self.recompute(false);
         }
@@ -487,11 +504,15 @@ impl ComposingText {
     pub fn set_before(&mut self, before: &str) {
         if let Some(mixed) = self.mixed.as_mut() {
             let n = before.chars().count();
-            mixed.before = before
+            let trimmed: String = before
                 .chars()
                 .skip(n.saturating_sub(MIXED_BEFORE))
                 .collect();
-            self.recompute(false);
+            if mixed.before != trimmed {
+                mixed.before = trimmed;
+                mixed.cache.get_mut().entries.clear();
+                self.recompute(false);
+            }
         }
     }
 
@@ -527,21 +548,13 @@ impl ComposingText {
 
     /// Whether the composition ends in an English word.
     pub fn ends_in_english(&self) -> bool {
-        let Some(mixed) = &self.mixed else {
-            return false;
-        };
-        mixed
-            .model
-            .cased_with(
-                &self.raw,
-                Some(&mixed.before),
-                true,
-                mixed.casing,
-                self.lexicon.as_deref(),
-            )
-            .1
-            .last()
-            .is_some_and(|span| span.lang == Lang::En && span.end == self.raw.chars().count())
+        let len = self.raw.chars().count();
+        self.with_cased_mixed(&self.raw, true, |_, spans| {
+            spans
+                .last()
+                .is_some_and(|span| span.lang == Lang::En && span.end == len)
+        })
+        .unwrap_or(false)
     }
 
     /// Whether the composition ends in a lone `i`, which the word after it
@@ -828,6 +841,55 @@ impl ComposingText {
         self.hiragana.clear();
         self.pending.clear();
         self.cursor = 0;
+        self.clear_mixed_cache();
+    }
+
+    fn clear_mixed_cache(&mut self) {
+        if let Some(mixed) = self.mixed.as_mut() {
+            mixed.cache.get_mut().entries.clear();
+        }
+    }
+
+    /// Run `f` on the cached `(cased_chars, spans)` of `(raw, fin)` for the active mixed model.
+    fn with_cased_mixed<R>(
+        &self,
+        raw: &str,
+        fin: bool,
+        f: impl FnOnce(&[char], &[Span]) -> R,
+    ) -> Option<R> {
+        let mixed = self.mixed.as_ref()?;
+        let romaji_gen = crate::romaji_table::generation();
+        {
+            let mut cache = mixed.cache.borrow_mut();
+            if cache.romaji_gen != romaji_gen {
+                cache.entries.clear();
+                cache.romaji_gen = romaji_gen;
+            }
+            if let Some(pos) = cache
+                .entries
+                .iter()
+                .position(|(k, cached_fin, _, _)| *cached_fin == fin && k == raw)
+            {
+                let (_, _, chars, spans) = &cache.entries[pos];
+                return Some(f(chars, spans));
+            }
+        }
+        let (chars, spans) = mixed.model.cased_with(
+            raw,
+            Some(&mixed.before),
+            fin,
+            mixed.casing,
+            self.lexicon.as_deref(),
+        );
+        let out = f(&chars, &spans);
+        let mut cache = mixed.cache.borrow_mut();
+        if cache.romaji_gen == romaji_gen {
+            if cache.entries.len() >= MIXED_CACHE_CAP {
+                cache.entries.remove(0);
+            }
+            cache.entries.push((raw.to_string(), fin, chars, spans));
+        }
+        Some(out)
     }
 
     /// `raw` as an edit writes it back: as shown, but the letters of an
@@ -839,17 +901,13 @@ impl ComposingText {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };
-        let (_, spans) = mixed.model.cased_with(
-            raw,
-            Some(&mixed.before),
-            flush_final_n,
-            mixed.casing,
-            self.lexicon.as_deref(),
-        );
         let chars: Vec<char> = raw.chars().collect();
-        let (text, pending) =
-            crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
-        Converted { text, pending }
+        self.with_cased_mixed(raw, flush_final_n, |_, spans| {
+            let (text, pending) =
+                crate::mixed::render_parts(&chars, spans, flush_final_n, &mixed.symbols);
+            Converted { text, pending }
+        })
+        .expect("mixed is Some")
     }
 
     /// `raw` as shown: romaji as kana, or with a mixed model its spans, ず
@@ -865,16 +923,12 @@ impl ComposingText {
         let Some(mixed) = &self.mixed else {
             return convert_raw(raw, flush_final_n);
         };
-        let (chars, spans) = mixed.model.cased_with(
-            raw,
-            Some(&mixed.before),
-            flush_final_n,
-            mixed.casing,
-            self.lexicon.as_deref(),
-        );
-        let (text, pending) =
-            crate::mixed::render_parts(&chars, &spans, flush_final_n, &mixed.symbols);
-        Converted { text, pending }
+        self.with_cased_mixed(raw, flush_final_n, |chars, spans| {
+            let (text, pending) =
+                crate::mixed::render_parts(chars, spans, flush_final_n, &mixed.symbols);
+            Converted { text, pending }
+        })
+        .expect("mixed is Some")
     }
 }
 
@@ -892,7 +946,7 @@ fn convert_raw(raw: &str, flush_final_n: bool) -> Converted {
     };
     for unit in romaji_units(&chars, flush_final_n) {
         match unit.kind {
-            UnitKind::Kana(kana) => out.text.push_str(kana),
+            UnitKind::Kana(kana) => out.text.push_str(&kana),
             UnitKind::Char(c) => out.text.push(c),
             UnitKind::Pending => out.pending = chars[unit.start..unit.end].iter().collect(),
         }
@@ -937,18 +991,18 @@ pub(crate) fn pending_kana(pending: &str) -> Vec<char> {
 
 /// One step of reading romaji: the chars `start..end` of the input and
 /// what they become.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RomajiUnit {
     pub start: usize,
     pub end: usize,
     pub kind: UnitKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnitKind {
     /// A syllable (`ka` → か, `-` → ー, a doubled consonant's first letter
-    /// → っ).
-    Kana(&'static str),
+    /// → っ). Borrowed for the built-in table; owned for custom tables.
+    Kana(Cow<'static, str>),
     /// A char kept as it is: a non-letter (digit, symbol) or a letter that
     /// starts no romaji (lowercased).
     Char(char),
@@ -976,7 +1030,7 @@ pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUni
     while i < chars.len() {
         let c = chars[i];
         if c == '-' {
-            push(i, 1, UnitKind::Kana("ー"));
+            push(i, 1, UnitKind::Kana(Cow::Borrowed("ー")));
             i += 1;
             continue;
         }
@@ -989,7 +1043,7 @@ pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUni
         if c == 'n' {
             if i + 1 >= chars.len() {
                 if flush_final_n {
-                    push(i, 1, UnitKind::Kana("ん"));
+                    push(i, 1, UnitKind::Kana(Cow::Borrowed("ん")));
                 } else {
                     push(i, 1, UnitKind::Pending);
                 }
@@ -998,12 +1052,12 @@ pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUni
             }
             let next = chars[i + 1];
             if next == 'n' || next == '\'' {
-                push(i, 2, UnitKind::Kana("ん"));
+                push(i, 2, UnitKind::Kana(Cow::Borrowed("ん")));
                 i += 2;
                 continue;
             }
             if !matches!(next, 'a' | 'i' | 'u' | 'e' | 'o' | 'y') {
-                push(i, 1, UnitKind::Kana("ん"));
+                push(i, 1, UnitKind::Kana(Cow::Borrowed("ん")));
                 i += 1;
                 continue;
             }
@@ -1013,7 +1067,7 @@ pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUni
             && chars[i] == chars[i + 1]
             && !matches!(c, 'a' | 'i' | 'u' | 'e' | 'o' | 'n')
         {
-            push(i, 1, UnitKind::Kana("っ"));
+            push(i, 1, UnitKind::Kana(Cow::Borrowed("っ")));
             i += 1;
             continue;
         }
@@ -1024,7 +1078,7 @@ pub(crate) fn romaji_units(chars: &[char], flush_final_n: bool) -> Vec<RomajiUni
             .copied()
         {
             let len = romaji.chars().count();
-            push(i, len, UnitKind::Kana(kana));
+            push(i, len, UnitKind::Kana(Cow::Borrowed(kana)));
             i += len;
             continue;
         }

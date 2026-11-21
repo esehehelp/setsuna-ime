@@ -25,6 +25,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static LOG_NAME: OnceLock<&'static str> = OnceLock::new();
+/// Cached resolved log file path for `LOG_NAME` (its parent directory ensured
+/// once on initialization) so `log()` avoids per-keystroke `env::var_os` and
+/// `create_dir_all` calls.
+static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static LOG_TYPED_TEXT: AtomicBool = AtomicBool::new(false);
 
 /// Log what the user types as it is (`[diagnostics] log_typed_text`).
@@ -60,8 +64,21 @@ pub fn init(name: &'static str) {
     let _ = LOG_NAME.set(name);
 }
 
+fn cached_log_path() -> Option<&'static Path> {
+    let name = *LOG_NAME.get()?;
+    LOG_PATH
+        .get_or_init(|| {
+            let path = log_path(name)?;
+            if let Some(parent) = path.parent() {
+                let _ = crate::private_file::create_dir_all(parent);
+            }
+            Some(path)
+        })
+        .as_deref()
+}
+
 pub fn log(message: impl AsRef<str>) {
-    let Some(path) = LOG_NAME.get().and_then(|name| log_path(name)) else {
+    let Some(path) = cached_log_path() else {
         return;
     };
     let line = format!(
@@ -70,7 +87,7 @@ pub fn log(message: impl AsRef<str>) {
         std::process::id(),
         message.as_ref()
     );
-    if let Some(mut file) = open_log(&path) {
+    if let Some(mut file) = open_capped_inner(path, LOG_LIMIT, false) {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -83,11 +100,26 @@ pub fn open_log(path: &Path) -> Option<File> {
 }
 
 fn open_capped(path: &Path, limit: u64) -> Option<File> {
-    if let Some(parent) = path.parent() {
-        let _ = crate::private_file::create_dir_all(parent);
+    open_capped_inner(path, limit, true)
+}
+
+fn open_capped_inner(path: &Path, limit: u64, ensure_dir: bool) -> Option<File> {
+    if ensure_dir {
+        if let Some(parent) = path.parent() {
+            let _ = crate::private_file::create_dir_all(parent);
+        }
     }
     // the user's alone, as what is typed may be in it (`log_typed_text`)
-    let open = || crate::private_file::append(path).ok();
+    let open = || match crate::private_file::append(path) {
+        Ok(f) => Some(f),
+        Err(e) if !ensure_dir && e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = crate::private_file::create_dir_all(parent);
+            }
+            crate::private_file::append(path).ok()
+        }
+        Err(_) => None,
+    };
     let file = open()?;
     if file.metadata().is_ok_and(|m| m.len() > limit) {
         drop(file);
