@@ -39,15 +39,10 @@ if ($InstallDir.Length -gt 3) { $InstallDir = $InstallDir.TrimEnd('\', '/') }
 # installs before the code moved to Program Files, and the install log and cache
 $UserDir    = Join-Path $env:LOCALAPPDATA 'setsuna-ime'
 $ConfigDir  = Join-Path $env:APPDATA      'setsuna-ime'
-# what regsvr32 /u is run on when the registry names nothing there: the shim
-# registered as the IME, else the IME DLL itself (an install before the shim),
-# in the install directory only: regsvr32 runs elevated and loads what it is
-# given, and the user's directory is the user's to write (an install before
-# 0.3.0 there is unregistered as the machine's registration names it)
-$DllPath    = Join-Path $InstallDir 'setsuna_tsf_shim.dll'
-foreach ($p in @(Join-Path $InstallDir 'setsuna_tsf.dll')) {
-    if (-not (Test-Path -LiteralPath $DllPath)) { $DllPath = $p }
-}
+# regsvr32 /u is run on the DLL the machine's registration names, and on
+# nothing else: it runs elevated and loads what it is given, and -InstallDir
+# is the caller's to give (a DLL there need not be Setsuna's). Every install,
+# before the shim too, registered for the machine.
 # the machine's registration: HKEY_CLASSES_ROOT puts the user's own
 # HKCU\Software\Classes, which the user may write, over it
 $ClsidReg   = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{C3F4DFA2-6E28-4AA0-9DAA-407B575EF52D}\InProcServer32'
@@ -130,14 +125,15 @@ function Test-InstallDir([string]$Dir) {
     return (@($marks).Count -gt 0 -and $dlls.Count -gt 0)
 }
 
+# The DLL the machine's registration names, when it is there; else none.
 function Get-RegisteredDllPath {
     try {
         $registered = (Get-ItemProperty -LiteralPath $ClsidReg -ErrorAction Stop).'(default)'
-        if ($registered -and (Test-Path -LiteralPath $registered)) {
+        if ($registered -and (Test-Path -LiteralPath $registered -PathType Leaf)) {
             return $registered
         }
     } catch { }
-    return $DllPath
+    return $null
 }
 
 Write-Log INFO "uninstall starting (Yes=$Yes, KeepConfig=$KeepConfig, NoElevate=$NoElevate, InstallDir=$InstallDir)"
@@ -146,7 +142,7 @@ $RegisteredDllPath = Get-RegisteredDllPath
 
 # 1. Elevate for regsvr32 /u and Program Files (something still there + caller
 # not admin + elevation allowed).
-if (((Test-Path -LiteralPath $RegisteredDllPath) -or (Test-Path -LiteralPath $InstallDir)) -and
+if (($RegisteredDllPath -or (Test-Path -LiteralPath $InstallDir)) -and
     -not (Test-IsAdmin) -and -not $NoElevate) {
     Write-Log INFO 'elevating for regsvr32 /u'
     $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Format-Argument $PSCommandPath))
@@ -166,7 +162,7 @@ if (((Test-Path -LiteralPath $RegisteredDllPath) -or (Test-Path -LiteralPath $In
 }
 
 # 2. Unregister DLL.
-if ((Test-Path -LiteralPath $RegisteredDllPath) -and -not $NoElevate) {
+if ($RegisteredDllPath -and -not $NoElevate) {
     Write-Log INFO "regsvr32 /u /s $RegisteredDllPath"
     $p = Start-Process regsvr32.exe -ArgumentList '/u','/s', "`"$RegisteredDllPath`"" -Wait -PassThru -NoNewWindow
     Write-Log INFO "regsvr32 exit: $($p.ExitCode)"
@@ -207,8 +203,12 @@ if ((Test-Path -LiteralPath $InstallDir) -and -not (Test-InstallDir $InstallDir)
 }
 
 # 4b. What installs before the move to Program Files left in the user's
-# directory (the install log stays until the end).
-if ((Test-Path -LiteralPath $UserDir) -and ($UserDir -ne $InstallDir)) {
+# directory (the install log stays until the end); not when the directory is
+# a link (its listing would be where the link leads, deleted elevated).
+$userDirItem = Get-Item -LiteralPath $UserDir -Force -ErrorAction SilentlyContinue
+if ($userDirItem -and (Test-ReparsePoint $userDirItem)) {
+    Write-Log WARN "$UserDir is a link: what it holds is left as it is"
+} elseif ((Test-Path -LiteralPath $UserDir) -and ($UserDir -ne $InstallDir)) {
     Get-ChildItem -LiteralPath $UserDir -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notmatch '^(install|uninstall)\.log$' } |
         ForEach-Object {

@@ -493,18 +493,32 @@ function Install-ArtifactFile {
     if (-not (Test-InCache $Source)) {
         return Copy-InstallFile -Source $Source -Destination $Destination -AllowLockedFallback:$AllowLockedFallback
     }
-    # one an install before linked to the cache is the cache's file, which the
-    # user may write: it is replaced by a copy like any other
-    $target = $Destination
-    if (Test-Path -LiteralPath $Destination) {
+    # One an install before linked to the cache is the cache's file, which the
+    # user may write: it is replaced by a copy like any other. One there
+    # unlinked with the content stays.
+    $exists = Test-Path -LiteralPath $Destination
+    if ($exists -and -not (Test-HardLinked -Source $Source -Destination $Destination) -and
+        (Test-SameContent -Source $Source -Destination $Destination)) {
+        Write-Log INFO "skip (unchanged) $Destination"
+        return $Destination
+    }
+    # Copied, not linked (a link is the cache's file, with the ACL of the
+    # user's directory it was downloaded to), beside its place first: the file
+    # there goes only once the new one is whole (on a full disk the copy
+    # fails and the installed model stays as it was).
+    $new = "$Destination.new"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $new -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    if ($exists) {
         try {
             Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
         } catch {
-            if (-not (Test-HardLinked -Source $Source -Destination $Destination) -and
-                (Test-SameContent -Source $Source -Destination $Destination)) {
-                Write-Log INFO "skip (unchanged, in use) $Destination"
-                return $Destination
-            }
+            # held (a lexicon apps map): the new one under its content's name
+            Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue
             if (-not $AllowLockedFallback) { throw }
             $target = Join-Path (Split-Path -Parent $Destination) (Get-ContentAddressedName -Source $Source -Destination $Destination)
             if (-not (Test-HardLinked -Source $Source -Destination $target) -and
@@ -513,14 +527,14 @@ function Install-ArtifactFile {
                 return $target
             }
             Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            Copy-Item -LiteralPath $Source -Destination $target -Force
             Write-Log WARN "$Destination was locked; installing $target"
+            return $target
         }
     }
-    # copied, not linked: a link is the cache's file, with the ACL of the
-    # user's directory it was downloaded to
-    Copy-Item -LiteralPath $Source -Destination $target -Force
-    Write-Log INFO "copied $Source -> $target"
-    return $target
+    Move-Item -LiteralPath $new -Destination $Destination
+    Write-Log INFO "copied $Source -> $Destination"
+    return $Destination
 }
 
 # The files a model, reranker or analyzer manifest names, relative to it.
@@ -1340,7 +1354,10 @@ Set-ItemProperty $UninstReg InstallLocation $InstallDir
 Set-ItemProperty $UninstReg InstallDate     (Get-Date -Format 'yyyyMMdd')
 # Windows PowerShell: always there, whichever PowerShell installed this.
 $WinPs = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
-Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`" -InstallDir `"$InstallDir`""
+# a files-only install's uninstaller is one too: elevated, it would unregister
+# the machine's install
+$uninstallArgs = if ($NoElevate) { ' -NoElevate' } else { '' }
+Set-ItemProperty $UninstReg UninstallString "`"$WinPs`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`" -InstallDir `"$InstallDir`"$uninstallArgs"
 Set-ItemProperty $UninstReg NoModify        1 -Type DWord
 Set-ItemProperty $UninstReg NoRepair        1 -Type DWord
 Write-Log INFO "registered Uninstall entry: $UninstReg"

@@ -634,24 +634,36 @@ impl ShimTip_Impl {
             return;
         }
         let handed = new.swap_in(&state);
-        match unsafe { new.tip.ActivateEx(&thread_mgr, tid, flags) } {
+        // Still in the swap while a core activates: TSF may deactivate the
+        // shim from inside that too, when `core` is still the old one, which
+        // is deactivated already. The core that came up then goes down here.
+        self.state.borrow_mut().swapping = true;
+        let activated = unsafe { new.tip.ActivateEx(&thread_mgr, tid, flags) };
+        let (core, came_up) = match activated {
             Ok(()) => {
                 log(format!(
                     "swapped {} -> {} (state handed over: {handed})",
                     old.path.display(),
                     new.path.display()
                 ));
-                self.state.borrow_mut().core = Some(new);
+                (new, true)
             }
             Err(e) => {
                 log(format!(
                     "swap: the new core did not activate: {e:?}; the old one again"
                 ));
                 old.swap_in(&state);
-                let _ = unsafe { old.tip.ActivateEx(&thread_mgr, tid, flags) };
+                let again = unsafe { old.tip.ActivateEx(&thread_mgr, tid, flags) }.is_ok();
                 self.state.borrow_mut().failed = now;
+                (old, again)
             }
+        };
+        self.state.borrow_mut().swapping = false;
+        if came_up && self.state.borrow().active.is_none() {
+            log("swap: deactivated while the core activated; it goes down too");
+            let _ = unsafe { core.tip.Deactivate() };
         }
+        self.state.borrow_mut().core = Some(core);
     }
 
     /// After the directory's watch saw a change: it waits for the next

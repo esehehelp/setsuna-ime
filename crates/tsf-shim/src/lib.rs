@@ -46,7 +46,7 @@ mod shim;
 /// that the linker keeps it.
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
-pub static SetsunaShimVersion: [u8; 23] = *b"setsuna-shim-version:3\0";
+pub static SetsunaShimVersion: [u8; 23] = *b"setsuna-shim-version:4\0";
 
 #[cfg(test)]
 mod tests {
@@ -82,7 +82,7 @@ mod tests {
             .expect("setsuna-shim-version:<digits>\\0");
         assert_eq!(
             (version, format!("{digest:016x}")),
-            (3, "5327c2584531a102".to_string()),
+            (4, "0bb480a717419e79".to_string()),
             "the shim's sources changed: raise SetsunaShimVersion if what the shim does changed, then record both"
         );
     }

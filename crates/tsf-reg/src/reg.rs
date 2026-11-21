@@ -93,6 +93,14 @@ fn clsid_key(service: &TextService) -> String {
 pub fn register(service: &TextService, dll_path: &str) -> Result<()> {
     let key_path = clsid_key(service);
     unsafe {
+        // A class of the same CLSID in the user's own classes comes before
+        // the machine's in the user's apps: one left there (an older
+        // registration, or one made to come first) goes.
+        let _ = RegDeleteKeyW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(format!("{key_path}\\InProcServer32")),
+        );
+        let _ = RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(&key_path));
         let mut key = HKEY::default();
         RegCreateKeyW(HKEY_LOCAL_MACHINE, &HSTRING::from(&key_path), &mut key).ok()?;
         let set = set_string(key, PCWSTR::null(), service.description);

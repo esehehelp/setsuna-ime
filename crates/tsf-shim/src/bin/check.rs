@@ -102,8 +102,20 @@ mod run {
         code
     }
 
-    /// The work directories of checks before (`check-*` in the shim's
-    /// directory) an hour old: what a check that crashed left.
+    /// Whether `name` is a work directory's as `main` names them:
+    /// `check-<pid>-<nanos>`, nothing else a directory may be called.
+    fn is_work_name(name: &str) -> bool {
+        name.strip_prefix("check-")
+            .and_then(|rest| rest.split_once('-'))
+            .is_some_and(|(pid, stamp)| {
+                [pid, stamp]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            })
+    }
+
+    /// The work directories of checks before (`check-<pid>-<nanos>` in the
+    /// shim's directory) an hour old: what a check that crashed left.
     fn remove_old_work(dir: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -114,7 +126,7 @@ mod run {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.elapsed().ok());
-            if entry.file_name().to_string_lossy().starts_with("check-")
+            if is_work_name(&entry.file_name().to_string_lossy())
                 && entry.file_type().is_ok_and(|t| t.is_dir())
                 && old.is_some_and(|age| age > std::time::Duration::from_secs(3600))
             {

@@ -247,21 +247,27 @@ fn create_notify_window(service_ptr: *const core::ffi::c_void) -> HWND {
     let class_pcw = PCWSTR(class_w.as_ptr());
 
     unsafe {
-        static REGISTERED: std::sync::Once = std::sync::Once::new();
-        REGISTERED.call_once(|| {
+        // registered once it took (a failure is tried again at the next
+        // service's window, not taken for done)
+        static REGISTERED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !REGISTERED.load(std::sync::atomic::Ordering::Acquire) {
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(notify_wnd_proc),
                 hInstance: hinstance,
                 lpszClassName: class_pcw,
                 ..Default::default()
             };
-            if RegisterClassW(&wc) == 0 {
+            const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+            if RegisterClassW(&wc) != 0 || GetLastError().0 == ERROR_CLASS_ALREADY_EXISTS {
+                REGISTERED.store(true, std::sync::atomic::Ordering::Release);
+            } else {
                 setsuna_core::diagnostics::log(format!(
                     "RegisterClassW failed class={class_name} err={:?}",
                     GetLastError()
                 ));
             }
-        });
+        }
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_pcw,
