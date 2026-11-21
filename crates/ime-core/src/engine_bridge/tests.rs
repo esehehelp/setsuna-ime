@@ -3304,6 +3304,40 @@ fn every_user_word_of_the_other_reading_is_offered() {
 }
 
 #[test]
+fn the_other_readings_late_list_leaves_a_form_shown() {
+    // the other reading's list came after its wait and F7 was pressed
+    // first: the katakana form stays what Enter commits
+    let (mut bridge, mock) = mixed_bridge();
+    type_str(&mut bridge, "yoro");
+    bridge.phase = Phase::Converting {
+        candidates: v(&["yoro"]),
+        selected: 0,
+        seg: None,
+    };
+    bridge.comp.alt = Some(AltList {
+        reading: Some("よろ".into()),
+        req_id: Some(7),
+        awaited: false,
+        candidates: Vec::new(),
+        main: v(&["yoro"]),
+        ends_english: false,
+        typed: "yoro".into(),
+        typed_early: false,
+        user_words: Vec::new(),
+    });
+    let out = bridge.handle_convert_to(Form::Katakana);
+    let form = preedit(&out.actions).expect("a form shown");
+    *mock.state.next.borrow_mut() = Some(EngineResult {
+        req_id: 7,
+        reading: "よろ".into(),
+        candidates: v(&["余呂", "世路"]),
+        ..Default::default()
+    });
+    assert!(shown(&bridge.apply_async_result()).is_none());
+    assert_eq!(commits(&bridge.handle_enter().actions), vec![form]);
+}
+
+#[test]
 fn a_shortcut_word_stays_out_of_the_preedit_of_a_longer_reading() {
     let (mut bridge, mock) = bridge_with_mock();
     let (entries, _) = crate::user_dict::parse("じゅうしょ\t東京都千代田区1-1\t短縮よみ\n");

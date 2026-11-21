@@ -511,8 +511,10 @@ impl ComposingText {
             if mixed.before != trimmed {
                 mixed.before = trimmed;
                 mixed.cache.get_mut().entries.clear();
-                self.recompute(false);
             }
+            // as typing shows it even when the text before is the same (a
+            // reading finished by `commit_reading` goes back to typing)
+            self.recompute(false);
         }
     }
 
@@ -883,7 +885,9 @@ impl ComposingText {
         );
         let out = f(&chars, &spans);
         let mut cache = mixed.cache.borrow_mut();
-        if cache.romaji_gen == romaji_gen {
+        // kept only when no other table came in while it was read (another
+        // thread's `romaji_table::configure`): it may have read that one
+        if cache.romaji_gen == romaji_gen && crate::romaji_table::generation() == romaji_gen {
             if cache.entries.len() >= MIXED_CACHE_CAP {
                 cache.entries.remove(0);
             }
@@ -1448,6 +1452,31 @@ mod tests {
             };
             assert_eq!(c.commit_tail(), expected, "{word}");
             assert!(c.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_text_before_set_again_shows_the_typing_as_typed() {
+        // the same text before, after a reading finished by commit_reading:
+        // the preedit is what typing shows again, as when it changed
+        let model = Arc::new(crate::mixed::tests::model());
+        // (`how`: ほw while typed, how once finished, the input kept as typed)
+        for word in ["how", "ok", "kyouha"] {
+            let mut c = ComposingText::new();
+            c.set_mixed(
+                Some(model.clone()),
+                &crate::config::default_symbol_map(),
+                crate::mixed::Casing::default(),
+            );
+            c.set_before("");
+            word.chars().for_each(|ch| c.input_char(ch));
+            let typing = c.preedit();
+            c.commit_reading();
+            if word == "how" {
+                assert_eq!(c.preedit(), "how");
+            }
+            c.set_before("");
+            assert_eq!(c.preedit(), typing, "{word}");
         }
     }
 

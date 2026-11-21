@@ -352,9 +352,34 @@ struct LastProposal {
 #[derive(Default)]
 struct ProposalCache {
     slots: [Option<LastProposal>; 2],
+    /// The settings its proposals were made with.
+    settings: ProposalSettings,
+}
+
+/// What a proposal depends on besides its key (context, reading, greedy, inspect): the session's settings, which a
+/// caller of the library may change between conversions (the daemon never does).
+#[derive(Default, PartialEq)]
+struct ProposalSettings {
+    max_context: usize,
+    top_k: usize,
+    vocab_blacklist: Vec<u32>,
 }
 
 impl ProposalCache {
+    /// Empty the cache when its proposals were made with other settings.
+    fn settings(&mut self, max_context: usize, top_k: usize, vocab_blacklist: &[u32]) {
+        let s = &self.settings;
+        if s.max_context != max_context || s.top_k != top_k || s.vocab_blacklist != vocab_blacklist
+        {
+            self.slots = [None, None];
+            self.settings = ProposalSettings {
+                max_context,
+                top_k,
+                vocab_blacklist: vocab_blacklist.to_vec(),
+            };
+        }
+    }
+
     fn get(
         &mut self,
         context: &str,
@@ -1011,6 +1036,9 @@ impl EngineSession {
         let greedy_only = greedy && self.inspect == 0;
 
         let proposal_t0 = Instant::now();
+        let top_k = cfg.top_k_per_step.max(self.inspect.saturating_add(1));
+        self.last_proposals
+            .settings(cfg.max_context, top_k, &cfg.vocab_blacklist);
         let (ort_ms, reduce_ms) = if self
             .last_proposals
             .get(context, reading, greedy_only, self.inspect)
@@ -1035,7 +1063,7 @@ impl EngineSession {
                 &self.tokenizer,
                 encoded,
                 &cfg.vocab_blacklist,
-                cfg.top_k_per_step.max(self.inspect.saturating_add(1)),
+                top_k,
                 self.reduce,
                 greedy_only,
             )?;
@@ -1460,6 +1488,18 @@ mod tests {
         // Greedy / inspect mismatches do not hit
         assert!(cache.get("ctx", "other", true, 0).is_none());
         assert!(cache.get("ctx", "other", false, 1).is_none());
+        // Other settings empty it, the same ones keep it
+        cache.settings(64, 16, &[]);
+        cache.insert(entry("ctx", "other", false, 0, 2));
+        cache.settings(64, 16, &[]);
+        assert!(cache.get("ctx", "other", false, 0).is_some());
+        cache.settings(0, 16, &[]);
+        assert!(cache.get("ctx", "other", false, 0).is_none());
+        cache.insert(entry("ctx", "other", false, 0, 2));
+        cache.settings(0, 16, &[7]);
+        assert!(cache.get("ctx", "other", false, 0).is_none());
+        cache.insert(entry("ctx", "first", false, 0, 1));
+        cache.insert(entry("ctx", "other", false, 0, 2));
         // Inserting a third reading evicts the LRU ("first"), keeping MRU ("other") and the new one ("third")
         cache.insert(entry("ctx", "third", false, 0, 3));
         assert!(cache.get("ctx", "first", false, 0).is_none());

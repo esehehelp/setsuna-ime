@@ -318,6 +318,8 @@ impl Lexicon {
     /// `CONNECTION_WEIGHT` (for evaluations).
     pub fn set_connection_weight(&mut self, w: f32) {
         self.connection_weight = w;
+        // another lexicon to what caches its costs by its id
+        self.id = NEXT_LEXICON_ID.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The cost of a word with left id `lid` after one with right id `rid`.

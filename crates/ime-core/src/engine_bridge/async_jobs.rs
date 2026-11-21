@@ -286,6 +286,10 @@ impl EngineBridge {
         if !self.store_alt_result(result) {
             return Vec::new();
         }
+        // an F6–F10 form shown stays: the list is there again when it is left
+        if self.form_shown().is_some() {
+            return Vec::new();
+        }
         let shown = match &self.phase {
             Phase::Converting {
                 candidates,

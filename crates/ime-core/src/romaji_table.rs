@@ -201,9 +201,11 @@ impl RomajiTable {
 static ACTIVE: RwLock<Option<(String, Arc<RomajiTable>)>> = RwLock::new(None);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Monotonic generation incremented whenever the active romaji table changes.
+/// Monotonic generation incremented whenever the active romaji table changes,
+/// under the table's lock: one read before a conversion and one after it that
+/// agree say the conversion read the table of that generation.
 pub(crate) fn generation() -> u64 {
-    GENERATION.load(Ordering::Relaxed)
+    GENERATION.load(Ordering::SeqCst)
 }
 
 /// The table in effect (`None`: the built-in romaji).
@@ -258,8 +260,9 @@ pub fn configure(spec: &str) -> Result<(), String> {
     };
     if let Ok(mut a) = ACTIVE.write() {
         *a = table;
+        // with the table: no reader sees the new table with the old generation
+        GENERATION.fetch_add(1, Ordering::SeqCst);
     }
-    GENERATION.fetch_add(1, Ordering::Relaxed);
     result
 }
 

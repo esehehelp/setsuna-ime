@@ -249,8 +249,9 @@ pub(crate) fn read_json_stream<R: BufRead>(
         if !ready {
             if is_ready(trimmed) {
                 ready = true;
-                crate::diagnostics::log(format!("{label} ready: {trimmed}"));
+                // ready before the log line: a waiter must not wait on the log
                 on_ready(trimmed);
+                crate::diagnostics::log(format!("{label} ready: {trimmed}"));
             } else {
                 crate::diagnostics::log(format!("{label} skipped a line before the ready line"));
             }
