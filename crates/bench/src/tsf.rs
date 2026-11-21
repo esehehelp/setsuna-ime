@@ -370,6 +370,9 @@ fn wait_front() {
         pump(500);
     }
     if told {
+        // the input method Windows gives the window coming to the front
+        // lands meanwhile, to be seen by the caller
+        pump(300);
         eprintln!("the bench window is in front again");
     }
 }
@@ -645,14 +648,62 @@ struct Meta {
     key_last_ms_p95: f64,
     key_last_ms_p99: f64,
     latency_keys: usize,
+    /// The times the input method had to be made this process's again
+    /// (Windows gives a window that comes to the front the input method in
+    /// use elsewhere when one serves every app).
+    reactivations: usize,
+}
+
+/// Make `prof` (none: the US keyboard) this process's input method.
+unsafe fn activate(mgr: &ITfInputProcessorProfileMgr, prof: Option<&Profile>) -> Result<()> {
+    match prof {
+        Some(p) => mgr.ActivateProfile(
+            TF_PROFILETYPE_INPUTPROCESSOR,
+            0x0411,
+            &p.clsid,
+            &p.profile,
+            HKL::default(),
+            TF_IPPMF_FORPROCESS,
+        )?,
+        None => mgr.ActivateProfile(
+            TF_PROFILETYPE_KEYBOARDLAYOUT,
+            0x0409,
+            &GUID::zeroed(),
+            &GUID::zeroed(),
+            HKL(0x0409_0409 as _),
+            TF_IPPMF_FORPROCESS,
+        )?,
+    }
+    Ok(())
+}
+
+/// Whether `prof` (none: a keyboard layout, no input method) is the one
+/// this thread's keys go to.
+unsafe fn is_active(mgr: &ITfInputProcessorProfileMgr, prof: Option<&Profile>) -> Result<bool> {
+    let mut active = TF_INPUTPROCESSORPROFILE::default();
+    mgr.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut active)?;
+    Ok(match prof {
+        Some(p) => {
+            active.dwProfileType == TF_PROFILETYPE_INPUTPROCESSOR
+                && active.clsid == p.clsid
+                && active.guidProfile == p.profile
+        }
+        None => active.dwProfileType == TF_PROFILETYPE_KEYBOARDLAYOUT,
+    })
 }
 
 /// Setsuna in this process neither learns from what the runner types, nor
 /// records it for prediction, nor sends it to the rewriter: the user's
 /// config has an `[[apps]]` entry for the runner that turns them off. Its
 /// history would change the user's conversions and the next run's, and the
-/// rewriter's answers the outputs.
-fn setsuna_records_nothing() -> Result<()> {
+/// rewriter's answers the outputs. Checked for every input method where
+/// Setsuna is set up (`required` only for Setsuna's own run): Windows can
+/// give the runner's window the input method in use elsewhere.
+fn setsuna_records_nothing(required: bool) -> Result<()> {
+    let set_up = setsuna_core::config::Config::appdata_config_path().is_some_and(|p| p.exists());
+    if !set_up && !required {
+        return Ok(());
+    }
     let exe = std::env::current_exe()?;
     let name = exe
         .file_name()
@@ -673,9 +724,7 @@ pub fn run(args: Args) -> Result<()> {
     let rows = crate::set::load(&args.sets, &args.only)?;
     let rows: Vec<_> = rows.into_iter().take(args.limit).collect();
     let prof = profile(&args.ime)?;
-    if args.ime == "setsuna" {
-        setsuna_records_nothing()?;
-    }
+    setsuna_records_nothing(args.ime == "setsuna")?;
     let rich = match args.field.as_str() {
         "edit" => false,
         "richedit" => true,
@@ -711,34 +760,29 @@ pub fn run(args: Args) -> Result<()> {
         let base = usage(&processes).me;
         let mgr: ITfInputProcessorProfileMgr =
             CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
-        match &prof {
-            Some(p) => mgr.ActivateProfile(
-                TF_PROFILETYPE_INPUTPROCESSOR,
-                0x0411,
-                &p.clsid,
-                &p.profile,
-                HKL::default(),
-                TF_IPPMF_FORPROCESS,
-            )?,
-            None => mgr.ActivateProfile(
-                TF_PROFILETYPE_KEYBOARDLAYOUT,
-                0x0409,
-                &GUID::zeroed(),
-                &GUID::zeroed(),
-                HKL(0x0409_0409 as _),
-                TF_IPPMF_FORPROCESS,
-            )?,
-        }
+        activate(&mgr, prof.as_ref())?;
         pump(800);
-        let mut active = TF_INPUTPROCESSORPROFILE::default();
-        mgr.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut active)?;
-        if let Some(p) = &prof {
-            ensure!(
-                active.clsid == p.clsid,
-                "{} did not become this process's input method",
-                args.ime
-            );
-        }
+        ensure!(
+            is_active(&mgr, prof.as_ref())?,
+            "{} did not become this process's input method",
+            args.ime
+        );
+        // the times it had to be made this process's input method again
+        let mut reactivations = 0;
+        let mut hold = |prof: Option<&Profile>| -> Result<()> {
+            wait_front();
+            if !is_active(&mgr, prof)? {
+                reactivations += 1;
+                activate(&mgr, prof)?;
+                pump(300);
+                ensure!(
+                    is_active(&mgr, prof)?,
+                    "{} did not become this process's input method again",
+                    args.ime
+                );
+            }
+            Ok(())
+        };
         let on = |p: &Option<Profile>| {
             for &k in p.as_ref().map(|p| p.on_keys).unwrap_or(&[]) {
                 press(k, false);
@@ -763,6 +807,7 @@ pub fn run(args: Args) -> Result<()> {
         let f = new_field(top, rich, "")?;
         pump(300);
         let field_transitory = transitory();
+        hold(prof.as_ref())?;
         on(&prof);
         type_keys("korehatesutodesu");
         let _ = f.settle(quiet, Duration::from_secs(10));
@@ -788,9 +833,10 @@ pub fn run(args: Args) -> Result<()> {
                 .map_err(|c| anyhow::anyhow!("{}: cannot type {c:?}", row.id))?;
             let mut tries = 0;
             let (f, s1, s2a, s2) = loop {
-                LOST.store(false, std::sync::atomic::Ordering::SeqCst);
                 let f = new_field(top, rich, &row.context)?;
                 pump(10);
+                hold(prof.as_ref())?;
+                LOST.store(false, std::sync::atomic::Ordering::SeqCst);
                 on(&prof);
                 type_keys(&keys);
                 let (_, s1) = f.settle(quiet, Duration::from_secs(5));
@@ -799,9 +845,17 @@ pub fn run(args: Args) -> Result<()> {
                 press(0x0D, false);
                 f.settle(after_enter, Duration::from_secs(3));
                 tries += 1;
-                if LOST.load(std::sync::atomic::Ordering::SeqCst) && tries < 5 {
-                    // typed while another window was in front: again
+                // typed while another window was in front, or with the
+                // input method that window gave this one: again
+                let kept = is_active(&mgr, prof.as_ref())?;
+                if LOST.load(std::sync::atomic::Ordering::SeqCst) || !kept {
                     let _ = DestroyWindow(f.hwnd);
+                    ensure!(
+                        tries < 5,
+                        "{}: {} did not stay this process's input method",
+                        row.id,
+                        args.ime
+                    );
                     continue;
                 }
                 break (f, s1, s2a, s2);
@@ -867,29 +921,56 @@ pub fn run(args: Args) -> Result<()> {
             let pause = Duration::from_millis(args.latency_quiet_ms);
             for row in rows.iter().step_by(step).take(args.latency_rows) {
                 let keys = crate::romaji::keys(&row.reading).unwrap_or_default();
-                let f = new_field(top, rich, &row.context)?;
-                pump(10);
-                on(&prof);
-                for (i, c) in keys.chars().enumerate() {
-                    type_char(c);
-                    let (first, last) = f.settle(pause, Duration::from_secs(2));
-                    if !first.is_zero() {
-                        key_first.push(ms(first));
-                        key_last.push(ms(last));
-                        key_rows.push(KeyOut {
-                            id: row.id.clone(),
-                            key: i,
-                            first_ms: ms(first),
-                            last_ms: ms(last),
-                        });
+                let mut tries = 0;
+                let got = loop {
+                    let f = new_field(top, rich, &row.context)?;
+                    pump(10);
+                    hold(prof.as_ref())?;
+                    LOST.store(false, std::sync::atomic::Ordering::SeqCst);
+                    on(&prof);
+                    let mut got = Vec::new();
+                    for (i, c) in keys.chars().enumerate() {
+                        type_char(c);
+                        let (first, last) = f.settle(pause, Duration::from_secs(2));
+                        if !first.is_zero() {
+                            got.push(KeyOut {
+                                id: row.id.clone(),
+                                key: i,
+                                first_ms: ms(first),
+                                last_ms: ms(last),
+                            });
+                        }
                     }
+                    press(0x20, false);
+                    f.settle_after(look, quiet, Duration::from_secs(8));
+                    press(0x0D, false);
+                    f.settle(after_enter, Duration::from_secs(3));
+                    let _ = DestroyWindow(f.hwnd);
+                    tries += 1;
+                    let kept = is_active(&mgr, prof.as_ref())?;
+                    if LOST.load(std::sync::atomic::Ordering::SeqCst) || !kept {
+                        ensure!(
+                            tries < 5,
+                            "{}: {} did not stay this process's input method",
+                            row.id,
+                            args.ime
+                        );
+                        continue;
+                    }
+                    break got;
+                };
+                for k in got {
+                    key_first.push(k.first_ms);
+                    key_last.push(k.last_ms);
+                    key_rows.push(k);
                 }
-                press(0x20, false);
-                f.settle_after(look, quiet, Duration::from_secs(8));
-                press(0x0D, false);
-                f.settle(after_enter, Duration::from_secs(3));
-                let _ = DestroyWindow(f.hwnd);
             }
+        }
+        if reactivations > 0 {
+            eprintln!(
+                "{} made this process's input method again {reactivations} times",
+                args.ime
+            );
         }
         let storage: u64 = prof
             .as_ref()
@@ -936,6 +1017,7 @@ pub fn run(args: Args) -> Result<()> {
             key_last_ms_p95: pct(&key_last, 0.95),
             key_last_ms_p99: pct(&key_last, 0.99),
             latency_keys: key_first.len(),
+            reactivations,
         };
         let mut lat = String::new();
         for k in &key_rows {
