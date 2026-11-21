@@ -304,19 +304,51 @@ enum Path {
     Plain,
 }
 
+/// The codes in the layout the active execution path reads (never both unless tile mode 5 needs both).
+enum Codes {
+    /// Two 4-bit codes a byte (N * K / 2 bytes): default x86_64 (`TILE_MODE_DEFAULT = 6`) and `Path::Plain`.
+    Packed(Vec<u8>),
+    /// One byte per code, 64-byte blocks (N * K bytes): ARMv8.2 UDOT (`Path::Dot`) and x86_64 tile modes 0..=4.
+    Unpacked(Vec<i8>),
+    /// Both layouts: x86_64 tile mode 5 (packed for fewer than 6 rows, unpacked for 6 or more) and multi-mode tests.
+    Both { packed: Vec<u8>, unpacked: Vec<i8> },
+}
+
+impl Codes {
+    fn unpack(w: &[u8]) -> Vec<i8> {
+        // each 32-byte block: the low nibbles are values 0-31, the high ones 32-63
+        w.chunks(32)
+            .flat_map(|b| {
+                b.iter()
+                    .map(|&v| (v & 0x0f) as i8)
+                    .chain(b.iter().map(|&v| (v >> 4) as i8))
+            })
+            .collect()
+    }
+
+    #[inline(always)]
+    fn packed(&self) -> &[u8] {
+        match self {
+            Codes::Packed(p) | Codes::Both { packed: p, .. } => p,
+            Codes::Unpacked(_) => panic!("packed codes requested on an unpacked-only weight"),
+        }
+    }
+
+    #[inline(always)]
+    fn unpacked(&self) -> &[i8] {
+        match self {
+            Codes::Unpacked(u) | Codes::Both { unpacked: u, .. } => u,
+            Codes::Packed(_) => panic!("unpacked codes requested on a packed-only weight"),
+        }
+    }
+}
+
 /// The codes and the per-group terms of the output.
 pub(crate) struct GroupWeights {
     n: usize,
     k: usize,
     g: usize,
-    /// The codes as they come, two a byte ((K / g) groups of (N, g) blocked codes, g / 2 bytes a row), which the
-    /// tiles that read them packed take: the weights' own copy (they once read their loader's buffer through a
-    /// pointer, which that buffer had to outlive)
-    packed: Vec<u8>,
-    /// The codes unpacked to one byte each, blocked as the packed ones (64-byte blocks: (K / g, N / 16, g / 4, 64)),
-    /// read by the VNNI kernel as they are (unpacking the nibbles in the kernel cost more than the dot products), and
-    /// by the plain path (`code`)
-    unpacked: Vec<i8>,
+    codes: Codes,
     /// (K / g, N): s_g, and -s_g z_g
     scale: Vec<f32>,
     scale_zero: Vec<f32>,
@@ -333,8 +365,8 @@ pub(crate) struct GroupScratch {
 }
 
 impl GroupWeights {
-    /// The weights of the codes `w` ((K / g) groups of (N, g) blocked codes, g / 2 bytes a row), copied and
-    /// unpacked into the weights' own buffers; `scales` and `zeros` (N, K / g).
+    /// The weights of the codes `w` ((K / g) groups of (N, g) blocked codes, g / 2 bytes a row), copied into the
+    /// layout the active path reads; `scales` and `zeros` (N, K / g).
     pub(crate) fn in_place(
         w: &[u8],
         scales: &[f32],
@@ -342,6 +374,19 @@ impl GroupWeights {
         n: usize,
         k: usize,
         g: usize,
+    ) -> Result<Self, String> {
+        Self::in_place_for(w, scales, zeros, n, k, g, detect(), tile_mode())
+    }
+
+    fn in_place_for(
+        w: &[u8],
+        scales: &[f32],
+        zeros: &[f32],
+        n: usize,
+        k: usize,
+        g: usize,
+        path: Path,
+        mode: u8,
     ) -> Result<Self, String> {
         if n % 16 != 0 || g % 4 != 0 || g == 0 || k % g != 0 {
             return Err(format!(
@@ -358,29 +403,34 @@ impl GroupWeights {
                 zeros.len()
             ));
         }
+        let codes = match path {
+            Path::Plain => Codes::Packed(w.to_vec()),
+            Path::Dot => Codes::Unpacked(Codes::unpack(w)),
+            Path::Vnni512 | Path::Vnni256 | Path::Avx2 | Path::Avx => match mode {
+                6 => Codes::Packed(w.to_vec()),
+                5 => Codes::Both {
+                    packed: w.to_vec(),
+                    unpacked: Codes::unpack(w),
+                },
+                _ => Codes::Unpacked(Codes::unpack(w)),
+            },
+        };
         let mut weights = GroupWeights {
             n,
             k,
             g,
-            packed: w.to_vec(),
-            // each 32-byte block: the low nibbles are values 0-31, the high ones 32-63
-            unpacked: w
-                .chunks(32)
-                .flat_map(|b| {
-                    b.iter()
-                        .map(|&v| (v & 0x0f) as i8)
-                        .chain(b.iter().map(|&v| (v >> 4) as i8))
-                })
-                .collect(),
+            codes,
             scale: vec![0f32; groups * n],
             scale_zero: vec![0f32; groups * n],
             t: vec![0f32; n],
-            path: detect(),
+            path,
         };
         for gi in 0..groups {
             for o in 0..n {
                 let (s, z) = (scales[o * groups + gi], zeros[o * groups + gi]);
-                let c: u32 = (0..g).map(|i| weights.code(o, gi * g + i) as u32).sum();
+                let c: u32 = (0..g)
+                    .map(|i| Self::packed_code(w, n, g, o, gi * g + i) as u32)
+                    .sum();
                 weights.scale[gi * n + o] = s;
                 weights.scale_zero[gi * n + o] = -(s * z);
                 weights.t[o] += s * (c as f32 - g as f32 * z);
@@ -389,18 +439,23 @@ impl GroupWeights {
         Ok(weights)
     }
 
-    /// The code of output `o`, input `i`: the packed codes' 32-byte block of it, unpacked to 64 (its low nibbles,
-    /// then its high ones), the code's place in that block.
+    /// The code of output `o`, input `i` from whichever layout `self.codes` holds.
     fn code(&self, o: usize, i: usize) -> u8 {
-        let (g, n) = (self.g, self.n);
-        let (gi, ii) = (i / g, i % g);
-        let block = (o / 16) * (g / 4) + ii / 4;
-        let v = (o % 16) * 4 + ii % 4;
-        self.unpacked[(gi * (n * g / 2) + block * 32) * 2 + v] as u8
+        match &self.codes {
+            Codes::Packed(p) | Codes::Both { packed: p, .. } => {
+                Self::packed_code(p, self.n, self.g, o, i)
+            }
+            Codes::Unpacked(u) => {
+                let (g, n) = (self.g, self.n);
+                let (gi, ii) = (i / g, i % g);
+                let block = (o / 16) * (g / 4) + ii / 4;
+                let v = (o % 16) * 4 + ii % 4;
+                u[(gi * (n * g / 2) + block * 32) * 2 + v] as u8
+            }
+        }
     }
 
-    /// The code as the packed bytes hold it (the tests' check of `code` against them).
-    #[cfg(test)]
+    /// The code as the packed bytes hold it (32-byte blocks: low nibbles 0-31, high nibbles 32-63).
     fn packed_code(w: &[u8], n: usize, g: usize, o: usize, i: usize) -> u8 {
         let (gi, ii) = (i / g, i % g);
         let block = (o / 16) * (g / 4) + ii / 4;
@@ -574,6 +629,15 @@ impl GroupWeights {
         self.path = path;
         self
     }
+
+    #[cfg(test)]
+    fn with_both_codes(mut self, w: &[u8]) -> Self {
+        self.codes = Codes::Both {
+            packed: w.to_vec(),
+            unpacked: Codes::unpack(w),
+        };
+        self
+    }
 }
 
 /// The VNNI kernel's tiles (`x86::inner`'s modes 0-6; `TILE_MODE_DEFAULT` unless SETSUNA_TILE_MODE names another, a
@@ -652,7 +716,7 @@ mod arm {
     ) {
         let (n, k, g) = (w.n, w.k, w.g);
         let (groups, steps, gstride) = (k / g, g / 4, n * g);
-        let codes = w.unpacked.as_ptr() as *const u8;
+        let codes = w.codes.unpacked().as_ptr() as *const u8;
         let (sc, sz) = (w.scale.as_ptr(), w.scale_zero.as_ptr());
         for gi in 0..groups {
             let mut acc = [[vdupq_n_u32(0); 4]; RT];
@@ -737,16 +801,19 @@ mod x86 {
             ) {
                 let (n, k, g) = (w.n, w.k, w.g);
                 let (groups, steps, gstride) = (k / g, g / 4, n * g);
-                let codes = w.unpacked.as_ptr();
                 let (sc, sz, tt) = (w.scale.as_ptr(), w.scale_zero.as_ptr(), w.t.as_ptr());
                 let ones = _mm256_set1_epi16(1);
                 let low = _mm256_set1_epi8(0x0f);
                 for gi in 0..groups {
                     let mut acc = [[_mm256_setzero_si256(); 2]; RT];
-                    let wg = codes.add(gi * gstride + ob * steps * 64);
+                    let off = gi * gstride + ob * steps * 64;
                     // NIB: the packed codes, 32 bytes for the block's 64 (the low nibbles its codes 0-31, the high
                     // ones 32-63: the two registers below), half the bytes from memory
-                    let pg = w.packed.as_ptr().add((gi * gstride + ob * steps * 64) / 2);
+                    let (wg, pg) = if NIB {
+                        (std::ptr::null(), w.codes.packed().as_ptr().add(off / 2))
+                    } else {
+                        (w.codes.unpacked().as_ptr().add(off), std::ptr::null())
+                    };
                     for s in 0..steps {
                         let (w0, w1) = if NIB {
                             let v = _mm256_loadu_si256(pg.add(s * 32) as *const __m256i);
@@ -830,6 +897,18 @@ mod x86 {
         };
     }
 
+    /// Resolve `tile_mode()` against what `w.codes` stores: packed-only weights always use mode 6
+    /// (avoiding even the atomic load on the default hot path), unpacked-only stay within modes 0..=4,
+    /// and `Both` follows `tile_mode()` freely.
+    #[inline(always)]
+    fn effective_mode(w: &GroupWeights) -> u8 {
+        match &w.codes {
+            super::Codes::Packed(_) => 6,
+            super::Codes::Unpacked(_) => super::tile_mode().min(4),
+            super::Codes::Both { .. } => super::tile_mode(),
+        }
+    }
+
     /// `inner` with 256-bit tiles: up to 6 rows by one block with AVX-VNNI (12 sums, 2 codes, a broadcast; 5 with
     /// the codes read packed, their mask and unpacking a register more), 4 with AVX2 (its pair products a register
     /// more each). The codes read packed as `super::tile_mode` says (5: for fewer than 6 rows; 6, the default: all).
@@ -848,7 +927,7 @@ mod x86 {
                 let (n, k, groups) = (w.n, w.k, w.k / w.g);
                 assert!(y.len() >= rows * n && xs.len() >= rows && a.len() >= rows * groups);
                 let b = bias.map_or(std::ptr::null(), <[f32]>::as_ptr);
-                let mode = super::tile_mode();
+                let mode = effective_mode(w);
                 let nib = mode == 6 || (mode == 5 && rows < 6);
                 for ob in 0..n / 16 {
                     let mut r0 = 0;
@@ -892,14 +971,17 @@ mod x86 {
     ) {
         let (n, k, g) = (w.n, w.k, w.g);
         let (groups, steps, gstride) = (k / g, g / 4, n * g);
-        let codes = w.unpacked.as_ptr();
         let (sc, sz, tt) = (w.scale.as_ptr(), w.scale_zero.as_ptr(), w.t.as_ptr());
         let ones = _mm_set1_epi16(1);
         let low = _mm_set1_epi8(0x0f);
         for gi in 0..groups {
             let mut acc = [[_mm_setzero_si128(); 4]; RT];
-            let wg = codes.add(gi * gstride + ob * steps * 64);
-            let pg = w.packed.as_ptr().add((gi * gstride + ob * steps * 64) / 2);
+            let off = gi * gstride + ob * steps * 64;
+            let (wg, pg) = if NIB {
+                (std::ptr::null(), w.codes.packed().as_ptr().add(off / 2))
+            } else {
+                (w.codes.unpacked().as_ptr().add(off), std::ptr::null())
+            };
             for s in 0..steps {
                 let wv = if NIB {
                     let p0 = _mm_loadu_si128(pg.add(s * 32) as *const __m128i);
@@ -969,7 +1051,7 @@ mod x86 {
         let (n, k, groups) = (w.n, w.k, w.k / w.g);
         assert!(y.len() >= rows * n && xs.len() >= rows && a.len() >= rows * groups);
         let b = bias.map_or(std::ptr::null(), <[f32]>::as_ptr);
-        let mode = super::tile_mode();
+        let mode = effective_mode(w);
         let nib = mode == 6 || (mode == 5 && rows < 6);
         for ob in 0..n / 16 {
             let mut r0 = 0;
@@ -1038,7 +1120,7 @@ mod x86 {
     ) {
         let (n, k, g) = (w.n, w.k, w.g);
         let (groups, steps, gstride) = (k / g, g / 4, n * g);
-        let codes = w.unpacked.as_ptr();
+        let codes = w.codes.unpacked().as_ptr();
         let (sc, sz, tt) = (w.scale.as_ptr(), w.scale_zero.as_ptr(), w.t.as_ptr());
         for gi in 0..groups {
             let mut acc = [[_mm512_setzero_si512(); C]; RT];
@@ -1115,14 +1197,22 @@ mod x86 {
     ) {
         let (n, k, g) = (w.n, w.k, w.g);
         let (groups, steps, gstride) = (k / g, g / 4, n * g);
-        let codes = w.unpacked.as_ptr();
         let (sc, sz, tt) = (w.scale.as_ptr(), w.scale_zero.as_ptr(), w.t.as_ptr());
         let low = _mm256_set1_epi8(0x0f);
         let mut fs = [[_mm512_setzero_ps(); C]; RT];
         for gi in 0..groups {
             let mut acc = [[_mm512_setzero_si512(); C]; RT];
-            let wg = codes.add(gi * gstride);
-            let pg = w.packed.as_ptr().add(gi * gstride / 2);
+            let (wg, pg) = if NIB {
+                (
+                    std::ptr::null(),
+                    w.codes.packed().as_ptr().add(gi * gstride / 2),
+                )
+            } else {
+                (
+                    w.codes.unpacked().as_ptr().add(gi * gstride),
+                    std::ptr::null(),
+                )
+            };
             for s in 0..steps {
                 let mut wv = [_mm512_setzero_si512(); C];
                 for (c, wc) in wv.iter_mut().enumerate() {
@@ -1218,7 +1308,7 @@ mod x86 {
         // little in 3 x 4); 5, as 4 with the codes read packed for fewer than 6 rows (1b20e28: the experts 190 -> 175
         // us a 30-frame conversion); 6 (the default), as 4 with the codes read packed for all (half the bytes: in the
         // latency runs, the caches cold between conversions, the weights' reads are most of the encoder's time)
-        let mode = super::tile_mode();
+        let mode = effective_mode(w);
         let (cmax, rmax, reg, nib) = match mode {
             0 => (4, 6, false, false),
             1 => (4, 3, true, false),
@@ -1375,11 +1465,14 @@ mod tests {
                     yp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                     "the kernel and the plain path, n {n} k {k} g {g} rows {rows}"
                 );
-                // every tile of the kernel: the same bits
+                // every tile of the kernel: the same bits (each built for its own mode, verifying the mode's layout)
+                let both = GroupWeights::in_place(&w, &scales, &zeros, n, k, g)
+                    .unwrap()
+                    .with_both_codes(&w);
                 for mode in 0..=6u8 {
                     TILE_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
                     let mut ym = vec![f32::NAN; rows * n];
-                    weights.forward(&x, &mut ym, &mut GroupScratch::default());
+                    both.forward(&x, &mut ym, &mut GroupScratch::default());
                     TILE_MODE.store(TILE_MODE_DEFAULT, std::sync::atomic::Ordering::Relaxed);
                     assert_eq!(
                         ym.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -1412,11 +1505,11 @@ mod tests {
                     if !has_path(path) {
                         continue;
                     }
-                    let other = GroupWeights::in_place(&w, &scales, &zeros, n, k, g)
-                        .unwrap()
-                        .with_path(path);
-                    // the codes read unpacked (mode 4) and packed (6)
+                    // the codes read unpacked (mode 4) and packed (6), each built for that path and mode
                     for mode in [4u8, 6] {
+                        let other =
+                            GroupWeights::in_place_for(&w, &scales, &zeros, n, k, g, path, mode)
+                                .unwrap();
                         TILE_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
                         let (mut yo, mut yob) = (vec![f32::NAN; rows * n], vec![7.5f32; rows * n]);
                         other.forward(&x, &mut yo, &mut GroupScratch::default());
@@ -1528,6 +1621,16 @@ mod tests {
         );
         // the layer on every kernel this CPU can run: the same bits
         let mut moe = moe;
+        for (ex, (l1, l2)) in moe.experts.iter_mut().enumerate() {
+            l1.codes = Codes::Both {
+                packed: keep[ex].0 .0.clone(),
+                unpacked: Codes::unpack(&keep[ex].0 .0),
+            };
+            l2.codes = Codes::Both {
+                packed: keep[ex].1 .0.clone(),
+                unpacked: Codes::unpack(&keep[ex].1 .0),
+            };
+        }
         for path in [
             Path::Plain,
             Path::Avx,
@@ -1552,6 +1655,27 @@ mod tests {
             );
         }
         drop(keep);
+    }
+
+    #[test]
+    fn group_weights_keeps_only_the_active_layout() {
+        let (n, k, g) = (16usize, 64usize, 64usize);
+        let w = vec![0x35u8; n * k / 2];
+        let scales = vec![0.02f32; n];
+        let zeros = vec![4.0f32; n];
+        for path in [Path::Vnni512, Path::Vnni256, Path::Avx2, Path::Avx] {
+            let gw = GroupWeights::in_place_for(&w, &scales, &zeros, n, k, g, path, 6).unwrap();
+            assert!(matches!(gw.codes, Codes::Packed(_)), "{path:?} mode 6");
+            let gw = GroupWeights::in_place_for(&w, &scales, &zeros, n, k, g, path, 4).unwrap();
+            assert!(matches!(gw.codes, Codes::Unpacked(_)), "{path:?} mode 4");
+            let gw = GroupWeights::in_place_for(&w, &scales, &zeros, n, k, g, path, 5).unwrap();
+            assert!(matches!(gw.codes, Codes::Both { .. }), "{path:?} mode 5");
+        }
+        let plain =
+            GroupWeights::in_place_for(&w, &scales, &zeros, n, k, g, Path::Plain, 0).unwrap();
+        assert!(matches!(plain.codes, Codes::Packed(_)));
+        let dot = GroupWeights::in_place_for(&w, &scales, &zeros, n, k, g, Path::Dot, 6).unwrap();
+        assert!(matches!(dot.codes, Codes::Unpacked(_)));
     }
 
     /// The 4M's Linear shapes on 30 rows (QKV 192 -> 576, FFN 192 -> 768 and 768 -> 192), median of 500.

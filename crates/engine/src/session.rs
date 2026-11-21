@@ -317,9 +317,10 @@ pub struct EngineSession {
     /// Candidates of the chunks of long readings, by (context, reading,
     /// beam width).
     chunk_cache: HashMap<(String, String, usize), Vec<Candidate>>,
-    /// The last span's proposal: a `continue_beam` request (or the same
-    /// request again) decodes it again without running the model.
-    last_proposal: Option<LastProposal>,
+    /// Two-slot LRU cache of recent span proposals: a `continue_beam` request
+    /// (or both readings of a reading-corrected conversion) decodes again
+    /// without re-running the encoder.
+    last_proposals: ProposalCache,
     /// The model's CTC-CRF transitions (manifest `crf`), added by the beam.
     crf: Option<crate::pipeline::crf::CrfTables>,
     /// The candidates' rescoring (manifest `rescore`), when a weight is set.
@@ -344,6 +345,45 @@ struct LastProposal {
     proposal: proposal::ProposalOutput,
     frame_reading: Vec<u32>,
     inputs: Vec<i64>,
+}
+
+/// Two-slot LRU cache of recent span proposals so a reading corrector's
+/// `first` / `other` pair does not evict each other before `continue_beam`.
+#[derive(Default)]
+struct ProposalCache {
+    slots: [Option<LastProposal>; 2],
+}
+
+impl ProposalCache {
+    fn get(
+        &mut self,
+        context: &str,
+        reading: &str,
+        greedy: bool,
+        inspect: usize,
+    ) -> Option<&LastProposal> {
+        let idx = self.slots.iter().position(|slot| {
+            slot.as_ref().is_some_and(|p| {
+                p.greedy == greedy
+                    && p.inspect == inspect
+                    && p.context == context
+                    && p.reading == reading
+            })
+        })?;
+        if idx == 1 {
+            self.slots.swap(0, 1);
+        }
+        self.slots[0].as_ref()
+    }
+
+    fn insert(&mut self, entry: LastProposal) {
+        self.slots[1] = self.slots[0].take();
+        self.slots[0] = Some(entry);
+    }
+
+    fn mru(&self) -> Option<&LastProposal> {
+        self.slots[0].as_ref()
+    }
 }
 
 /// Chunk results [`EngineSession`] keeps before starting over.
@@ -468,7 +508,7 @@ impl EngineSession {
             reduce: FrameReduce::default(),
             inspect: 0,
             chunk_cache: HashMap::new(),
-            last_proposal: None,
+            last_proposals: ProposalCache::default(),
             crf,
             rescorer,
             ar_margin: env.ar_margin,
@@ -971,13 +1011,13 @@ impl EngineSession {
         let greedy_only = greedy && self.inspect == 0;
 
         let proposal_t0 = Instant::now();
-        let hit = self.last_proposal.as_ref().is_some_and(|p| {
-            p.greedy == greedy_only
-                && p.inspect == self.inspect
-                && p.context == context
-                && p.reading == reading
-        });
-        if !hit {
+        let (ort_ms, reduce_ms) = if self
+            .last_proposals
+            .get(context, reading, greedy_only, self.inspect)
+            .is_some()
+        {
+            (0.0, 0.0)
+        } else {
             let encoded = proposal::encode(
                 &self.tokenizer,
                 self.seq_len,
@@ -999,7 +1039,8 @@ impl EngineSession {
                 self.reduce,
                 greedy_only,
             )?;
-            self.last_proposal = Some(LastProposal {
+            let (ort_ms, reduce_ms) = (runner.last_ort_ms, runner.last_reduce_ms);
+            self.last_proposals.insert(LastProposal {
                 context: context.to_string(),
                 reading: reading.to_string(),
                 greedy: greedy_only,
@@ -1008,12 +1049,9 @@ impl EngineSession {
                 frame_reading,
                 inputs,
             });
-        }
-        let (ort_ms, reduce_ms) = match (&self.model, hit) {
-            (Model::Ctc(runner), false) => (runner.last_ort_ms, runner.last_reduce_ms),
-            _ => (0.0, 0.0),
+            (ort_ms, reduce_ms)
         };
-        let last = self.last_proposal.as_ref().expect("stored above");
+        let last = self.last_proposals.mru().expect("stored or promoted above");
         let (proposal, frame_reading, inputs) = (&last.proposal, &last.frame_reading, &last.inputs);
         let proposal_ms = proposal_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1386,5 +1424,56 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(cfg.pool_limit(), 1);
+    }
+
+    #[test]
+    fn proposal_cache_keeps_two_readings_warm_lru() {
+        let entry = |ctx: &str, rd: &str, greedy: bool, inspect: usize, len: usize| LastProposal {
+            context: ctx.into(),
+            reading: rd.into(),
+            greedy,
+            inspect,
+            proposal: proposal::ProposalOutput {
+                steps: Vec::new(),
+                frames: Vec::new(),
+                input_len: len,
+            },
+            frame_reading: Vec::new(),
+            inputs: Vec::new(),
+        };
+        let mut cache = ProposalCache::default();
+        cache.insert(entry("ctx", "first", false, 0, 1));
+        cache.insert(entry("ctx", "other", false, 0, 2));
+        // Alternating between the two readings hits both without eviction (reading corrector + continue_beam)
+        assert_eq!(
+            cache
+                .get("ctx", "first", false, 0)
+                .map(|p| p.proposal.input_len),
+            Some(1)
+        );
+        assert_eq!(
+            cache
+                .get("ctx", "other", false, 0)
+                .map(|p| p.proposal.input_len),
+            Some(2)
+        );
+        // Greedy / inspect mismatches do not hit
+        assert!(cache.get("ctx", "other", true, 0).is_none());
+        assert!(cache.get("ctx", "other", false, 1).is_none());
+        // Inserting a third reading evicts the LRU ("first"), keeping MRU ("other") and the new one ("third")
+        cache.insert(entry("ctx", "third", false, 0, 3));
+        assert!(cache.get("ctx", "first", false, 0).is_none());
+        assert_eq!(
+            cache
+                .get("ctx", "other", false, 0)
+                .map(|p| p.proposal.input_len),
+            Some(2)
+        );
+        assert_eq!(
+            cache
+                .get("ctx", "third", false, 0)
+                .map(|p| p.proposal.input_len),
+            Some(3)
+        );
     }
 }

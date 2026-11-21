@@ -2445,7 +2445,13 @@ mod tests {
             eprintln!("SETSUNA_NATIVE_ENCODER_FILE not set");
             return;
         };
+        // mode 5 keeps both packed and unpacked codes so the comparison below can time modes 0, 4, 5 and 6
+        crate::group_q::TILE_MODE.store(5, std::sync::atomic::Ordering::Relaxed);
         let mut enc = NativeEncoder::load(Path::new(&path)).unwrap();
+        crate::group_q::TILE_MODE.store(
+            crate::group_q::TILE_MODE_DEFAULT,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         eprintln!(
             "level {:?} (SETSUNA_CPU_LEVEL {:?})",
             crate::cpu::level(),

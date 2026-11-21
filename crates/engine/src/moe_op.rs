@@ -15,99 +15,94 @@
 
 /// An int8 matrix (out, in) prepacked for the u8 x i8 dot products: 16 output rows x 4 inputs a 64-byte block (lane j
 /// = row 16 * b + j), blocks along the inputs; `colsum` the sum of each row (for the activations' zero point). Only
-/// one layout is kept:
-/// `blocked` for the VNNI paths, else `raw` (row-major, the plain path).
+/// one layout is kept, matching the active ISA.
 pub(crate) struct Packed {
     out: usize,
     inp: usize,
-    blocked: Blocked,
-    raw: Vec<i8>,
+    weights: WeightLayout,
     colsum: Vec<i32>,
-    /// the AVX2 kernel's 16-bit copy of `blocked` (`widen`), made when the engine's level is AVX2; else empty
-    wide: Vec<i16>,
 }
 
-/// The blocked layout, packed here.
-enum Blocked {
-    Owned(Vec<i8>),
-}
-
-impl std::ops::Deref for Blocked {
-    type Target = [i8];
-
-    fn deref(&self) -> &[i8] {
-        match self {
-            Blocked::Owned(v) => v,
-        }
-    }
+/// Mutually exclusive weight buffer for the active execution path.
+enum WeightLayout {
+    /// Row-major int8 (plain path or shape not aligned to 16 x 4 blocks).
+    Raw(Vec<i8>),
+    /// 16 x 4 blocked int8 (VNNI-512, AVX-VNNI, ARM SDOT).
+    Blocked(Vec<i8>),
+    /// 16-bit widened copy of the 16 x 4 blocks (AVX2, AVX).
+    Wide(Vec<i16>),
 }
 
 impl Packed {
-    /// `blocked`: pack for the VNNI paths (when the shape allows 16 x 4 blocks), else keep the matrix as it is.
+    /// `blocked`: pack for the active SIMD path (when the shape allows 16 x 4 blocks), else keep row-major.
     pub(crate) fn new(w: &[i8], out: usize, inp: usize, blocked: bool) -> Self {
+        Self::new_for(w, out, inp, blocked, detect_isa())
+    }
+
+    fn new_for(w: &[i8], out: usize, inp: usize, blocked: bool, isa: Isa) -> Self {
         assert_eq!(w.len(), out * inp);
         let colsum = (0..out)
             .map(|o| w[o * inp..(o + 1) * inp].iter().map(|&v| v as i32).sum())
             .collect();
-        if !(blocked && out % 16 == 0 && inp % 4 == 0) {
-            return Packed {
-                out,
-                inp,
-                blocked: Blocked::Owned(Vec::new()),
-                raw: w.to_vec(),
-                colsum,
-                wide: Vec::new(),
-            };
-        }
-        let mut blocked = vec![0i8; out * inp];
-        let mut i = 0;
-        for ob in 0..out / 16 {
-            for kg in 0..inp / 4 {
-                for j in 0..16 {
-                    let row = (ob * 16 + j) * inp + kg * 4;
-                    blocked[i..i + 4].copy_from_slice(&w[row..row + 4]);
-                    i += 4;
-                }
-            }
-        }
-        let wide = if matches!(detect_isa(), Isa::Avx2 | Isa::Avx) {
-            widen(&blocked)
+        let weights = if !(blocked && out % 16 == 0 && inp % 4 == 0) {
+            WeightLayout::Raw(w.to_vec())
+        } else if matches!(isa, Isa::Avx2 | Isa::Avx) {
+            WeightLayout::Wide(widen_from_raw(w, out, inp))
         } else {
-            Vec::new()
+            WeightLayout::Blocked(pack_blocked(w, out, inp))
         };
         Packed {
             out,
             inp,
-            blocked: Blocked::Owned(blocked),
-            raw: Vec::new(),
+            weights,
             colsum,
-            wide,
         }
     }
 
-    /// Tests only: `new` with the AVX2 kernel's 16-bit copy whatever the CPU.
+    /// Tests only: pack into 16 x 4 `Blocked` bytes regardless of the CPU ISA.
     #[cfg(test)]
-    pub(crate) fn with_wide(mut self) -> Self {
-        if !self.blocked.is_empty() {
-            self.wide = widen(&self.blocked);
-        }
-        self
+    pub(crate) fn new_blocked(w: &[i8], out: usize, inp: usize) -> Self {
+        Self::new_for(w, out, inp, true, Isa::Vnni512)
+    }
+
+    /// Tests only: pack into the AVX2/AVX 16-bit `Wide` layout regardless of the CPU ISA.
+    #[cfg(test)]
+    pub(crate) fn new_wide(w: &[i8], out: usize, inp: usize) -> Self {
+        Self::new_for(w, out, inp, true, Isa::Avx2)
     }
 }
 
-/// The AVX2 kernel's copy of a blocked int8 matrix in 16 bits: for each block of 16 outputs and each 4 inputs, 4
-/// registers of 16 values, outputs 0-7 with inputs 0 and 1 (output after output, its two inputs side by side), then
-/// with inputs 2 and 3, then outputs 8-15 likewise; so one 16-bit multiply-add of a pair of inputs gives 8 outputs'
-/// partial sums (`x86::tile_avx2w`).
-fn widen(blocked: &[i8]) -> Vec<i16> {
-    let mut wide = Vec::with_capacity(blocked.len());
-    for b in blocked.chunks_exact(64) {
-        for half in 0..2 {
-            for pair in 0..2 {
-                for o in 0..8 {
-                    let at = (half * 8 + o) * 4 + pair * 2;
-                    wide.push(b[at] as i16);
-                    wide.push(b[at + 1] as i16);
+/// Pack row-major `(out, inp)` int8 weights into 16 outputs x 4 inputs blocks.
+fn pack_blocked(w: &[i8], out: usize, inp: usize) -> Vec<i8> {
+    let mut blocked = vec![0i8; out * inp];
+    let mut i = 0;
+    for ob in 0..out / 16 {
+        for kg in 0..inp / 4 {
+            for j in 0..16 {
+                let row = (ob * 16 + j) * inp + kg * 4;
+                blocked[i..i + 4].copy_from_slice(&w[row..row + 4]);
+                i += 4;
+            }
+        }
+    }
+    blocked
+}
+
+/// The AVX2/AVX kernels' 16-bit widened layout built directly from row-major `(out, inp)` int8 weights: for each
+/// block of 16 outputs and each 4 inputs, 4 registers of 16 values, outputs 0-7 with inputs 0 and 1 (output after
+/// output, its two inputs side by side), then with inputs 2 and 3, then outputs 8-15 likewise; so one 16-bit
+/// multiply-add of a pair of inputs gives 8 outputs' partial sums (`x86::tile_avx2w`).
+fn widen_from_raw(w: &[i8], out: usize, inp: usize) -> Vec<i16> {
+    let mut wide = Vec::with_capacity(out * inp);
+    for ob in 0..out / 16 {
+        for kg in 0..inp / 4 {
+            for half in 0..2 {
+                for pair in 0..2 {
+                    for o in 0..8 {
+                        let at = (ob * 16 + half * 8 + o) * inp + kg * 4 + pair * 2;
+                        wide.push(w[at] as i16);
+                        wide.push(w[at + 1] as i16);
+                    }
                 }
             }
         }
@@ -175,25 +170,30 @@ pub(crate) fn gemm_u8i8(isa: Isa, q: &[u8], rows: usize, w: &Packed, acc: &mut [
         w.out
     );
     assert!(supported(isa), "{isa:?} on a CPU without it");
-    if w.blocked.is_empty() {
-        return gemm_plain(q, rows, w, acc);
-    }
-    match isa {
+    match (isa, &w.weights) {
         #[cfg(target_arch = "x86_64")]
-        Isa::Vnni512 => unsafe { x86::gemm_vnni512(q, rows, w, acc) },
+        (Isa::Vnni512, WeightLayout::Blocked(blocked)) => unsafe {
+            x86::gemm_vnni512(q, rows, w, blocked, acc)
+        },
         #[cfg(target_arch = "x86_64")]
-        Isa::Vnni256 => unsafe { x86::gemm_vnni256(q, rows, w, acc) },
-        // AVX2: the 16-bit copy's kernel when the matrix has it (the engine's level was AVX2 when it was packed)
+        (Isa::Vnni256, WeightLayout::Blocked(blocked)) => unsafe {
+            x86::gemm_vnni256(q, rows, w, blocked, acc)
+        },
+        // AVX2: the 16-bit copy's kernel when the matrix has it (packed at the AVX2/AVX level)
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 if !w.wide.is_empty() => unsafe { x86::gemm_avx2w(q, rows, w, acc) },
+        (Isa::Avx2, WeightLayout::Wide(wide)) => unsafe { x86::gemm_avx2w(q, rows, w, wide, acc) },
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 => unsafe { x86::gemm_avx2(q, rows, w, acc) },
-        // AVX (128-bit integers): the 16-bit copy's kernel (a matrix packed at the AVX level has it)
+        (Isa::Avx2, WeightLayout::Blocked(blocked)) => unsafe {
+            x86::gemm_avx2(q, rows, w, blocked, acc)
+        },
+        // AVX (128-bit integers): the 16-bit copy's kernel
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx if !w.wide.is_empty() => unsafe { x86::gemm_avxw(q, rows, w, acc) },
+        (Isa::Avx, WeightLayout::Wide(wide)) => unsafe { x86::gemm_avxw(q, rows, w, wide, acc) },
         // SAFETY: the CPU has the dot products (`detect_isa`)
         #[cfg(target_arch = "aarch64")]
-        Isa::Dot => unsafe { arm::gemm_dot(q, rows, w, acc) },
+        (Isa::Dot, WeightLayout::Blocked(blocked)) => unsafe {
+            arm::gemm_dot(q, rows, w, blocked, acc)
+        },
         _ => gemm_plain(q, rows, w, acc),
     }
 }
@@ -248,27 +248,30 @@ pub(crate) fn gemm_u8i8_f32(
             bias: e.bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
             out: e.out,
         };
-        if isa == Isa::Vnni512 && !w.blocked.is_empty() {
-            // SAFETY: the CPU has AVX-512 VNNI (`isa`); the slices hold what the asserts say
-            return unsafe { x86::gemm_vnni512_f32(q, rows, w, &raw, y) };
-        }
-        if matches!(isa, Isa::Avx2 | Isa::Avx) && !w.wide.is_empty() {
-            // the 16-bit copy's kernels read each row's inputs as 16-bit pairs (x0 | x1 << 16), made here into `acc`
-            let k = w.inp;
-            acc.clear();
-            acc.extend(
-                q[..rows * k]
-                    .chunks_exact(2)
-                    .map(|p| p[0] as i32 | (p[1] as i32) << 16),
-            );
-            // SAFETY: the CPU has AVX2 and FMA, or AVX, SSSE3 and SSE4.1 (`isa`); as above
-            return unsafe {
-                if isa == Isa::Avx2 {
-                    x86::gemm_avx2w_f32(acc, rows, w, &raw, y)
-                } else {
-                    x86::gemm_avxw_f32(acc, rows, w, &raw, y)
-                }
-            };
+        match (isa, &w.weights) {
+            (Isa::Vnni512, WeightLayout::Blocked(blocked)) => {
+                // SAFETY: the CPU has AVX-512 VNNI (`isa`); the slices hold what the asserts say
+                return unsafe { x86::gemm_vnni512_f32(q, rows, w, blocked, &raw, y) };
+            }
+            (Isa::Avx2 | Isa::Avx, WeightLayout::Wide(wide)) => {
+                // the 16-bit copy's kernels read each row's inputs as 16-bit pairs (x0 | x1 << 16), made here into `acc`
+                let k = w.inp;
+                acc.clear();
+                acc.extend(
+                    q[..rows * k]
+                        .chunks_exact(2)
+                        .map(|p| p[0] as i32 | (p[1] as i32) << 16),
+                );
+                // SAFETY: the CPU has AVX2 and FMA, or AVX, SSSE3 and SSE4.1 (`isa`); as above
+                return unsafe {
+                    if isa == Isa::Avx2 {
+                        x86::gemm_avx2w_f32(acc, rows, w, wide, &raw, y)
+                    } else {
+                        x86::gemm_avxw_f32(acc, rows, w, wide, &raw, y)
+                    }
+                };
+            }
+            _ => {}
         }
     }
     let n = w.out;
@@ -382,10 +385,16 @@ mod arm {
 
     /// The integer sums of `super::gemm_u8i8` on a blocked matrix.
     #[target_feature(enable = "neon,dotprod")]
-    pub(super) unsafe fn gemm_dot(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+    pub(super) unsafe fn gemm_dot(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        blocked: &[i8],
+        acc: &mut [i32],
+    ) {
         let (n, k) = (w.out, w.inp);
         let bstride = k * 16;
-        let (qp, ap, wp) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr());
+        let (qp, ap, wp) = (q.as_ptr(), acc.as_mut_ptr(), blocked.as_ptr());
         // few rows: more blocks at once, so the sums do not wait on each other
         let c = match rows {
             1 => 4,
@@ -442,19 +451,35 @@ fn gemm_plain(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
     for r in 0..rows {
         let qr = &q[r * k..(r + 1) * k];
         for o in 0..n {
-            acc[r * n + o] = if w.raw.is_empty() {
-                // the blocked layout: row o's inputs 4g..4g+4 at ((o / 16 * k / 4 + g) * 16 + o % 16) * 4
-                (0..k / 4)
-                    .map(|g| {
-                        let b = ((o / 16 * (k / 4) + g) * 16 + o % 16) * 4;
-                        (0..4)
-                            .map(|t| qr[g * 4 + t] as i32 * w.blocked[b + t] as i32)
-                            .sum::<i32>()
-                    })
-                    .sum()
-            } else {
-                let wr = &w.raw[o * k..(o + 1) * k];
-                qr.iter().zip(wr).map(|(&a, &b)| a as i32 * b as i32).sum()
+            acc[r * n + o] = match &w.weights {
+                WeightLayout::Raw(raw) => {
+                    let wr = &raw[o * k..(o + 1) * k];
+                    qr.iter().zip(wr).map(|(&a, &b)| a as i32 * b as i32).sum()
+                }
+                WeightLayout::Blocked(blocked) => {
+                    // the blocked layout: row o's inputs 4g..4g+4 at ((o / 16 * k / 4 + g) * 16 + o % 16) * 4
+                    (0..k / 4)
+                        .map(|g| {
+                            let b = ((o / 16 * (k / 4) + g) * 16 + o % 16) * 4;
+                            (0..4)
+                                .map(|t| qr[g * 4 + t] as i32 * blocked[b + t] as i32)
+                                .sum::<i32>()
+                        })
+                        .sum()
+                }
+                WeightLayout::Wide(wide) => {
+                    let (ob, j) = (o / 16, o % 16);
+                    let (half, oo) = (j / 8, j % 8);
+                    (0..k / 4)
+                        .map(|g| {
+                            let base = (ob * (k / 4) + g) * 64 + half * 32 + oo * 2;
+                            qr[g * 4] as i32 * wide[base] as i32
+                                + qr[g * 4 + 1] as i32 * wide[base + 1] as i32
+                                + qr[g * 4 + 2] as i32 * wide[base + 16] as i32
+                                + qr[g * 4 + 3] as i32 * wide[base + 17] as i32
+                        })
+                        .sum()
+                }
             };
         }
     }
@@ -639,12 +664,13 @@ mod x86 {
         q: &[u8],
         rows: usize,
         w: &Packed,
+        blocked: &[i8],
         e: &Epi,
         y: &mut [f32],
     ) {
         let (n, k, out) = (w.out, w.inp, e.out);
-        assert!(y.len() >= rows * out && w.colsum.len() >= n);
-        let (qp, yp, wp, bstride) = (q.as_ptr(), y.as_mut_ptr(), w.blocked.as_ptr(), k * 16);
+        assert!(y.len() >= rows * out && w.colsum.len() >= n && blocked.len() == n * k);
+        let (qp, yp, wp, bstride) = (q.as_ptr(), y.as_mut_ptr(), blocked.as_ptr(), k * 16);
         tiles(rows, n / 16, |rt, r0, ob, c| {
             let (q, yr, wb) = (qp.add(r0 * k), yp.add(r0 * out), wp.add(ob * bstride));
             if c == 4 {
@@ -682,9 +708,15 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx512f,avx512vnni")]
-    pub(super) unsafe fn gemm_vnni512(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+    pub(super) unsafe fn gemm_vnni512(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        blocked: &[i8],
+        acc: &mut [i32],
+    ) {
         let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr(), k * 16);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), blocked.as_ptr(), k * 16);
         tiles(rows, n / 16, |rt, r0, ob, c| {
             let (q, a, wb) = (
                 qp.add(r0 * k),
@@ -875,9 +907,15 @@ mod x86 {
 
     /// `gemm_u8i8` with AVX2 from the 16-bit copy: one block at a time, up to 4 rows a tile.
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn gemm_avx2w(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+    pub(super) unsafe fn gemm_avx2w(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        wide: &[i16],
+        acc: &mut [i32],
+    ) {
         let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), wide.as_ptr(), k * 16);
         for ob in 0..n / 16 {
             let mut r0 = 0;
             while r0 < rows {
@@ -957,6 +995,7 @@ mod x86 {
         pairs: &[i32],
         rows: usize,
         w: &Packed,
+        wide: &[i16],
         e: &Epi,
         y: &mut [f32],
     ) {
@@ -964,10 +1003,10 @@ mod x86 {
         assert!(
             y.len() >= rows * out
                 && w.colsum.len() >= n
-                && w.wide.len() == n * k
+                && wide.len() == n * k
                 && pairs.len() >= rows * k / 2
         );
-        let (xp, yp, wp, bstride) = (pairs.as_ptr(), y.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        let (xp, yp, wp, bstride) = (pairs.as_ptr(), y.as_mut_ptr(), wide.as_ptr(), k * 16);
         for ob in 0..n / 16 {
             if ob * 16 >= out {
                 break;
@@ -1094,9 +1133,15 @@ mod x86 {
 
     /// `gemm_u8i8` at the AVX level from the 16-bit copy: one block at a time, up to 2 rows a tile.
     #[target_feature(enable = "avx,ssse3,sse4.1")]
-    pub(super) unsafe fn gemm_avxw(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+    pub(super) unsafe fn gemm_avxw(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        wide: &[i16],
+        acc: &mut [i32],
+    ) {
         let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), wide.as_ptr(), k * 16);
         for ob in 0..n / 16 {
             let mut r0 = 0;
             while r0 < rows {
@@ -1172,6 +1217,7 @@ mod x86 {
         pairs: &[i32],
         rows: usize,
         w: &Packed,
+        wide: &[i16],
         e: &Epi,
         y: &mut [f32],
     ) {
@@ -1179,10 +1225,10 @@ mod x86 {
         assert!(
             y.len() >= rows * out
                 && w.colsum.len() >= n
-                && w.wide.len() == n * k
+                && wide.len() == n * k
                 && pairs.len() >= rows * k / 2
         );
-        let (xp, yp, wp, bstride) = (pairs.as_ptr(), y.as_mut_ptr(), w.wide.as_ptr(), k * 16);
+        let (xp, yp, wp, bstride) = (pairs.as_ptr(), y.as_mut_ptr(), wide.as_ptr(), k * 16);
         for ob in 0..n / 16 {
             if ob * 16 >= out {
                 break;
@@ -1203,9 +1249,15 @@ mod x86 {
 
     /// `gemm_u8i8` with AVX2 alone: one block at a time, up to 4 rows a tile.
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn gemm_avx2(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+    pub(super) unsafe fn gemm_avx2(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        blocked: &[i8],
+        acc: &mut [i32],
+    ) {
         let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr(), k * 16);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), blocked.as_ptr(), k * 16);
         for ob in 0..n / 16 {
             let mut r0 = 0;
             while r0 < rows {
@@ -1227,9 +1279,15 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2,avxvnni")]
-    pub(super) unsafe fn gemm_vnni256(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
+    pub(super) unsafe fn gemm_vnni256(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        blocked: &[i8],
+        acc: &mut [i32],
+    ) {
         let (n, k) = (w.out, w.inp);
-        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), w.blocked.as_ptr(), k * 16);
+        let (qp, ap, wp, bstride) = (q.as_ptr(), acc.as_mut_ptr(), blocked.as_ptr(), k * 16);
         tiles256(rows, n / 16, |rt, r0, ob, c| {
             let (q, a, wb) = (
                 qp.add(r0 * k),
@@ -1708,7 +1766,7 @@ mod tests {
             let (mut q8, _) = quantize_rows(&w, out, inp);
             q8.resize(stride * inp, 0);
             let packed = Packed::new(&q8, stride, inp, isa != Isa::Plain);
-            let wide = Packed::new(&q8, stride, inp, true).with_wide();
+            let wide = Packed::new_wide(&q8, stride, inp);
             let col: Vec<f32> = (0..out).map(|_| 0.01 + rng.next().abs() * 0.02).collect();
             let bias: Vec<f32> = (0..out).map(|_| rng.next()).collect();
             for rows in [1usize, 6, 7, 13] {
@@ -1795,24 +1853,46 @@ mod tests {
         let mut rng = Rng(7);
         let (out, inp) = (80, 40);
         let w: Vec<i8> = (0..out * inp).map(|_| (rng.next() * 127.0) as i8).collect();
-        let (raw, p) = (
+        let (raw, p, pw) = (
             Packed::new(&w, out, inp, false),
-            Packed::new(&w, out, inp, true),
+            Packed::new_blocked(&w, out, inp),
+            Packed::new_wide(&w, out, inp),
         );
         assert!(
-            raw.blocked.is_empty() && p.raw.is_empty(),
+            matches!(raw.weights, WeightLayout::Raw(_))
+                && matches!(p.weights, WeightLayout::Blocked(_))
+                && matches!(pw.weights, WeightLayout::Wide(_)),
             "one layout each"
         );
+        assert!(matches!(
+            Packed::new_for(&w, out, inp, true, Isa::Avx2).weights,
+            WeightLayout::Wide(_)
+        ));
+        assert!(matches!(
+            Packed::new_for(&w, out, inp, true, Isa::Avx).weights,
+            WeightLayout::Wide(_)
+        ));
+        assert!(matches!(
+            Packed::new_for(&w, out, inp, true, Isa::Vnni512).weights,
+            WeightLayout::Blocked(_)
+        ));
+        assert!(matches!(
+            Packed::new_for(&w, out, inp, true, Isa::Plain).weights,
+            WeightLayout::Blocked(_)
+        ));
         for rows in [1, 3, 8, 9, 13] {
             let q: Vec<u8> = (0..rows * inp)
                 .map(|_| ((rng.next() + 1.0) * 127.0) as u8)
                 .collect();
             let mut want = vec![0i32; rows * out];
             gemm_plain(&q, rows, &raw, &mut want);
-            // the plain path on the blocked layout (a CPU without VNNI never packs, but it must agree)
+            // the plain path on the blocked and wide layouts must agree
             let mut got = vec![0i32; rows * out];
             gemm_plain(&q, rows, &p, &mut got);
             assert_eq!(got, want, "plain on blocked, rows {rows}");
+            let mut got = vec![0i32; rows * out];
+            gemm_plain(&q, rows, &pw, &mut got);
+            assert_eq!(got, want, "plain on wide, rows {rows}");
             for isa in [Isa::Vnni512, Isa::Vnni256, Isa::Avx2, Isa::Dot] {
                 if detect_isa() == Isa::Plain
                     || (isa == Isa::Vnni512 && detect_isa() != Isa::Vnni512)
@@ -1836,7 +1916,6 @@ mod tests {
                 assert_eq!(got, want, "{isa:?} rows {rows}");
                 if isa == Isa::Avx2 {
                     // the 16-bit copy's kernel too (a CPU at the AVX2 level packs it)
-                    let pw = Packed::new(&w, out, inp, true).with_wide();
                     let mut got = vec![0i32; rows * out];
                     gemm_u8i8(isa, &q, rows, &pw, &mut got);
                     assert_eq!(got, want, "AVX2 from 16 bits, rows {rows}");
