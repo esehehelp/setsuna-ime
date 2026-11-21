@@ -752,7 +752,13 @@ pub fn log_probs_with(
         {
             f32::NEG_INFINITY
         } else {
-            row[blank_id as usize] - lse
+            // a NaN blank (a model gone wrong) is no path, as a NaN token is none
+            let b = row[blank_id as usize] - lse;
+            if b.is_nan() {
+                f32::NEG_INFINITY
+            } else {
+                b
+            }
         };
         let (top1_id, top1_lp) = top.first().copied().unwrap_or((0, f32::NEG_INFINITY));
         let top2_lp = if vocab == 1 {
@@ -949,6 +955,20 @@ mod tests {
             .top
             .iter()
             .all(|&(_, lp)| !lp.is_nan()));
+        // a NaN blank is no path either (the beam would carry the NaN on)
+        let nan_blank = log_probs_from_logits(
+            &{
+                let mut r = flat[..vocab].to_vec();
+                r[4] = f32::NAN;
+                r
+            },
+            1,
+            vocab,
+            &[],
+            4,
+            16,
+        );
+        assert_eq!(nan_blank.steps[0].blank, f32::NEG_INFINITY);
         let mut odd = flat[..2 * vocab].to_vec();
         odd[100] = f32::NAN;
         odd[vocab + 200] = f32::INFINITY;

@@ -358,7 +358,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn this_machine_s_topology_is_whole() {
-        let (domains, cores, allowed) = sys::topology().expect("the topology");
+        let Some((domains, cores, allowed)) = sys::topology() else {
+            // none past processor group 0, by design (no pinning there)
+            let groups =
+                unsafe { windows_sys::Win32::System::Threading::GetActiveProcessorGroupCount() };
+            assert!(
+                groups > 1,
+                "no topology on a machine of one processor group"
+            );
+            return;
+        };
         assert!(!cores.is_empty() && cores.iter().all(|c| !c.is_empty()));
         let mut all: Vec<usize> = cores.iter().flatten().copied().collect();
         let n = all.len();

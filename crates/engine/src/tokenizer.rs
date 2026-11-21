@@ -26,28 +26,7 @@ pub struct SharedCharTokenizer {
 
 impl SharedCharTokenizer {
     pub fn load_vocab_hex_tsv(path: &Path) -> Result<Self> {
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let reader = BufReader::new(f);
-
-        let mut token_to_id: HashMap<String, u32> = HashMap::new();
-        let mut max_id: i64 = -1;
-        for line in reader.lines() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
-            }
-            let (id_str, hex_str) = match line.split_once('\t') {
-                Some(pair) => pair,
-                None => continue,
-            };
-            let id: u32 = id_str.parse()?;
-            let token = decode_hex_bytes(hex_str)?;
-            token_to_id.insert(token, id);
-            if id as i64 > max_id {
-                max_id = id as i64;
-            }
-        }
-        anyhow::ensure!(max_id >= 0, "no tokens parsed from {}", path.display());
+        let (token_to_id, max_id) = Self::read_vocab_hex_tsv(path)?;
         // the table is as long as the highest id: one far past the entries (a line's id of 4294967295) asked for
         // a hundred gigabytes
         anyhow::ensure!(
@@ -80,14 +59,41 @@ impl SharedCharTokenizer {
         })
     }
 
+    /// The tokens of a vocabulary file (`<id>	<hex bytes>` lines) and its highest id; its ids need not be dense.
+    fn read_vocab_hex_tsv(path: &Path) -> Result<(HashMap<String, u32>, i64)> {
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let reader = BufReader::new(f);
+
+        let mut token_to_id: HashMap<String, u32> = HashMap::new();
+        let mut max_id: i64 = -1;
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let (id_str, hex_str) = match line.split_once('\t') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let id: u32 = id_str.parse()?;
+            let token = decode_hex_bytes(hex_str)?;
+            token_to_id.insert(token, id);
+            if id as i64 > max_id {
+                max_id = id as i64;
+            }
+        }
+        anyhow::ensure!(max_id >= 0, "no tokens parsed from {}", path.display());
+        Ok((token_to_id, max_id))
+    }
+
     /// Read the input vocabulary (manifest `input_vocab`): its tokens other
     /// than specials and byte tokens, the chars a training row held as one
     /// token each.
     pub fn with_input_vocab(mut self, path: &Path) -> Result<Self> {
-        let input = Self::load_vocab_hex_tsv(path)?;
+        // its tokens only: a part of a vocabulary keeps its ids, no table of them is made
+        let (input, _) = Self::read_vocab_hex_tsv(path)?;
         self.input_chars = Some(
             input
-                .token_to_id
                 .into_keys()
                 .filter(|t| {
                     !(t.starts_with('[') && t.ends_with(']')) && parse_byte_token(t).is_none()
@@ -295,6 +301,29 @@ mod tests {
             mask_id: 5,
             input_chars: None,
         }
+    }
+
+    #[test]
+    fn an_input_vocabulary_keeps_its_sparse_ids() {
+        // a part of the model's vocabulary with the ids it had there (no
+        // table is made of it), where the model's own must be dense
+        let dir = std::env::temp_dir().join(format!("setsuna-input-vocab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hex = |t: &str| t.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let sparse = dir.join("input.tsv");
+        std::fs::write(
+            &sparse,
+            format!("0\t{}\n90000\t{}\n", hex("[PAD]"), hex("あ")),
+        )
+        .unwrap();
+        let t = tokenizer(&[
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ",
+        ])
+        .with_input_vocab(&sparse)
+        .unwrap();
+        assert!(t.input_chars.as_ref().unwrap().contains("あ"));
+        assert!(SharedCharTokenizer::load_vocab_hex_tsv(&sparse).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -388,9 +388,9 @@ impl GroupWeights {
         path: Path,
         mode: u8,
     ) -> Result<Self, String> {
-        if n % 16 != 0 || g % 4 != 0 || g == 0 || k % g != 0 {
+        if n == 0 || k == 0 || n % 16 != 0 || g % 4 != 0 || g == 0 || k % g != 0 {
             return Err(format!(
-                "N {n} must be in 16s, the group {g} in 4s and divide K {k}"
+                "N {n} must be in 16s, the group {g} in 4s and divide K {k}, neither N nor K 0"
             ));
         }
         let groups = k / g;
@@ -1655,6 +1655,14 @@ mod tests {
             );
         }
         drop(keep);
+    }
+
+    #[test]
+    fn a_matrix_of_no_width_does_not_load() {
+        // a model's hidden -> 0 -> hidden feed-forward loaded, then divided by
+        // zero at its first conversion
+        assert!(GroupWeights::in_place(&[], &[], &[], 0, 64, 64).is_err());
+        assert!(GroupWeights::in_place(&[], &[], &[], 16, 0, 64).is_err());
     }
 
     #[test]

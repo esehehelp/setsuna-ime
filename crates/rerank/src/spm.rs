@@ -60,6 +60,8 @@ impl<'a> Reader<'a> {
         for shift in (0..64).step_by(7) {
             let b = *self.buf.get(self.at).context("truncated varint")?;
             self.at += 1;
+            // the tenth byte holds bit 63 only: more would be dropped by the shift
+            ensure!(shift < 63 || b <= 1, "varint past 64 bits");
             v |= u64::from(b & 0x7f) << shift;
             if b < 0x80 {
                 return Ok(v);
@@ -342,6 +344,16 @@ mod tests {
             .map(|(p, s, t)| (p.as_str(), *s, *t))
             .collect();
         SentencePiece::parse(&model(&refs, byte_fallback)).unwrap()
+    }
+
+    #[test]
+    fn a_varint_past_64_bits_is_refused() {
+        let ok = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        let mut r = Reader { buf: &ok, at: 0 };
+        assert_eq!(r.varint().unwrap(), u64::MAX);
+        // a tenth byte of 2: bit 64, dropped, read as a small length before
+        let over = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert!(Reader { buf: &over, at: 0 }.varint().is_err());
     }
 
     #[test]

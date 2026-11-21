@@ -71,6 +71,22 @@ pub struct Reranker {
     pub config: RerankConfig,
 }
 
+/// llama.cpp's backend, initialized once a process (`LlamaBackend::init`
+/// fails the second time): a load that failed after it may be tried again.
+fn backend() -> Result<&'static LlamaBackend> {
+    static BACKEND: std::sync::Mutex<Option<&'static LlamaBackend>> = std::sync::Mutex::new(None);
+    let mut slot = BACKEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(b) = *slot {
+        return Ok(b);
+    }
+    let b: &'static LlamaBackend =
+        Box::leak(Box::new(LlamaBackend::init().context("init llama.cpp")?));
+    *slot = Some(b);
+    Ok(b)
+}
+
 /// Load llama.cpp's CPU backends: next to the executable when they were
 /// installed there, else from where the build put them.
 fn load_backends() {
@@ -112,16 +128,13 @@ impl Reranker {
             None => None,
         };
         load_backends();
-        let backend: &'static LlamaBackend =
-            Box::leak(Box::new(LlamaBackend::init().context("init llama.cpp")?));
+        let backend = backend()?;
         let model = LlamaModel::load_from_file(
             backend,
             &manifest.weights_path,
             &LlamaModelParams::default(),
         )
         .with_context(|| format!("load {}", manifest.weights_path.display()))?;
-        // the daemon keeps one model for its whole life
-        let model: &'static LlamaModel = Box::leak(Box::new(model));
         // the manifest's BOS and the tokenizer's ids are the model's: one past
         // its vocabulary would go to llama.cpp as it is
         let n_vocab = model.n_vocab();
@@ -141,6 +154,8 @@ impl Reranker {
                 "the tokenizer's ids go past the model's vocabulary of {n_vocab}"
             );
         }
+        // the daemon keeps one model for its whole life (one rejected above is freed)
+        let model: &'static LlamaModel = Box::leak(Box::new(model));
         let n_ubatch = options.n_ubatch.unwrap_or(scorer::N_UBATCH);
         let scorer = scorer::TreeScorer::new(model, backend, config.threads, n_ubatch)?;
         Ok(Self {

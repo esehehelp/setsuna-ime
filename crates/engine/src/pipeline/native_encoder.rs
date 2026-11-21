@@ -273,6 +273,10 @@ impl Lin8 {
 
     /// `name`.q (out, inp) int8, `.scale` (1), `.zero` (1) int8 and 0, `.bias` (out) when `bias`.
     fn load(isa: Isa, w: &Weights, name: &str, out: usize, inp: usize, bias: bool) -> Result<Self> {
+        anyhow::ensure!(
+            out > 0 && inp > 0,
+            "{name}: {out} x {inp}, a matrix of no width"
+        );
         let q = w.i8(&format!("{name}.q"), &[out, inp])?;
         let zero = w.i8(&format!("{name}.zero"), &[1])?[0];
         anyhow::ensure!(
