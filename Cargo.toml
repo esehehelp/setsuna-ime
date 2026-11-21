@@ -7,7 +7,7 @@ exclude = ["vendor/vibrato-packed"]
 
 [workspace.package]
 edition = "2021"
-version = "0.3.0"
+version = "0.3.1"
 license = "MIT"
 repository = "https://github.com/esehehelp/setsuna-ime"
 

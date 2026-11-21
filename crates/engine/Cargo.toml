@@ -3,7 +3,7 @@ name = "setsuna-engine"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-version = "0.3.0"
+version = "0.3.1"
 description = "Inference-only kana-kanji conversion engine: a CTC-NAT model (its weights for the engine's own implementation), loaded through a manifest, run as proposal -> CTC beam (or AR decoder) -> candidates, as a library or a stdio daemon."
 
 [lib]
