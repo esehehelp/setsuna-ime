@@ -314,7 +314,13 @@ impl Harness {
         Ok((out, ms(first), ms(pressed + space), ms(typed)))
     }
 
-    pub fn run(&mut self, rows: &[Row], mut each: impl FnMut(&Typed)) -> Result<Vec<Typed>> {
+    /// Type `rows`, `each` told of every row typed; the run stops at a row
+    /// `each` answers false for (its output cannot be written).
+    pub fn run(
+        &mut self,
+        rows: &[Row],
+        mut each: impl FnMut(&Typed) -> bool,
+    ) -> Result<Vec<Typed>> {
         let mut done = Vec::new();
         for row in rows.iter().take(self.opts.limit) {
             let keys = match crate::romaji::keys(&row.reading) {
@@ -334,8 +340,11 @@ impl Harness {
                 space_ms,
                 typed_ms,
             };
-            each(&t);
+            let go_on = each(&t);
             done.push(t);
+            if !go_on {
+                break;
+            }
         }
         Ok(done)
     }

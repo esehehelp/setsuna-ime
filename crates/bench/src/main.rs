@@ -149,16 +149,15 @@ fn main() -> Result<()> {
             // run: the first such error ends it, reported
             let mut written: std::io::Result<()> = Ok(());
             let typed = h.run(&rows, |t| {
-                if written.is_ok() {
-                    written = serde_json::to_string(t)
-                        .map_err(std::io::Error::other)
-                        .and_then(|line| writeln!(f, "{line}"))
-                        .and_then(|()| f.flush());
-                }
+                written = serde_json::to_string(t)
+                    .map_err(std::io::Error::other)
+                    .and_then(|line| writeln!(f, "{line}"))
+                    .and_then(|()| f.flush());
                 k += 1;
                 if k % 50 == 0 {
                     eprintln!("{k}/{n} in {:.1} min", t0.elapsed().as_secs_f64() / 60.0);
                 }
+                written.is_ok()
             })?;
             written.with_context(|| format!("write {}", out.display()))?;
             let mut engine = h.engine_ms.lock().unwrap().clone();

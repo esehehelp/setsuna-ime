@@ -40,6 +40,19 @@ pub fn file_within(manifest: &Path, rel: &Path, what: &str) -> Result<PathBuf> {
         rel.display()
     );
     let base = manifest.parent().unwrap_or_else(|| Path::new("."));
+    // no part of it a link to a share, looked at before anything opens it:
+    // opening one would send the user's credentials to the host before
+    // the check below could refuse it
+    let mut part = base.to_path_buf();
+    for c in rel.components() {
+        part.push(c);
+        anyhow::ensure!(
+            !leads_to_share(&part),
+            "manifest {}: {what} {} leads to a network share",
+            manifest.display(),
+            rel.display()
+        );
+    }
     let full = base.join(rel);
     anyhow::ensure!(
         full.is_file(),
@@ -62,6 +75,39 @@ pub fn file_within(manifest: &Path, rel: &Path, what: &str) -> Result<PathBuf> {
         rel.display()
     );
     Ok(full)
+}
+
+/// Whether `path` is a link that leads, itself or through the links it
+/// leads to (a few at most), to a network path (`\\host\share`); read
+/// without following any. A link that cannot be read is taken for one.
+fn leads_to_share(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let network = |p: &Path| {
+        matches!(p.components().next(),
+            Some(Component::Prefix(x)) if matches!(x.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)))
+            || p.to_string_lossy().starts_with("//")
+    };
+    let mut p = path.to_path_buf();
+    for _ in 0..8 {
+        let Ok(m) = std::fs::symlink_metadata(&p) else {
+            return false;
+        };
+        if !m.file_type().is_symlink() {
+            return false;
+        }
+        let Ok(target) = std::fs::read_link(&p) else {
+            return true;
+        };
+        if network(&target) {
+            return true;
+        }
+        p = if target.is_absolute() {
+            target
+        } else {
+            p.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        };
+    }
+    true
 }
 
 pub fn read_manifest(path: &Path) -> Result<(Envelope, serde_json::Value)> {
@@ -1492,6 +1538,29 @@ mod tests {
             ),
         );
         assert!(LmScorerManifest::load(&below).is_ok());
+        // a link to a share is refused before it is opened (where links can
+        // be made: Windows needs the privilege or developer mode)
+        let share = if cfg!(windows) {
+            r"\\share-host.invalid\models\w.gguf"
+        } else {
+            "//share-host.invalid/models/w.gguf"
+        };
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(share, dir.join("linked.gguf"));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(share, dir.join("linked.gguf"));
+        if linked.is_ok() {
+            let m = write(
+                &dir,
+                "linked.json",
+                &body(
+                    r#"{"path":"linked.gguf","format":"gguf","precision":"f16"}"#,
+                    "",
+                ),
+            );
+            let e = LmScorerManifest::load(&m).unwrap_err();
+            assert!(format!("{e:#}").contains("network share"), "{e:#}");
+        }
     }
 
     #[test]
