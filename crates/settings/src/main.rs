@@ -56,10 +56,64 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
         })
 }
 
+const TITLE: &str = "Setsuna 設定";
+
+/// One settings window at a time: two each held the config as it was when
+/// they opened, and the one saved last undid what the other had saved. The
+/// first takes a lock in the config directory and holds it while it runs
+/// (`Some`); a second finds it held, brings the first forward and ends
+/// (`None`). Without a config directory or a lock to take, it runs anyway.
+fn first_instance() -> Option<Option<std::fs::File>> {
+    let Some(dir) = setsuna_core::config::config_dir() else {
+        return Some(None);
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("settings.lock"))
+    else {
+        return Some(None);
+    };
+    match lock.try_lock() {
+        Ok(()) => Some(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(_)) => Some(None),
+    }
+}
+
+/// The settings window another process has open, restored and brought to
+/// the front.
+#[cfg(windows)]
+fn show_open_window() {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    unsafe {
+        if let Ok(hwnd) = FindWindowW(None, &HSTRING::from(TITLE)) {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn show_open_window() {
+    eprintln!("the settings window is open already");
+}
+
 fn main() -> wry::Result<()> {
+    let Some(_instance) = first_instance() else {
+        show_open_window();
+        return Ok(());
+    };
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
-        .with_title("Setsuna 設定")
+        .with_title(TITLE)
         .with_inner_size(tao::dpi::LogicalSize::new(720.0, 820.0))
         .with_min_inner_size(tao::dpi::LogicalSize::new(480.0, 420.0))
         .build(&event_loop)
