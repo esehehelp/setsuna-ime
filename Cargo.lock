@@ -2712,6 +2712,7 @@ dependencies = [
 name = "setsuna-settings"
 version = "0.3.1"
 dependencies = [
+ "gtk",
  "serde_json",
  "setsuna-core",
  "setsuna-rewrite",

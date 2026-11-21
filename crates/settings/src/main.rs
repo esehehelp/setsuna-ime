@@ -24,6 +24,8 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(target_os = "linux")]
+mod raise;
 mod rewriter;
 
 use serde_json::{json, Value};
@@ -35,11 +37,14 @@ use wry::WebViewBuilder;
 
 const INDEX: &str = include_str!("../web/index.html");
 
-/// What reaches the event loop: a message from the page, or a reply a
-/// thread finished.
+/// What reaches the event loop: a message from the page, a reply a thread
+/// finished, or (Linux) a later start asking for the window, with the
+/// activation token its launcher gave it.
 pub enum UserEvent {
     Ipc(String),
     Reply(Value),
+    #[cfg(target_os = "linux")]
+    Present(String),
 }
 
 /// The webview's profile: in the user's local app data, under the name
@@ -101,13 +106,21 @@ fn show_open_window() {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux no process may raise another's window: the one that has it open
+/// is asked to, with this start's activation token (`raise`).
+#[cfg(target_os = "linux")]
+fn show_open_window() {
+    raise::ask(&raise::launch_token());
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn show_open_window() {
     eprintln!("the settings window is open already");
 }
 
 fn main() -> wry::Result<()> {
-    let Some(_instance) = first_instance() else {
+    // held until the process ends: the event loop below never returns
+    let Some(instance) = first_instance() else {
         show_open_window();
         return Ok(());
     };
@@ -153,6 +166,15 @@ fn main() -> wry::Result<()> {
         builder.build_gtk(window.default_vbox().expect("gtk vbox"))?
     };
 
+    // The holder of the lock is the one a later start asks for its window;
+    // without a lock there may be several, and none listens.
+    #[cfg(target_os = "linux")]
+    if instance.is_some() {
+        raise::listen(event_loop.create_proxy());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = &instance;
+
     let mut page = Page::load();
     let mut rewriter = rewriter::Rewriter::new(event_loop.create_proxy());
     event_loop.run(move |event, _, control_flow| {
@@ -178,10 +200,19 @@ fn main() -> wry::Result<()> {
                 Some(rewriter.refreshed(&reply))
             }
             Event::UserEvent(UserEvent::Reply(reply)) => Some(reply),
+            #[cfg(target_os = "linux")]
+            Event::UserEvent(UserEvent::Present(token)) => {
+                raise::present(&window, &token);
+                None
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                #[cfg(target_os = "linux")]
+                if instance.is_some() {
+                    raise::forget();
+                }
                 *control_flow = ControlFlow::Exit;
                 None
             }

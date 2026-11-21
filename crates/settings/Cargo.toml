@@ -20,7 +20,7 @@ required-features = ["gui"]
 [features]
 default = ["gui"]
 # The desktop window and the rewriter's sign-in, keys and models.
-gui = ["dep:wry", "dep:tao", "dep:setsuna-rewrite"]
+gui = ["dep:wry", "dep:tao", "dep:setsuna-rewrite", "dep:gtk"]
 
 [dependencies]
 setsuna-core = { path = "../ime-core" }
@@ -37,6 +37,11 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The window tao made, presented with a later start's activation token
+# (`raise`); the version tao and wry build with.
+gtk = { version = "0.18", optional = true }
 
 [dev-dependencies]
 toml.workspace = true
