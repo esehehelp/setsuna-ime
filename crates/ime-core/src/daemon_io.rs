@@ -133,6 +133,14 @@ pub(crate) fn spawn_child(
     }
     let mut child = cmd.spawn()?;
     crate::diagnostics::log(format!("{label} child pid={}", child.id()));
+    #[cfg(windows)]
+    match setsuna_pipe::win::place_on_largest_l3(child.id()) {
+        Ok(Some(mask)) => crate::diagnostics::log(format!(
+            "{label} child kept to the processors {mask:#x} (the largest L3)"
+        )),
+        Ok(None) => {}
+        Err(e) => crate::diagnostics::log(format!("{label} child: its processors not set: {e}")),
+    }
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         kill_and_wait(&mut child);
         return Err(io::Error::other("child stdio not piped"));

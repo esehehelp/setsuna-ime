@@ -83,6 +83,17 @@ pub(crate) fn connect(
                         "{} server started pid={pid} out_of_job={own_job} args={:?}",
                         target.label, target.args
                     ));
+                    match win::place_on_largest_l3(pid) {
+                        Ok(Some(mask)) => crate::diagnostics::log(format!(
+                            "{} server kept to the processors {mask:#x} (the largest L3)",
+                            target.label
+                        )),
+                        Ok(None) => {}
+                        Err(e) => crate::diagnostics::log(format!(
+                            "{} server: its processors not set: {e}",
+                            target.label
+                        )),
+                    }
                     started = Some(pid);
                 }
                 // gone with no pipe: it could not load (or serve) the model
