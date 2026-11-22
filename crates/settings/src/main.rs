@@ -61,6 +61,26 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
         })
 }
 
+/// What WebView2 fetched or kept in the settings' folder that the page never
+/// uses: its components (a DRM module, ad-block lists, speech recognition,
+/// their downloads) and its crash dumps, 120 MB on a PC where nothing turned
+/// them off. Gone before the webview starts (one settings window at a time:
+/// no browser process of ours has them open); the profile and the shader
+/// cache stay.
+#[cfg(windows)]
+fn prune_webview_data(dir: &std::path::Path) {
+    let web = dir.join("EBWebView");
+    for sub in [
+        "Crashpad",
+        "WidevineCdm",
+        "component_crx_cache",
+        "Subresource Filter",
+        "Speech Recognition",
+    ] {
+        let _ = std::fs::remove_dir_all(web.join(sub));
+    }
+}
+
 const TITLE: &str = "Setsuna 設定";
 
 /// One settings window at a time: two each held the config as it was when
@@ -140,9 +160,24 @@ fn main() -> wry::Result<()> {
     // window never came up). The context lives as long as `main`, which the
     // event loop never returns to.
     #[cfg(windows)]
-    let mut context = wry::WebContext::new(webview_data_dir());
+    let data_dir = webview_data_dir();
     #[cfg(windows)]
-    let builder = WebViewBuilder::new_with_web_context(&mut context);
+    if let Some(dir) = &data_dir {
+        prune_webview_data(dir);
+    }
+    #[cfg(windows)]
+    let mut context = wry::WebContext::new(data_dir);
+    #[cfg(windows)]
+    let builder = {
+        use wry::WebViewBuilderExtWindows;
+        // wry's own (in place of which these go), and none of the browser's
+        // components fetched (a DRM module, ad-block lists, speech: 55 MB
+        // the page never uses) nor its crash dumps kept
+        WebViewBuilder::new_with_web_context(&mut context).with_additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --disable-component-update --disable-breakpad --disable-crash-reporter",
+        )
+    };
     #[cfg(not(windows))]
     let builder = WebViewBuilder::new();
     // The page is the one built in, and stays: it loads as inline HTML
