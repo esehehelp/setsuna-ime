@@ -516,6 +516,38 @@ impl Field {
         self.settle_after(Duration::ZERO, quiet, cap)
     }
 
+    /// As `settle`, the field read after each message this thread is sent
+    /// or posted (an input method changes the field in the handling of one:
+    /// its key, an edit session, its own window's message, a call from its
+    /// process), else every millisecond: the times to the change itself, not
+    /// to a read some milliseconds on (`settle` reads every few, which put
+    /// 4 to 5 ms under every key). For the keys of the latency rows.
+    fn settle_close(&self, quiet: Duration, cap: Duration) -> (Duration, Duration) {
+        let start = Instant::now();
+        let mut last = self.view();
+        let mut changed = start;
+        let mut first = None;
+        loop {
+            unsafe {
+                let _ = MsgWaitForMultipleObjectsEx(None, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let now = self.view();
+            if now != last {
+                last = now;
+                changed = Instant::now();
+                first.get_or_insert(changed);
+            }
+            if changed.elapsed() >= quiet || start.elapsed() >= cap {
+                return (first.unwrap_or(start) - start, changed - start);
+            }
+        }
+    }
+
     /// As `settle`, but for `at_least` in any case.
     fn settle_after(
         &self,
@@ -931,7 +963,7 @@ pub fn run(args: Args) -> Result<()> {
                     let mut got = Vec::new();
                     for (i, c) in keys.chars().enumerate() {
                         type_char(c);
-                        let (first, last) = f.settle(pause, Duration::from_secs(2));
+                        let (first, last) = f.settle_close(pause, Duration::from_secs(2));
                         if !first.is_zero() {
                             got.push(KeyOut {
                                 id: row.id.clone(),
