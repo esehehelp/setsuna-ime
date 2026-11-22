@@ -135,7 +135,8 @@ function Remove-AtRestart([string]$Path) {
 public static extern bool MoveFileEx(string existing, string replacement, int flags);
 '@
     }
-    return [Setsuna.Uninstall.Native]::MoveFileEx($Path, $null, 4)
+    # [NullString]: a $null passed for a string becomes "" (no such path), not NULL
+    return [Setsuna.Uninstall.Native]::MoveFileEx($Path, [NullString]::Value, 4)
 }
 
 # Whether $Dir is an install of install.ps1's to delete: a directory of its

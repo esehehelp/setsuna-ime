@@ -592,6 +592,10 @@ function Remove-StaleFiles {
         }
     }
 
+    # a file this install keeps that an install before left to be deleted at
+    # the restart (in use then; the same build installed again has its name)
+    $pendingDeletes = if (Test-IsAdmin) { Undo-RestartDeletes $keepSet } else { $null }
+
     $stale = @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object {
         $_.Name -match '^(setsuna_tsf|setsuna_tsf_shim|setsuna-tsf-check|setsuna-engine|setsuna-rewrite|onnxruntime)_[0-9a-f]{12}\.(dll|exe)$' -or
         # the ONNX Runtime an earlier engine loaded (the engine runs its own inference since 0.3)
@@ -627,9 +631,72 @@ function Remove-StaleFiles {
             Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
             Write-Log INFO "removed unused $full"
         } catch {
-            Write-Log INFO "kept $full (in use)"
+            # a DLL an app still has loaded: an app keeps every version the
+            # shim loaded into it until it exits, so that they pile up while
+            # apps run for days; gone at the next restart
+            if (-not $item.PSIsContainer -and $pendingDeletes -and $pendingDeletes.Contains($full)) {
+                Write-Log INFO "in use: $full deleted at the next restart (as an install before left it)"
+            } elseif (-not $item.PSIsContainer -and (Test-IsAdmin) -and (Remove-AtRestart $full)) {
+                Write-Log INFO "in use: $full deleted at the next restart"
+            } else {
+                Write-Log INFO "kept $full (in use)"
+            }
         }
     }
+}
+
+# The deletes at the restart (`Remove-AtRestart`: PendingFileRenameOperations,
+# pairs of a path and where it goes, nothing for a delete) of the files in
+# $Keep taken back; every other pair stays as it is. The paths still to be
+# deleted (a set), so that none is put in twice.
+function Undo-RestartDeletes($Keep) {
+    $pending = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $key = 'SYSTEM\CurrentControlSet\Control\Session Manager'
+    $name = 'PendingFileRenameOperations'
+    $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($key, $true)
+    if (-not $k) { return ,$pending }
+    try {
+        $ops = @($k.GetValue($name, $null, 'DoNotExpandEnvironmentNames'))
+        if ($ops.Count -lt 2 -or $ops.Count % 2) { return ,$pending }
+        $out = [Collections.Generic.List[string]]::new()
+        $undone = @()
+        for ($i = 0; $i -lt $ops.Count; $i += 2) {
+            $path = $ops[$i] -replace '^\\\?\?\\', ''
+            $delete = $ops[$i + 1] -eq '' -and $ops[$i].StartsWith('\??\')
+            if ($delete -and $Keep.Contains($path)) {
+                $undone += $path
+                continue
+            }
+            if ($delete) { [void]$pending.Add($path) }
+            $out.Add($ops[$i]); $out.Add($ops[$i + 1])
+        }
+        if (-not $undone) { return ,$pending }
+        if ($out.Count) {
+            $k.SetValue($name, [string[]]$out.ToArray(), [Microsoft.Win32.RegistryValueKind]::MultiString)
+        } else {
+            $k.DeleteValue($name)
+        }
+        foreach ($p in $undone) { Write-Log INFO "kept $p (its delete at the restart taken back)" }
+        return ,$pending
+    } finally {
+        $k.Close()
+    }
+}
+
+# $Path deleted when Windows next starts (MOVEFILE_DELAY_UNTIL_REBOOT, an
+# administrator's): only under Program Files, where no user can put a link
+# for the start to delete through.
+function Remove-AtRestart([string]$Path) {
+    $programFiles = [IO.Path]::Combine([Environment]::GetFolderPath('ProgramFiles'), 'x').TrimEnd('x')
+    if (-not $Path.StartsWith($programFiles, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not ('Setsuna.Install.Native' -as [type])) {
+        Add-Type -Namespace Setsuna.Install -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool MoveFileEx(string existing, string replacement, int flags);
+'@
+    }
+    # [NullString]: a $null passed for a string becomes "" (no such path), not NULL
+    return [Setsuna.Install.Native]::MoveFileEx($Path, [NullString]::Value, 4)
 }
 
 function Set-OrAppendConfigValue {
