@@ -295,6 +295,8 @@ pub(super) struct BridgeConfig {
     /// instead of typing; for a window that labels its candidates.
     pub(super) digit_select: bool,
     pub(super) full_width_space: bool,
+    /// `[frontend] space_converts_last_segment`.
+    pub(super) space_last_segment: bool,
     /// `[frontend] sentence_case`: the punctuation typed after an English
     /// sentence is English (`mixed::english_after`).
     pub(super) sentence_case: bool,
@@ -327,6 +329,7 @@ impl BridgeConfig {
             page_size: 10,
             digit_select: false,
             full_width_space: frontend.full_width_space,
+            space_last_segment: frontend.space_converts_last_segment,
             sentence_case: frontend.sentence_case,
             live_conversion: frontend.live_conversion.unwrap_or(true),
             backspace_deletes_shown: frontend.backspace_deletes_shown,

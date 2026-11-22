@@ -344,6 +344,13 @@ button.chatgpt:hover:not(:disabled) { background: #2a2a2a; }
   </div>
   <div class="row">
     <div class="text">
+      <div class="title">スペースで末尾の文節だけを変換</div>
+      <div class="desc">スペースを押すと文全体を変換し、最後の文節の候補だけを表示します。前の文節は変換したまま残ります。もう一度スペースでその文節の次の候補、← / → でほかの文節に移ります。オフのときは文全体の候補を表示します。</div>
+    </div>
+    <div class="control" data-switch="frontend.space_converts_last_segment"></div>
+  </div>
+  <div class="row">
+    <div class="text">
       <div class="title">/コマンド・@ファイルを直接入力</div>
       <div class="desc">行頭や空白の直後に続く /・$・@ で始まる文字列を変換せずそのままアプリへ送ります（AI エージェントの補完機能などに便利です）。カーソル前のテキストを取得できるアプリでのみ動作します。</div>
     </div>

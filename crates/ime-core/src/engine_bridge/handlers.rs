@@ -362,6 +362,56 @@ impl EngineBridge {
     }
 
     pub fn handle_space(&mut self) -> KeyOutcome {
+        let composing = matches!(self.phase, Phase::Composing { .. });
+        let out = self.space_convert();
+        if composing && self.cfg.space_last_segment {
+            return self.on_last_segment(out);
+        }
+        out
+    }
+
+    /// `out`, the whole sentence converted (`space_convert`), as segment
+    /// editing on its last segment: the segments before it stay as
+    /// converted, the list is that segment's. `out` as it is when the
+    /// conversion cannot be cut (no list of its reading yet).
+    fn on_last_segment(&mut self, out: KeyOutcome) -> KeyOutcome {
+        if !out.consumed
+            || !matches!(self.phase, Phase::Converting { seg: None, .. })
+            || !self.ensure_segmented()
+        {
+            return out;
+        }
+        if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
+            s.focus = s.segs.len().saturating_sub(1);
+        }
+        self.query_focused_segment();
+        // the sentence's preedit and list give way to the segments'; what
+        // else the conversion did (a rewrite asked for) stays
+        let mut actions = self.segment_actions();
+        actions.extend(out.actions.into_iter().filter(|a| {
+            !matches!(
+                a,
+                Action::UpdatePreedit { .. } | Action::ShowCandidates { .. }
+            )
+        }));
+        consumed(actions)
+    }
+
+    /// Live conversion shows the conversion of all that is typed (not the
+    /// kana Escape brought back, nor one of a reading still being typed).
+    fn shows_whole_conversion(&self) -> bool {
+        self.cfg.live_conversion
+            && matches!(self.phase, Phase::Composing { .. })
+            && self.composing.cursor_at_end()
+            && self.composing.pending_romaji().is_empty()
+            && !self.comp.kana_shown
+            && !self.comp.cached_prefix_kanji.is_empty()
+            && self.comp.cached_prefix_reading == self.composing.live_reading()
+    }
+
+    /// Space: convert the reading typed (the whole sentence's list), or
+    /// the next candidate of a conversion open.
+    fn space_convert(&mut self) -> KeyOutcome {
         // the list the preview went without, whole for this key
         self.finish_list_now(true);
         // a command's name ends
@@ -745,6 +795,14 @@ impl EngineBridge {
     pub fn handle_move_cursor(&mut self, delta: i32) -> KeyOutcome {
         // the list the preview went without, whole for this key
         self.finish_list_now(true);
+        // ← on the conversion live conversion shows: its segments to edit,
+        // the last one first, as Space on it (`on_last_segment`); the
+        // conversion stays, where moving the caret into it brought the kana
+        // typed back
+        if delta < 0 && self.shows_whole_conversion() {
+            let out = self.space_convert();
+            return self.on_last_segment(out);
+        }
         match &self.phase {
             Phase::Composing { .. } => {
                 self.composing.move_cursor(delta);

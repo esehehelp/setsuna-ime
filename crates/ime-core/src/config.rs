@@ -495,6 +495,11 @@ pub struct FrontendCfg {
     /// MS-IME and Mozc do in hiragana mode; false leaves it to the app (a
     /// half-width space). Shift+Space types the other width.
     pub full_width_space: bool,
+    /// Space converts the sentence typed and opens the list of its last
+    /// segment (文節) only, the segments before it kept as converted: Space
+    /// again steps through that segment's candidates, ← / → move to another.
+    /// False: the list of the whole sentence.
+    pub space_converts_last_segment: bool,
     /// While typing, show the conversion in the text (true) or keep the
     /// typed kana there and list the conversions in a suggestion window
     /// (false, as Mozc does). Unset: true on every frontend.
@@ -676,6 +681,7 @@ impl Default for FrontendCfg {
             typo_correction: true,
             pass_through_commands: false,
             full_width_space: false,
+            space_converts_last_segment: false,
             live_conversion: None,
             backspace_deletes_shown: true,
             escape_to_kana: true,
@@ -1275,6 +1281,9 @@ impl Config {
              # Space with nothing composed types a full-width space (U+3000);\n\
              # Shift+Space types the other width.\n\
              full_width_space = false\n\
+             # Space opens the list of the sentence's last segment only (true),\n\
+             # or of the whole sentence (false).\n\
+             space_converts_last_segment = false\n\
              # While typing, show the conversion in the text (true) or the\n\
              # typed kana with the conversions in a suggestion window (false).\n\
              # Default true.\n\

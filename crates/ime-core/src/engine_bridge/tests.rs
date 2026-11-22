@@ -2164,6 +2164,68 @@ fn v(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|s| s.to_string()).collect()
 }
 
+/// きしゃのきしゃ typed and converted live (記者の記者 shown), nothing pressed.
+fn live_kisha() -> (EngineBridge, MockClient) {
+    let (mut bridge, mock) = bridge_with_mock();
+    type_str(&mut bridge, "kishanokisha");
+    let pos: &[u32] = &[0, 2, 3, 4, 6];
+    mock.set_aligned(
+        "きしゃのきしゃ",
+        &["記者の記者", "汽車の記者", "記者の汽車"],
+        &[pos, pos, pos],
+    );
+    bridge.apply_async_result();
+    (bridge, mock)
+}
+
+#[test]
+fn space_can_open_the_last_segments_list_only() {
+    let (mut bridge, _mock) = live_kisha();
+    bridge.cfg.space_last_segment = true;
+    let out = bridge.handle_space();
+    // the sentence converted, the last segment the one being edited
+    assert_eq!(segments_shown(&out.actions), (v(&["記者の", "記者"]), 1));
+    let (list, selected, at) = segment_list(&out.actions);
+    assert_eq!((list[..2].to_vec(), selected), (v(&["記者", "汽車"]), 0));
+    assert_eq!(at, "記者の".encode_utf16().count());
+    // Space again: that segment's next candidate, the one before as it was
+    let out = bridge.handle_space();
+    assert_eq!(segments_shown(&out.actions), (v(&["記者の", "汽車"]), 1));
+    // ← to the segment before
+    let out = bridge.handle_move_cursor(-1);
+    assert_eq!(segments_shown(&out.actions).1, 0);
+    // off (the default): the whole sentence's list
+    let (mut bridge, _mock) = live_kisha();
+    let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+    assert_eq!(list[0], "記者の記者");
+}
+
+#[test]
+fn left_on_a_live_conversion_edits_its_segments_instead_of_bringing_the_kana_back() {
+    let (mut bridge, _mock) = live_kisha();
+    let out = bridge.handle_move_cursor(-1);
+    assert!(out.consumed);
+    // the conversion stays, its last segment to edit
+    assert_eq!(segments_shown(&out.actions), (v(&["記者の", "記者"]), 1));
+    assert!(bridge.is_converting());
+    // → at the end of it: nothing to go to, the conversion as it is
+    let (mut bridge, _mock) = live_kisha();
+    let out = bridge.handle_move_cursor(1);
+    assert!(out.consumed);
+    assert!(!bridge.is_converting());
+    // with the kana shown (Escape), ← moves the caret in them
+    let (mut bridge, _mock) = live_kisha();
+    bridge.handle_escape();
+    let out = bridge.handle_move_cursor(-1);
+    assert!(!bridge.is_converting());
+    assert!(
+        matches!(out.actions.last(), Some(Action::UpdatePreedit { text }) if text == "きしゃのきしゃ"),
+        "{:?}",
+        out.actions
+    );
+    assert_eq!(bridge.caret(), Some(6));
+}
+
 #[test]
 fn discard_drops_the_composition_and_a_late_result() {
     let (mut bridge, mock) = converting_kisha();
