@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// setsuna, msime, shunti, zeroconvert, fumiori, copilot or none (the US
+    /// setsuna, msime, shunti, zeroconvert, fumiori, copilot, azookey, mozkey or none (the US
     /// keyboard: the runner's own cost).
     #[arg(long)]
     ime: String,
@@ -139,6 +139,31 @@ fn profile(name: &str) -> Result<Option<Profile>> {
                 "%USERPROFILE%\\AppData\\LocalLow\\Mozc",
             ],
         },
+        // azooKey for Windows (ZeroConvert's base, the same CLSID: one of the
+        // two installed at a time)
+        "azookey" => Profile {
+            clsid: GUID::from_u128(0xffde_fe79_2fc2_11ef_b16b_94e7_0b2c_378c),
+            profile: GUID::from_u128(0xffde_fe7a_2fc2_11ef_b16b_94e7_0b2c_378c),
+            on_keys: &[0x16],
+            processes: &["%ProgramFiles%\\Azookey\\"],
+            storage: &[
+                "%ProgramFiles%\\Azookey",
+                "%LOCALAPPDATA%\\Azookey",
+                "%APPDATA%\\Azookey",
+            ],
+        },
+        // Mozkey: Mozc and a local Zenz (llama-server) in the OSS Mozc's
+        // place and CLSID (Fumiori's too: one of the two at a time)
+        "mozkey" => Profile {
+            clsid: GUID::from_u128(0x10a6_7bc8_22fa_4a59_90dc_2546_652c_56bf),
+            profile: GUID::from_u128(0x186f_700c_71cf_43fe_a00e_aacb_1d9e_6d3d),
+            on_keys: &[0x16],
+            processes: &["%ProgramFiles(x86)%\\Mozc\\"],
+            storage: &[
+                "%ProgramFiles(x86)%\\Mozc",
+                "%USERPROFILE%\\AppData\\LocalLow\\Mozc",
+            ],
+        },
         "copilot" => Profile {
             clsid: GUID::from_u128(0xd4e1_a2b3_5f6c_4d7e_8a9b_0c1d_2e3f_4a5b),
             profile: GUID::from_u128(0xa1b2_c3d4_e5f6_7890_1234_5678_9abc_def0),
@@ -148,7 +173,7 @@ fn profile(name: &str) -> Result<Option<Profile>> {
         },
         "none" => return Ok(None),
         _ => bail!(
-            "unknown input method {name} (setsuna, msime, shunti, zeroconvert, fumiori, copilot, none)"
+            "unknown input method {name} (setsuna, msime, shunti, zeroconvert, fumiori, copilot, azookey, mozkey, none)"
         ),
     }))
 }
