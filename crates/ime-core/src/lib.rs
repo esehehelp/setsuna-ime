@@ -28,6 +28,7 @@ pub mod keysym;
 pub mod learning;
 pub mod lexicon;
 pub mod mixed;
+mod mixed_tables;
 pub mod numbers;
 pub mod postprocess;
 pub mod predict;

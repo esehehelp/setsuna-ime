@@ -1454,6 +1454,35 @@ pub fn config_dir() -> Option<PathBuf> {
     base.map(|b| b.join("setsuna-ime"))
 }
 
+/// Where data made from the installed files is kept to be read again (the
+/// mixed-input model's tables, `mixed_tables`): `cache` in the app's state
+/// directory where it named one ([`set_app_dirs`]: Android), else
+/// `%LOCALAPPDATA%\setsuna-ime\cache` on Windows, `$XDG_CACHE_HOME/setsuna-ime`
+/// (or `~/.cache/setsuna-ime`) elsewhere; none in an elevated process, which
+/// reads nothing the user's other processes can change.
+pub fn cache_dir() -> Option<PathBuf> {
+    // nor this crate's tests, which would leave their models' tables in the
+    // user's cache
+    if process_is_elevated() || cfg!(test) {
+        return None;
+    }
+    if let Some(dirs) = app_dirs() {
+        return Some(dirs.state_home.join("setsuna-ime").join("cache"));
+    }
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if cfg!(windows) {
+        env("LOCALAPPDATA").map(|b| b.join("setsuna-ime").join("cache"))
+    } else {
+        env("XDG_CACHE_HOME")
+            .or_else(|| env("HOME").map(|h| h.join(".cache")))
+            .map(|b| b.join("setsuna-ime"))
+    }
+}
+
 /// Copy every key of `new` into `doc`: tables are merged key by key, any
 /// other item replaces the old one. A replaced value keeps its old
 /// decoration (its trailing comment); the key keeps the comments above it.

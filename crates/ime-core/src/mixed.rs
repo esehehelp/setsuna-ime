@@ -213,16 +213,12 @@ impl MixedParams {
 }
 
 pub struct MixedModel {
-    kana: CharLm,
-    letters: CharLm,
-    words: FastMap<String, (u32, u32)>,
-    /// The words sorted, with running totals of their counts (Japanese,
-    /// English text) before each: the mass of a prefix, for a word still
-    /// being typed.
-    sorted: Vec<String>,
-    running: Vec<(u64, u64)>,
-    ja_total: f64,
-    en_total: f64,
+    /// The kana and the letter models, and the Latin words with their
+    /// counts (Japanese, English text), sorted with the running totals of
+    /// the counts: the mass of a prefix, for a word still being typed. A
+    /// block of bytes in place (`mixed_tables`), the pages of a file every
+    /// process maps.
+    tables: crate::mixed_tables::Tables,
     /// The names dictionary by lowercase form: the name as written, its
     /// weight and whether it is a common one (an acronym or an ordinary
     /// word too: OK, Word).
@@ -246,7 +242,7 @@ const LEXICON_COSTS: usize = 4096;
 impl std::fmt::Debug for MixedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MixedModel")
-            .field("words", &self.words.len())
+            .field("words", &self.tables.n_words())
             .field("names", &self.names.len())
             .field("params", &self.params)
             .finish_non_exhaustive()
@@ -304,35 +300,36 @@ const SURU: &[&str] = &[
 ];
 
 impl MixedModel {
+    /// The model in `dir`: its tables from the cache, made once for its
+    /// files (`mixed_tables::load`), so that every process maps the same.
     pub fn load(dir: &Path) -> Result<Self> {
-        let read = |name: &str| {
-            let path = dir.join(name);
-            std::fs::read_to_string(&path).with_context(|| path.display().to_string())
-        };
-        let params = read("params.txt").ok();
-        Self::from_texts(&read("kana.tsv")?, &read("latin.tsv")?, params.as_deref())
+        let params = std::fs::read_to_string(dir.join("params.txt")).ok();
+        let tables = crate::mixed_tables::load(dir, Self::tables_of)?;
+        Self::with_tables(tables, params.as_deref())
     }
 
     /// A model from the contents of its files.
     pub fn from_texts(kana_tsv: &str, latin_tsv: &str, params_txt: Option<&str>) -> Result<Self> {
-        let mut kana = CharLm::default();
+        let tables = crate::mixed_tables::Tables::from_vec(Self::tables_of(kana_tsv, latin_tsv))?;
+        Self::with_tables(tables, params_txt)
+    }
+
+    /// The tables' block of the contents of kana.tsv and latin.tsv.
+    fn tables_of(kana_tsv: &str, latin_tsv: &str) -> Vec<u8> {
+        let mut kana = crate::mixed_tables::Counts::default();
         for line in kana_tsv.lines() {
             if let Some((gram, count)) = line.split_once('\t') {
                 kana.add(gram, count.parse().unwrap_or(0));
             }
         }
-        kana.finish();
-        let mut words = FastMap::default();
-        let mut letters = CharLm::default();
-        let (mut ja_total, mut en_total) = (0.0, 0.0);
+        let mut words = Vec::new();
+        let mut letters = crate::mixed_tables::Counts::default();
         for line in latin_tsv.lines() {
             let mut cols = line.split('\t');
             let (Some(word), Some(ja), Some(en)) = (cols.next(), cols.next(), cols.next()) else {
                 continue;
             };
             let (ja, en): (u32, u32) = (ja.parse().unwrap_or(0), en.parse().unwrap_or(0));
-            ja_total += ja as f64;
-            en_total += en as f64;
             // The letter model counts word types: what unseen words look like.
             let padded: Vec<char> = std::iter::once('^')
                 .chain(word.chars().map(letter_class))
@@ -343,20 +340,16 @@ impl MixedModel {
                     letters.add_chars(gram, 1);
                 }
             }
-            words.insert(word.to_string(), (ja, en));
+            words.push(crate::mixed_tables::Word {
+                word: word.to_string(),
+                ja,
+                en,
+            });
         }
-        letters.finish();
-        let mut sorted: Vec<String> = words.keys().cloned().collect();
-        sorted.sort();
-        let mut running = Vec::with_capacity(sorted.len() + 1);
-        let (mut ja, mut en) = (0u64, 0u64);
-        for word in &sorted {
-            running.push((ja, en));
-            let (j, e) = words[word];
-            ja += j as u64;
-            en += e as u64;
-        }
-        running.push((ja, en));
+        crate::mixed_tables::write(&kana, &letters, words)
+    }
+
+    fn with_tables(tables: crate::mixed_tables::Tables, params_txt: Option<&str>) -> Result<Self> {
         // Tuned parameters, if any.
         let mut params = MixedParams::default();
         for line in params_txt
@@ -367,13 +360,7 @@ impl MixedModel {
             params.set(line)?;
         }
         Ok(Self {
-            kana,
-            letters,
-            words,
-            sorted,
-            running,
-            ja_total: ja_total.max(1.0),
-            en_total: en_total.max(1.0),
+            tables,
             names: FastMap::default(),
             params,
             lexicon_costs: Mutex::default(),
@@ -838,7 +825,7 @@ impl MixedModel {
                             '.' | '!' | '?' => '。',
                             _ => '、',
                         };
-                        cost += self.kana.cost(ctx[0], ctx[1], class);
+                        cost += self.tables.kana_cost(ctx[0], ctx[1], class);
                         ctx = [ctx[1], class];
                     }
                     let ends = chars[start..end]
@@ -910,7 +897,7 @@ impl MixedModel {
                     // right after the context's Japanese: the odds of `@`
                     // after its kana
                     Some(JA) if first && !spaced => {
-                        p.switch_in + self.kana.cost(context_kana[0], context_kana[1], '@')
+                        p.switch_in + self.tables.kana_cost(context_kana[0], context_kana[1], '@')
                     }
                     Some(JA) if spaced => p.switch_in,
                     Some(JA_EN) if !spaced => p.switch_in,
@@ -1091,7 +1078,7 @@ impl MixedModel {
             let mut ctx = [before, '@'];
             let mut cost = 0.0;
             for c in kana.chars() {
-                cost += self.kana.cost(ctx[0], ctx[1], c);
+                cost += self.tables.kana_cost(ctx[0], ctx[1], c);
                 ctx = [ctx[1], c];
             }
             cost
@@ -1190,13 +1177,13 @@ impl MixedModel {
         let mut pos = 0;
         let mut left_over = 0usize;
         for unit in units {
-            let to_latin = self.kana.cost(ctx[0], ctx[1], '@');
+            let to_latin = self.tables.kana_cost(ctx[0], ctx[1], '@');
             // An end inside this unit leaves its letters unread.
             for end in pos + 1..unit.end {
                 out.push((end, cost + p.leftover * (end - unit.start) as f64, to_latin));
             }
             let mut add = |c: char| {
-                let step = self.kana.cost(ctx[0], ctx[1], c);
+                let step = self.tables.kana_cost(ctx[0], ctx[1], c);
                 ctx = [ctx[1], c];
                 step
             };
@@ -1226,12 +1213,12 @@ impl MixedModel {
                     let typed: String = chars[unit.start..unit.end].iter().collect();
                     let odds: f64 = pending_kana(&typed)
                         .into_iter()
-                        .map(|k| (-self.kana.cost(ctx[0], ctx[1], k)).exp())
+                        .map(|k| (-self.tables.kana_cost(ctx[0], ctx[1], k)).exp())
                         .sum();
                     -odds.max(f64::MIN_POSITIVE).ln()
                 }
             };
-            out.push((unit.end, cost, self.kana.cost(ctx[0], ctx[1], '@')));
+            out.push((unit.end, cost, self.tables.kana_cost(ctx[0], ctx[1], '@')));
             pos = unit.end;
         }
         out
@@ -1332,7 +1319,7 @@ impl MixedModel {
         let (known, letters) = if prefix {
             (self.prefix_mass(&piece.lower), piece.letters)
         } else {
-            let end = self.letters.cost(piece.ctx[0], piece.ctx[1], '$');
+            let end = self.tables.letters_cost(piece.ctx[0], piece.ctx[1], '$');
             (self.known(&piece.lower).unwrap_or(0.0), piece.letters + end)
         };
         let prob = p.known * known + (1.0 - p.known) * (-letters).exp();
@@ -1347,20 +1334,16 @@ impl MixedModel {
     /// The frequency of the words starting with `prefix` (lowercase).
     fn prefix_mass(&self, prefix: &str) -> f64 {
         let p = &self.params;
-        let from = self.sorted.partition_point(|w| w.as_str() < prefix);
-        let to = from + self.sorted[from..].partition_point(|w| w.starts_with(prefix));
-        let (ja, en) = (
-            self.running[to].0 - self.running[from].0,
-            self.running[to].1 - self.running[from].1,
-        );
-        p.ja_text * ja as f64 / self.ja_total + (1.0 - p.ja_text) * en as f64 / self.en_total
+        let (ja, en) = self.tables.prefix_counts(prefix);
+        p.ja_text * ja as f64 / self.tables.ja_total()
+            + (1.0 - p.ja_text) * en as f64 / self.tables.en_total()
     }
 
     /// Whether `word` (any case) is a Latin word of the model's text or a
     /// name of its names dictionary.
     pub fn knows(&self, word: &str) -> bool {
         let lower = word.to_ascii_lowercase();
-        self.words.contains_key(&lower) || self.name_weight(&lower).is_some()
+        self.tables.word(&lower).is_some() || self.name_weight(&lower).is_some()
     }
 
     /// `known` of `word` in any case (for the bench).
@@ -1373,10 +1356,10 @@ impl MixedModel {
     /// a name's (`name_weight`).
     fn known(&self, word: &str) -> Option<f64> {
         let p = &self.params;
-        match self.words.get(word) {
-            Some(&(ja, en)) => Some(
-                p.ja_text * ja as f64 / self.ja_total
-                    + (1.0 - p.ja_text) * en as f64 / self.en_total,
+        match self.tables.word(word) {
+            Some((ja, en)) => Some(
+                p.ja_text * ja as f64 / self.tables.ja_total()
+                    + (1.0 - p.ja_text) * en as f64 / self.tables.en_total(),
             ),
             None => self.name_weight(word).map(|weight| p.name * weight),
         }
@@ -1400,7 +1383,7 @@ impl MixedModel {
             .collect();
         chars
             .windows(3)
-            .map(|w| self.kana.cost(w[0], w[1], w[2]))
+            .map(|w| self.tables.kana_cost(w[0], w[1], w[2]))
             .sum()
     }
 
@@ -1681,7 +1664,7 @@ impl Piece {
         self.lower.push(lower);
         self.typed.push(c);
         let class = letter_class(lower);
-        self.letters += model.letters.cost(self.ctx[0], self.ctx[1], class);
+        self.letters += model.tables.letters_cost(self.ctx[0], self.ctx[1], class);
         self.ctx = [self.ctx[1], class];
     }
 }
@@ -2136,71 +2119,7 @@ impl Hasher for FastHasher {
     }
 }
 
-/// A char trigram model with Witten–Bell interpolation, from counts of
-/// 1- to 3-grams.
-#[derive(Default)]
-struct CharLm {
-    counts: FastMap<(char, char, char), u32>,
-    /// Per context (1 or 2 chars, the first `\0` for one): total count and
-    /// number of distinct chars that follow it.
-    contexts: FastMap<(char, char), (u64, u32)>,
-    unigram_total: u64,
-    vocab: u32,
-}
-
 const NONE: char = '\0';
-
-impl CharLm {
-    fn add(&mut self, gram: &str, count: u32) {
-        let chars: Vec<char> = gram.chars().collect();
-        self.add_chars(&chars, count);
-    }
-
-    fn add_chars(&mut self, chars: &[char], count: u32) {
-        let key = match *chars {
-            [c] => (NONE, NONE, c),
-            [b, c] => (NONE, b, c),
-            [a, b, c] => (a, b, c),
-            _ => return,
-        };
-        *self.counts.entry(key).or_insert(0) += count;
-    }
-
-    fn finish(&mut self) {
-        self.contexts.clear();
-        self.unigram_total = 0;
-        self.vocab = 0;
-        for (&(a, b, _), &count) in &self.counts {
-            if b == NONE {
-                self.unigram_total += count as u64;
-                self.vocab += 1;
-            } else {
-                let e = self.contexts.entry((a, b)).or_insert((0, 0));
-                e.0 += count as u64;
-                e.1 += 1;
-            }
-        }
-    }
-
-    /// −ln P(c | a b).
-    fn cost(&self, a: char, b: char, c: char) -> f64 {
-        let count = |k: (char, char, char)| *self.counts.get(&k).unwrap_or(&0) as f64;
-        let p1 =
-            (count((NONE, NONE, c)) + 1.0) / (self.unigram_total as f64 + self.vocab as f64 + 1.0);
-        let interpolate = |ctx: (char, char), key: (char, char, char), lower: f64| match self
-            .contexts
-            .get(&ctx)
-        {
-            Some(&(total, types)) => {
-                (count(key) + types as f64 * lower) / (total as f64 + types as f64)
-            }
-            None => lower,
-        };
-        let p2 = interpolate((NONE, b), (NONE, b, c), p1);
-        let p3 = interpolate((a, b), (a, b, c), p2);
-        -p3.ln()
-    }
-}
 
 /// What the spans of `chars` show, and the romaji still pending at its end
 /// (shown after it, not yet part of the reading): Japanese as kana with its
