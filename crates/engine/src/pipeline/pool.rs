@@ -11,6 +11,38 @@ use crate::pipeline::decode::BeamHypothesis;
 use crate::pipeline::proposal::ProposalOutput;
 use crate::tokenizer::SharedCharTokenizer;
 
+/// The most hypotheses whose duplicates are found by comparing a text with
+/// the ones kept (a beam's: no allocation, and faster than hashing that few);
+/// more go through a hash set.
+const DEDUP_BY_SCAN: usize = 32;
+
+/// Whether `normalize_candidate` may change a char of `s`: an ASCII `,` `.`
+/// `?` `!`, or a char of U+F000..=U+FFFF (the lead byte 0xEF: the full-width
+/// forms it maps are U+FF01..=U+FF5E). A text without any comes back from it
+/// as it went in, so it is not sent through (most candidates: kana and
+/// kanji); the tests hold this to `normalize_candidate` over every char.
+#[inline]
+fn may_normalize(s: &str) -> bool {
+    s.bytes()
+        .any(|b| matches!(b, b',' | b'.' | b'?' | b'!' | 0xEF))
+}
+
+/// `raw` as a candidate's text: normalized with `normalize`, else as decoded;
+/// a whitespace-only text is empty either way. The flag says whether the text
+/// still has `raw`'s chars one for one (not when `normalize_candidate` changed
+/// their number, or the text was emptied).
+fn candidate_text(raw: String, normalize: bool) -> (String, bool) {
+    if normalize && may_normalize(&raw) {
+        let text = normalize_candidate(&raw);
+        let same = text.chars().count() == raw.chars().count();
+        (text, same)
+    } else if raw.chars().all(char::is_whitespace) {
+        (String::new(), raw.is_empty())
+    } else {
+        (raw, true)
+    }
+}
+
 /// Text of `tokens` (normalized with `normalize`, else as decoded; a
 /// whitespace-only text is empty either way) and each char's reading
 /// position. `normalize_candidate` maps char for char, so the positions
@@ -22,23 +54,17 @@ fn aligned_text(
     frame_reading: &[u32],
     normalize: bool,
 ) -> (String, Vec<u32>) {
-    let (raw, char_frames) = tokenizer.decode_aligned(tokens, frames);
-    let text = if normalize {
-        normalize_candidate(&raw)
-    } else if raw.chars().all(char::is_whitespace) {
-        String::new()
+    // one frame a char of the decoded text
+    let (raw, mut pos) = tokenizer.decode_aligned(tokens, frames);
+    let (text, aligned) = candidate_text(raw, normalize);
+    if aligned {
+        let last = frame_reading.last().copied().unwrap_or(0);
+        for p in pos.iter_mut() {
+            *p = frame_reading.get(*p as usize).copied().unwrap_or(last);
+        }
     } else {
-        raw
-    };
-    let last = frame_reading.last().copied().unwrap_or(0);
-    let pos = if text.chars().count() == char_frames.len() {
-        char_frames
-            .iter()
-            .map(|&f| frame_reading.get(f as usize).copied().unwrap_or(last))
-            .collect()
-    } else {
-        Vec::new()
-    };
+        pos.clear();
+    }
     (text, pos)
 }
 
@@ -59,12 +85,21 @@ pub fn candidates(
     } else {
         CandidateSource::Beam
     };
+    let scan = hyps.len() <= DEDUP_BY_SCAN;
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<Candidate> = Vec::with_capacity(hyps.len());
     for h in hyps {
         let (text, reading_pos) =
             aligned_text(tokenizer, &h.tokens, &h.frames, frame_reading, normalize);
-        if !text.is_empty() && seen.insert(text.clone()) {
+        if text.is_empty() {
+            continue;
+        }
+        let new = if scan {
+            !out.iter().any(|c| c.text == text)
+        } else {
+            seen.insert(text.clone())
+        };
+        if new {
             out.push(Candidate {
                 text,
                 score: h.score,
@@ -120,14 +155,7 @@ pub fn fallback(reading: &str) -> Vec<Candidate> {
 /// Text of an AR hypothesis's ids: decoded, normalized with `normalize`
 /// (else as decoded; a whitespace-only text is empty either way).
 pub fn ar_text(tokenizer: &SharedCharTokenizer, ids: &[u32], normalize: bool) -> String {
-    let raw = tokenizer.decode(ids);
-    if normalize {
-        normalize_candidate(&raw)
-    } else if raw.chars().all(char::is_whitespace) {
-        String::new()
-    } else {
-        raw
-    }
+    candidate_text(tokenizer.decode(ids), normalize).0
 }
 
 fn hira_to_kata(s: &str) -> String {
@@ -144,10 +172,7 @@ mod tests {
     use super::*;
     use crate::pipeline::proposal::ProposalFrame;
 
-    fn tokenizer() -> SharedCharTokenizer {
-        let names = [
-            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ", "い", "亜",
-        ];
+    fn tokenizer_of(names: &[&str]) -> SharedCharTokenizer {
         let id_to_token: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let token_to_id = id_to_token
             .iter()
@@ -165,6 +190,12 @@ mod tests {
             mask_id: 5,
             input_chars: None,
         }
+    }
+
+    fn tokenizer() -> SharedCharTokenizer {
+        tokenizer_of(&[
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ", "い", "亜",
+        ])
     }
 
     fn proposal(top1: &[u32]) -> ProposalOutput {
@@ -235,6 +266,44 @@ mod tests {
         assert!(out.iter().all(|c| c.source == CandidateSource::Beam));
     }
 
+    /// A beam's worth of hypotheses (duplicates found by comparing) and more
+    /// (by a hash set) keep the same: the first of each text, in decode order.
+    #[test]
+    fn many_hypotheses_are_deduped_as_few() {
+        let tok = tokenizer();
+        // the texts of 1..=3 tokens of あ い 亜, each several times over
+        let all: Vec<BeamHypothesis> = (0..200u32)
+            .map(|i| {
+                let n = 1 + (i % 3) as usize;
+                let tokens: Vec<u32> = (0..n as u32)
+                    .map(|k| 6 + (i / 3 + k * (i % 5)) % 3)
+                    .collect();
+                beam(&tokens, -(i as f32))
+            })
+            .collect();
+        for count in [1, 5, DEDUP_BY_SCAN, DEDUP_BY_SCAN + 1, 200] {
+            let out = candidates(
+                all[..count].to_vec(),
+                false,
+                &proposal(&[4]),
+                "あい",
+                &tok,
+                FRAMES,
+                false,
+            );
+            let mut want: Vec<(String, f32)> = Vec::new();
+            for h in &all[..count] {
+                let text = tok.decode(&h.tokens);
+                if !want.iter().any(|w| w.0 == text) {
+                    want.push((text, h.score));
+                }
+            }
+            let got: Vec<(String, f32)> = out.iter().map(|c| (c.text.clone(), c.score)).collect();
+            assert_eq!(got, want, "{count} hypotheses");
+            assert!(count < 100 || got.len() < count);
+        }
+    }
+
     #[test]
     fn empty_decode_falls_back_to_greedy_then_reading() {
         let tok = tokenizer();
@@ -284,5 +353,84 @@ mod tests {
             (out[0].text.as_str(), out[0].source),
             ("亜", CandidateSource::Greedy)
         );
+    }
+
+    /// Normalized or not, a text keeps its chars' reading positions, and a
+    /// whitespace-only one is no candidate.
+    #[test]
+    fn normalized_texts_keep_their_reading_positions() {
+        let tok = tokenizer_of(&[
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BLANK]", "[MASK]", "あ", ",", "Ａ", " ", "東京",
+        ]);
+        let frame_reading = [0, 0, 1, 2, 3];
+        let text = |tokens: &[u32], normalize: bool| {
+            let frames: Vec<u32> = (1..=tokens.len() as u32).collect();
+            aligned_text(&tok, tokens, &frames, &frame_reading, normalize)
+        };
+        // nothing to normalize: the text as decoded, either way
+        for normalize in [false, true] {
+            assert_eq!(
+                text(&[6, 10, 6], normalize),
+                ("あ東京あ".to_string(), vec![0, 1, 1, 2])
+            );
+            assert_eq!(text(&[9, 9], normalize), (String::new(), Vec::new()));
+            assert_eq!(text(&[], normalize), (String::new(), Vec::new()));
+            // a frame past the reading's takes its last position
+            assert_eq!(
+                aligned_text(&tok, &[6], &[9], &frame_reading, normalize),
+                ("あ".to_string(), vec![3])
+            );
+        }
+        assert_eq!(
+            text(&[6, 7, 8], false),
+            ("あ,Ａ".to_string(), vec![0, 1, 2])
+        );
+        assert_eq!(text(&[6, 7, 8], true), ("あ、A".to_string(), vec![0, 1, 2]));
+        assert_eq!(
+            text(&[8, 7, 9, 6], true),
+            ("A, あ".to_string(), vec![0, 1, 2, 3])
+        );
+        assert_eq!(ar_text(&tok, &[6, 7, 8], true), "あ、A");
+        assert_eq!(ar_text(&tok, &[6, 7, 8], false), "あ,Ａ");
+        assert_eq!(ar_text(&tok, &[6, 10], true), "あ東京");
+        assert_eq!(ar_text(&tok, &[9], true), "");
+        assert_eq!(ar_text(&tok, &[9], false), "");
+    }
+
+    /// `may_normalize` misses no char `normalize_candidate` changes: every
+    /// char, alone and after a letter (the low ones and the full-width forms
+    /// after a digit, a kana and a space too), comes back as it went in
+    /// whenever the text is said to need no normalizing (and the chars it
+    /// does change are said to).
+    #[test]
+    fn texts_left_alone_are_what_normalizing_leaves() {
+        let mut changed = 0usize;
+        for c in (0..=char::MAX as u32).filter_map(char::from_u32) {
+            let near = (c as u32) < 0x3100 || (0xFF00..0xFFF0).contains(&(c as u32));
+            let contexts: &[&str] = if near {
+                &["", "a", "7", "あ", " "]
+            } else {
+                &["", "a"]
+            };
+            for &before in contexts {
+                let mut s = String::with_capacity(8);
+                s.push_str(before);
+                s.push(c);
+                let normalized = normalize_candidate(&s);
+                if may_normalize(&s) {
+                    changed += (normalized != s) as usize;
+                    continue;
+                }
+                let want = if s.chars().all(char::is_whitespace) {
+                    ""
+                } else {
+                    s.as_str()
+                };
+                assert_eq!(normalized, want, "{s:?}");
+                assert_eq!(candidate_text(s.clone(), true), candidate_text(s, false));
+            }
+        }
+        // `,` `.` `?` `!` and the full-width forms
+        assert!(changed > 90 * 4);
     }
 }

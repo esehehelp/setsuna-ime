@@ -91,9 +91,10 @@ pub fn encode(
     reading: &str,
 ) -> Result<(Vec<i64>, Vec<i64>, usize)> {
     anyhow::ensure!(seq_len >= 2, "model sequence must hold [CLS] and [SEP]");
-    let mut reading_ids: Vec<u32> = Vec::new();
-    for ch in &chars(reading) {
-        reading_ids.extend(tokenizer.encode_with_byte_fallback(ch));
+    let mut reading_ids: Vec<u32> = Vec::with_capacity(reading.len().min(seq_len));
+    let mut utf8 = [0u8; 4];
+    for ch in reading.chars() {
+        tokenizer.encode_with_byte_fallback_into(ch.encode_utf8(&mut utf8), &mut reading_ids);
     }
     anyhow::ensure!(
         reading_ids.len() <= seq_len - 2,
@@ -103,32 +104,34 @@ pub fn encode(
     );
     // every char is at least one token: the last max_context chars hold the
     // last max_context tokens
-    let ctx_chars = chars(context);
-    let mut ctx_ids: Vec<u32> = Vec::new();
-    for ch in &ctx_chars[ctx_chars.len().saturating_sub(max_context)..] {
-        ctx_ids.extend(tokenizer.encode_with_byte_fallback(ch));
-    }
     let keep = max_context.min(seq_len - 2 - reading_ids.len());
-    if ctx_ids.len() > keep {
-        ctx_ids.drain(..ctx_ids.len() - keep);
+    let mut ctx_ids: Vec<u32> = Vec::with_capacity(keep);
+    if keep > 0 && !context.is_empty() {
+        let start = context
+            .char_indices()
+            .rev()
+            .nth(max_context.saturating_sub(1))
+            .map_or(0, |(idx, _)| idx);
+        for ch in context[start..].chars() {
+            tokenizer.encode_with_byte_fallback_into(ch.encode_utf8(&mut utf8), &mut ctx_ids);
+        }
+        if ctx_ids.len() > keep {
+            ctx_ids.drain(..ctx_ids.len() - keep);
+        }
     }
     let mut ids: Vec<i64> = Vec::with_capacity(seq_len);
     ids.push(tokenizer.cls_id as i64);
-    for id in &ctx_ids {
-        ids.push(*id as i64);
+    for &id in &ctx_ids {
+        ids.push(id as i64);
     }
     ids.push(tokenizer.sep_id as i64);
-    for id in &reading_ids {
-        ids.push(*id as i64);
+    for &id in &reading_ids {
+        ids.push(id as i64);
     }
     let actual = ids.len();
     let mut mask: Vec<i64> = vec![0; seq_len];
-    for slot in mask.iter_mut().take(actual) {
-        *slot = 1;
-    }
-    while ids.len() < seq_len {
-        ids.push(tokenizer.pad_id as i64);
-    }
+    mask[..actual].fill(1);
+    ids.resize(seq_len, tokenizer.pad_id as i64);
     Ok((ids, mask, actual))
 }
 
@@ -146,20 +149,15 @@ pub fn frame_reading(
         .skip(1)
         .position(|&id| id == tokenizer.sep_id as i64)
         .map_or(actual, |i| i + 2);
-    let mut out = vec![0u32; sep.min(actual)];
+    let mut out = Vec::with_capacity(actual);
+    out.resize(sep.min(actual), 0u32);
+    let mut buf = [0u8; 4];
     for (i, ch) in reading.chars().enumerate() {
-        let mut buf = [0u8; 4];
-        let n = tokenizer
-            .encode_with_byte_fallback(ch.encode_utf8(&mut buf))
-            .len();
+        let n = tokenizer.encoded_char_len(ch.encode_utf8(&mut buf));
         out.extend(std::iter::repeat_n(i as u32, n));
     }
     out.truncate(actual);
     out
-}
-
-fn chars(s: &str) -> Vec<String> {
-    s.chars().map(|c| c.to_string()).collect()
 }
 
 /// The proposal graph's computation: the engine's own encoder (`pipeline::native_encoder`, the manifest's
@@ -229,34 +227,140 @@ impl ProposalRunner {
         greedy: bool,
     ) -> Result<ProposalOutput> {
         self.whole_vocabulary()?;
-        self.forward(
-            tokenizer,
-            encoded,
-            tokenizer.vocab_size(),
-            |flat, actual, vocab| {
+        let vocab = tokenizer.vocab_size();
+        // Fast fused path: parallel head GEMM + online LSE + top-k without materializing the (T, V) logits buffer.
+        #[allow(unpredictable_function_pointer_comparisons)]
+        let is_peaked = reduce.lse == (crate::pipeline::lse::peaked as fn(&[f32]) -> f32);
+        if is_peaked {
+            let (mut ids, mask, actual) = encoded;
+            ids.truncate(actual);
+            anyhow::ensure!(
+                mask.len() >= actual && mask[..actual].iter().all(|&m| m == 1),
+                "the native encoder takes a row without padding"
+            );
+            anyhow::ensure!(
+                self.encoder.config.vocab == vocab && self.encoder.logit_width() == Some(vocab),
+                "native encoder logits {:?} wide over {} tokens, the tokenizer's vocabulary {} (columns {vocab})",
+                self.encoder.logit_width(),
+                self.encoder.config.vocab,
+                vocab
+            );
+            anyhow::ensure!(
+                (tokenizer.blank_id as usize) < vocab,
+                "blank_id {} out of range for vocab {vocab}",
+                tokenizer.blank_id
+            );
+            let k = top_k.max(2).min(vocab.max(1));
+            let t0 = Instant::now();
+            if let Some(reduced) =
+                self.encoder
+                    .logits_reduced(&ids, vocab_blacklist, tokenizer.blank_id, k, greedy)?
+            {
+                self.last_ort_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                self.last_reduce_ms = 0.0;
                 if greedy {
-                    greedy_from_logits(
-                        flat,
-                        actual,
-                        vocab,
-                        vocab_blacklist,
-                        tokenizer.blank_id,
-                        top_k,
-                        reduce,
-                    )
+                    let mut near_tie = false;
+                    let mut frames = Vec::with_capacity(actual);
+                    for (top, _, top1_id, _, top2) in &reduced {
+                        if top.is_empty() {
+                            near_tie = true;
+                            break;
+                        }
+                        let gap = -*top2;
+                        if gap > 0.0 && gap <= 1e-4 {
+                            near_tie = true;
+                            break;
+                        }
+                        frames.push(ProposalFrame {
+                            top1_id: *top1_id,
+                            top1_log_prob: 0.0,
+                            top2_log_prob: f32::NEG_INFINITY,
+                        });
+                    }
+                    if !near_tie {
+                        return Ok(ProposalOutput {
+                            steps: Vec::new(),
+                            frames,
+                            input_len: actual,
+                        });
+                    }
                 } else {
-                    log_probs_with(
-                        flat,
-                        actual,
-                        vocab,
-                        vocab_blacklist,
-                        tokenizer.blank_id,
-                        top_k,
-                        reduce,
-                    )
+                    let mut steps = Vec::with_capacity(actual);
+                    let mut frames = Vec::with_capacity(actual);
+                    for (top, blank, top1_id, top1_lp, top2_lp) in reduced {
+                        let (id1, lp1) = if top.is_empty() {
+                            (0, f32::NEG_INFINITY)
+                        } else {
+                            (top1_id, top1_lp)
+                        };
+                        let lp2 = if vocab == 1 { lp1 } else { top2_lp };
+                        frames.push(ProposalFrame {
+                            top1_id: id1,
+                            top1_log_prob: lp1,
+                            top2_log_prob: lp2,
+                        });
+                        steps.push(FrameLogProbs { top, blank });
+                    }
+                    return Ok(ProposalOutput {
+                        steps,
+                        frames,
+                        input_len: actual,
+                    });
                 }
-            },
-        )
+            }
+            // Non-finite logits or greedy near-tie: re-run unfused fallback cleanly.
+            return self.forward(
+                tokenizer,
+                (ids, mask, actual),
+                vocab,
+                |flat, actual, vocab| {
+                    if greedy {
+                        greedy_from_logits(
+                            flat,
+                            actual,
+                            vocab,
+                            vocab_blacklist,
+                            tokenizer.blank_id,
+                            top_k,
+                            reduce,
+                        )
+                    } else {
+                        log_probs_with(
+                            flat,
+                            actual,
+                            vocab,
+                            vocab_blacklist,
+                            tokenizer.blank_id,
+                            top_k,
+                            reduce,
+                        )
+                    }
+                },
+            );
+        }
+        self.forward(tokenizer, encoded, vocab, |flat, actual, vocab| {
+            if greedy {
+                greedy_from_logits(
+                    flat,
+                    actual,
+                    vocab,
+                    vocab_blacklist,
+                    tokenizer.blank_id,
+                    top_k,
+                    reduce,
+                )
+            } else {
+                log_probs_with(
+                    flat,
+                    actual,
+                    vocab,
+                    vocab_blacklist,
+                    tokenizer.blank_id,
+                    top_k,
+                    reduce,
+                )
+            }
+        })
     }
 
     /// The graph run as [`Self::run`] runs it, each frame reduced to the log-probs of the blank and of `ids` (sorted,

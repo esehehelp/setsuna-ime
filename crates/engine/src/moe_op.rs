@@ -28,7 +28,7 @@ enum WeightLayout {
     /// Row-major int8 (plain path or shape not aligned to 16 x 4 blocks).
     Raw(Vec<i8>),
     /// 16 x 4 blocked int8 (VNNI-512, AVX-VNNI, ARM SDOT).
-    Blocked(Vec<i8>),
+    Blocked(BlockedWeights),
     /// 16-bit widened copy of the 16 x 4 blocks (AVX2, AVX).
     Wide(Vec<i16>),
 }
@@ -59,6 +59,11 @@ impl Packed {
         }
     }
 
+    /// Number of 16-column work units. Only a raw matrix can have a short last block.
+    pub(crate) fn blocks(&self) -> usize {
+        self.out.div_ceil(16)
+    }
+
     /// Tests only: pack into 16 x 4 `Blocked` bytes regardless of the CPU ISA.
     #[cfg(test)]
     pub(crate) fn new_blocked(w: &[i8], out: usize, inp: usize) -> Self {
@@ -72,9 +77,25 @@ impl Packed {
     }
 }
 
-/// Pack row-major `(out, inp)` int8 weights into 16 outputs x 4 inputs blocks.
-fn pack_blocked(w: &[i8], out: usize, inp: usize) -> Vec<i8> {
-    let mut blocked = vec![0i8; out * inp];
+struct BlockedWeights {
+    buf: Vec<i8>,
+    offset: usize,
+}
+
+impl std::ops::Deref for BlockedWeights {
+    type Target = [i8];
+
+    fn deref(&self) -> &[i8] {
+        &self.buf[self.offset..]
+    }
+}
+
+/// Pack row-major `(out, inp)` int8 weights into cache-line-aligned 16 x 4 blocks.
+fn pack_blocked(w: &[i8], out: usize, inp: usize) -> BlockedWeights {
+    let mut buf = Vec::<i8>::with_capacity(w.len() + 63);
+    let offset = buf.as_ptr().align_offset(64);
+    buf.resize(offset + w.len(), 0);
+    let blocked = &mut buf[offset..];
     let mut i = 0;
     for ob in 0..out / 16 {
         for kg in 0..inp / 4 {
@@ -85,7 +106,7 @@ fn pack_blocked(w: &[i8], out: usize, inp: usize) -> Vec<i8> {
             }
         }
     }
-    blocked
+    BlockedWeights { buf, offset }
 }
 
 /// The AVX2/AVX kernels' 16-bit widened layout built directly from row-major `(out, inp)` int8 weights: for each
@@ -223,35 +244,26 @@ pub(crate) fn gemm_u8i8_f32(
     y: &mut [f32],
 ) {
     let per_row = e.xs.len() > 1;
-    assert!(
-        per_row && e.xs.len() >= rows || e.xs.len() == 1,
-        "{} scales for {rows} rows",
-        e.xs.len()
-    );
-    assert!(e.out <= w.out && y.len() >= span(rows, e.out) && w.colsum.len() >= e.out);
-    assert!(e.col.is_none_or(|c| c.len() >= e.out) && e.bias.is_none_or(|b| b.len() >= e.out));
-    assert!(
-        q.len() >= span(rows, w.inp),
-        "{} inputs for {rows} rows of {}",
-        q.len(),
-        w.inp
-    );
-    assert!(supported(isa), "{isa:?} on a CPU without it");
+    validate_f32(isa, q, rows, w, e);
+    assert!(y.len() >= span(rows, e.out));
     #[cfg(target_arch = "x86_64")]
     {
-        let raw = x86::Epi {
-            xs: e.xs.as_ptr(),
-            per_row,
-            cs: w.colsum.as_ptr(),
-            col: e.col.map_or(std::ptr::null(), <[f32]>::as_ptr),
-            scale: e.scale,
-            bias: e.bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
-            out: e.out,
-        };
+        let raw = x86::Epi::new(w, e);
         match (isa, &w.weights) {
             (Isa::Vnni512, WeightLayout::Blocked(blocked)) => {
                 // SAFETY: the CPU has AVX-512 VNNI (`isa`); the slices hold what the asserts say
-                return unsafe { x86::gemm_vnni512_f32(q, rows, w, blocked, &raw, y) };
+                return unsafe {
+                    x86::gemm_vnni512_f32(
+                        q,
+                        rows,
+                        w,
+                        blocked,
+                        &raw,
+                        y.as_mut_ptr(),
+                        0,
+                        e.out.div_ceil(16),
+                    )
+                };
             }
             (Isa::Avx2 | Isa::Avx, WeightLayout::Wide(wide)) => {
                 // the 16-bit copy's kernels read each row's inputs as 16-bit pairs (x0 | x1 << 16), made here into `acc`
@@ -294,6 +306,399 @@ pub(crate) fn gemm_u8i8_f32(
                 v += b[o];
             }
             yr[o] = v;
+        }
+    }
+}
+
+fn validate_f32(isa: Isa, q: &[u8], rows: usize, w: &Packed, e: &Epilogue) {
+    assert!(
+        e.xs.len() >= rows || e.xs.len() == 1,
+        "{} scales for {rows} rows",
+        e.xs.len()
+    );
+    assert!(e.out <= w.out);
+    assert!(e.col.is_none_or(|c| c.len() >= e.out) && e.bias.is_none_or(|b| b.len() >= e.out));
+    assert!(q.len() >= span(rows, w.inp));
+    assert!(supported(isa), "{isa:?} on a CPU without it");
+}
+
+/// Writes only the requested columns into the (rows, `e.out`) output.
+/// # Safety
+/// Each cell of the selected column blocks (up to `e.out`) in each row must be writable at `y`.
+/// No overlapping accesses or references are permitted; workers can share a raw base pointer
+/// to write disjoint column ranges.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) unsafe fn gemm_u8i8_f32_cols_ptr(
+    isa: Isa,
+    q: &[u8],
+    rows: usize,
+    w: &Packed,
+    e: &Epilogue,
+    y: *mut f32,
+    ob_start: usize,
+    ob_end: usize,
+) {
+    validate_f32(isa, q, rows, w, e);
+    span(rows, e.out);
+    assert!(ob_start <= ob_end && ob_end <= w.blocks());
+    let end = ob_end.min(e.out.div_ceil(16));
+    if ob_start >= end || rows == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let (Isa::Vnni512, WeightLayout::Blocked(blocked)) = (isa, &w.weights) {
+        return x86::gemm_vnni512_f32(q, rows, w, blocked, &x86::Epi::new(w, e), y, ob_start, end);
+    }
+    visit_fallback_tiles(isa, q, rows, w, e, ob_start, end, |r, o, v| {
+        std::ptr::copy_nonoverlapping(v.as_ptr(), y.add(r * e.out + o), v.len());
+    });
+}
+
+/// A row's reduction over one column range. Blacklisted columns affect the normalization,
+/// but not `top`. The blank is recorded raw, even when blacklisted.
+#[derive(Debug)]
+pub(crate) struct PartialFrameReduce {
+    pub max: f32,
+    pub sum_exp: f32,
+    pub top: Vec<(u32, f32)>,
+    pub blank_logit: f32,
+    pub has_non_finite: bool,
+}
+
+impl Default for PartialFrameReduce {
+    fn default() -> Self {
+        Self {
+            max: f32::NEG_INFINITY,
+            sum_exp: 0.0,
+            top: Vec::new(),
+            blank_logit: f32::NEG_INFINITY,
+            has_non_finite: false,
+        }
+    }
+}
+
+impl PartialFrameReduce {
+    #[inline]
+    pub(crate) fn reset(&mut self, seed_max: f32) {
+        self.max = seed_max;
+        self.sum_exp = 0.0;
+        self.top.clear();
+        self.blank_logit = f32::NEG_INFINITY;
+        self.has_non_finite = false;
+    }
+
+    #[inline]
+    fn insert(&mut self, keep: usize, id: u32, v: f32) {
+        let i = self
+            .top
+            .partition_point(|&(j, x)| x > v || (x == v && j < id));
+        if i < keep {
+            if self.top.len() == keep {
+                self.top.copy_within(i..keep - 1, i + 1);
+                self.top[i] = (id, v);
+            } else {
+                self.top.insert(i, (id, v));
+            }
+        }
+    }
+
+    #[inline]
+    fn raise_max(&mut self, new: f32, greedy_only: bool) {
+        if new > self.max {
+            if !greedy_only && self.sum_exp != 0.0 {
+                self.sum_exp *= crate::pipeline::lse::exp(self.max - new);
+            }
+            self.max = new;
+        }
+    }
+
+    fn reduce_scalar(
+        &mut self,
+        start: usize,
+        v: &[f32],
+        blocked: u16,
+        blank: u32,
+        keep: usize,
+        greedy_only: bool,
+    ) {
+        let mut max = f32::NEG_INFINITY;
+        for (j, &x) in v.iter().enumerate() {
+            let id = (start + j) as u32;
+            if id == blank {
+                self.blank_logit = x;
+            }
+            self.has_non_finite |= !x.is_finite();
+            max = max.max(x);
+            if blocked & (1 << j) == 0
+                && !x.is_nan()
+                && (self.top.len() < keep || self.top.last().is_some_and(|&(_, y)| x > y))
+            {
+                self.insert(keep, id, x);
+            }
+        }
+        self.raise_max(max, greedy_only);
+        // The scalar lse::peaked always includes the short final block.
+        if !greedy_only && self.max.is_finite() && (v.len() < 16 || max > self.max - 24.0) {
+            self.sum_exp += v
+                .iter()
+                .map(|&x| crate::pipeline::lse::exp(x - self.max))
+                .sum::<f32>();
+        }
+    }
+}
+
+/// Reduce a column range during the GEMM, retaining just its per-row summaries. Ranges are
+/// in units of 16 columns relative to the original matrix, clamped to `e.out`.
+/// `blacklist` and `blank_id` are column IDs. Each worker owns its own returned summaries.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn gemm_u8i8_reduce_cols(
+    isa: Isa,
+    q: &[u8],
+    rows: usize,
+    w: &Packed,
+    e: &Epilogue,
+    ob_start: usize,
+    ob_end: usize,
+    blacklist: &[u32],
+    blank_id: u32,
+    k: usize,
+    greedy_only: bool,
+) -> Vec<PartialFrameReduce> {
+    let mut partial = Vec::new();
+    let mut masks = Vec::new();
+    gemm_u8i8_reduce_cols_into(
+        isa,
+        q,
+        rows,
+        w,
+        e,
+        ob_start,
+        ob_end,
+        blacklist,
+        blank_id,
+        k,
+        greedy_only,
+        None,
+        &mut partial,
+        &mut masks,
+    );
+    partial
+}
+
+/// Zero-allocation version of [`gemm_u8i8_reduce_cols`] reusing caller-owned `partial` and `masks`.
+/// When `seed_max` is provided (`seed_max[r] <= global_max[r]` from another block, e.g. block 0),
+/// each row starts with `max = seed_max[r]` so blocks below `seed_max[r] - 24` skip `exp16_le0`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_u8i8_reduce_cols_into(
+    isa: Isa,
+    q: &[u8],
+    rows: usize,
+    w: &Packed,
+    e: &Epilogue,
+    ob_start: usize,
+    ob_end: usize,
+    blacklist: &[u32],
+    blank_id: u32,
+    k: usize,
+    greedy_only: bool,
+    seed_max: Option<&[f32]>,
+    partial: &mut Vec<PartialFrameReduce>,
+    masks: &mut Vec<u16>,
+) {
+    validate_f32(isa, q, rows, w, e);
+    assert!(ob_start <= ob_end && ob_end <= w.blocks() && u32::try_from(e.out).is_ok());
+    let end = ob_end.min(e.out.div_ceil(16));
+    let keep = if greedy_only { 2 } else { k.max(2) }.min(e.out);
+    if partial.len() < rows {
+        partial.resize_with(rows, PartialFrameReduce::default);
+    }
+    partial.truncate(rows);
+    let cap = keep.min(end.saturating_sub(ob_start) * 16);
+    for (r, p) in partial.iter_mut().enumerate() {
+        let seed = seed_max.map_or(f32::NEG_INFINITY, |s| s[r]);
+        p.reset(seed);
+        if p.top.capacity() < cap {
+            p.top.reserve(cap - p.top.len());
+        }
+    }
+    if ob_start >= end || rows == 0 {
+        return;
+    }
+    let n_blocks = end - ob_start;
+    masks.clear();
+    masks.resize(n_blocks, 0u16);
+    for &id in blacklist {
+        let (b, j) = (id as usize / 16, id % 16);
+        if (ob_start..end).contains(&b) {
+            masks[b - ob_start] |= 1 << j;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let (Isa::Vnni512, WeightLayout::Blocked(blocked)) = (isa, &w.weights) {
+        unsafe {
+            x86::gemm_vnni512_reduce(
+                q,
+                rows,
+                w,
+                blocked,
+                &x86::Epi::new(w, e),
+                ob_start,
+                masks,
+                blank_id,
+                keep,
+                greedy_only,
+                partial,
+            )
+        };
+        return;
+    }
+    visit_fallback_tiles(isa, q, rows, w, e, ob_start, end, |r, o, v| {
+        partial[r].reduce_scalar(o, v, masks[o / 16 - ob_start], blank_id, keep, greedy_only);
+    });
+}
+
+pub(crate) type FrameReduction = (Vec<(u32, f32)>, f32, u32, f32, f32);
+
+/// Merge workers' summaries in any range order. Returns `(top, blank, top1_id, top1, top2)`
+/// per frame. `None` requests an unfused fallback (non-finite logits). Greedy scores are
+/// shifted by the best eligible logit, not normalized; the returned `top` has at most two entries.
+#[allow(dead_code)]
+pub(crate) fn merge_partial_reduce(
+    parts: &[Vec<PartialFrameReduce>],
+    blacklist: &[u32],
+    blank_id: u32,
+    k: usize,
+    greedy_only: bool,
+) -> Option<Vec<FrameReduction>> {
+    let slices: Vec<&[PartialFrameReduce]> = parts.iter().map(Vec::as_slice).collect();
+    merge_partial_reduce_slices(&slices, blacklist, blank_id, k, greedy_only)
+}
+
+/// Slice-based version of [`merge_partial_reduce`] that borrows worker-owned slices without moving Vecs.
+pub(crate) fn merge_partial_reduce_slices(
+    parts: &[&[PartialFrameReduce]],
+    blacklist: &[u32],
+    blank_id: u32,
+    k: usize,
+    greedy_only: bool,
+) -> Option<Vec<FrameReduction>> {
+    let rows = parts.first().map_or(0, |p| p.len());
+    assert!(parts.iter().all(|p| p.len() == rows));
+    let keep = if greedy_only { 2 } else { k.max(2) };
+    let blank_blocked = blacklist.contains(&blank_id);
+    let mut frames = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut combined = PartialFrameReduce {
+            top: Vec::with_capacity(keep),
+            ..PartialFrameReduce::default()
+        };
+        for p in parts {
+            let p = &p[r];
+            if p.has_non_finite {
+                return None;
+            }
+            combined.max = combined.max.max(p.max);
+            combined.blank_logit = combined.blank_logit.max(p.blank_logit);
+            for &(id, v) in &p.top {
+                if combined.top.len() < keep
+                    || v > combined.top[keep - 1].1
+                    || (v == combined.top[keep - 1].1 && id < combined.top[keep - 1].0)
+                {
+                    combined.insert(keep, id, v);
+                }
+            }
+        }
+        let norm = if greedy_only {
+            combined.top.first().map_or(0.0, |&(_, v)| v)
+        } else if combined.max.is_finite() {
+            let sum: f32 = parts
+                .iter()
+                .map(|p| {
+                    let p = &p[r];
+                    if p.sum_exp == 0.0 {
+                        0.0
+                    } else {
+                        p.sum_exp * crate::pipeline::lse::exp(p.max - combined.max)
+                    }
+                })
+                .sum();
+            combined.max + sum.ln()
+        } else {
+            0.0
+        };
+        let lp = |v: f32| v - norm;
+        let (top1_id, top1) = combined
+            .top
+            .first()
+            .map_or((blank_id, f32::NEG_INFINITY), |&(id, v)| (id, lp(v)));
+        let top2 = combined
+            .top
+            .get(1)
+            .map_or(f32::NEG_INFINITY, |&(_, v)| lp(v));
+        let blank = if blank_blocked {
+            f32::NEG_INFINITY
+        } else {
+            lp(combined.blank_logit)
+        };
+        combined.top.truncate(if greedy_only { 2 } else { k });
+        for (_, v) in &mut combined.top {
+            *v = lp(*v);
+        }
+        frames.push((combined.top, blank, top1_id, top1, top2));
+    }
+    Some(frames)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_fallback_tiles(
+    isa: Isa,
+    q: &[u8],
+    rows: usize,
+    w: &Packed,
+    e: &Epilogue,
+    start: usize,
+    end: usize,
+    mut visit: impl FnMut(usize, usize, &[f32]),
+) {
+    const RT: usize = 4;
+    let per_row = e.xs.len() > 1;
+    for ob in start..end {
+        let o = ob * 16;
+        let len = (e.out - o).min(16);
+        for r0 in (0..rows).step_by(RT) {
+            let m = (rows - r0).min(RT);
+            let input = &q[r0 * w.inp..(r0 + m) * w.inp];
+            let mut acc = [[0; 16]; RT];
+            #[cfg(target_arch = "x86_64")]
+            let simd = unsafe { x86::fallback_tile(isa, input, m, w, ob, acc.as_mut_ptr().cast()) };
+            #[cfg(target_arch = "aarch64")]
+            let simd = if let (Isa::Dot, WeightLayout::Blocked(blocked)) = (isa, &w.weights) {
+                unsafe { arm::fallback_tile(input, m, w, blocked, ob, acc.as_mut_ptr().cast()) };
+                true
+            } else {
+                false
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let simd = false;
+            for (r, a) in acc[..m].iter().enumerate() {
+                let (sx, zx) = e.xs[if per_row { r0 + r } else { 0 }];
+                let qr = &input[r * w.inp..(r + 1) * w.inp];
+                let mut v = [0.0; 16];
+                for j in 0..len {
+                    let c = o + j;
+                    let sum = if simd { a[j] } else { dot_plain(qr, w, c) };
+                    let f = sum.wrapping_sub(zx.wrapping_mul(w.colsum[c])) as f32;
+                    let mut f = match e.col {
+                        None => f * (sx * e.scale),
+                        Some(scale) => sx * scale[c] * f,
+                    };
+                    if let Some(b) = e.bias {
+                        f += b[c];
+                    }
+                    v[j] = f;
+                }
+                visit(r0 + r, o, &v[..len]);
+            }
         }
     }
 }
@@ -383,6 +788,33 @@ mod arm {
         };
     }
 
+    #[target_feature(enable = "neon,dotprod")]
+    pub(super) unsafe fn fallback_tile(
+        q: &[u8],
+        m: usize,
+        w: &Packed,
+        blocked: &[i8],
+        ob: usize,
+        a: *mut i32,
+    ) {
+        let stride = w.inp * 16;
+        by_rows!(
+            m,
+            1,
+            q.as_ptr(),
+            w.inp,
+            blocked.as_ptr().add(ob * stride),
+            stride,
+            a,
+            16
+        );
+        for r in 0..m {
+            for j in 0..16 {
+                *a.add(r * 16 + j) += 128 * w.colsum[ob * 16 + j];
+            }
+        }
+    }
+
     /// The integer sums of `super::gemm_u8i8` on a blocked matrix.
     #[target_feature(enable = "neon,dotprod")]
     pub(super) unsafe fn gemm_dot(
@@ -451,48 +883,326 @@ fn gemm_plain(q: &[u8], rows: usize, w: &Packed, acc: &mut [i32]) {
     for r in 0..rows {
         let qr = &q[r * k..(r + 1) * k];
         for o in 0..n {
-            acc[r * n + o] = match &w.weights {
-                WeightLayout::Raw(raw) => {
-                    let wr = &raw[o * k..(o + 1) * k];
-                    qr.iter().zip(wr).map(|(&a, &b)| a as i32 * b as i32).sum()
-                }
-                WeightLayout::Blocked(blocked) => {
-                    // the blocked layout: row o's inputs 4g..4g+4 at ((o / 16 * k / 4 + g) * 16 + o % 16) * 4
-                    (0..k / 4)
-                        .map(|g| {
-                            let b = ((o / 16 * (k / 4) + g) * 16 + o % 16) * 4;
-                            (0..4)
-                                .map(|t| qr[g * 4 + t] as i32 * blocked[b + t] as i32)
-                                .sum::<i32>()
-                        })
-                        .sum()
-                }
-                WeightLayout::Wide(wide) => {
-                    let (ob, j) = (o / 16, o % 16);
-                    let (half, oo) = (j / 8, j % 8);
-                    (0..k / 4)
-                        .map(|g| {
-                            let base = (ob * (k / 4) + g) * 64 + half * 32 + oo * 2;
-                            qr[g * 4] as i32 * wide[base] as i32
-                                + qr[g * 4 + 1] as i32 * wide[base + 1] as i32
-                                + qr[g * 4 + 2] as i32 * wide[base + 16] as i32
-                                + qr[g * 4 + 3] as i32 * wide[base + 17] as i32
-                        })
-                        .sum()
-                }
-            };
+            acc[r * n + o] = dot_plain(qr, w, o);
+        }
+    }
+}
+
+#[inline]
+fn dot_plain(qr: &[u8], w: &Packed, o: usize) -> i32 {
+    let k = w.inp;
+    match &w.weights {
+        WeightLayout::Raw(raw) => {
+            let wr = &raw[o * k..(o + 1) * k];
+            qr.iter().zip(wr).map(|(&a, &b)| a as i32 * b as i32).sum()
+        }
+        WeightLayout::Blocked(blocked) => {
+            // the blocked layout: row o's inputs 4g..4g+4 at ((o / 16 * k / 4 + g) * 16 + o % 16) * 4
+            (0..k / 4)
+                .map(|g| {
+                    let b = ((o / 16 * (k / 4) + g) * 16 + o % 16) * 4;
+                    (0..4)
+                        .map(|t| qr[g * 4 + t] as i32 * blocked[b + t] as i32)
+                        .sum::<i32>()
+                })
+                .sum()
+        }
+        WeightLayout::Wide(wide) => {
+            let (ob, j) = (o / 16, o % 16);
+            let (half, oo) = (j / 8, j % 8);
+            (0..k / 4)
+                .map(|g| {
+                    let base = (ob * (k / 4) + g) * 64 + half * 32 + oo * 2;
+                    qr[g * 4] as i32 * wide[base] as i32
+                        + qr[g * 4 + 1] as i32 * wide[base + 1] as i32
+                        + qr[g * 4 + 2] as i32 * wide[base + 16] as i32
+                        + qr[g * 4 + 3] as i32 * wide[base + 17] as i32
+                })
+                .sum()
         }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-mod x86 {
+pub(super) mod x86 {
     use super::Packed;
     use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    pub(crate) unsafe fn quantize_range(v: &[f32]) -> (f32, f32) {
+        let mut lo = _mm512_setzero_ps();
+        let mut hi = lo;
+        let chunks = v.chunks_exact(16);
+        let tail = chunks.remainder();
+        for c in chunks {
+            let x = _mm512_loadu_ps(c.as_ptr());
+            // A NaN (or equal value) selects the old lane, the second operand.
+            lo = _mm512_min_ps(x, lo);
+            hi = _mm512_max_ps(x, hi);
+        }
+        let lo = tail
+            .iter()
+            .copied()
+            .fold(_mm512_reduce_min_ps(lo), f32::min);
+        let hi = tail
+            .iter()
+            .copied()
+            .fold(_mm512_reduce_max_ps(hi), f32::max);
+        super::quantize_params(lo, hi)
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn quantize16(v: *const f32, inv: __m512, zp: __m512) -> __m128i {
+        let y = _mm512_add_ps(_mm512_mul_ps(_mm512_loadu_ps(v), inv), zp);
+        let y = _mm512_max_ps(y, _mm512_setzero_ps());
+        let y = _mm512_min_ps(y, _mm512_set1_ps(255.0));
+        _mm512_cvtusepi32_epi8(_mm512_cvttps_epi32(_mm512_add_ps(y, _mm512_set1_ps(0.5))))
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    #[inline]
+    pub(crate) unsafe fn quantize_group(v: &[f32], q: &mut [u8], inv: f32, zp: f32) -> f32 {
+        debug_assert_eq!(v.len(), q.len());
+        let vi = _mm512_set1_ps(inv);
+        let vz = _mm512_set1_ps(zp);
+        let zero = _mm512_setzero_si512();
+        let mut sums = zero;
+        let whole = v.len() / 64 * 64;
+        for i in (0..whole).step_by(64) {
+            let p = v.as_ptr().add(i);
+            let bytes = _mm512_inserti32x4::<3>(
+                _mm512_inserti32x4::<2>(
+                    _mm512_inserti32x4::<1>(
+                        _mm512_castsi128_si512(quantize16(p, vi, vz)),
+                        quantize16(p.add(16), vi, vz),
+                    ),
+                    quantize16(p.add(32), vi, vz),
+                ),
+                quantize16(p.add(48), vi, vz),
+            );
+            _mm512_storeu_si512(q.as_mut_ptr().add(i).cast(), bytes);
+            sums = _mm512_add_epi64(sums, _mm512_sad_epu8(bytes, zero));
+        }
+        let tail = v.len() / 16 * 16;
+        let mut short_sums = _mm_setzero_si128();
+        for i in (whole..tail).step_by(16) {
+            let bytes = quantize16(v.as_ptr().add(i), vi, vz);
+            _mm_storeu_si128(q.as_mut_ptr().add(i).cast(), bytes);
+            short_sums = _mm_add_epi64(short_sums, _mm_sad_epu8(bytes, _mm_setzero_si128()));
+        }
+        super::quantize_tail(&v[tail..], &mut q[tail..], inv, zp);
+        let short_sum = _mm_cvtsi128_si64(_mm_add_epi64(
+            short_sums,
+            _mm_unpackhi_epi64(short_sums, short_sums),
+        )) as u32;
+        let tail_sum: u32 = q[tail..].iter().map(|&x| x as u32).sum();
+        (_mm512_reduce_add_epi64(sums) as u32 + short_sum + tail_sum) as f32
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn quantize_codes(v: &[f32], q: &mut [u8], inv: f32, zp: f32) {
+        let vi = _mm512_set1_ps(inv);
+        let vz = _mm512_set1_ps(zp);
+        let whole = v.len() / 16 * 16;
+        for i in (0..whole).step_by(16) {
+            _mm_storeu_si128(
+                q.as_mut_ptr().add(i).cast(),
+                quantize16(v.as_ptr().add(i), vi, vz),
+            );
+        }
+        super::quantize_tail(&v[whole..], &mut q[whole..], inv, zp);
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
+        let (scale, zp) = quantize_range(v);
+        let n = v.len().min(q.len());
+        quantize_codes(&v[..n], &mut q[..n], 1.0 / scale, zp);
+        (scale, zp as i32)
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn gelu_slice(x: &mut [f32]) {
+        gelu_slice_impl::<false>(x);
+    }
+
+    /// The GELU pass can track the quantizer's row range without reloading the output.
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    pub(crate) unsafe fn gelu_quantize_range(x: &mut [f32]) -> (f32, f32) {
+        gelu_slice_impl::<true>(x)
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn gelu_slice_impl<const RANGE: bool>(x: &mut [f32]) -> (f32, f32) {
+        let mut lo = _mm512_setzero_ps();
+        let mut hi = lo;
+        let mut chunks = x.chunks_exact_mut(16);
+        for c in &mut chunks {
+            let v = _mm512_loadu_ps(c.as_ptr());
+            let z = _mm512_mul_ps(v, _mm512_set1_ps(std::f32::consts::FRAC_1_SQRT_2));
+            // NaN is the second operand so both halves of the clamp propagate it.
+            let z = _mm512_min_ps(_mm512_set1_ps(4.0), _mm512_max_ps(_mm512_set1_ps(-4.0), z));
+            let z2 = _mm512_mul_ps(z, z);
+            let mut p = _mm512_set1_ps(super::ERF_P[0]);
+            let mut q = _mm512_set1_ps(super::ERF_Q[0]);
+            for &coef in &super::ERF_P[1..] {
+                p = _mm512_add_ps(_mm512_mul_ps(z2, p), _mm512_set1_ps(coef));
+            }
+            for &coef in &super::ERF_Q[1..] {
+                q = _mm512_add_ps(_mm512_mul_ps(z2, q), _mm512_set1_ps(coef));
+            }
+            let erf = _mm512_div_ps(_mm512_mul_ps(z, p), q);
+            let h = _mm512_mul_ps(
+                _mm512_mul_ps(_mm512_set1_ps(0.5), v),
+                _mm512_add_ps(_mm512_set1_ps(1.0), erf),
+            );
+            if RANGE {
+                lo = _mm512_min_ps(h, lo);
+                hi = _mm512_max_ps(h, hi);
+            }
+            _mm512_storeu_ps(c.as_mut_ptr(), h);
+        }
+        let tail = chunks.into_remainder();
+        for v in tail.iter_mut() {
+            *v = super::gelu(*v);
+        }
+        if RANGE {
+            let lo = tail
+                .iter()
+                .copied()
+                .fold(_mm512_reduce_min_ps(lo), f32::min);
+            let hi = tail
+                .iter()
+                .copied()
+                .fold(_mm512_reduce_max_ps(hi), f32::max);
+            super::quantize_params(lo, hi)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn route_logits(x: &[f32], w: &[f32], logits: &mut [f32]) {
+        let d = x.len();
+        let mut experts = logits.chunks_exact_mut(4);
+        for (j, l) in (&mut experts).enumerate() {
+            route_dot::<4>(x, w.as_ptr().add(j * 4 * d), l);
+        }
+        let start = logits.len() / 4 * 4;
+        for (j, l) in logits[start..].iter_mut().enumerate() {
+            route_dot::<1>(x, w.as_ptr().add((start + j) * d), std::slice::from_mut(l));
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn route_dot<const E: usize>(x: &[f32], w: *const f32, logits: &mut [f32]) {
+        let d = x.len();
+        let mut acc = [_mm512_setzero_ps(); E];
+        let whole = d / 16 * 16;
+        for i in (0..whole).step_by(16) {
+            let v = _mm512_loadu_ps(x.as_ptr().add(i));
+            for (j, a) in acc.iter_mut().enumerate() {
+                let wy = _mm512_loadu_ps(w.add(j * d + i));
+                *a = _mm512_add_ps(*a, _mm512_mul_ps(v, wy));
+            }
+        }
+        // Sum each expert's lanes in the original order; vectorize across experts, not lanes.
+        if E == 4 {
+            let mut sums = _mm_setzero_ps();
+            macro_rules! four_lanes {
+                ($i:literal) => {{
+                    let [a, b, c, d] =
+                        std::array::from_fn(|j| _mm512_extractf32x4_ps::<$i>(acc[j]));
+                    let (ab, cd) = (_mm_unpacklo_ps(a, b), _mm_unpacklo_ps(c, d));
+                    sums = _mm_add_ps(sums, _mm_movelh_ps(ab, cd));
+                    sums = _mm_add_ps(sums, _mm_movehl_ps(cd, ab));
+                    let (ab, cd) = (_mm_unpackhi_ps(a, b), _mm_unpackhi_ps(c, d));
+                    sums = _mm_add_ps(sums, _mm_movelh_ps(ab, cd));
+                    sums = _mm_add_ps(sums, _mm_movehl_ps(cd, ab));
+                }};
+            }
+            four_lanes!(0);
+            four_lanes!(1);
+            four_lanes!(2);
+            four_lanes!(3);
+            _mm_storeu_ps(logits.as_mut_ptr(), sums);
+        } else {
+            let mut lanes = [0.0; 16];
+            _mm512_storeu_ps(lanes.as_mut_ptr(), acc[0]);
+            logits[0] = lanes.iter().sum();
+        }
+        for (j, logit) in logits.iter_mut().enumerate() {
+            let tail = std::slice::from_raw_parts(w.add(j * d + whole), d - whole);
+            *logit += x[whole..]
+                .iter()
+                .zip(tail)
+                .map(|(&a, &b)| a * b)
+                .sum::<f32>();
+        }
+    }
 
     #[inline(always)]
     unsafe fn bcast4(q: *const u8) -> i32 {
         (q as *const i32).read_unaligned()
+    }
+
+    /// Integer sums for the non-AVX-512 range and reducer paths, one block at a time.
+    pub(super) unsafe fn fallback_tile(
+        isa: super::Isa,
+        q: &[u8],
+        m: usize,
+        w: &Packed,
+        ob: usize,
+        a: *mut i32,
+    ) -> bool {
+        use super::{Isa, WeightLayout};
+        let (q, k) = (q.as_ptr(), w.inp);
+        let off = ob * k * 16;
+        macro_rules! run {
+            ($tile:ident, $p:expr) => {
+                match m {
+                    1 => $tile::<1>(q, k, $p, a, 16),
+                    2 => $tile::<2>(q, k, $p, a, 16),
+                    3 => $tile::<3>(q, k, $p, a, 16),
+                    _ => $tile::<4>(q, k, $p, a, 16),
+                }
+            };
+        }
+        match (isa, &w.weights) {
+            (Isa::Vnni256, WeightLayout::Blocked(b)) => {
+                let wb = b.as_ptr().add(off);
+                match m {
+                    1 => tile256::<1, 1>(q, k, wb, k * 16, a, 16),
+                    2 => tile256::<2, 1>(q, k, wb, k * 16, a, 16),
+                    3 => tile256::<3, 1>(q, k, wb, k * 16, a, 16),
+                    _ => tile256::<4, 1>(q, k, wb, k * 16, a, 16),
+                }
+            }
+            (Isa::Avx2, WeightLayout::Blocked(b)) => run!(tile_avx2, b.as_ptr().add(off)),
+            (Isa::Avx2, WeightLayout::Wide(b)) => run!(tile_avx2w, b.as_ptr().add(off)),
+            (Isa::Avx, WeightLayout::Wide(b)) => {
+                let wb = b.as_ptr().add(off);
+                if m == 1 {
+                    tile_avxw::<1>(q, k, wb, a, 16);
+                } else {
+                    tile_avxw::<2>(q, k, wb, a, 16);
+                }
+                if m == 3 {
+                    tile_avxw::<1>(q.add(2 * k), k, wb, a.add(32), 16);
+                }
+                if m == 4 {
+                    tile_avxw::<2>(q.add(2 * k), k, wb, a.add(32), 16);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// `$tile::<rt, $c>($args)` for a row count `rt` known only at run time, up to 6 rows ($c 4) or 8 ($c 1).
@@ -549,7 +1259,7 @@ mod x86 {
         }
     }
 
-    /// RT rows x C output blocks of int8 weights (block c `bstride` bytes after block 0).
+    /// RT rows x C cache-line-aligned output blocks (block c `bstride` bytes after block 0).
     #[target_feature(enable = "avx512f,avx512vnni")]
     unsafe fn tile512<const RT: usize, const C: usize>(
         q: *const u8,
@@ -559,19 +1269,7 @@ mod x86 {
         acc: *mut i32,
         n: usize,
     ) {
-        let mut a = [[_mm512_setzero_si512(); C]; RT];
-        for kg in 0..k / 4 {
-            let mut w = [_mm512_setzero_si512(); C];
-            for (c, wc) in w.iter_mut().enumerate() {
-                *wc = _mm512_loadu_si512(wb.add(c * bstride + kg * 64) as *const _);
-            }
-            for (r, ar) in a.iter_mut().enumerate() {
-                let x = _mm512_set1_epi32(bcast4(q.add(r * k + kg * 4)));
-                for (ac, wc) in ar.iter_mut().zip(&w) {
-                    *ac = _mm512_dpbusd_epi32(*ac, x, *wc);
-                }
-            }
-        }
+        let a = sums512::<RT, C>(q, k, wb, bstride);
         for (r, ar) in a.iter().enumerate() {
             for (c, ac) in ar.iter().enumerate() {
                 _mm512_storeu_si512(acc.add(r * n + c * 16) as *mut _, *ac);
@@ -591,9 +1289,46 @@ mod x86 {
         pub out: usize,
     }
 
-    /// RT rows x C output blocks of int8 weights as `tile512`, the sums turned to `gemm_u8i8_f32`'s outputs in
-    /// registers: row r's outputs at `y + r * ystride`, block c's at column `col0 + 16 c`, the columns past `out`
-    /// left unwritten (masked).
+    impl Epi {
+        pub(super) fn new(w: &Packed, e: &super::Epilogue<'_>) -> Self {
+            Self {
+                xs: e.xs.as_ptr(),
+                per_row: e.xs.len() > 1,
+                cs: w.colsum.as_ptr(),
+                col: e.col.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                scale: e.scale,
+                bias: e.bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                out: e.out,
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[inline]
+    unsafe fn sums512<const RT: usize, const C: usize>(
+        q: *const u8,
+        k: usize,
+        wb: *const i8,
+        bstride: usize,
+    ) -> [[__m512i; C]; RT] {
+        let mut a = [[_mm512_setzero_si512(); C]; RT];
+        for kg in 0..k / 4 {
+            let mut w = [_mm512_setzero_si512(); C];
+            for (c, wc) in w.iter_mut().enumerate() {
+                *wc = _mm512_load_si512(wb.add(c * bstride + kg * 64).cast());
+            }
+            for (r, ar) in a.iter_mut().enumerate() {
+                let x = _mm512_set1_epi32(bcast4(q.add(r * k + kg * 4)));
+                for (ac, wc) in ar.iter_mut().zip(&w) {
+                    *ac = _mm512_dpbusd_epi32(*ac, x, *wc);
+                }
+            }
+        }
+        a
+    }
+
+    /// RT rows x C output blocks of int8 weights as `tile512`, with the float epilogue.
+    /// `col0` is the global column offset for weights and scales; `y` already points to the first column of the tile.
     #[target_feature(enable = "avx512f,avx512vnni")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn tile512_f32<const RT: usize, const C: usize>(
@@ -607,19 +1342,7 @@ mod x86 {
         r0: usize,
         e: &Epi,
     ) {
-        let mut a = [[_mm512_setzero_si512(); C]; RT];
-        for kg in 0..k / 4 {
-            let mut w = [_mm512_setzero_si512(); C];
-            for (c, wc) in w.iter_mut().enumerate() {
-                *wc = _mm512_loadu_si512(wb.add(c * bstride + kg * 64) as *const _);
-            }
-            for (r, ar) in a.iter_mut().enumerate() {
-                let x = _mm512_set1_epi32(bcast4(q.add(r * k + kg * 4)));
-                for (ac, wc) in ar.iter_mut().zip(&w) {
-                    *ac = _mm512_dpbusd_epi32(*ac, x, *wc);
-                }
-            }
-        }
+        let a = sums512::<RT, C>(q, k, wb, bstride);
         for c in 0..C {
             let o = col0 + c * 16;
             if o >= e.out {
@@ -653,7 +1376,7 @@ mod x86 {
                 if !e.bias.is_null() {
                     f = _mm512_add_ps(f, bias);
                 }
-                _mm512_mask_storeu_ps(y.add(r * ystride + o), m, f);
+                _mm512_mask_storeu_ps(y.add(r * ystride + c * 16), m, f);
             }
         }
     }
@@ -666,13 +1389,19 @@ mod x86 {
         w: &Packed,
         blocked: &[i8],
         e: &Epi,
-        y: &mut [f32],
+        y: *mut f32,
+        start: usize,
+        end: usize,
     ) {
-        let (n, k, out) = (w.out, w.inp, e.out);
-        assert!(y.len() >= rows * out && w.colsum.len() >= n && blocked.len() == n * k);
-        let (qp, yp, wp, bstride) = (q.as_ptr(), y.as_mut_ptr(), blocked.as_ptr(), k * 16);
-        tiles(rows, n / 16, |rt, r0, ob, c| {
-            let (q, yr, wb) = (qp.add(r0 * k), yp.add(r0 * out), wp.add(ob * bstride));
+        let (k, out) = (w.inp, e.out);
+        let (qp, wp, bstride) = (q.as_ptr(), blocked.as_ptr(), k * 16);
+        tiles(rows, end - start, |rt, r0, ob, c| {
+            let ob = ob + start;
+            let (q, yr, wb) = (
+                qp.add(r0 * k),
+                y.add(r0 * out + ob * 16),
+                wp.add(ob * bstride),
+            );
             if c == 4 {
                 by_rows!(
                     rt,
@@ -705,6 +1434,120 @@ mod x86 {
                 )
             }
         });
+    }
+
+    /// Consume a small GEMM tile before moving on to the next columns. The output
+    /// buffer is independent of the width of the head and the number of frames.
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn gemm_vnni512_reduce(
+        q: &[u8],
+        rows: usize,
+        w: &Packed,
+        blocked: &[i8],
+        e: &Epi,
+        start: usize,
+        masks: &[u16],
+        blank: u32,
+        keep: usize,
+        greedy_only: bool,
+        partial: &mut [super::PartialFrameReduce],
+    ) {
+        let k = w.inp;
+        let (qp, wp, bstride) = (q.as_ptr(), blocked.as_ptr(), k * 16);
+        let mut tile = [0.0f32; 6 * 64];
+        tiles(rows, masks.len(), |rt, r0, i, c| {
+            let ob = start + i;
+            let (q, wb, o, stride) = (qp.add(r0 * k), wp.add(ob * bstride), ob * 16, c * 16);
+            let y = tile.as_mut_ptr();
+            if c == 4 {
+                by_rows!(rt, tile512_f32, 4, q, k, wb, bstride, y, stride, o, r0, e);
+            } else {
+                by_rows!(rt, tile512_f32, 1, q, k, wb, bstride, y, stride, o, r0, e);
+            }
+            let len = (e.out - o).min(stride);
+            let blocked = &masks[i..i + c];
+            for r in 0..rt {
+                let p = &mut partial[r0 + r];
+                let v = &tile[r * stride..][..len];
+                match len {
+                    64 => reduce_blocks::<4>(p, o, v, blocked, blank, keep, greedy_only),
+                    16 => reduce_blocks::<1>(p, o, v, blocked, blank, keep, greedy_only),
+                    _ => {
+                        for (j, (v, &mask)) in v.chunks(16).zip(blocked).enumerate() {
+                            p.reduce_scalar(o + j * 16, v, mask, blank, keep, greedy_only);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn reduce_blocks<const C: usize>(
+        p: &mut super::PartialFrameReduce,
+        o: usize,
+        tile: &[f32],
+        blocked: &[u16],
+        blank: u32,
+        keep: usize,
+        greedy_only: bool,
+    ) {
+        let logits: [__m512; C] =
+            std::array::from_fn(|j| _mm512_loadu_ps(tile.as_ptr().add(j * 16)));
+        let mut highest = _mm512_set1_ps(f32::NEG_INFINITY);
+        let mut finite = u16::MAX;
+        for &v in &logits {
+            highest = _mm512_max_ps(v, highest);
+            let bits = _mm512_and_si512(_mm512_castps_si512(v), _mm512_set1_epi32(i32::MAX));
+            finite &=
+                _mm512_cmplt_epi32_mask(bits, _mm512_set1_epi32(f32::INFINITY.to_bits() as i32));
+        }
+        if finite != u16::MAX {
+            for (j, (v, &mask)) in tile.chunks_exact(16).zip(blocked).enumerate() {
+                p.reduce_scalar(o + j * 16, v, mask, blank, keep, greedy_only);
+            }
+            return;
+        }
+        if let Some(&b) = tile.get((blank as usize).wrapping_sub(o)) {
+            p.blank_logit = b;
+        }
+        if _mm512_cmp_ps_mask::<_CMP_GT_OQ>(highest, _mm512_set1_ps(p.max)) != 0 {
+            p.raise_max(_mm512_reduce_max_ps(highest), greedy_only);
+        }
+        let lim = _mm512_set1_ps(p.max - 24.0);
+        if !greedy_only && _mm512_cmp_ps_mask::<_CMP_GT_OQ>(highest, lim) != 0 {
+            let mut sum = _mm512_setzero_ps();
+            let max = _mm512_set1_ps(p.max);
+            for &v in &logits {
+                if C == 1 || _mm512_cmp_ps_mask::<_CMP_GT_OQ>(v, lim) != 0 {
+                    sum =
+                        _mm512_add_ps(sum, crate::pipeline::lse::exp16_le0(_mm512_sub_ps(v, max)));
+                }
+            }
+            p.sum_exp += _mm512_reduce_add_ps(sum);
+        }
+        if p.top.len() == keep
+            && _mm512_cmp_ps_mask::<_CMP_GT_OQ>(highest, _mm512_set1_ps(p.top[keep - 1].1)) == 0
+        {
+            return;
+        }
+        for (j, &v) in logits.iter().enumerate() {
+            let mut hits = !blocked[j];
+            if p.top.len() == keep {
+                // Columns arrive in increasing order, so ties can't displace the last one.
+                hits &= _mm512_cmp_ps_mask::<_CMP_GT_OQ>(v, _mm512_set1_ps(p.top[keep - 1].1));
+            }
+            while hits != 0 {
+                let lane = j * 16 + hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                let x = tile[lane];
+                if p.top.len() < keep || x > p.top[keep - 1].1 {
+                    p.insert(keep, (o + lane) as u32, x);
+                }
+            }
+        }
     }
 
     #[target_feature(enable = "avx512f,avx512vnni")]
@@ -1302,6 +2145,15 @@ mod x86 {
 /// Per row: u8 codes of `v` (asymmetric, the range widened to hold 0 exactly), its scale and zero point.
 #[inline(always)]
 pub(crate) fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::avx512() {
+        return unsafe { x86::quantize_row(v, q) };
+    }
+    quantize_row_scalar(v, q)
+}
+
+#[inline(always)]
+pub(super) fn quantize_row_scalar(v: &[f32], q: &mut [u8]) -> (f32, i32) {
     // the range in 16 lanes by compares (one vector min / max each; f32::min / max and one running pair did not
     // vectorize: 1.4 ns a value), NaN skipped as f32::min skips it
     let (mut lo16, mut hi16) = ([0.0f32; 16], [0.0f32; 16]);
@@ -1320,9 +2172,20 @@ pub(crate) fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
     for &x in hi16.iter().chain(tail) {
         hi = hi.max(x);
     }
+    let (scale, zp) = quantize_params(lo, hi);
+    quantize_tail(v, q, 1.0 / scale, zp);
+    (scale, zp as i32)
+}
+
+#[inline(always)]
+fn quantize_params(lo: f32, hi: f32) -> (f32, f32) {
     let scale = if hi > lo { (hi - lo) / 255.0 } else { 1.0 };
     let zp = ((-lo / scale).clamp(0.0, 255.0) + 0.5).floor();
-    let inv = 1.0 / scale;
+    (scale, zp)
+}
+
+#[inline(always)]
+fn quantize_tail(v: &[f32], q: &mut [u8], inv: f32, zp: f32) {
     // codes >= 0 after the clamp, so +0.5 and truncation round to nearest (f32::round does not vectorize); the clamp
     // by compares, NaN failing the first one to code 0 as before, so the truncation needs no saturating checks (`as
     // i32` kept the loop scalar: 0.58 ns a value)
@@ -1333,7 +2196,6 @@ pub(crate) fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
         // SAFETY: y + 0.5 is in [0.5, 255.5], finite and within i32
         *c = unsafe { (y + 0.5).to_int_unchecked::<i32>() } as u8;
     }
-    (scale, zp as i32)
 }
 
 /// erf for exact GELU, branch-free f32 (vectorizes): one rational function on [-4, 4], an odd polynomial of degree 13
@@ -1344,22 +2206,42 @@ pub(crate) fn quantize_row(v: &[f32], q: &mut [u8]) -> (f32, i32) {
 fn erf(x: f32) -> f32 {
     let x = x.clamp(-4.0, 4.0);
     let x2 = x * x;
-    let mut p = x2 * -2.726_142_3e-10 + 2.770_681_4e-8;
-    p = x2 * p - 2.101_024e-6;
-    p = x2 * p - 5.692_506_4e-5;
-    p = x2 * p - 7.349_906_3e-4;
-    p = x2 * p - 2.954_599_8e-3;
-    p = x2 * p - 1.609_603_3e-2;
-    let mut q = x2 * -1.456_607_2e-5 - 2.133_740_6e-4;
-    q = x2 * q - 1.682_827e-3;
-    q = x2 * q - 7.373_329_2e-3;
-    q = x2 * q - 1.426_473_9e-2;
+    let p = ERF_P[1..].iter().fold(ERF_P[0], |p, &c| x2 * p + c);
+    let q = ERF_Q[1..].iter().fold(ERF_Q[0], |q, &c| x2 * q + c);
     x * p / q
 }
 
 #[inline(always)]
 pub(crate) fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2))
+}
+
+const ERF_P: [f32; 7] = [
+    -2.726_142_3e-10,
+    2.770_681_4e-8,
+    -2.101_024e-6,
+    -5.692_506_4e-5,
+    -7.349_906_3e-4,
+    -2.954_599_8e-3,
+    -1.609_603_3e-2,
+];
+const ERF_Q: [f32; 5] = [
+    -1.456_607_2e-5,
+    -2.133_740_6e-4,
+    -1.682_827e-3,
+    -7.373_329_2e-3,
+    -1.426_473_9e-2,
+];
+
+/// In-place GELU, respecting the engine's CPU cap.
+pub(crate) fn gelu_slice(x: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::avx512() {
+        return unsafe { x86::gelu_slice(x) };
+    }
+    for v in x {
+        *v = gelu(*v);
+    }
 }
 
 /// sum a[i] * b[i] in 16 partial sums (vectorizes).
@@ -1541,10 +2423,10 @@ impl MoeWeights {
 
     #[inline(always)]
     fn forward_body(&self, x: &[f32], y: &mut [f32], s: &mut Scratch) {
-        let (e, d, k) = (self.e, self.d, self.k);
+        let d = self.d;
         let n = x.len() / d;
         y.fill(0.0);
-        route(x, &self.router, e, d, k, &mut s.rows);
+        route(x, &self.router, self.e, d, self.k, &mut s.rows);
         // the frames' u8 codes, once for every expert they go to
         s.xq.resize(n * d, 0);
         s.xs.clear();
@@ -1552,7 +2434,6 @@ impl MoeWeights {
             let qs = quantize_row(&x[r * d..(r + 1) * d], &mut s.xq[r * d..(r + 1) * d]);
             s.xs.push(qs);
         }
-        let active: Vec<usize> = (0..e).filter(|&ex| !s.rows[ex].is_empty()).collect();
         let Scratch {
             rows,
             xq,
@@ -1560,10 +2441,12 @@ impl MoeWeights {
             out,
             es,
         } = s;
-        for &ex in &active {
-            out.resize(rows[ex].len() * d, 0.0);
-            self.expert(ex, &rows[ex], xq, xs, out, es);
-            add_routed(y, &rows[ex], out, d);
+        for (ex, routed) in rows.iter().enumerate() {
+            if !routed.is_empty() {
+                out.resize(routed.len() * d, 0.0);
+                self.expert(ex, routed, xq, xs, out, es);
+                add_routed(y, routed, out, d);
+            }
         }
     }
 
@@ -1646,13 +2529,15 @@ impl MoeWeights {
             let (acc, h) = (&s.acc[i * f..(i + 1) * f], &mut s.h[i * f..(i + 1) * f]);
             for ((((hv, &a), &c), &sc), &b) in h.iter_mut().zip(acc).zip(&w1.colsum).zip(s1).zip(b1)
             {
-                *hv = gelu(sx * sc * (a - zx * c) as f32 + b);
+                *hv = sx * sc * (a - zx * c) as f32 + b;
             }
         }
         s.hq.resize(m * f, 0);
         s.hs.clear();
         for i in 0..m {
-            let qs = quantize_row(&s.h[i * f..(i + 1) * f], &mut s.hq[i * f..(i + 1) * f]);
+            let h = &mut s.h[i * f..(i + 1) * f];
+            gelu_slice(h);
+            let qs = quantize_row(h, &mut s.hq[i * f..(i + 1) * f]);
             s.hs.push(qs);
         }
         let w2 = &self.w2[ex];
@@ -1672,6 +2557,81 @@ impl MoeWeights {
     }
 }
 
+/// Route a contiguous slice of `rows` rows of `x` (`rows * d`) into `out` (`rows * k`), writing
+/// each row's top-`k` `(expert_id, weight)` pairs with zero heap allocation (thread-safe for
+/// disjoint row ranges).
+#[allow(dead_code)]
+pub(crate) fn route_rows_slice(
+    x: &[f32],
+    router: &[f32],
+    e: usize,
+    d: usize,
+    k: usize,
+    out: &mut [(usize, f32)],
+) {
+    assert!((1..=e).contains(&k));
+    assert!(router.len() >= span(e, d));
+    let mut stack_logits = [0.0; 64];
+    let mut heap_logits;
+    let logits = if e <= stack_logits.len() {
+        &mut stack_logits[..e]
+    } else {
+        heap_logits = vec![0.0; e];
+        &mut heap_logits[..]
+    };
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = crate::cpu::avx512();
+    for (r, xr) in x.chunks_exact(d).enumerate() {
+        let scalar_logits = |logits: &mut [f32]| {
+            for (l, wr) in logits.iter_mut().zip(router.chunks_exact(d)) {
+                *l = dot(xr, wr);
+            }
+        };
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            unsafe { x86::route_logits(xr, router, logits) };
+        } else {
+            scalar_logits(logits);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        scalar_logits(logits);
+
+        let top = &mut out[r * k..(r + 1) * k];
+        let mut used = 0u64;
+        let mut z = 0.0;
+        let mut m = 0.0;
+        for i in 0..k {
+            let mut best = None;
+            for j in 0..e {
+                if if e <= 64 {
+                    used & (1u64 << j) != 0
+                } else {
+                    top[..i].iter().any(|&(id, _)| id == j)
+                } {
+                    continue;
+                }
+                match best {
+                    Some(b) if logits[b] >= logits[j] => {}
+                    _ => best = Some(j),
+                }
+            }
+            let j = best.unwrap();
+            if e <= 64 {
+                used |= 1u64 << j;
+            }
+            if i == 0 {
+                m = logits[j];
+            }
+            let p = (logits[j] - m).exp();
+            top[i] = (j, p);
+            z += p;
+        }
+        for (_, p) in top.iter_mut() {
+            *p /= z;
+        }
+    }
+}
+
 /// Each frame of `x` (n, d) routed to the top-`k` of its router logits (`router` (e, d)), with the softmax over the k
 /// as its weights: `rows[j]` the (frame, weight) pairs of expert j, in frame order (cleared first).
 #[inline(always)]
@@ -1683,31 +2643,76 @@ pub(crate) fn route(
     k: usize,
     rows: &mut Vec<Vec<(usize, f32)>>,
 ) {
-    let n = x.len() / d;
+    assert!((1..=e).contains(&k));
+    assert!(router.len() >= span(e, d));
     rows.resize_with(e, Vec::new);
     rows.iter_mut().for_each(Vec::clear);
-    let mut logits = vec![0.0f32; e];
-    let mut top: Vec<usize> = Vec::with_capacity(k);
-    for r in 0..n {
-        let xr = &x[r * d..(r + 1) * d];
-        for (j, l) in logits.iter_mut().enumerate() {
-            *l = dot(xr, &router[j * d..(j + 1) * d]);
+    let mut stack_logits = [0.0; 64];
+    let mut stack_top = [(0, 0.0); 16];
+    let mut heap_logits;
+    let mut heap_top;
+    let logits = if e <= stack_logits.len() {
+        &mut stack_logits[..e]
+    } else {
+        heap_logits = vec![0.0; e];
+        &mut heap_logits[..]
+    };
+    let top = if k <= stack_top.len() {
+        &mut stack_top[..k]
+    } else {
+        heap_top = vec![(0, 0.0); k];
+        &mut heap_top[..]
+    };
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = crate::cpu::avx512();
+    for (r, xr) in x.chunks_exact(d).enumerate() {
+        let scalar_logits = |logits: &mut [f32]| {
+            for (l, wr) in logits.iter_mut().zip(router.chunks_exact(d)) {
+                *l = dot(xr, wr);
+            }
+        };
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            unsafe { x86::route_logits(xr, router, logits) };
+        } else {
+            scalar_logits(logits);
         }
-        top.clear();
-        for _ in 0..k {
-            let best = (0..e)
-                .filter(|j| !top.contains(j))
-                .fold(None, |b: Option<usize>, j| match b {
-                    Some(i) if logits[i] >= logits[j] => Some(i),
-                    _ => Some(j),
-                })
-                .unwrap();
-            top.push(best);
+        #[cfg(not(target_arch = "x86_64"))]
+        scalar_logits(logits);
+
+        // Fast path for small routers: a bit per selected expert. Keep the original
+        // comparison (including its behavior for ties, infinities and NaNs).
+        let mut used = 0u64;
+        let mut z = 0.0;
+        let mut m = 0.0;
+        for i in 0..k {
+            let mut best = None;
+            for j in 0..e {
+                if if e <= 64 {
+                    used & (1u64 << j) != 0
+                } else {
+                    top[..i].iter().any(|&(id, _)| id == j)
+                } {
+                    continue;
+                }
+                match best {
+                    Some(b) if logits[b] >= logits[j] => {}
+                    _ => best = Some(j),
+                }
+            }
+            let j = best.unwrap();
+            if e <= 64 {
+                used |= 1u64 << j;
+            }
+            if i == 0 {
+                m = logits[j];
+            }
+            let p = (logits[j] - m).exp();
+            top[i] = (j, p);
+            z += p;
         }
-        let m = logits[top[0]];
-        let z: f32 = top.iter().map(|&j| (logits[j] - m).exp()).sum();
-        for &j in &top {
-            rows[j].push((r, (logits[j] - m).exp() / z));
+        for &(j, p) in top.iter() {
+            rows[j].push((r, p / z));
         }
     }
 }
@@ -1751,6 +2756,321 @@ mod tests {
             }
         }
         (q, s)
+    }
+
+    #[test]
+    fn simd_quantization_gelu_and_routing_keep_scalar_bits() {
+        let mut rng = Rng(438147);
+        for len in [1, 15, 16, 17, 48, 63, 64, 65, 192, 389] {
+            let mut x: Vec<_> = (0..len).map(|_| rng.next() * 25.0 - 12.5).collect();
+            for special in [
+                0.0,
+                -0.0,
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::from_bits(1),
+            ] {
+                x[len / 3] = special;
+                let mut want = vec![1; len];
+                let mut got = vec![2; len];
+                let a = quantize_row_scalar(&x, &mut want);
+                let b = quantize_row(&x, &mut got);
+                assert_eq!((a.0.to_bits(), a.1), (b.0.to_bits(), b.1));
+                assert_eq!(got, want, "len {len}, special {special}");
+                let mut h = x.clone();
+                gelu_slice(&mut h);
+                for (&x, y) in x.iter().zip(h) {
+                    let v = gelu(x);
+                    assert!(if v.is_nan() {
+                        y.is_nan()
+                    } else {
+                        v.to_bits() == y.to_bits()
+                    });
+                }
+            }
+        }
+        for (e, d, k) in [(16, 192, 2), (7, 36, 3), (65, 19, 18)] {
+            let x: Vec<_> = (0..3 * d).map(|_| rng.next() * 2.0 - 1.0).collect();
+            let mut router: Vec<_> = (0..e * d).map(|_| rng.next() * 2.0 - 1.0).collect();
+            router.copy_within(0..d, d); // tie between the first two experts
+            for with_nan in [false, true] {
+                if with_nan {
+                    router[4 * d] = f32::NAN;
+                }
+                let mut want = vec![Vec::new(); e];
+                for (r, xr) in x.chunks_exact(d).enumerate() {
+                    let logits: Vec<_> = router.chunks_exact(d).map(|w| dot(xr, w)).collect();
+                    let mut top = Vec::new();
+                    for _ in 0..k {
+                        top.push(
+                            (0..e)
+                                .filter(|id| !top.contains(id))
+                                .reduce(|a, b| if logits[a] >= logits[b] { a } else { b })
+                                .unwrap(),
+                        );
+                    }
+                    let m = logits[top[0]];
+                    let z: f32 = top.iter().map(|&id| (logits[id] - m).exp()).sum();
+                    for id in top {
+                        want[id].push((r, ((logits[id] - m).exp() / z).to_bits()));
+                    }
+                }
+                let mut got = Vec::new();
+                route(&x, &router, e, d, k, &mut got);
+                let got: Vec<Vec<_>> = got
+                    .iter()
+                    .map(|p| p.iter().map(|&(r, w)| (r, w.to_bits())).collect())
+                    .collect();
+                for (a, b) in got.iter().zip(want) {
+                    assert_eq!(a.len(), b.len());
+                    for (&(r, a), (s, b)) in a.iter().zip(b) {
+                        assert_eq!(r, s);
+                        assert!(
+                            a == b || (f32::from_bits(a).is_nan() && f32::from_bits(b).is_nan())
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_gemm_and_fused_reducer_match_full_logits() {
+        let mut rng = Rng(17493);
+        for (rows, out, inp, packed) in [
+            (7, 517usize, 28, true),
+            (3, 8006, 16, true),
+            (5, 261, 13, false),
+        ] {
+            let n = if packed {
+                out.next_multiple_of(16)
+            } else {
+                out
+            };
+            let mut raw: Vec<_> = (0..n * inp)
+                .map(|_| (rng.next() * 255.0 - 128.0) as i8)
+                .collect();
+            raw[..2 * inp].fill(0);
+            let q: Vec<_> = (0..rows * inp)
+                .map(|_| (rng.next() * 255.0) as u8)
+                .collect();
+            let xs: Vec<_> = (0..rows)
+                .map(|i| (0.01 + rng.next() * 0.02, 100 + i as i32))
+                .collect();
+            let col: Vec<_> = (0..out).map(|_| 0.002 + rng.next() * 0.003).collect();
+            let mut bias: Vec<_> = (0..out).map(|_| rng.next() * 2.0 - 1.0).collect();
+            bias[0] = 29.0;
+            bias[1] = 29.0; // same logit, lower ID wins
+            bias[out / 2] = 35.0; // a blacklisted max still contributes to the LSE
+            bias[out - 1] = 27.0; // the masked tail is eligible for top-k
+            let blank = (out - 2) as u32;
+            let blocked = [17, (out / 2) as u32, (out + 13) as u32];
+            let stack = Epilogue {
+                xs: &xs,
+                col: Some(&col),
+                scale: 0.08,
+                bias: Some(&bias),
+                out,
+            };
+            for isa in [
+                Isa::Plain,
+                Isa::Avx,
+                Isa::Avx2,
+                Isa::Vnni256,
+                Isa::Vnni512,
+                Isa::Dot,
+            ] {
+                if !supported(isa) {
+                    continue;
+                }
+                let w = Packed::new_for(&raw, n, inp, packed, isa);
+                let mut logits = vec![0.0; rows * out];
+                gemm_u8i8_f32(isa, &q, rows, &w, &stack, &mut Vec::new(), &mut logits);
+                for splits in [1, 4, 8] {
+                    let mut separate = vec![f32::NAN; rows * out];
+                    let mut parts = Vec::new();
+                    let mut greedy = Vec::new();
+                    // Deliberately merge the parts in descending column order.
+                    for i in (0..splits).rev() {
+                        let start = i * w.blocks() / splits;
+                        let end = (i + 1) * w.blocks() / splits;
+                        unsafe {
+                            gemm_u8i8_f32_cols_ptr(
+                                isa,
+                                &q,
+                                rows,
+                                &w,
+                                &stack,
+                                separate.as_mut_ptr(),
+                                start,
+                                end,
+                            )
+                        };
+                        if i == splits - 1 {
+                            for row in separate.chunks_exact(out) {
+                                assert!(row[..start * 16].iter().all(|v| v.is_nan()));
+                            }
+                        }
+                        parts.push(gemm_u8i8_reduce_cols(
+                            isa, &q, rows, &w, &stack, start, end, &blocked, blank, 12, false,
+                        ));
+                        let p = gemm_u8i8_reduce_cols(
+                            isa, &q, rows, &w, &stack, start, end, &blocked, blank, 12, true,
+                        );
+                        assert!(p.iter().all(|p| p.top.len() <= 2 && p.sum_exp == 0.0));
+                        greedy.push(p);
+                    }
+                    assert!(
+                        logits
+                            .iter()
+                            .zip(&separate)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{isa:?} splits={splits}"
+                    );
+                    let result = merge_partial_reduce(&parts, &blocked, blank, 12, false).unwrap();
+                    let greedy = merge_partial_reduce(&greedy, &blocked, blank, 12, true).unwrap();
+                    for (r, row) in logits.chunks_exact(out).enumerate() {
+                        let lse = crate::pipeline::lse::peaked(row);
+                        let mut want: Vec<_> = row
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !blocked.contains(&(*i as u32)))
+                            .map(|(i, v)| (i as u32, *v))
+                            .collect();
+                        want.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+                        let (top, blank_lp, id, top1, top2) = &result[r];
+                        let check = |a: f32, b: f32| {
+                            assert!(
+                                (a - b).abs() <= 1e-5,
+                                "{isa:?} n={n} splits={splits}: {a} vs {b}"
+                            )
+                        };
+                        assert_eq!(top.len(), 12);
+                        for (&(id, val), &(j, want)) in top.iter().zip(&want) {
+                            assert_eq!(id, j);
+                            check(val, want - lse);
+                        }
+                        assert_eq!(*id, want[0].0);
+                        check(*top1, want[0].1 - lse);
+                        check(*top2, want[1].1 - lse);
+                        check(*blank_lp, row[blank as usize] - lse);
+                        assert_eq!(greedy[r].2, want[0].0);
+                        assert_eq!(greedy[r].3, 0.0);
+                        check(greedy[r].4, want[1].1 - want[0].1);
+                        check(greedy[r].1, row[blank as usize] - want[0].1);
+                    }
+                }
+                let mut bad_bias = bias.clone();
+                bad_bias[17] = f32::NAN; // even when blacklisted, this requests fallback
+                bad_bias[out - 1] = f32::INFINITY;
+                let stack = Epilogue {
+                    bias: Some(&bad_bias),
+                    ..stack
+                };
+                let bad = gemm_u8i8_reduce_cols(
+                    isa,
+                    &q,
+                    rows,
+                    &w,
+                    &stack,
+                    0,
+                    w.blocks(),
+                    &blocked,
+                    blank,
+                    12,
+                    false,
+                );
+                assert!(bad
+                    .iter()
+                    .all(|p| p.has_non_finite && p.max == f32::INFINITY));
+                assert!(merge_partial_reduce(&[bad], &blocked, blank, 12, false).is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn timing_head() {
+        let isa = detect_isa();
+        if isa == Isa::Plain {
+            return;
+        }
+        let (rows, out, inp) = (30usize, 8006usize, 192usize);
+        let n = out.next_multiple_of(16);
+        let mut rng = Rng(41);
+        let w: Vec<_> = (0..n * inp)
+            .map(|_| (rng.next() * 255.0 - 128.0) as i8)
+            .collect();
+        let w = Packed::new(&w, n, inp, true);
+        let q: Vec<_> = (0..rows * inp)
+            .map(|_| (rng.next() * 255.0) as u8)
+            .collect();
+        let xs = vec![(0.012, 128); rows];
+        let bias: Vec<_> = (0..out)
+            .map(|i| {
+                if i == 256 {
+                    35.0
+                } else {
+                    rng.next() * 2.0 - 1.0
+                }
+            })
+            .collect();
+        let e = Epilogue {
+            xs: &xs,
+            col: None,
+            scale: 0.001,
+            bias: Some(&bias),
+            out,
+        };
+        let mut acc = Vec::new();
+        let mut y = vec![0.0; rows * out];
+        for (variant, greedy) in [
+            ("logits", false),
+            ("logits + top-k", false),
+            ("fused top-k", false),
+            ("fused greedy", true),
+        ] {
+            let mut ns = [0; 500];
+            for t in &mut ns {
+                let start = std::time::Instant::now();
+                if variant.starts_with("logits") {
+                    gemm_u8i8_f32(isa, &q, rows, &w, &e, &mut acc, &mut y);
+                    std::hint::black_box(&y);
+                    if variant == "logits + top-k" {
+                        std::hint::black_box(crate::pipeline::proposal::log_probs_from_logits(
+                            &y,
+                            rows,
+                            out,
+                            &[],
+                            0,
+                            16,
+                        ));
+                    }
+                } else {
+                    let p = gemm_u8i8_reduce_cols(
+                        isa,
+                        &q,
+                        rows,
+                        &w,
+                        &e,
+                        0,
+                        w.blocks(),
+                        &[],
+                        0,
+                        16,
+                        greedy,
+                    );
+                    std::hint::black_box(merge_partial_reduce(&[p], &[], 0, 16, greedy));
+                }
+                *t = start.elapsed().as_nanos();
+            }
+            ns.sort_unstable();
+            println!(
+                "int8 head {rows}x{inp} -> {out} ({isa:?}, {variant}): {:.3} us",
+                ns[ns.len() / 2] as f64 / 1000.0
+            );
+        }
     }
 
     /// `gemm_u8i8_f32` on the CPU's ISA against its plain pass, the same bits: both epilogues (one scale with a

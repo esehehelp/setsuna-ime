@@ -30,7 +30,10 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::group_q::{group_moe, GroupMoe, GroupMoeScratch, GroupScratch, GroupWeights};
-use crate::moe_op::{detect_isa, gelu, gemm_u8i8_f32, Epilogue, Isa, MoeWeights, Packed};
+use crate::moe_op::{
+    detect_isa, gelu_slice, gemm_u8i8_f32, gemm_u8i8_reduce_cols_into, merge_partial_reduce_slices,
+    Epilogue, FrameReduction, Isa, MoeWeights, Packed, PartialFrameReduce,
+};
 use crate::norm_op::add_layer_norm_here;
 use crate::pipeline::ar_native::{lane_sum, parse_safetensors, row_max, Weight, Weights};
 use crate::pipeline::lse::exp;
@@ -134,10 +137,16 @@ pub struct ArCrossConfig {
     pub head_dim: usize,
 }
 
+/// Raw 8-bit storage for [`Table8`]: keeps the PLE table at 1 byte per value (half the cache footprint).
+enum Table8Data {
+    U8(Vec<u8>),
+    I8(Vec<i8>),
+}
+
 /// An 8-bit table as ONNX Runtime's DequantizeLinear reads it: row r is (q[r] - zero) * scale.
 struct Table8 {
-    q: Vec<i16>,
-    zero: i16,
+    q: Table8Data,
+    zero: i32,
     scale: f32,
     cols: usize,
 }
@@ -145,19 +154,19 @@ struct Table8 {
 impl Table8 {
     fn load(w: &Weights, name: &str, rows: usize, cols: usize) -> Result<Self> {
         let scale = w.f32(&format!("{name}.scale"), &[1])?[0];
-        let (q, zero): (Vec<i16>, i16) = match (
+        let (q, zero): (Table8Data, i32) = match (
             w.0.get(&format!("{name}.q")),
             w.0.get(&format!("{name}.zero")),
         ) {
             (Some(Weight::U8(q, s)), Some(Weight::U8(z, zs)))
                 if s[..] == [rows, cols] && zs[..] == [1] =>
             {
-                (q.iter().map(|&v| v as i16).collect(), z[0] as i16)
+                (Table8Data::U8(q.to_vec()), z[0] as i32)
             }
             (Some(Weight::I8(q, s)), Some(Weight::I8(z, zs)))
                 if s[..] == [rows, cols] && zs[..] == [1] =>
             {
-                (q.iter().map(|&v| v as i16).collect(), z[0] as i16)
+                (Table8Data::I8(q.to_vec()), z[0] as i32)
             }
             _ => anyhow::bail!(
                 "{name}: q ({rows}, {cols}) and zero (1), both uint8 or both int8, expected"
@@ -173,22 +182,89 @@ impl Table8 {
 
     /// out = row r.
     fn row(&self, r: usize, out: &mut [f32]) {
-        for (o, &v) in out
-            .iter_mut()
-            .zip(&self.q[r * self.cols..(r + 1) * self.cols])
-        {
-            *o = (v - self.zero) as f32 * self.scale;
+        let start = r * self.cols;
+        let end = start + self.cols;
+        match &self.q {
+            Table8Data::U8(q) => {
+                for (o, &v) in out.iter_mut().zip(&q[start..end]) {
+                    *o = (v as i32 - self.zero) as f32 * self.scale;
+                }
+            }
+            Table8Data::I8(q) => {
+                for (o, &v) in out.iter_mut().zip(&q[start..end]) {
+                    *o = (v as i32 - self.zero) as f32 * self.scale;
+                }
+            }
         }
     }
 
     /// out += row r.
     fn add_row(&self, r: usize, out: &mut [f32]) {
-        for (o, &v) in out
-            .iter_mut()
-            .zip(&self.q[r * self.cols..(r + 1) * self.cols])
-        {
-            *o += (v - self.zero) as f32 * self.scale;
+        let start = r * self.cols;
+        let end = start + self.cols;
+        match &self.q {
+            Table8Data::U8(q) => {
+                for (o, &v) in out.iter_mut().zip(&q[start..end]) {
+                    *o += (v as i32 - self.zero) as f32 * self.scale;
+                }
+            }
+            Table8Data::I8(q) => {
+                for (o, &v) in out.iter_mut().zip(&q[start..end]) {
+                    *o += (v as i32 - self.zero) as f32 * self.scale;
+                }
+            }
         }
+    }
+
+    /// out = sum_{r in rows} row(r), optimized for 16-wide PLE lookups (accumulates in i32, scales once).
+    fn sum_rows(&self, rows: &[usize], out: &mut [f32]) {
+        if rows.is_empty() {
+            out.fill(0.0);
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.cols == 16 && crate::pipeline::lse::avx512f() {
+            // SAFETY: CPU has AVX-512F and cols == 16 == out.len().
+            unsafe {
+                self.sum_rows_16_avx512(rows, out);
+            }
+            return;
+        }
+        self.row(rows[0], out);
+        for &r in &rows[1..] {
+            self.add_row(r, out);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn sum_rows_16_avx512(&self, rows: &[usize], out: &mut [f32]) {
+        use std::arch::x86_64::*;
+        assert!(out.len() >= 16);
+        let vz = _mm512_set1_epi32(self.zero);
+        let vscale = _mm512_set1_ps(self.scale);
+        let mut acc = _mm512_setzero_ps();
+        match &self.q {
+            Table8Data::U8(q) => {
+                let base = q.as_ptr();
+                for &r in rows {
+                    assert!((r + 1) * 16 <= q.len());
+                    let v = _mm_loadu_si128(base.add(r * 16) as *const __m128i);
+                    let d = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(v), vz));
+                    acc = _mm512_add_ps(acc, _mm512_mul_ps(d, vscale));
+                }
+            }
+            Table8Data::I8(q) => {
+                let base = q.as_ptr();
+                for &r in rows {
+                    assert!((r + 1) * 16 <= q.len());
+                    let v = _mm_loadu_si128(base.add(r * 16) as *const __m128i);
+                    let d = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepi8_epi32(v), vz));
+                    acc = _mm512_add_ps(acc, _mm512_mul_ps(d, vscale));
+                }
+            }
+        }
+        _mm512_storeu_ps(out.as_mut_ptr(), acc);
     }
 }
 
@@ -232,6 +308,46 @@ impl Q4g {
         let rows = x.len() / self.k;
         y.resize(rows * self.n, 0.0);
         self.w.forward_bias(x, y, self.bias.as_deref(), s);
+    }
+
+    /// y (rows, N) slice of x (rows, K), the bias added (no Vec resize).
+    #[inline(always)]
+    fn forward_slice(&self, x: &[f32], y: &mut [f32], s: &mut GroupScratch) {
+        self.w.forward_bias(x, y, self.bias.as_deref(), s);
+    }
+
+    /// y (rows, N) slice of pre-quantized (q, a, xs), the bias added.
+    #[inline(always)]
+    fn forward_quantized(
+        &self,
+        q: &[u8],
+        a: &[f32],
+        xs: &[(f32, i32)],
+        rows: usize,
+        y: &mut [f32],
+    ) {
+        assert!(y.len() >= rows * self.n);
+        // SAFETY: `y` exclusively owns `rows * self.n` outputs.
+        unsafe {
+            self.w.codes_with_cols_ptr(
+                q,
+                a,
+                xs,
+                rows,
+                y.as_mut_ptr(),
+                self.n,
+                self.bias.as_deref(),
+                0,
+                self.w.blocks(),
+            );
+        }
+    }
+
+    /// Apply GELU in-place to `h` (rows, K), quantize, and run this Linear into `y` (rows, N).
+    #[inline(always)]
+    fn forward_after_gelu(&self, h: &mut [f32], y: &mut [f32], s: &mut GroupScratch) {
+        self.w
+            .forward_after_gelu_bias(h, y, self.bias.as_deref(), s);
     }
 }
 
@@ -322,11 +438,62 @@ impl Lin8 {
         };
         gemm_u8i8_f32(isa, q, rows, &self.w, &e, acc, y);
     }
+
+    /// Fused head GEMM + online LSE + top-k over all column blocks, reusing scratch buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_reduce(
+        &self,
+        isa: Isa,
+        q: &[u8],
+        rows: usize,
+        (sx, zx): (f32, i32),
+        blacklist: &[u32],
+        blank_id: u32,
+        top_k: usize,
+        greedy_only: bool,
+        partial: &mut Vec<PartialFrameReduce>,
+        masks: &mut Vec<u16>,
+    ) -> Option<Vec<FrameReduction>> {
+        let e = Epilogue {
+            xs: &[(sx, zx)],
+            col: None,
+            scale: self.scale,
+            bias: self.bias.as_deref(),
+            out: self.out,
+        };
+        gemm_u8i8_reduce_cols_into(
+            isa,
+            q,
+            rows,
+            &self.w,
+            &e,
+            0,
+            self.w.blocks(),
+            blacklist,
+            blank_id,
+            top_k,
+            greedy_only,
+            None,
+            partial,
+            masks,
+        );
+        let slices = [partial.as_slice()];
+        merge_partial_reduce_slices(&slices, blacklist, blank_id, top_k, greedy_only)
+    }
 }
 
 /// ONNX Runtime's DynamicQuantizeLinear: u8 codes of the whole of `x` with one scale and zero point, the range
 /// widened to hold 0, (max - min) / 255, the zero point and the codes rounded half to even.
 fn quantize_tensor(x: &[f32], q: &mut Vec<u8>) -> (f32, i32) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::pipeline::lse::avx512f() {
+        // SAFETY: CPU has AVX-512F.
+        return unsafe { quantize_tensor_avx512(x, q) };
+    }
+    quantize_tensor_scalar(x, q)
+}
+
+fn quantize_tensor_scalar(x: &[f32], q: &mut Vec<u8>) -> (f32, i32) {
     let (mut lo, mut hi) = (0.0f32, 0.0f32);
     for &v in x {
         lo = lo.min(v);
@@ -340,6 +507,53 @@ fn quantize_tensor(x: &[f32], q: &mut Vec<u8>) -> (f32, i32) {
         x.iter()
             .map(|&v| ((v / scale).clamp(lo_c, hi_c).round_ties_even() + zp) as u8),
     );
+    (scale, zp as i32)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn quantize_tensor_avx512(x: &[f32], q: &mut Vec<u8>) -> (f32, i32) {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let xp = x.as_ptr();
+    let mut vlo = _mm512_setzero_ps();
+    let mut vhi = _mm512_setzero_ps();
+    let whole = n - n % 16;
+    for i in (0..whole).step_by(16) {
+        let v = _mm512_loadu_ps(xp.add(i));
+        // Second operand returned on NaN, matching f32::min/max skipping NaN.
+        vlo = _mm512_min_ps(v, vlo);
+        vhi = _mm512_max_ps(v, vhi);
+    }
+    let mut lo = _mm512_reduce_min_ps(vlo);
+    let mut hi = _mm512_reduce_max_ps(vhi);
+    for &v in &x[whole..] {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let scale = if hi == lo { 1.0 } else { (hi - lo) / 255.0 };
+    let zp = (0.0 - lo / scale).clamp(0.0, 255.0).round_ties_even();
+    let (lo_c, hi_c) = (0.0 - zp, 255.0 - zp);
+    q.resize(n, 0);
+    let qp = q.as_mut_ptr();
+    let v_scale = _mm512_set1_ps(scale);
+    let v_loc = _mm512_set1_ps(lo_c);
+    let v_hic = _mm512_set1_ps(hi_c);
+    let v_zp = _mm512_set1_ps(zp);
+    for i in (0..whole).step_by(16) {
+        let v = _mm512_loadu_ps(xp.add(i));
+        let mut s = _mm512_div_ps(v, v_scale);
+        s = _mm512_max_ps(s, v_loc);
+        s = _mm512_min_ps(s, v_hic);
+        s = _mm512_roundscale_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(s);
+        let shifted = _mm512_add_ps(s, v_zp);
+        let ints = _mm512_cvttps_epi32(shifted);
+        let bytes = _mm512_cvtusepi32_epi8(ints);
+        _mm_storeu_si128(qp.add(i) as *mut __m128i, bytes);
+    }
+    for i in whole..n {
+        q[i] = ((x[i] / scale).clamp(lo_c, hi_c).round_ties_even() + zp) as u8;
+    }
     (scale, zp as i32)
 }
 
@@ -519,14 +733,10 @@ impl Ple {
     /// The lookup (T, dim): each frame's slot rows summed, slot after slot (the graph's ReduceSum).
     fn lookup(&self, rows: &[usize], t: usize, out: &mut Vec<f32>) {
         let (slots, dim) = (self.c.orders.len(), self.c.dim);
-        out.clear();
         out.resize(t * dim, 0.0);
         for f in 0..t {
             let o = &mut out[f * dim..(f + 1) * dim];
-            self.table.row(rows[f * slots], o);
-            for s in 1..slots {
-                self.table.add_row(rows[f * slots + s], o);
-            }
+            self.table.sum_rows(&rows[f * slots..(f + 1) * slots], o);
         }
     }
 }
@@ -584,16 +794,28 @@ struct Scratch {
     f: Vec<f32>,
     qkv: Vec<f32>,
     kv: Vec<f32>,
+    skip: Vec<f32>,
+    sum: Vec<f32>,
     bias: Vec<f32>,
     bias2: Vec<f32>,
     attn: AttentionScratch,
+    seg: Vec<usize>,
+    ple_u: Vec<u64>,
     rows: Vec<usize>,
     lookup: Vec<f32>,
+    ple_q: Vec<u8>,
+    ple_xs: Vec<(f32, i32)>,
+    ple_a: Vec<f32>,
+    h_q: Vec<u8>,
+    h_xs: Vec<(f32, i32)>,
+    h_a: Vec<f32>,
     q8: Vec<u8>,
     acc: Vec<i32>,
     lin: LinScratch,
     moe: GroupMoeScratch,
     moe8: crate::moe_op::Scratch,
+    head_partial: Vec<PartialFrameReduce>,
+    head_masks: Vec<u16>,
 }
 
 /// The parts of a conversion [`Profile`] times.
@@ -962,7 +1184,7 @@ impl NativeEncoder {
             self.config.output
         );
         let mut prof = self.profile.take();
-        let (seg, mut s) = match self.encode(ids, &mut prof) {
+        let mut s = match self.encode(ids, &mut prof) {
             Ok(x) => x,
             Err(e) => {
                 // the profile kept: a refused request does not end it
@@ -979,7 +1201,6 @@ impl NativeEncoder {
             decoder,
             self.config.hidden,
             self.config.norm_eps,
-            &seg,
             &mut s,
             &mut prof,
         );
@@ -993,6 +1214,62 @@ impl NativeEncoder {
         Ok(logits)
     }
 
+    /// Fused CTC encoder + decoder + head GEMM + online LSE + top-k reduction.
+    /// Returns `Ok(Some(frames))` when the fused path succeeded (all logits finite), or
+    /// `Ok(None)` if non-finite logits were seen (caller should fall back to `logits()`).
+    pub(crate) fn logits_reduced(
+        &mut self,
+        ids: &[i64],
+        blacklist: &[u32],
+        blank_id: u32,
+        top_k: usize,
+        greedy_only: bool,
+    ) -> Result<Option<Vec<FrameReduction>>> {
+        anyhow::ensure!(
+            matches!(self.output, Output::Ctc { .. }),
+            "this encoder's output is {}, not CTC logits",
+            self.config.output
+        );
+        let mut prof = self.profile.take();
+        let mut s = match self.encode(ids, &mut prof) {
+            Ok(x) => x,
+            Err(e) => {
+                self.profile = prof;
+                return Err(e);
+            }
+        };
+        let t = ids.len();
+        let Output::Ctc { decoder, head } = &self.output else {
+            unreachable!()
+        };
+        decode(
+            self.isa,
+            decoder,
+            self.config.hidden,
+            self.config.norm_eps,
+            &mut s,
+            &mut prof,
+        );
+        let sx = quantize_tensor(&s.x[..t * self.config.hidden], &mut s.q8);
+        lap(&mut prof, 13);
+        let reduced = head.forward_reduce(
+            self.isa,
+            &s.q8,
+            t,
+            sx,
+            blacklist,
+            blank_id,
+            top_k,
+            greedy_only,
+            &mut s.head_partial,
+            &mut s.head_masks,
+        );
+        lap(&mut prof, 14);
+        self.scratch = s;
+        self.profiled(prof, t);
+        Ok(reduced)
+    }
+
     /// The AR layers' cross-attention keys and values of one row of ids, each (layers, 1, heads, T, head_dim).
     pub fn cross(&mut self, ids: &[i64]) -> Result<(Vec<f32>, Vec<f32>)> {
         anyhow::ensure!(
@@ -1001,7 +1278,7 @@ impl NativeEncoder {
             self.config.output
         );
         let mut prof = self.profile.take();
-        let (_, mut s) = match self.encode(ids, &mut prof) {
+        let mut s = match self.encode(ids, &mut prof) {
             Ok(x) => x,
             Err(e) => {
                 self.profile = prof;
@@ -1035,9 +1312,9 @@ impl NativeEncoder {
         Ok((ks, vs))
     }
 
-    /// The encoder's frames (T, hidden) in the scratch's `x`, and each frame's segment (1 after the row's first [SEP];
+    /// The encoder's frames (T, hidden) in `s.x`, and each frame's segment in `s.seg` (1 after the row's first [SEP];
     /// a row without one counts from its first frame).
-    fn encode(&mut self, ids: &[i64], prof: &mut Option<Profile>) -> Result<(Vec<usize>, Scratch)> {
+    fn encode(&mut self, ids: &[i64], prof: &mut Option<Profile>) -> Result<Scratch> {
         if let Some(p) = prof.as_mut() {
             p.last = Instant::now();
         }
@@ -1059,9 +1336,9 @@ impl NativeEncoder {
             .iter()
             .position(|&id| id == c.sep_id as i64)
             .unwrap_or(0);
-        let seg: Vec<usize> = (0..t).map(|f| usize::from(f > sep)).collect();
+        s.seg.clear();
+        s.seg.extend((0..t).map(|f| usize::from(f > sep)));
         // the input rows
-        s.x.clear();
         s.x.resize(t * d, 0.0);
         for (f, &id) in ids.iter().enumerate() {
             self.embedding
@@ -1073,19 +1350,27 @@ impl NativeEncoder {
             }
         }
         if let Some(ple) = &self.ple {
-            let u: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
-            ple.rows(&u, &mut s.rows);
+            s.ple_u.clear();
+            s.ple_u.extend(ids.iter().map(|&id| id as u64));
+            ple.rows(&s.ple_u, &mut s.rows);
             ple.lookup(&s.rows, t, &mut s.lookup);
         }
         let mut bias = std::mem::take(&mut s.bias);
         if let Some(r) = &self.relative {
-            r.bias(&seg, 0, c.heads, &mut bias);
+            r.bias(&s.seg, 0, c.heads, &mut bias);
         }
         let rel = self.relative.as_ref().map(|_| &bias[..]);
         lap(prof, 0);
+
+        if !c.int8_linears {
+            self.encode_q4g(t, d, rel, &mut s, prof);
+            s.bias = bias;
+            return Ok(s);
+        }
+
+        // int8_linears path (whole-tensor activation quantization)
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ple) = &self.ple {
-                // x + sigmoid(gate(x)) * proj(lookup)
                 ple.gates[i].forward(isa, &s.x, &mut s.a, &mut s.lin);
                 ple.projs[i].forward(isa, &s.lookup, &mut s.b, &mut s.lin);
                 add_gated(&mut s.x, &s.a, &s.b);
@@ -1125,7 +1410,6 @@ impl NativeEncoder {
                 None,
             );
             lap(prof, 4);
-            // the FFN (and the routed experts) on the normed frames
             layer.ffn1.forward(isa, &s.h, &mut s.f, &mut s.lin);
             gelu_in_place(&mut s.f);
             layer.ffn2.forward(isa, &s.f, &mut s.b, &mut s.lin);
@@ -1149,7 +1433,6 @@ impl NativeEncoder {
             );
             lap(prof, 7);
         }
-        // the final norm (the graph's AddLayerNorm with a zero skip: the norm of x itself)
         s.h.resize(t * d, 0.0);
         add_layer_norm_here(
             &s.x,
@@ -1163,7 +1446,158 @@ impl NativeEncoder {
         std::mem::swap(&mut s.x, &mut s.h);
         s.bias = bias;
         lap(prof, 8);
-        Ok((seg, s))
+        Ok(s)
+    }
+
+    /// Single-threaded fused Q4G encoder stack: pre-quantizes PLE lookup once across all layers,
+    /// shares post-norm1 quantization between shared FFN and MoE experts, and fuses GELU + quantization.
+    fn encode_q4g(
+        &self,
+        t: usize,
+        d: usize,
+        rel: Option<&[f32]>,
+        s: &mut Scratch,
+        prof: &mut Option<Profile>,
+    ) {
+        let c = &self.config;
+        let eps = c.norm_eps;
+
+        // Pre-quantize s.lookup once for all layers' PLE projections.
+        if let Some(ple) = &self.ple {
+            if let Linear::Q4g(p0) = &ple.projs[0] {
+                p0.w.quantize_rows(&s.lookup, &mut s.ple_q, &mut s.ple_xs, &mut s.ple_a);
+            }
+        }
+
+        s.qkv.resize(t * 3 * d, 0.0);
+        s.a.resize(t * d, 0.0);
+        s.b.resize(t * d, 0.0);
+        s.h.resize(t * d, 0.0);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(ple) = &self.ple {
+                let Linear::Q4g(gate_q) = &ple.gates[i] else {
+                    unreachable!()
+                };
+                let Linear::Q4g(proj_q) = &ple.projs[i] else {
+                    unreachable!()
+                };
+                gate_q.forward_slice(&s.x[..t * d], &mut s.a[..t * d], &mut s.lin.group);
+                proj_q.forward_quantized(&s.ple_q, &s.ple_a, &s.ple_xs, t, &mut s.b[..t * d]);
+                add_gated(&mut s.x[..t * d], &s.a[..t * d], &s.b[..t * d]);
+                lap(prof, 1);
+            }
+            let Linear::Q4g(qkv_q) = &layer.qkv else {
+                unreachable!()
+            };
+            qkv_q.forward_slice(&s.x[..t * d], &mut s.qkv[..t * 3 * d], &mut s.lin.group);
+            lap(prof, 2);
+
+            attention(
+                &s.qkv,
+                3 * d,
+                0,
+                &s.qkv,
+                3 * d,
+                d,
+                &s.qkv,
+                3 * d,
+                2 * d,
+                t,
+                t,
+                c.heads,
+                d / c.heads,
+                rel,
+                &mut s.a,
+                &mut s.attn,
+            );
+            lap(prof, 3);
+
+            let Linear::Q4g(out_q) = &layer.out else {
+                unreachable!()
+            };
+            let Linear::Q4g(ffn1_q) = &layer.ffn1 else {
+                unreachable!()
+            };
+            let Linear::Q4g(ffn2_q) = &layer.ffn2 else {
+                unreachable!()
+            };
+            out_q.forward_slice(&s.a[..t * d], &mut s.b[..t * d], &mut s.lin.group);
+            add_layer_norm_here(
+                &s.x[..t * d],
+                Some(&s.b[..t * d]),
+                &layer.norm1.g,
+                &layer.norm1.b,
+                eps,
+                &mut s.h[..t * d],
+                None,
+            );
+            lap(prof, 4);
+
+            s.f.resize(t * ffn1_q.n, 0.0);
+            if let Some(Moe::Q4g(moe)) = &layer.moe {
+                if moe.g() == ffn1_q.w.g() {
+                    ffn1_q
+                        .w
+                        .quantize_rows(&s.h[..t * d], &mut s.h_q, &mut s.h_xs, &mut s.h_a);
+                    ffn1_q.forward_quantized(&s.h_q, &s.h_a, &s.h_xs, t, &mut s.f[..t * ffn1_q.n]);
+                    ffn2_q.forward_after_gelu(
+                        &mut s.f[..t * ffn1_q.n],
+                        &mut s.b[..t * d],
+                        &mut s.lin.group,
+                    );
+                    lap(prof, 5);
+                    moe.forward_quantized(
+                        &s.h[..t * d],
+                        &s.h_q,
+                        &s.h_xs,
+                        &s.h_a,
+                        &mut s.a[..t * d],
+                        &mut s.moe,
+                    );
+                } else {
+                    ffn1_q.forward_slice(&s.h[..t * d], &mut s.f[..t * ffn1_q.n], &mut s.lin.group);
+                    ffn2_q.forward_after_gelu(
+                        &mut s.f[..t * ffn1_q.n],
+                        &mut s.b[..t * d],
+                        &mut s.lin.group,
+                    );
+                    lap(prof, 5);
+                    moe.forward(&s.h[..t * d], &mut s.a[..t * d], &mut s.moe);
+                }
+                add_row_in_place(&mut s.b[..t * d], &s.a[..t * d]);
+                lap(prof, 6);
+            } else {
+                ffn1_q.forward_slice(&s.h[..t * d], &mut s.f[..t * ffn1_q.n], &mut s.lin.group);
+                ffn2_q.forward_after_gelu(
+                    &mut s.f[..t * ffn1_q.n],
+                    &mut s.b[..t * d],
+                    &mut s.lin.group,
+                );
+                lap(prof, 5);
+            }
+            add_layer_norm_here(
+                &s.h[..t * d],
+                Some(&s.b[..t * d]),
+                &layer.norm2.g,
+                &layer.norm2.b,
+                eps,
+                &mut s.x[..t * d],
+                None,
+            );
+            lap(prof, 7);
+        }
+        add_layer_norm_here(
+            &s.x[..t * d],
+            None,
+            &self.final_norm.g,
+            &self.final_norm.b,
+            eps,
+            &mut s.h[..t * d],
+            None,
+        );
+        std::mem::swap(&mut s.x, &mut s.h);
+        lap(prof, 8);
     }
 }
 
@@ -1246,35 +1680,37 @@ fn decode(
     dec: &Decoder,
     d: usize,
     eps: f32,
-    seg: &[usize],
     s: &mut Scratch,
     prof: &mut Option<Profile>,
 ) {
-    let t = seg.len();
+    let t = s.seg.len();
     let heads = dec.c.heads;
     let dh = d / heads;
     let layers = dec.layers.len();
-    // every layer's keys and values from the encoder's frames
-    dec.kv.forward(isa, &s.x, &mut s.kv, &mut s.lin);
     let (mut self_bias, mut cross_bias) =
         (std::mem::take(&mut s.bias), std::mem::take(&mut s.bias2));
     if let Some(r) = &dec.relative {
-        r.bias(seg, 0, heads, &mut self_bias);
-        r.bias(seg, heads, heads, &mut cross_bias);
+        r.bias(&s.seg, 0, heads, &mut self_bias);
+        r.bias(&s.seg, heads, heads, &mut cross_bias);
     }
     let (sb, cb) = match &dec.relative {
         Some(_) => (Some(&self_bias[..]), Some(&cross_bias[..])),
         None => (None, None),
     };
-    // the residual stream as (x, skip), summed in the next norm: x the encoder's frames, skip the positions' rows
+
+    dec.kv.forward(isa, &s.x, &mut s.kv, &mut s.lin);
     let mut x = std::mem::take(&mut s.x);
-    let mut skip = vec![0f32; t * d];
+    let mut skip = std::mem::take(&mut s.skip);
+    skip.resize(t * d, 0.0);
     if let Some(pt) = &dec.positions {
         for f in 0..t {
             pt.row(f, &mut skip[f * d..(f + 1) * d]);
         }
+    } else {
+        skip.fill(0.0);
     }
-    let mut sum = vec![0f32; t * d];
+    let mut sum = std::mem::take(&mut s.sum);
+    sum.resize(t * d, 0.0);
     s.h.resize(t * d, 0.0);
     lap(prof, 9);
     for (i, layer) in dec.layers.iter().enumerate() {
@@ -1353,8 +1789,13 @@ fn decode(
         );
         std::mem::swap(&mut x, &mut sum);
         layer.ffn1.forward(isa, &s.h, &mut s.f, &mut s.lin);
-        gelu_in_place(&mut s.f);
-        layer.ffn2.forward(isa, &s.f, &mut skip, &mut s.lin);
+        if let Linear::Q4g(ffn2_q) = &layer.ffn2 {
+            skip.resize(t * d, 0.0);
+            ffn2_q.forward_after_gelu(&mut s.f, &mut skip, &mut s.lin.group);
+        } else {
+            gelu_in_place(&mut s.f);
+            layer.ffn2.forward(isa, &s.f, &mut skip, &mut s.lin);
+        }
         lap(prof, 12);
     }
     s.x.resize(t * d, 0.0);
@@ -1367,6 +1808,8 @@ fn decode(
         &mut s.x,
         None,
     );
+    s.skip = skip;
+    s.sum = sum;
     s.bias = self_bias;
     s.bias2 = cross_bias;
     lap(prof, 12);
@@ -1385,48 +1828,7 @@ fn sigmoid(x: f32) -> f32 {
 
 /// v = GELU(v), element by element.
 fn gelu_in_place(v: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    if crate::pipeline::lse::avx512f() {
-        // SAFETY: the CPU has AVX-512 F (3941823: 46 us a conversion of 30 frames in AVX2)
-        return unsafe { gelu_avx512(v) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if avx2() {
-        // SAFETY: the CPU has the features (`avx2`)
-        return unsafe { gelu_avx2(v) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if crate::cpu::avx() {
-        // SAFETY: the CPU has AVX
-        return unsafe { gelu_avx1(v) };
-    }
-    gelu_body(v)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx2,fma")]
-unsafe fn gelu_avx512(v: &mut [f32]) {
-    gelu_body(v)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn gelu_avx2(v: &mut [f32]) {
-    gelu_body(v)
-}
-
-/// The AVX level's build (no AVX2 or FMA).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn gelu_avx1(v: &mut [f32]) {
-    gelu_body(v)
-}
-
-#[inline(always)]
-fn gelu_body(v: &mut [f32]) {
-    for x in v.iter_mut() {
-        *x = gelu(*x);
-    }
+    gelu_slice(v);
 }
 
 /// x += sigmoid(g) * p, element by element (the PLE's gated injection).
@@ -1450,9 +1852,25 @@ fn add_gated(x: &mut [f32], g: &[f32], p: &[f32]) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx2,fma")]
+#[target_feature(enable = "avx512f")]
 unsafe fn add_gated_avx512(x: &mut [f32], g: &[f32], p: &[f32]) {
-    add_gated_body(x, g, p)
+    use std::arch::x86_64::*;
+    let n = x.len().min(g.len()).min(p.len());
+    let whole = n - n % 16;
+    let (xp, gp, pp) = (x.as_mut_ptr(), g.as_ptr(), p.as_ptr());
+    let zero = _mm512_setzero_ps();
+    let one = _mm512_set1_ps(1.0);
+    for i in (0..whole).step_by(16) {
+        let gv = _mm512_loadu_ps(gp.add(i));
+        let pv = _mm512_loadu_ps(pp.add(i));
+        let xv = _mm512_loadu_ps(xp.add(i));
+        let e = crate::pipeline::lse::exp16(_mm512_sub_ps(zero, gv));
+        let sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
+        _mm512_storeu_ps(xp.add(i), _mm512_add_ps(xv, _mm512_mul_ps(sig, pv)));
+    }
+    for i in whole..n {
+        x[i] += sigmoid(g[i]) * p[i];
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1475,6 +1893,37 @@ fn add_gated_body(x: &mut [f32], g: &[f32], p: &[f32]) {
     }
 }
 
+/// `dst[i] += src[i]`.
+#[inline(always)]
+fn add_row_in_place(dst: &mut [f32], src: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::pipeline::lse::avx512f() {
+        // SAFETY: CPU has AVX-512F.
+        return unsafe { add_row_in_place_avx512(dst, src) };
+    }
+    for (o, &v) in dst.iter_mut().zip(src) {
+        *o += v;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn add_row_in_place_avx512(dst: &mut [f32], src: &[f32]) {
+    use std::arch::x86_64::*;
+    let n = dst.len().min(src.len());
+    let whole = n - n % 16;
+    let dp = dst.as_mut_ptr();
+    let sp = src.as_ptr();
+    for i in (0..whole).step_by(16) {
+        let d = _mm512_loadu_ps(dp.add(i));
+        let s = _mm512_loadu_ps(sp.add(i));
+        _mm512_storeu_ps(dp.add(i), _mm512_add_ps(d, s));
+    }
+    for i in whole..n {
+        *dp.add(i) += *sp.add(i);
+    }
+}
+
 /// One head's keys transposed (head_dim, T) and values (T, head_dim), its scaled queries (T, head_dim), and the
 /// scores (a row, or every query's rows padded to 8s).
 #[derive(Default)]
@@ -1483,6 +1932,116 @@ struct AttentionScratch {
     vh: Vec<f32>,
     qh: Vec<f32>,
     scores: Vec<f32>,
+}
+
+/// One 32-wide head of AVX-512 attention, writing to `out` at columns `h * 32..(h + 1) * 32` of each row (stride `heads * 32`).
+///
+/// # Safety
+/// The CPU has AVX-512 F, AVX2 and FMA; `out` has `tq * heads * 32` floats and no other thread writes head `h`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn attention_head_avx512_32(
+    q: &[f32],
+    q_stride: usize,
+    q_off: usize,
+    k: &[f32],
+    k_stride: usize,
+    k_off: usize,
+    v: &[f32],
+    v_stride: usize,
+    v_off: usize,
+    tq: usize,
+    tk: usize,
+    heads: usize,
+    h: usize,
+    bias: Option<&[f32]>,
+    out_ptr: *mut f32,
+    s: &mut AttentionScratch,
+) {
+    use std::arch::x86_64::*;
+    const DH: usize = 32;
+    let scale = 1.0 / (DH as f32).sqrt();
+    let width = heads * DH;
+    let tp = tk.div_ceil(16) * 16;
+    s.kt.resize(DH * tp, 0.0);
+    s.vh.resize(tk * DH, 0.0);
+    s.qh.resize(tq * DH, 0.0);
+    s.scores.resize(tq * tp, 0.0);
+    let tail: __mmask16 = if tk % 16 == 0 {
+        0xFFFF
+    } else {
+        (1u16 << (tk % 16)) - 1
+    };
+    let kt_ptr = s.kt.as_mut_ptr();
+    let vh_ptr = s.vh.as_mut_ptr();
+    let k_base = k.as_ptr().add(k_off + h * DH);
+    let v_base = v.as_ptr().add(v_off + h * DH);
+    for j in 0..tk {
+        let kr = k_base.add(j * k_stride);
+        for c in 0..DH {
+            *kt_ptr.add(c * tp + j) = *kr.add(c);
+        }
+        let vr = v_base.add(j * v_stride);
+        let vd = vh_ptr.add(j * DH);
+        _mm512_storeu_ps(vd, _mm512_loadu_ps(vr));
+        _mm512_storeu_ps(vd.add(16), _mm512_loadu_ps(vr.add(16)));
+    }
+    if tk < tp {
+        for c in 0..DH {
+            for j in tk..tp {
+                *kt_ptr.add(c * tp + j) = 0.0;
+            }
+        }
+    }
+    let vscale = _mm512_set1_ps(scale);
+    let q_base = q.as_ptr().add(q_off + h * DH);
+    let qh_ptr = s.qh.as_mut_ptr();
+    for i in 0..tq {
+        let qr = q_base.add(i * q_stride);
+        let qd = qh_ptr.add(i * DH);
+        _mm512_storeu_ps(qd, _mm512_mul_ps(_mm512_loadu_ps(qr), vscale));
+        _mm512_storeu_ps(
+            qd.add(16),
+            _mm512_mul_ps(_mm512_loadu_ps(qr.add(16)), vscale),
+        );
+    }
+    let (kt, qh, sc) = (s.kt.as_ptr(), s.qh.as_ptr(), s.scores.as_mut_ptr());
+    let mut i = 0;
+    while i < tq {
+        let rows = (tq - i).min(8);
+        match rows {
+            8 => scores_block::<8>(kt, qh, sc, i, tp),
+            7 => scores_block::<7>(kt, qh, sc, i, tp),
+            6 => scores_block::<6>(kt, qh, sc, i, tp),
+            5 => scores_block::<5>(kt, qh, sc, i, tp),
+            4 => scores_block::<4>(kt, qh, sc, i, tp),
+            3 => scores_block::<3>(kt, qh, sc, i, tp),
+            2 => scores_block::<2>(kt, qh, sc, i, tp),
+            _ => scores_block::<1>(kt, qh, sc, i, tp),
+        }
+        i += rows;
+    }
+    for i in 0..tq {
+        let b = bias.map_or(std::ptr::null(), |b| b.as_ptr().add((h * tq + i) * tk));
+        softmax16(sc.add(i * tp), tp, tk, tail, b);
+    }
+    let (vh, sc, op) = (s.vh.as_ptr(), s.scores.as_ptr(), out_ptr.add(h * DH));
+    let mut i = 0;
+    while i < tq {
+        let rows = (tq - i).min(8);
+        match rows {
+            8 => pv_block::<8>(vh, sc, op, i, tk, tp, width),
+            7 => pv_block::<7>(vh, sc, op, i, tk, tp, width),
+            6 => pv_block::<6>(vh, sc, op, i, tk, tp, width),
+            5 => pv_block::<5>(vh, sc, op, i, tk, tp, width),
+            4 => pv_block::<4>(vh, sc, op, i, tk, tp, width),
+            3 => pv_block::<3>(vh, sc, op, i, tk, tp, width),
+            2 => pv_block::<2>(vh, sc, op, i, tk, tp, width),
+            _ => pv_block::<1>(vh, sc, op, i, tk, tp, width),
+        }
+        i += rows;
+    }
 }
 
 /// The attention of 32-wide heads in AVX-512 (`attention`'s function; 3941823's AVX2 kernel took 109 us a
@@ -1513,84 +2072,63 @@ unsafe fn attention_avx512_32(
     out: &mut [f32],
     s: &mut AttentionScratch,
 ) {
-    use std::arch::x86_64::*;
-    const DH: usize = 32;
-    let scale = 1.0 / (DH as f32).sqrt();
-    let width = heads * DH;
-    let tp = tk.div_ceil(16) * 16;
-    s.kt.clear();
-    s.kt.resize(DH * tp, 0.0);
-    s.vh.resize(tk * DH, 0.0);
-    s.qh.resize(tq * DH, 0.0);
-    s.scores.resize(tq * tp, 0.0);
-    assert!(out.len() >= tq * width);
+    assert!(out.len() >= tq * heads * 32);
     if let Some(b) = bias {
         assert!(b.len() >= heads * tq * tk);
     }
-    // the last 16 keys' lanes in the row
-    let tail: __mmask16 = if tk % 16 == 0 {
-        0xFFFF
-    } else {
-        (1u16 << (tk % 16)) - 1
-    };
     for h in 0..heads {
-        for j in 0..tk {
-            let kr = &k[j * k_stride + k_off + h * DH..j * k_stride + k_off + (h + 1) * DH];
-            for (c, &kv) in kr.iter().enumerate() {
-                s.kt[c * tp + j] = kv;
-            }
-            s.vh[j * DH..(j + 1) * DH].copy_from_slice(
-                &v[j * v_stride + v_off + h * DH..j * v_stride + v_off + (h + 1) * DH],
-            );
-        }
-        for i in 0..tq {
-            let qr = &q[i * q_stride + q_off + h * DH..i * q_stride + q_off + (h + 1) * DH];
-            for (o, &qv) in s.qh[i * DH..(i + 1) * DH].iter_mut().zip(qr) {
-                *o = qv * scale;
-            }
-        }
-        let (kt, qh, sc) = (s.kt.as_ptr(), s.qh.as_ptr(), s.scores.as_mut_ptr());
-        let mut i = 0;
-        while i < tq {
-            let rows = (tq - i).min(8);
-            match rows {
-                8 => scores_block::<8>(kt, qh, sc, i, tp),
-                7 => scores_block::<7>(kt, qh, sc, i, tp),
-                6 => scores_block::<6>(kt, qh, sc, i, tp),
-                5 => scores_block::<5>(kt, qh, sc, i, tp),
-                4 => scores_block::<4>(kt, qh, sc, i, tp),
-                3 => scores_block::<3>(kt, qh, sc, i, tp),
-                2 => scores_block::<2>(kt, qh, sc, i, tp),
-                _ => scores_block::<1>(kt, qh, sc, i, tp),
-            }
-            i += rows;
-        }
-        // the bias and the softmax over each query's tk keys
-        for i in 0..tq {
-            let b = bias.map_or(std::ptr::null(), |b| b.as_ptr().add((h * tq + i) * tk));
-            softmax16(sc.add(i * tp), tp, tk, tail, b);
-        }
-        // P v
-        let (vh, sc, op) = (
-            s.vh.as_ptr(),
-            s.scores.as_ptr(),
-            out.as_mut_ptr().add(h * DH),
+        attention_head_avx512_32(
+            q,
+            q_stride,
+            q_off,
+            k,
+            k_stride,
+            k_off,
+            v,
+            v_stride,
+            v_off,
+            tq,
+            tk,
+            heads,
+            h,
+            bias,
+            out.as_mut_ptr(),
+            s,
         );
-        let mut i = 0;
-        while i < tq {
-            let rows = (tq - i).min(8);
-            match rows {
-                8 => pv_block::<8>(vh, sc, op, i, tk, tp, width),
-                7 => pv_block::<7>(vh, sc, op, i, tk, tp, width),
-                6 => pv_block::<6>(vh, sc, op, i, tk, tp, width),
-                5 => pv_block::<5>(vh, sc, op, i, tk, tp, width),
-                4 => pv_block::<4>(vh, sc, op, i, tk, tp, width),
-                3 => pv_block::<3>(vh, sc, op, i, tk, tp, width),
-                2 => pv_block::<2>(vh, sc, op, i, tk, tp, width),
-                _ => pv_block::<1>(vh, sc, op, i, tk, tp, width),
-            }
-            i += rows;
+    }
+}
+
+/// Register-resident softmax for `B` 16-float vectors (`tp == B * 16`, up to 64 keys): single load + single store.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma")]
+#[inline]
+unsafe fn softmax16_reg<const B: usize>(row: *mut f32, tail: u16, b: *const f32) {
+    use std::arch::x86_64::*;
+    let mut xs = [_mm512_setzero_ps(); B];
+    let mut m = _mm512_set1_ps(f32::NEG_INFINITY);
+    for c in 0..B {
+        let mask: __mmask16 = if c + 1 < B { 0xFFFF } else { tail };
+        let mut x = _mm512_maskz_loadu_ps(mask, row.add(c * 16));
+        if !b.is_null() {
+            x = _mm512_add_ps(x, _mm512_maskz_loadu_ps(mask, b.add(c * 16)));
         }
+        xs[c] = x;
+        m = _mm512_mask_max_ps(m, mask, x, m);
+    }
+    let vm = _mm512_set1_ps(_mm512_reduce_max_ps(m));
+    let mut sum = _mm512_setzero_ps();
+    for c in 0..B {
+        let mask: __mmask16 = if c + 1 < B { 0xFFFF } else { tail };
+        let e = _mm512_maskz_mov_ps(
+            mask,
+            crate::pipeline::lse::exp16_le0(_mm512_sub_ps(xs[c], vm)),
+        );
+        xs[c] = e;
+        sum = _mm512_add_ps(sum, e);
+    }
+    let inv = _mm512_set1_ps(1.0 / _mm512_reduce_add_ps(sum));
+    for c in 0..B {
+        _mm512_storeu_ps(row.add(c * 16), _mm512_mul_ps(xs[c], inv));
     }
 }
 
@@ -1603,6 +2141,13 @@ unsafe fn attention_avx512_32(
 #[target_feature(enable = "avx512f,avx2,fma")]
 #[inline]
 unsafe fn softmax16(row: *mut f32, tp: usize, tk: usize, tail: u16, b: *const f32) {
+    match tp {
+        16 => return softmax16_reg::<1>(row, tail, b),
+        32 => return softmax16_reg::<2>(row, tail, b),
+        48 => return softmax16_reg::<3>(row, tail, b),
+        64 => return softmax16_reg::<4>(row, tail, b),
+        _ => {}
+    }
     use std::arch::x86_64::*;
     let mut m = _mm512_set1_ps(f32::NEG_INFINITY);
     for jb in (0..tp).step_by(16) {
@@ -1620,7 +2165,7 @@ unsafe fn softmax16(row: *mut f32, tp: usize, tk: usize, tail: u16, b: *const f3
         let mask = if jb + 16 <= tk { 0xFFFF } else { tail };
         let e = _mm512_maskz_mov_ps(
             mask,
-            crate::pipeline::lse::exp16(_mm512_sub_ps(_mm512_loadu_ps(row.add(jb)), vm)),
+            crate::pipeline::lse::exp16_le0(_mm512_sub_ps(_mm512_loadu_ps(row.add(jb)), vm)),
         );
         _mm512_storeu_ps(row.add(jb), e);
         sum = _mm512_add_ps(sum, e);
@@ -2390,7 +2935,7 @@ mod tests {
         };
         let ple = Ple {
             table: Table8 {
-                q: vec![0; 36],
+                q: Table8Data::U8(vec![0; 36]),
                 zero: 0,
                 scale: 1.0,
                 cols: 2,
