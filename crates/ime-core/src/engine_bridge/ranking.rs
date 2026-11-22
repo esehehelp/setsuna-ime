@@ -23,6 +23,22 @@ pub fn order_candidates(
     ngram: Option<(&crate::char_ngram::CharNgram, f32, f32)>,
     result: &mut EngineResult,
 ) {
+    order_candidates_with(lexicon, ngram, result, true);
+}
+
+/// `order_candidates`, with the lexicon's costs and conversions
+/// (`lexicon_costs`) or without them: the same first candidate either way
+/// (the lexicon's step keeps the one before it first), the others in the
+/// engine's order and none added or dropped. The lexicon's part is most of
+/// the ordering's time (3 ms of a reading of 20 to 30 kana, 8 to 19 of a
+/// longer one), which a live conversion's preview, showing the first only,
+/// need not wait for.
+pub(super) fn order_candidates_with(
+    lexicon: Option<&crate::lexicon::Lexicon>,
+    ngram: Option<(&crate::char_ngram::CharNgram, f32, f32)>,
+    result: &mut EngineResult,
+    lexicon_costs: bool,
+) {
     use unicode_normalization::UnicodeNormalization;
     // the lexicon that judges the engine's candidates: not a partial one,
     // whose missing words are no slips (Lexicon::partial)
@@ -83,7 +99,7 @@ pub fn order_candidates(
         }
         order = by.iter().map(|&k| order[k]).collect();
     }
-    if let (Some(lex), true) = (ranking, scored) {
+    if let (Some(lex), true) = (ranking.filter(|_| lexicon_costs), scored) {
         // the model's top as ordered so far stays first: the lexicon's costs
         // read no context, and putting their cheapest first lost more than
         // it won (Cymbidium-v1.1-xsmall's top 20, EM1: AJIMEE v2-fix2 77.9
@@ -244,11 +260,23 @@ impl EngineBridge {
     /// The engine's candidates in the IME's order (`order_candidates`),
     /// with this bridge's lexicon and n-gram.
     pub(super) fn order_engine_result(&self, result: &mut EngineResult) {
+        self.order_engine_result_with(result, true);
+    }
+
+    /// `order_engine_result`, with or without the lexicon's costs
+    /// (`order_candidates_with`).
+    pub(super) fn order_engine_result_with(&self, result: &mut EngineResult, lexicon_costs: bool) {
         let ngram = self
             .ngram
             .as_ref()
             .map(|(t, w2, w3)| (t.as_ref(), *w2, *w3));
-        order_candidates(self.lexicon.as_deref(), ngram, result);
+        order_candidates_with(self.lexicon.as_deref(), ngram, result, lexicon_costs);
+    }
+
+    /// Whether the lexicon's costs would change the order of a result: a
+    /// whole lexicon is loaded (`order_candidates`).
+    pub(super) fn lexicon_ranks(&self) -> bool {
+        self.lexicon.as_deref().is_some_and(|l| !l.partial())
     }
 
     /// Space: the other reading to offer, or `None`: with English in the

@@ -38,7 +38,22 @@ impl EngineBridge {
         if result.req_id < self.result_floor {
             return Vec::new();
         }
-        self.order_engine_result(&mut result);
+        // live typing: the preview shows the first candidate, which the
+        // lexicon's costs never change; the whole list, which waits for them,
+        // is made when it is wanted (`finish_list_now`): at the frontend's
+        // next idle (`tick`), or at a key but one typed into the reading
+        let quick = self.cfg.live_conversion
+            && matches!(self.phase, Phase::Composing { .. })
+            && self.reranker.is_none()
+            && self.segmented().is_none()
+            && self.lexicon_ranks()
+            && !self
+                .comp
+                .alt
+                .as_ref()
+                .is_some_and(|alt| alt.req_id == Some(result.req_id));
+        let unordered = quick.then(|| result.clone());
+        self.order_engine_result_with(&mut result, !quick);
         if self
             .comp
             .alt
@@ -77,6 +92,7 @@ impl EngineBridge {
             }
             self.comp.list_reading = result.reading.clone();
             self.comp.list_starts = starts;
+            self.comp.unfinished = unordered;
             // the conversion of all that is typed: rerank it once typing pauses
             let whole = result.reading == current_hira;
             // one that reads a pending n as ん is what Enter commits; the
@@ -767,9 +783,14 @@ impl EngineBridge {
         }
     }
 
-    /// The deferred preedit's deadline passed: the engine's top, without the
-    /// reranked one.
+    /// The frontend's timer (`deferred_for`): the list the preview went
+    /// without (`finish_list_now`), and the deferred preedit once its
+    /// deadline passed: the engine's top, without the reranked one.
     pub fn tick(&mut self) -> Vec<Action> {
+        let finished = self.finish_list_now(false);
+        if !finished.is_empty() {
+            return finished;
+        }
         let Some(d) = self.comp.deferred.take() else {
             return Vec::new();
         };
@@ -788,6 +809,55 @@ impl EngineBridge {
             _ => return Vec::new(),
         };
         self.cache_conversion(&d.reading, &list);
+        vec![Action::UpdatePreedit {
+            text: self.live_preedit(),
+        }]
+    }
+
+    /// The whole list of the result the live preview went without it for
+    /// (`unfinished`): the lexicon's costs and conversions, and what
+    /// `finish_list` does after them. `keep_shown`: a key came before the
+    /// frontend's idle, and the conversion on screen, which it acts on,
+    /// stays first; else the preview takes the list's first when that is
+    /// another one (a candidate the lexicon added, learned for the reading),
+    /// and these are its actions.
+    pub(super) fn finish_list_now(&mut self, keep_shown: bool) -> Vec<Action> {
+        let Some(mut result) = self.comp.unfinished.take() else {
+            return Vec::new();
+        };
+        let shown = match &self.phase {
+            Phase::Composing { candidates } if self.comp.list_reading == result.reading => {
+                candidates.first().cloned()
+            }
+            _ => return Vec::new(),
+        };
+        self.order_engine_result(&mut result);
+        let raw = std::mem::take(&mut result.candidates);
+        let mut list = self.finish_list(
+            &result.reading,
+            result.corrected_reading.as_deref(),
+            raw.clone(),
+            true,
+        );
+        let mut starts = self.list_starts_of(&result.reading, &raw, &result.reading_pos, &list);
+        let other = !list.is_empty() && list.first() != shown.as_ref();
+        if let (true, true, Some(top)) = (other, keep_shown, &shown) {
+            list.retain(|c| c != top);
+            list.insert(0, top.clone());
+            if let Some(s) = self.comp.list_starts.get(top) {
+                starts.entry(top.clone()).or_insert_with(|| s.clone());
+            }
+        }
+        if let Phase::Composing { candidates } = &mut self.phase {
+            *candidates = list.clone();
+        }
+        self.comp.list_starts = starts;
+        // the preview's conversion of that reading, where it shows it (not
+        // one kept back for a pending n)
+        if !other || keep_shown || self.comp.cached_prefix_reading != result.reading {
+            return Vec::new();
+        }
+        self.cache_conversion(&result.reading, &list);
         vec![Action::UpdatePreedit {
             text: self.live_preedit(),
         }]

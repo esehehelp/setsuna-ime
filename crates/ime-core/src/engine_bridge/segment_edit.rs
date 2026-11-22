@@ -14,6 +14,8 @@ impl EngineBridge {
     /// Shift+← / Shift+→: resize the focused segment by one reading char
     /// (moving the cursor while composing).
     pub fn handle_resize(&mut self, delta: i32) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match &self.phase {
             Phase::Composing { .. } => self.handle_move_cursor(delta),
             Phase::Converting { .. } => {

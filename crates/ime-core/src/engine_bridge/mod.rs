@@ -683,9 +683,14 @@ impl EngineBridge {
         });
     }
 
-    /// How long until the deferred preedit is shown anyway (`tick`), if one
-    /// waits: the frontend sets a timer.
+    /// How long until `tick` has something to do, if anything waits: the
+    /// list the preview went without (at once: the frontend's timer runs it
+    /// once no key waits), or the deferred preedit, shown anyway at its
+    /// deadline. The frontend sets a timer.
     pub fn deferred_for(&self) -> Option<Duration> {
+        if self.comp.unfinished.is_some() {
+            return Some(Duration::ZERO);
+        }
         self.comp
             .deferred
             .as_ref()

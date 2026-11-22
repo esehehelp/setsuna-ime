@@ -22,7 +22,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static LOG_NAME: OnceLock<&'static str> = OnceLock::new();
 /// Cached resolved log file path for `LOG_NAME` (its parent directory ensured
@@ -77,6 +78,22 @@ fn cached_log_path() -> Option<&'static Path> {
         .as_deref()
 }
 
+/// The log as this process has it open: opening it for each line took a
+/// quarter of a millisecond, a dozen times between a key and its
+/// conversion shown; a write to it open, some microseconds. Opened again
+/// (`open_capped_inner`: its size checked, moved aside past the limit) a
+/// second on, so that a file another process moved to `.1` is written to
+/// that long at most, and once this process's lines took it past the limit.
+struct OpenLog {
+    file: File,
+    opened: Instant,
+    len: u64,
+}
+
+static OPEN_LOG: Mutex<Option<OpenLog>> = Mutex::new(None);
+
+const REOPEN_LOG_AFTER: Duration = Duration::from_secs(1);
+
 pub fn log(message: impl AsRef<str>) {
     let Some(path) = cached_log_path() else {
         return;
@@ -87,8 +104,22 @@ pub fn log(message: impl AsRef<str>) {
         std::process::id(),
         message.as_ref()
     );
-    if let Some(mut file) = open_capped_inner(path, LOG_LIMIT, false) {
-        let _ = file.write_all(line.as_bytes());
+    let mut open = OPEN_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = match open.as_ref() {
+        Some(o) => o.opened.elapsed() >= REOPEN_LOG_AFTER || o.len > LOG_LIMIT,
+        None => true,
+    };
+    if stale {
+        *open = open_capped_inner(path, LOG_LIMIT, false).map(|file| OpenLog {
+            len: file.metadata().map_or(0, |m| m.len()),
+            file,
+            opened: Instant::now(),
+        });
+    }
+    if let Some(o) = open.as_mut() {
+        if o.file.write_all(line.as_bytes()).is_ok() {
+            o.len += line.len() as u64;
+        }
     }
 }
 

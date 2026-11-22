@@ -16,6 +16,8 @@ impl EngineBridge {
     /// On the predictions open (Tab while typing), the prediction is
     /// forgotten instead (`forget_prediction`).
     pub fn handle_forget_candidate(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         let Some(reading) = self.shown_reading() else {
             return not_consumed();
         };
@@ -302,6 +304,8 @@ impl EngineBridge {
     }
 
     pub fn handle_backspace(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match &self.phase {
             Phase::Empty => not_consumed(),
             Phase::Alphabet { buffer } => {
@@ -358,6 +362,8 @@ impl EngineBridge {
     }
 
     pub fn handle_space(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         // a command's name ends
         self.ctx.passing = false;
         if self.form_shown().is_some() {
@@ -565,6 +571,8 @@ impl EngineBridge {
     }
 
     pub fn handle_enter(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         self.commit_composition(true)
     }
 
@@ -572,6 +580,8 @@ impl EngineBridge {
     /// conversion (focus out, input method switch): never blocks the host's
     /// event loop, and keeps the commit aligned with what was displayed.
     pub fn flush_shown(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         self.commit_composition(false)
     }
 
@@ -680,6 +690,8 @@ impl EngineBridge {
     /// typed, and Escape on the kana clears the composition. Without it the
     /// window goes back to the live conversion, and Escape there clears.
     pub fn handle_escape(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         self.ctx.passing = false;
         match &self.phase {
             Phase::Empty => not_consumed(),
@@ -731,6 +743,8 @@ impl EngineBridge {
     }
 
     pub fn handle_move_cursor(&mut self, delta: i32) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match &self.phase {
             Phase::Composing { .. } => {
                 self.composing.move_cursor(delta);
@@ -762,12 +776,16 @@ impl EngineBridge {
     }
 
     pub fn handle_up(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         self.move_selection(-1)
     }
 
     /// ↓ steps down the list; while typing it opens the conversion, as
     /// Tab does.
     pub fn handle_down(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         if matches!(self.phase, Phase::Composing { .. }) {
             return self.handle_space();
         }
@@ -775,16 +793,22 @@ impl EngineBridge {
     }
 
     pub fn handle_page_up(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         self.move_page(-1)
     }
 
     pub fn handle_page_down(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         self.move_page(1)
     }
 
     /// Shift+Space: Space while composing; with nothing composed, the space
     /// width plain Space does not type.
     pub fn handle_shift_space(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match self.phase {
             Phase::Empty if !self.cfg.full_width_space => self.commit_space(),
             Phase::Empty => not_consumed(),
@@ -800,6 +824,8 @@ impl EngineBridge {
 
     /// Tab opens the candidates like Space, then steps down (Shift+Tab up).
     pub fn handle_tab(&mut self, back: bool) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match self.phase {
             Phase::Empty => not_consumed(),
             Phase::Alphabet { .. } => consumed(Vec::new()),
@@ -817,6 +843,8 @@ impl EngineBridge {
 
     /// Delete: remove the kana right of the caret.
     pub fn handle_delete(&mut self) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match self.phase {
             Phase::Empty => not_consumed(),
             Phase::Composing { .. } => {
@@ -837,6 +865,8 @@ impl EngineBridge {
     /// Home / End: the caret to the start / end of the composition, or the
     /// first / last candidate of the open list.
     pub fn handle_home_end(&mut self, end: bool) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         match self.phase {
             Phase::Empty => not_consumed(),
             Phase::Composing { .. } => {
@@ -863,6 +893,8 @@ impl EngineBridge {
     /// it, Space converts the reading as usual, Escape / Backspace go back
     /// to typing.
     pub fn handle_convert_to(&mut self, form: Form) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         let mut actions = Vec::new();
         match &self.phase {
             Phase::Empty => return not_consumed(),
@@ -1022,6 +1054,8 @@ impl EngineBridge {
     /// commits it, or, while editing segments, fixes the focused segment and
     /// moves to the next one (committing after the last), matching digit keys.
     pub fn handle_pick(&mut self, index: usize) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         let picked = self.handle_select(index);
         if !picked.consumed {
             return picked;
@@ -1045,6 +1079,8 @@ impl EngineBridge {
     /// While typing it picks from [`Self::suggestions`]: the conversion
     /// opens on that candidate.
     pub fn handle_select(&mut self, index: usize) -> KeyOutcome {
+        // the list the preview went without, whole for this key
+        self.finish_list_now(true);
         if matches!(self.phase, Phase::Composing { .. }) {
             if let Some(want) = self.suggestions().get(index).cloned() {
                 // the suggestion picked, where the list Space opens has it

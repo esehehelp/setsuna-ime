@@ -227,6 +227,10 @@ pub(super) struct CompositionState {
     pub(super) alt: Option<AltList>,
     /// The rewrite of the conversion open, asked for or in.
     pub(super) rewrite: Option<RewriteJob>,
+    /// The engine's result (as it came) whose list the preview went without
+    /// the lexicon's costs for (`apply_engine_result`): its whole list is
+    /// made when wanted (`finish_list_now`).
+    pub(super) unfinished: Option<crate::engine_client::EngineResult>,
 }
 
 impl CompositionState {

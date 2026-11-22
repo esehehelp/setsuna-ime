@@ -587,6 +587,8 @@ fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, no
         Some(f) => (f.reading, f.context, f.dispatched_at),
         None => (String::new(), String::new(), Instant::now()),
     };
+    let round_trip_ms = dispatched_at.elapsed().as_secs_f64() * 1000.0;
+    let engine_ms = resp.engine_ms;
     {
         let mut slot = lock(&shared.latest);
         *slot = Some(EngineResult {
@@ -599,12 +601,18 @@ fn deliver(shared: &Shared, resp: DaemonResponse, inflight: Option<InFlight>, no
             corrected_reading: resp.corrected_reading,
             engine_ms: resp.engine_ms,
             frames: resp.frames,
-            round_trip_ms: dispatched_at.elapsed().as_secs_f64() * 1000.0,
+            round_trip_ms,
         });
     }
     shared.latest_cv.notify_all();
     if shared.alive.load(Ordering::SeqCst) {
-        crate::diagnostics::log(format!("notify req_id={}", resp.id));
+        // where a conversion's time went: the engine's own, and from the
+        // key's dispatch to here (the pipe, the server, the queue)
+        crate::diagnostics::log(format!(
+            "notify req_id={} engine_ms={} round_trip_ms={round_trip_ms:.2}",
+            resp.id,
+            engine_ms.map_or("-".to_string(), |ms| format!("{ms:.2}"))
+        ));
         notify(resp.id);
     } else {
         crate::diagnostics::log(format!("notify skipped: client dropped req_id={}", resp.id));

@@ -2471,6 +2471,100 @@ fn the_lexicon_scores_the_candidates_and_drops_the_near_misses() {
 }
 
 #[test]
+fn a_live_preview_goes_without_the_lexicons_costs_until_the_idle_makes_the_list() {
+    let table = "続投\tぞくとう\t15.0\tnoun\n続\tぞく\t13.3\tpref\n頭\tとう\t11.0\tnoun\n\
+                 続騰\tぞくとう\t17.0\tnoun\n";
+    let path = std::env::temp_dir().join(format!(
+        "setsuna-bridge-live-lexicon-{}.lexicon",
+        std::process::id()
+    ));
+    std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+    let (mut bridge, mock) = bridge_with_mock();
+    bridge.set_live_conversion(true);
+    bridge.set_lexicon(&crate::config::LexiconCfg {
+        file: Some(path.to_string_lossy().into_owned()),
+    });
+    type_str(&mut bridge, "zokutou");
+    answer_scored(
+        &mock,
+        &["続頭", "続当", "続投", "続騰"],
+        &[-0.5, -0.6, -1.0, -1.5],
+    );
+    let actions = bridge.apply_async_result();
+    // the preview: the engine's first, which the lexicon's order keeps first
+    assert!(
+        matches!(actions.last(), Some(Action::UpdatePreedit { text }) if text == "続頭"),
+        "{actions:?}"
+    );
+    // the list as the engine ordered it (続当, which the lexicon drops, in),
+    // the frontend's timer due at once
+    let Phase::Composing { candidates } = &bridge.phase else {
+        panic!("not composing")
+    };
+    assert!(candidates.contains(&"続当".to_string()), "{candidates:?}");
+    assert_eq!(bridge.deferred_for(), Some(Duration::ZERO));
+    // the idle: the whole list, the preview as it was
+    assert!(bridge.tick().is_empty());
+    assert_eq!(bridge.deferred_for(), None);
+    let Phase::Composing { candidates } = &bridge.phase else {
+        panic!("not composing")
+    };
+    assert_eq!(candidates[..2], ["続頭", "続投"]);
+    assert!(!candidates.contains(&"続当".to_string()), "{candidates:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_lexicon_conversion_learned_first_comes_in_at_the_idle_or_waits_behind_the_one_shown() {
+    let table =
+        "大島村\tおおしまむら\t10.0\tnoun\n大島\tおおしま\t8.0\tnoun\n村\tむら\t6.0\tnoun\n";
+    let dir = std::env::temp_dir().join(format!(
+        "setsuna-bridge-live-learned-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.lexicon");
+    std::fs::write(&path, crate::lexicon::Lexicon::build(table, None).unwrap()).unwrap();
+    let cfg = crate::config::LearningCfg::default();
+    let mut learning = Learning::at(dir.join("learning.jsonl"), &cfg);
+    learning
+        .record("おおしまむら", "大島村", "おおしま村")
+        .unwrap();
+    let convert = |learning: Learning| {
+        let (mut bridge, mock) = bridge_with_mock();
+        bridge.set_live_conversion(true);
+        bridge.set_lexicon(&crate::config::LexiconCfg {
+            file: Some(path.to_string_lossy().into_owned()),
+        });
+        bridge.set_learning(Some(learning));
+        type_str(&mut bridge, "oosimamura");
+        // the engine gave no 大島村: the lexicon's conversion adds it
+        answer_scored(&mock, &["おおしま村", "大しま村"], &[-0.5, -1.0]);
+        let actions = bridge.apply_async_result();
+        assert!(
+            matches!(actions.last(), Some(Action::UpdatePreedit { text }) if text == "おおしま村"),
+            "{actions:?}"
+        );
+        bridge
+    };
+    // at the idle, the learned conversion takes the preview
+    let mut bridge = convert(Learning::at(dir.join("learning.jsonl"), &cfg));
+    let actions = bridge.tick();
+    assert!(
+        matches!(actions.last(), Some(Action::UpdatePreedit { text }) if text == "大島村"),
+        "{actions:?}"
+    );
+    // Space before the idle: the conversion on screen stays first, the
+    // learned one listed
+    let mut bridge = convert(learning);
+    let (list, _) = shown(&bridge.handle_space().actions).unwrap();
+    assert_eq!(list[0], "おおしま村");
+    assert!(list.contains(&"大島村".to_string()), "{list:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_reading_of_one_word_lists_the_lexicons_words_the_model_left_out() {
     let table = "研修\tけんしゅう\t9.4\tnoun\n検収\tけんしゅう\t14.6\tnoun\n\
                  献酬\tけんしゅう\t20.2\tnoun\n";
@@ -3859,6 +3953,10 @@ fn composition_state_clear_resets_all_transient_fields() {
             reading: "きょう".into(),
             text: Some("本日".into()),
         }),
+        unfinished: Some(crate::engine_client::EngineResult {
+            reading: "きょう".into(),
+            ..Default::default()
+        }),
     };
     comp.clear();
     assert!(comp.last_applied_reading.is_empty());
@@ -3879,4 +3977,5 @@ fn composition_state_clear_resets_all_transient_fields() {
     assert!(comp.rerank.is_none());
     assert!(comp.alt.is_none());
     assert!(comp.rewrite.is_none());
+    assert!(comp.unfinished.is_none());
 }
