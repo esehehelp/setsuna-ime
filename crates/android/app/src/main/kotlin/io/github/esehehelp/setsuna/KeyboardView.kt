@@ -628,7 +628,9 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 haptic(HapticFeedbackConstants.KEYBOARD_TAP)
                 preview(k, if (k.type == Type.FLICK) k.text else label(k))
                 when (k.type) {
-                    Type.BACKSPACE -> {
+                    // held: again and again, as long as the finger stays (the
+                    // arrows step the caret, or the segment edited, each time)
+                    Type.BACKSPACE, Type.LEFT, Type.RIGHT -> {
                         fire(k, p)
                         p.fired = true
                         repeating = k
