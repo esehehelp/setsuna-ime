@@ -68,6 +68,22 @@ pub struct Args {
     /// before the next.
     #[arg(long, default_value_t = 60)]
     latency_quiet_ms: u64,
+    /// A row's closing 。、！？ typed after Space, not before it: for an input
+    /// method that commits what it shows at that key (Mozkey: before its
+    /// delayed live conversion has shown anything, the kana typed).
+    #[arg(long)]
+    punct_after_space: bool,
+}
+
+/// `keys` without the closing punctuation key `punct_after_space` types
+/// after Space, and that key.
+fn split_closing(keys: &str, after_space: bool) -> (&str, Option<char>) {
+    match keys.chars().last() {
+        Some(c @ ('.' | ',' | '!' | '?')) if after_space && keys.len() > 1 => {
+            (&keys[..keys.len() - 1], Some(c))
+        }
+        _ => (keys, None),
+    }
 }
 
 struct Profile {
@@ -670,6 +686,8 @@ struct Meta {
     quiet_ms: u64,
     look_ms: u64,
     latency_quiet_ms: u64,
+    /// A row's closing punctuation typed after Space (`--punct-after-space`).
+    punct_after_space: bool,
     minutes: f64,
     /// The input method's own processes that did work in the run.
     used_processes: usize,
@@ -895,10 +913,15 @@ pub fn run(args: Args) -> Result<()> {
                 hold(prof.as_ref())?;
                 LOST.store(false, std::sync::atomic::Ordering::SeqCst);
                 on(&prof);
-                type_keys(&keys);
+                let (body, closing) = split_closing(&keys, args.punct_after_space);
+                type_keys(body);
                 let (_, s1) = f.settle(quiet, Duration::from_secs(5));
                 press(0x20, false);
                 let (s2a, s2) = f.settle_after(look, quiet, Duration::from_secs(8));
+                if let Some(c) = closing {
+                    type_char(c);
+                    f.settle(quiet, Duration::from_secs(5));
+                }
                 press(0x0D, false);
                 f.settle(after_enter, Duration::from_secs(3));
                 tries += 1;
@@ -1043,6 +1066,7 @@ pub fn run(args: Args) -> Result<()> {
             quiet_ms: args.quiet_ms,
             look_ms: args.look_ms,
             latency_quiet_ms: args.latency_quiet_ms,
+            punct_after_space: args.punct_after_space,
             minutes,
             used_processes: used.len(),
             base,
