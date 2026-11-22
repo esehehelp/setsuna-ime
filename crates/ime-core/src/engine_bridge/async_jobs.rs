@@ -83,6 +83,13 @@ impl EngineBridge {
             if !current_hira.starts_with(&result.reading) {
                 return Vec::new();
             }
+            self.hold_noun_end(
+                &result.reading,
+                &mut result.candidates,
+                &raw,
+                &result.scores,
+                &starts,
+            );
             let top = result.candidates.first().cloned().unwrap_or_default();
             if top.is_empty() {
                 return Vec::new();
@@ -840,6 +847,13 @@ impl EngineBridge {
             true,
         );
         let mut starts = self.list_starts_of(&result.reading, &raw, &result.reading_pos, &list);
+        // the noun end held while typing stays held (the conversion shown
+        // goes on first), and Space still finds the model's first
+        let held = self.comp.end_held.take();
+        self.hold_noun_end(&result.reading, &mut list, &raw, &result.scores, &starts);
+        if self.comp.end_held.is_none() && keep_shown {
+            self.comp.end_held = held.filter(|(r, _)| *r == result.reading);
+        }
         let other = !list.is_empty() && list.first() != shown.as_ref();
         if let (true, true, Some(top)) = (other, keep_shown, &shown) {
             list.retain(|c| c != top);

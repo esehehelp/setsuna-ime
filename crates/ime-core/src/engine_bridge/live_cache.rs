@@ -203,6 +203,79 @@ impl EngineBridge {
         }
     }
 
+    /// Live conversion: a candidate of `list` ending in kana goes first in
+    /// place of the model's first ending in a noun (明日え for 明日絵),
+    /// when it keeps all that first has before its last unit and scores
+    /// within `[frontend] live_noun_end_penalty` of it, so the end of what
+    /// is being typed does not keep changing. `raw` and `scores` are the
+    /// engine's candidates and their scores. A first of a single unit
+    /// (東京), one the engine did not give (learned, the user
+    /// dictionary's), one ending in punctuation (天気。) and what Backspace
+    /// kept stay. Space puts the model's first back (`model_first`).
+    pub(super) fn hold_noun_end(
+        &mut self,
+        reading: &str,
+        list: &mut Vec<String>,
+        raw: &[String],
+        scores: &[f32],
+        starts: &HashMap<String, Vec<usize>>,
+    ) {
+        self.comp.end_held = None;
+        let penalty = self.cfg.noun_end_penalty;
+        if !self.cfg.live_conversion
+            || penalty <= 0.0
+            || list.len() < 2
+            || scores.len() != raw.len()
+            || self
+                .comp
+                .kept
+                .as_ref()
+                .is_some_and(|(r, _, _)| r == reading)
+        {
+            return;
+        }
+        let score = |c: &str| raw.iter().position(|r| r == c).map(|i| scores[i]);
+        let top = list[0].clone();
+        let Some(top_score) = score(&top) else {
+            return;
+        };
+        if !ends_in_noun(&top) {
+            return;
+        }
+        let Some(before) = before_last_unit(reading, &top, starts.get(&top)) else {
+            return;
+        };
+        if before.is_empty() {
+            return;
+        }
+        let best = list
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, c)| c.len() > before.len() && c.starts_with(&before) && !ends_in_noun(c))
+            .filter_map(|(i, c)| score(c).map(|s| (i, s)))
+            .filter(|&(_, s)| s > top_score - penalty)
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((i, _)) = best {
+            let c = list.remove(i);
+            list.insert(0, c);
+            self.comp.end_held = Some((reading.to_string(), top));
+        }
+    }
+
+    /// The live list of `reading` with the model's first back first, where
+    /// a candidate ending in kana went before it (`hold_noun_end`): Space
+    /// converts.
+    pub(super) fn model_first(&mut self, reading: &str, mut list: Vec<String>) -> Vec<String> {
+        if let Some((_, top)) = self.comp.end_held.take().filter(|(r, _)| r == reading) {
+            if let Some(i) = list.iter().position(|c| *c == top) {
+                let c = list.remove(i);
+                list.insert(0, c);
+            }
+        }
+        list
+    }
+
     /// A provisional whole reading, never a stale candidate for a different
     /// reading. Only a matching converted prefix may replace its raw kana.
     pub(super) fn provisional_conversion(&self) -> String {
@@ -459,4 +532,78 @@ pub(super) fn starts_fit(starts: &[usize], text: &str, n: usize) -> bool {
 /// A kanji, or an iteration or abbreviation mark read as one (々, 〆, ヶ).
 fn is_kanji(c: char) -> bool {
     matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '々' | '〆' | 'ヶ')
+}
+
+/// Whether `text` ends in a noun: a kanji, katakana, digit or letter last
+/// (a long-vowel mark goes with the char before it, すげー ends in kana).
+/// Hiragana, punctuation and symbols are no noun (天気。, 「天気」).
+fn ends_in_noun(text: &str) -> bool {
+    text.chars()
+        .rev()
+        .find(|c| !matches!(c, 'ー' | '〜' | '～'))
+        .is_some_and(|c| c.is_alphanumeric() && !matches!(c, 'ぁ'..='ゖ' | 'ゝ' | 'ゞ'))
+}
+
+/// What `text` has before its last unit: the chars sharing its last
+/// reading start (敗 of 今日敗), with the katakana before them where they
+/// are katakana (a katakana word is placed a char a unit: コーヒー). The
+/// starts are the list's, else the kana anchors; `None` when they cannot
+/// be had.
+fn before_last_unit(reading: &str, text: &str, starts: Option<&Vec<usize>>) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let starts = match starts {
+        Some(s) => s.clone(),
+        None => crate::segments::char_starts(reading, text, None)?,
+    };
+    if chars.is_empty() || !starts_fit(&starts, text, reading.chars().count()) {
+        return None;
+    }
+    let last = *starts.last()?;
+    let mut k = starts.iter().rposition(|&s| s != last).map_or(0, |i| i + 1);
+    let katakana = |c: char| matches!(c, 'ァ'..='ヺ' | 'ー');
+    if chars[k..].iter().all(|&c| katakana(c)) {
+        while k > 0 && katakana(chars[k - 1]) {
+            k -= 1;
+        }
+    }
+    Some(chars[..k].iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{before_last_unit, ends_in_noun};
+
+    #[test]
+    fn a_noun_end_is_a_kanji_katakana_digit_or_letter_last() {
+        for t in ["明日絵", "会議の資料", "コーヒー", "100", "Windows", "人々"] {
+            assert!(ends_in_noun(t), "{t}");
+        }
+        for t in [
+            "明日え",
+            "天気。",
+            "天気、",
+            "天気！",
+            "天気？",
+            "「天気」",
+            "すげー",
+            "",
+        ] {
+            assert!(!ends_in_noun(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn the_last_unit_is_the_chars_sharing_the_last_start() {
+        let unit = |r: &str, t: &str, s: &[usize]| before_last_unit(r, t, Some(&s.to_vec()));
+        assert_eq!(
+            unit("きょうはい", "今日敗", &[0, 0, 3]).as_deref(),
+            Some("今日")
+        );
+        assert_eq!(unit("とうきょう", "東京", &[0, 0]).as_deref(), Some(""));
+        assert_eq!(
+            unit("きょうはこーひー", "今日はコーヒー", &[0, 0, 3, 4, 5, 6, 7]).as_deref(),
+            Some("今日は")
+        );
+        assert_eq!(unit("あした", "明日", &[0, 9]), None);
+    }
 }

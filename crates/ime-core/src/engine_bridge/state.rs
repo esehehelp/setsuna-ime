@@ -231,6 +231,10 @@ pub(super) struct CompositionState {
     /// the lexicon's costs for (`apply_engine_result`): its whole list is
     /// made when wanted (`finish_list_now`).
     pub(super) unfinished: Option<crate::engine_client::EngineResult>,
+    /// The live list's reading and the model's first, when a candidate
+    /// ending in kana went before it (`hold_noun_end`): Space puts it back
+    /// first.
+    pub(super) end_held: Option<(String, String)>,
 }
 
 impl CompositionState {
@@ -297,6 +301,8 @@ pub(super) struct BridgeConfig {
     pub(super) full_width_space: bool,
     /// `[frontend] space_converts_last_segment`.
     pub(super) space_last_segment: bool,
+    /// `[frontend] live_noun_end_penalty`.
+    pub(super) noun_end_penalty: f32,
     /// `[frontend] sentence_case`: the punctuation typed after an English
     /// sentence is English (`mixed::english_after`).
     pub(super) sentence_case: bool,
@@ -330,6 +336,7 @@ impl BridgeConfig {
             digit_select: false,
             full_width_space: frontend.full_width_space,
             space_last_segment: frontend.space_converts_last_segment,
+            noun_end_penalty: frontend.live_noun_end_penalty,
             sentence_case: frontend.sentence_case,
             live_conversion: frontend.live_conversion.unwrap_or(true),
             backspace_deletes_shown: frontend.backspace_deletes_shown,

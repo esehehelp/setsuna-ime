@@ -500,7 +500,9 @@ impl EngineBridge {
                             .apply(self.date_time_candidates(&reading)),
                     )
                 } else if ready {
-                    candidates
+                    // converting: the model's first, also where a candidate
+                    // ending in kana was shown before it
+                    self.model_first(&reading, candidates)
                 } else {
                     Vec::new()
                 };
@@ -800,6 +802,8 @@ impl EngineBridge {
         // conversion stays, where moving the caret into it brought the kana
         // typed back
         if delta < 0 && self.shows_whole_conversion() {
+            // the segments of the conversion shown, a noun end held too
+            self.comp.end_held = None;
             let out = self.space_convert();
             return self.on_last_segment(out);
         }

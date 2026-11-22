@@ -2226,6 +2226,68 @@ fn left_on_a_live_conversion_edits_its_segments_instead_of_bringing_the_kana_bac
     assert_eq!(bridge.caret(), Some(6));
 }
 
+/// `ashitae` typed and its conversion in, the chars of each candidate at
+/// あした and え, with these scores.
+fn live_ashitae(scores: &[f32]) -> (EngineBridge, Vec<Action>) {
+    let (mut bridge, mock) = bridge_with_mock();
+    type_str(&mut bridge, "ashitae");
+    let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+    *mock.state.next.borrow_mut() = Some(EngineResult {
+        req_id,
+        reading,
+        candidates: v(&["明日絵", "明日え", "明日エ"]),
+        reading_pos: vec![vec![0, 0, 3]; 3],
+        scores: scores.to_vec(),
+        ..Default::default()
+    });
+    let actions = bridge.apply_async_result();
+    (bridge, actions)
+}
+
+#[test]
+fn live_conversion_holds_a_noun_end_back_for_a_kana_one_close_to_it() {
+    // 明日え within the penalty of 明日絵: shown, and what Enter commits
+    let close = [-0.87, -1.23, -2.2];
+    let (mut bridge, actions) = live_ashitae(&close);
+    assert_eq!(preedit(&actions).as_deref(), Some("明日え"));
+    let out = bridge.handle_enter();
+    assert!(
+        out.actions
+            .iter()
+            .any(|a| matches!(a, Action::Commit { text } if text == "明日え")),
+        "{:?}",
+        out.actions
+    );
+    // Space converts: the model's first
+    let (mut bridge, _) = live_ashitae(&close);
+    let out = bridge.handle_space();
+    assert_eq!(preedit(&out.actions).as_deref(), Some("明日絵"));
+    // ← edits the conversion shown
+    let (mut bridge, _) = live_ashitae(&close);
+    let out = bridge.handle_move_cursor(-1);
+    assert_eq!(segments_shown(&out.actions).0.concat(), "明日え");
+    // the model surer of its noun than that: it stays
+    let (_, actions) = live_ashitae(&[-0.1, -4.0, -5.0]);
+    assert_eq!(preedit(&actions).as_deref(), Some("明日絵"));
+    // off
+    let (mut bridge, mock) = bridge_with_mock();
+    bridge.cfg.noun_end_penalty = 0.0;
+    type_str(&mut bridge, "ashitae");
+    let (req_id, _, reading) = mock.state.dispatched.borrow().last().cloned().unwrap();
+    *mock.state.next.borrow_mut() = Some(EngineResult {
+        req_id,
+        reading,
+        candidates: v(&["明日絵", "明日え"]),
+        reading_pos: vec![vec![0, 0, 3]; 2],
+        scores: close[..2].to_vec(),
+        ..Default::default()
+    });
+    assert_eq!(
+        preedit(&bridge.apply_async_result()).as_deref(),
+        Some("明日絵")
+    );
+}
+
 #[test]
 fn discard_drops_the_composition_and_a_late_result() {
     let (mut bridge, mock) = converting_kisha();
@@ -4019,6 +4081,7 @@ fn composition_state_clear_resets_all_transient_fields() {
             reading: "きょう".into(),
             ..Default::default()
         }),
+        end_held: Some(("きょう".into(), "今日".into())),
     };
     comp.clear();
     assert!(comp.last_applied_reading.is_empty());
@@ -4040,4 +4103,5 @@ fn composition_state_clear_resets_all_transient_fields() {
     assert!(comp.alt.is_none());
     assert!(comp.rewrite.is_none());
     assert!(comp.unfinished.is_none());
+    assert!(comp.end_held.is_none());
 }

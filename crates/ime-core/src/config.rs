@@ -500,6 +500,14 @@ pub struct FrontendCfg {
     /// again steps through that segment's candidates, ← / → move to another.
     /// False: the list of the whole sentence.
     pub space_converts_last_segment: bool,
+    /// Live conversion: what the conversion shown loses in score for ending
+    /// in a noun (a kanji, katakana, digit or letter last; punctuation is
+    /// none), against a candidate of the list that keeps all before its last
+    /// unit and ends in kana: 明日絵 gives way to 明日え within this much,
+    /// so the end of what is being typed does not keep changing. A
+    /// conversion the model is surer of than that stays, and so does one of
+    /// a single unit (東京). Space lists the model's order. 0: off.
+    pub live_noun_end_penalty: f32,
     /// While typing, show the conversion in the text (true) or keep the
     /// typed kana there and list the conversions in a suggestion window
     /// (false, as Mozc does). Unset: true on every frontend.
@@ -682,6 +690,7 @@ impl Default for FrontendCfg {
             pass_through_commands: false,
             full_width_space: false,
             space_converts_last_segment: false,
+            live_noun_end_penalty: 3.0,
             live_conversion: None,
             backspace_deletes_shown: true,
             escape_to_kana: true,
@@ -1284,6 +1293,9 @@ impl Config {
              # Space opens the list of the sentence's last segment only (true),\n\
              # or of the whole sentence (false).\n\
              space_converts_last_segment = false\n\
+             # Live conversion: the score a conversion shown loses for ending in a\n\
+             # noun, against a candidate ending in kana (明日絵 -> 明日え); 0: off.\n\
+             live_noun_end_penalty = 3.0\n\
              # While typing, show the conversion in the text (true) or the\n\
              # typed kana with the conversions in a suggestion window (false).\n\
              # Default true.\n\
