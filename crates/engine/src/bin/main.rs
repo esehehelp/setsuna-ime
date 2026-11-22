@@ -11,7 +11,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -675,40 +675,114 @@ fn backend_manifest() -> BackendManifest {
     }
 }
 
-/// The analyzer, once its background load has finished.
-#[derive(Clone, Default)]
-struct AnalyzerSlot(Arc<Mutex<Option<Result<Arc<Analyzer>, String>>>>);
+/// How long the analyzer stays loaded with nothing asked of the engine
+/// (`AnalyzerSlot`), and how often that is looked at.
+const ANALYZER_IDLE: Duration = Duration::from_secs(120);
+const ANALYZER_CHECK: Duration = Duration::from_secs(15);
+
+/// The analyzer: loaded on a thread of its own once anything is asked (a
+/// conversion: the user types, and segment editing, which asks for
+/// analyses, comes after typing; the dictionary loads in a fraction of a
+/// second, which no conversion waits for), and let go by a thread of its own
+/// once nothing has been asked for `ANALYZER_IDLE`. Its dictionary is 27 MB
+/// of the engine's 59, and stays loaded only while the IME is in use.
+#[derive(Clone)]
+struct AnalyzerSlot {
+    manifest: PathBuf,
+    slot: Arc<Mutex<Slot>>,
+}
+
+struct Slot {
+    state: SlotState,
+    last_asked: Instant,
+}
+
+enum SlotState {
+    Unloaded,
+    Loading,
+    Ready(Arc<Analyzer>),
+    Failed(String),
+}
 
 impl AnalyzerSlot {
-    /// Load `manifest` on a thread of its own: the dictionary takes about
-    /// half a second, which the first conversion does not wait for.
-    fn load_in_background(manifest: PathBuf) -> Self {
-        let slot = Self::default();
-        let s = slot.clone();
-        std::thread::spawn(move || {
-            let t0 = Instant::now();
-            let loaded = Analyzer::from_manifest_path(&manifest)
-                .map(Arc::new)
-                .map_err(|e| format!("{e:#}"));
-            match &loaded {
-                Ok(_) => eprintln!(
-                    "[engine] analyzer {} loaded in {:.2} s",
-                    manifest.display(),
-                    t0.elapsed().as_secs_f64()
-                ),
-                Err(e) => eprintln!("[engine] analyzer {}: {e}", manifest.display()),
+    fn new(manifest: PathBuf) -> Self {
+        let slot = Arc::new(Mutex::new(Slot {
+            state: SlotState::Unloaded,
+            last_asked: Instant::now(),
+        }));
+        // until the slot goes
+        let watched = Arc::downgrade(&slot);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(ANALYZER_CHECK);
+            let Some(slot) = watched.upgrade() else {
+                return;
+            };
+            if release_if_idle(&slot) {
+                eprintln!("[engine] analyzer let go: nothing asked for {ANALYZER_IDLE:?}");
             }
-            *s.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(loaded);
         });
-        slot
+        Self { manifest, slot }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
+        lock_slot(&self.slot)
+    }
+
+    /// Something was asked: the analyzer loads unless it is (or is being)
+    /// loaded already.
+    fn warm(&self) {
+        let mut slot = self.lock();
+        slot.last_asked = Instant::now();
+        if !matches!(slot.state, SlotState::Unloaded) {
+            return;
+        }
+        slot.state = SlotState::Loading;
+        let (shared, manifest) = (self.slot.clone(), self.manifest.clone());
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let next = match Analyzer::from_manifest_path(&manifest) {
+                Ok(a) => {
+                    eprintln!(
+                        "[engine] analyzer {} loaded in {:.2} s",
+                        manifest.display(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                    SlotState::Ready(Arc::new(a))
+                }
+                Err(e) => {
+                    eprintln!("[engine] analyzer {}: {e:#}", manifest.display());
+                    SlotState::Failed(format!("{e:#}"))
+                }
+            };
+            lock_slot(&shared).state = next;
+        });
+    }
+
+    /// The analyzer, an analysis asked: loaded now, or not yet (its load
+    /// started).
     fn get(&self) -> Result<Arc<Analyzer>, String> {
-        match &*self.0.lock().unwrap_or_else(|p| p.into_inner()) {
-            Some(r) => r.clone(),
-            None => Err("analyzer loading".to_string()),
+        self.warm();
+        match &self.lock().state {
+            SlotState::Ready(a) => Ok(a.clone()),
+            SlotState::Failed(e) => Err(e.clone()),
+            SlotState::Unloaded | SlotState::Loading => Err("analyzer loading".to_string()),
         }
     }
+}
+
+fn lock_slot(slot: &Mutex<Slot>) -> std::sync::MutexGuard<'_, Slot> {
+    slot.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Let the analyzer go when nothing has been asked for `ANALYZER_IDLE`
+/// (one being used goes once its analysis is done); true when it went.
+fn release_if_idle(slot: &Mutex<Slot>) -> bool {
+    let mut slot = lock_slot(slot);
+    if slot.last_asked.elapsed() < ANALYZER_IDLE || !matches!(slot.state, SlotState::Ready(_)) {
+        return false;
+    }
+    slot.state = SlotState::Unloaded;
+    true
 }
 
 /// What one request may ask for (any process of the user can reach the
@@ -757,7 +831,7 @@ impl Daemon {
             top_k: session.config.max_candidates,
             analyzer: args.analyzer.is_some(),
         })?;
-        let analyzer = args.analyzer.clone().map(AnalyzerSlot::load_in_background);
+        let analyzer = args.analyzer.clone().map(AnalyzerSlot::new);
         let daemon = Self {
             session,
             args,
@@ -777,6 +851,10 @@ impl Daemon {
             }
         };
         let t0 = Instant::now();
+        // the user types: the analyzer segment editing will want comes in
+        if let Some(slot) = &self.analyzer {
+            slot.warm();
+        }
         if let Some(texts) = &req.analyze {
             if texts.len() > MAX_ANALYZE_TEXTS
                 || texts.iter().any(|t| t.chars().count() > MAX_ANALYZE_CHARS)
@@ -919,7 +997,8 @@ fn run_serve(
         setsuna_pipe::server::ServeOptions {
             pipe_name: pipe,
             user_sid: user,
-            // the session has nothing to free and make again
+            // the session has nothing to free and make again (the analyzer
+            // goes by itself: `AnalyzerSlot`)
             idle_after: exit_after,
             exit_after,
             log,
@@ -1074,8 +1153,18 @@ mod tests {
         assert_eq!(r.reading, None);
         let r: Request = serde_json::from_str(r#"{"id":4,"reading":"きょう"}"#).unwrap();
         assert_eq!((r.reading.as_deref(), r.analyze), (Some("きょう"), None));
-        let slot = AnalyzerSlot::default();
+        // a manifest that is not there: loading, then its error
+        let slot = AnalyzerSlot::new(PathBuf::from("no such analyzer.json"));
         assert_eq!(slot.get().err().as_deref(), Some("analyzer loading"));
+        let t0 = Instant::now();
+        while slot.get().err().as_deref() == Some("analyzer loading") {
+            assert!(t0.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slot.get().is_err());
+        // what failed is not let go (nor loaded again at each ask)
+        slot.lock().last_asked = Instant::now() - ANALYZER_IDLE;
+        assert!(!release_if_idle(&slot.slot));
         let json = serde_json::to_value(AnalyzeResponse {
             id: 3,
             analyses: vec![vec![Token {
