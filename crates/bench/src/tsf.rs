@@ -73,6 +73,12 @@ pub struct Args {
     /// delayed live conversion has shown anything, the kana typed).
     #[arg(long)]
     punct_after_space: bool,
+    /// The row committed with Enter as it shows, no Space before: for an
+    /// input method with live conversion whose Space goes on to the next
+    /// candidate of the conversion shown (azooKey, Mozkey: the second one
+    /// was committed).
+    #[arg(long)]
+    no_space: bool,
 }
 
 /// `keys` without the closing punctuation key `punct_after_space` types
@@ -688,6 +694,8 @@ struct Meta {
     latency_quiet_ms: u64,
     /// A row's closing punctuation typed after Space (`--punct-after-space`).
     punct_after_space: bool,
+    /// Rows committed with Enter, no Space (`--no-space`).
+    no_space: bool,
     minutes: f64,
     /// The input method's own processes that did work in the run.
     used_processes: usize,
@@ -916,8 +924,12 @@ pub fn run(args: Args) -> Result<()> {
                 let (body, closing) = split_closing(&keys, args.punct_after_space);
                 type_keys(body);
                 let (_, s1) = f.settle(quiet, Duration::from_secs(5));
-                press(0x20, false);
-                let (s2a, s2) = f.settle_after(look, quiet, Duration::from_secs(8));
+                let (s2a, s2) = if args.no_space {
+                    (Duration::ZERO, Duration::ZERO)
+                } else {
+                    press(0x20, false);
+                    f.settle_after(look, quiet, Duration::from_secs(8))
+                };
                 if let Some(c) = closing {
                     type_char(c);
                     f.settle(quiet, Duration::from_secs(5));
@@ -1067,6 +1079,7 @@ pub fn run(args: Args) -> Result<()> {
             look_ms: args.look_ms,
             latency_quiet_ms: args.latency_quiet_ms,
             punct_after_space: args.punct_after_space,
+            no_space: args.no_space,
             minutes,
             used_processes: used.len(),
             base,
