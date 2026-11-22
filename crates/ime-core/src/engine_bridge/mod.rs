@@ -48,6 +48,7 @@ use crate::rerank_client::RerankClient;
 use crate::rewrite_client::RewriteClient;
 
 pub use ranking::order_candidates;
+pub use state::LIVE_SETTLE;
 
 use state::{
     BridgeConfig, CompositionState, ContextState, FormShown, Phase, UserDictSource, CONTEXT_WINDOW,
@@ -178,6 +179,10 @@ pub struct EngineBridge {
     req_counter: AtomicU64,
     /// Results older than this belong to a previous composition.
     result_floor: u64,
+    /// The engine's round trip lately (ms, a moving average of its results';
+    /// 0 before one): `settle_live` waits only for an engine that answers
+    /// within the wait (a phone's may take longer a conversion).
+    live_rtt_ms: f64,
     /// Conversion backend. `None` in hosts where the engine daemon failed
     /// to spawn — live conversion then degrades to a raw-hiragana preedit.
     client: Option<Box<dyn EngineClient>>,
@@ -219,6 +224,7 @@ impl EngineBridge {
             cfg: BridgeConfig::from_frontend(frontend),
             req_counter: AtomicU64::new(0),
             result_floor: 1,
+            live_rtt_ms: 0.0,
             client,
             reranker: None,
             rewriter: None,

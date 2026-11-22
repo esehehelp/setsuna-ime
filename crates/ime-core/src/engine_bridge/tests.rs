@@ -828,6 +828,37 @@ fn mixed_enter_commits_what_the_whole_reads_as() {
 }
 
 #[test]
+fn a_key_can_wait_for_its_conversion_and_show_it_at_once() {
+    let (mut bridge, mock) = bridge_with_mock();
+    mock.state
+        .answers
+        .borrow_mut()
+        .insert("きしゃ".into(), vec!["記者".into()]);
+    let mut last = Vec::new();
+    for c in "kisha".chars() {
+        last = bridge.handle_char(c).actions;
+    }
+    // the key shows the kana; its conversion, in at once, stands for them
+    assert_eq!(preedit(&last).as_deref(), Some("きしゃ"));
+    let wait = std::time::Duration::from_millis(4);
+    assert_eq!(preedit(&bridge.settle_live(wait)).as_deref(), Some("記者"));
+    // nothing out: nothing to wait for
+    assert!(bridge.settle_live(wait).is_empty());
+    // an engine slower than the wait lately: no wait, its kana as before
+    let (mut bridge, mock) = bridge_with_mock();
+    mock.state
+        .answers
+        .borrow_mut()
+        .insert("きしゃ".into(), vec!["記者".into()]);
+    bridge.live_rtt_ms = 9.0;
+    for c in "kisha".chars() {
+        bridge.handle_char(c);
+    }
+    assert!(bridge.settle_live(wait).is_empty());
+    assert_eq!(bridge.live_preedit(), "きしゃ");
+}
+
+#[test]
 fn mixed_enter_and_space_convert_the_reading_shown() {
     // the shipped model shows Nandinaha as Nandina + は; read again when
     // done it was Nand + いなは, and Enter committed Nand否は; Space froze
@@ -4082,6 +4113,7 @@ fn composition_state_clear_resets_all_transient_fields() {
             ..Default::default()
         }),
         end_held: Some(("きょう".into(), "今日".into())),
+        live_out: Some("きょう".into()),
     };
     comp.clear();
     assert!(comp.last_applied_reading.is_empty());
@@ -4104,4 +4136,5 @@ fn composition_state_clear_resets_all_transient_fields() {
     assert!(comp.rewrite.is_none());
     assert!(comp.unfinished.is_none());
     assert!(comp.end_held.is_none());
+    assert!(comp.live_out.is_none());
 }

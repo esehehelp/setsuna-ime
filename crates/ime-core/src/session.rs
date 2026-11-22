@@ -378,6 +378,9 @@ impl Session {
             return false;
         }
         self.apply(outcome.actions);
+        // the conversion the key asked for, drawn with it when in at once
+        let settled = self.bridge.settle_live(crate::engine_bridge::LIVE_SETTLE);
+        self.apply(settled);
         true
     }
 

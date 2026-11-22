@@ -38,6 +38,15 @@ impl EngineBridge {
         if result.req_id < self.result_floor {
             return Vec::new();
         }
+        if result.round_trip_ms > 0.0 {
+            // a slow one (the first after a while) counts as a little slow
+            let ms = result.round_trip_ms.min(10.0);
+            self.live_rtt_ms = if self.live_rtt_ms == 0.0 {
+                ms
+            } else {
+                0.8 * self.live_rtt_ms + 0.2 * ms
+            };
+        }
         // live typing: the preview shows the first candidate, which the
         // lexicon's costs never change; the whole list, which waits for them,
         // is made when it is wanted (`finish_list_now`): at the frontend's
@@ -788,6 +797,47 @@ impl EngineBridge {
             // what it shows is committed next: its actions go
             let _ = self.apply_engine_result();
         }
+    }
+
+    /// Typing: wait up to `budget` for the conversion of what is typed that
+    /// the key asked for, and take it in (`apply_async_result`), so that the
+    /// frontend draws the key once, converted, not its kana and then the
+    /// conversion: two edits of the host's text, each some ms in a TSF
+    /// host, where the engine answers in about one. Nothing when no such
+    /// conversion is out, or it does not come in time (it lands as before).
+    pub fn settle_live(&mut self, budget: Duration) -> Vec<Action> {
+        if budget.is_zero()
+            || !self.cfg.live_conversion
+            || !matches!(self.phase, Phase::Composing { .. })
+            || !self.composing.cursor_at_end()
+            || self.comp.kana_shown
+        {
+            return Vec::new();
+        }
+        // an engine that takes longer than the wait: its kana, as before
+        if self.live_rtt_ms > budget.as_secs_f64() * 1000.0 {
+            return Vec::new();
+        }
+        let reading = self.composing.live_reading();
+        if self.comp.live_out.as_deref() != Some(reading.as_str()) {
+            return Vec::new();
+        }
+        let deadline = Instant::now() + budget;
+        let mut actions = Vec::new();
+        while self.comp.list_reading != reading {
+            let Some(client) = self.client.as_ref() else {
+                break;
+            };
+            if !client.is_ready() || !client.is_alive() {
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || !client.wait_latest(left) {
+                break;
+            }
+            actions.extend(self.apply_async_result());
+        }
+        actions
     }
 
     /// The frontend's timer (`deferred_for`): the list the preview went

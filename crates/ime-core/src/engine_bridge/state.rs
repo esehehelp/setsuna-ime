@@ -40,6 +40,12 @@ pub(super) const ANALYSIS_WAIT: Duration = Duration::from_millis(150);
 /// a conversion, and one may be in flight before it.
 pub(super) const ENTER_WAIT: Duration = Duration::from_millis(1000);
 
+/// How long a key waits for the conversion it asked for before the frontend
+/// draws it (`EngineBridge::settle_live`): the engine answers in about 1 ms
+/// and an edit of a TSF host's text takes 3 to 8, so one edit with the
+/// conversion shows it sooner than the kana and then it.
+pub const LIVE_SETTLE: Duration = Duration::from_millis(4);
+
 /// How long Space waits for the other reading's list (`await_alt`) before
 /// the list opens without it: it is added when it comes, the selection
 /// staying where it is (`apply_alt_result`), so a candidate the user's
@@ -235,6 +241,9 @@ pub(super) struct CompositionState {
     /// ending in kana went before it (`hold_noun_end`): Space puts it back
     /// first.
     pub(super) end_held: Option<(String, String)>,
+    /// The reading the last live conversion was asked for (`dispatch_live`):
+    /// what `settle_live` waits for.
+    pub(super) live_out: Option<String>,
 }
 
 impl CompositionState {

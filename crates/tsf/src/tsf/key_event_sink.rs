@@ -12,7 +12,7 @@ use crate::keymap::{classify_vk, Mods, OnOff};
 use crate::placement::Rect;
 use crate::tsf::edit_session::ActionEditSession;
 use crate::tsf::text_input_processor::SetsunaTextService_Impl;
-use setsuna_core::engine_bridge::{Action, KeyKind};
+use setsuna_core::engine_bridge::{Action, KeyKind, LIVE_SETTLE};
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // OnPreservedKey takes *const GUID per the TSF interface
 impl ITfKeyEventSink_Impl for SetsunaTextService_Impl {
@@ -215,7 +215,11 @@ impl SetsunaTextService_Impl {
         }
 
         if let Some(context) = pic {
-            apply_actions(self, context, outcome.actions)?;
+            let settled = self.inner.borrow_mut().engine.settle_live(LIVE_SETTLE);
+            if !settled.is_empty() {
+                setsuna_core::diagnostics::log("OnKeyDown: the conversion came in");
+            }
+            apply_actions(self, context, merge_settled(outcome.actions, settled))?;
             setsuna_core::diagnostics::log("OnKeyDown consumed with context");
             return Ok(TRUE);
         }
@@ -501,6 +505,30 @@ fn win_down() -> bool {
     unsafe { GetKeyState(0x5B) < 0 || GetKeyState(0x5C) < 0 }
 }
 
+/// A key's actions and those of the conversion it asked for, taken in while
+/// it was handled (`settle_live`): the conversion's preedit stands for the
+/// key's, so the text is edited once; what the key committed before it
+/// stays.
+fn merge_settled(mut actions: Vec<Action>, settled: Vec<Action>) -> Vec<Action> {
+    if settled
+        .iter()
+        .any(|a| matches!(a, Action::UpdatePreedit { .. }))
+    {
+        let from = actions
+            .iter()
+            .rposition(|a| matches!(a, Action::Commit { .. } | Action::EndComposition))
+            .map_or(0, |i| i + 1);
+        let mut i = 0;
+        actions.retain(|a| {
+            let keep = i < from || !matches!(a, Action::UpdatePreedit { .. });
+            i += 1;
+            keep
+        });
+    }
+    actions.extend(settled);
+    actions
+}
+
 pub(crate) fn apply_actions(
     service: &SetsunaTextService_Impl,
     context: &ITfContext,
@@ -602,6 +630,7 @@ pub(crate) fn apply_actions(
         );
         let failed = session.panicked.clone();
         let edit_session: ITfEditSession = session.into();
+        let started = std::time::Instant::now();
         unsafe {
             let hr = context.RequestEditSession(
                 client_id,
@@ -613,7 +642,10 @@ pub(crate) fn apply_actions(
                 tracing::warn!("RequestEditSession failed: {:?}", hr);
                 setsuna_core::diagnostics::log(format!("RequestEditSession failed: {hr:?}"));
             } else {
-                setsuna_core::diagnostics::log(format!("RequestEditSession OK: {hr:?}"));
+                setsuna_core::diagnostics::log(format!(
+                    "RequestEditSession OK: {hr:?} in {:.2} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
             }
         }
         panicked = failed.get();
@@ -1040,6 +1072,26 @@ fn text_before_caret(context: &ITfContext, client_id: u32) -> (Option<String>, F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settled_conversion_stands_for_the_keys_preedit() {
+        let pre = |t: &str| Action::UpdatePreedit { text: t.into() };
+        let commit = |t: &str| Action::Commit { text: t.into() };
+        assert_eq!(
+            merge_settled(vec![pre("きしゃ")], vec![pre("記者")]),
+            vec![pre("記者")]
+        );
+        // what the key committed stays, before the new composition's
+        assert_eq!(
+            merge_settled(vec![commit("今日は。"), pre("あ")], vec![pre("亜")]),
+            vec![commit("今日は。"), pre("亜")]
+        );
+        // nothing came in: the key's as they were
+        assert_eq!(
+            merge_settled(vec![pre("きしゃ")], vec![]),
+            vec![pre("きしゃ")]
+        );
+    }
 
     #[test]
     fn character_keys_are_logged_without_their_code() {

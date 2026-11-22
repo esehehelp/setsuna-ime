@@ -61,6 +61,7 @@ impl EngineBridge {
             if let Some(client) = &self.client {
                 let req_id = self.next_req_id();
                 client.dispatch(req_id, &self.ctx.context, &hira);
+                self.comp.live_out = Some(hira.clone());
             }
         }
         if let Phase::Composing { candidates } = &self.phase {
