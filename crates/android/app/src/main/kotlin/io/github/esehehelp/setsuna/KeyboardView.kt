@@ -559,6 +559,8 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private class Press(val key: Key, val downX: Float, val downY: Float, val index: Int) {
         var fired = false
         var dragged = 0
+        /** An arrow key's step: its own (← / →), or ↑ / ↓ once flicked up or down. */
+        var arrow = 0
     }
 
     private val presses = SparseArray<Press>()
@@ -568,6 +570,17 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         override fun run() {
             val k = repeating ?: return
             fire(k, null)
+            main.postDelayed(this, 50)
+        }
+    }
+
+    /** An arrow key held: its step again and again (← / → in place, ↑ / ↓ flicked up or down). */
+    private var arrowPress: Press? = null
+    private val arrowRepeat = object : Runnable {
+        override fun run() {
+            val p = arrowPress ?: return
+            p.fired = true
+            listener.onKey(p.arrow, 0)
             main.postDelayed(this, 50)
         }
     }
@@ -628,13 +641,18 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 haptic(HapticFeedbackConstants.KEYBOARD_TAP)
                 preview(k, if (k.type == Type.FLICK) k.text else label(k))
                 when (k.type) {
-                    // held: again and again, as long as the finger stays (the
-                    // arrows step the caret, or the segment edited, each time)
-                    Type.BACKSPACE, Type.LEFT, Type.RIGHT -> {
+                    Type.BACKSPACE -> {
                         fire(k, p)
                         p.fired = true
                         repeating = k
                         main.postDelayed(repeat, 400)
+                    }
+                    // a tap steps once when the finger lifts (it may flick up
+                    // or down first); held, it steps again and again
+                    Type.LEFT, Type.RIGHT -> {
+                        p.arrow = k.sym
+                        arrowPress = p
+                        main.postDelayed(arrowRepeat, 400)
                     }
                     Type.GLOBE -> {
                         holding = p
@@ -661,6 +679,25 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                             if (steps != 0) p.fired = true
                         }
                         Type.FLICK -> preview(p.key, flicked(p.key, direction(p, e.getX(i), e.getY(i))))
+                        Type.LEFT, Type.RIGHT -> {
+                            // flicked up or down: a line up or down, at once
+                            // (and again and again while held there)
+                            val vertical = when (direction(p, e.getX(i), e.getY(i))) {
+                                1 -> Keysym.UP
+                                3 -> Keysym.DOWN
+                                else -> 0
+                            }
+                            if (vertical != 0 && vertical != p.arrow) {
+                                p.arrow = vertical
+                                p.fired = true
+                                haptic(HapticFeedbackConstants.KEYBOARD_TAP)
+                                listener.onKey(vertical, 0)
+                                if (p == arrowPress) {
+                                    main.removeCallbacks(arrowRepeat)
+                                    main.postDelayed(arrowRepeat, 400)
+                                }
+                            }
+                        }
                         else -> {}
                     }
                 }
@@ -675,6 +712,10 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                     if (p.key == repeating) {
                         main.removeCallbacks(repeat)
                         repeating = null
+                    }
+                    if (p == arrowPress) {
+                        main.removeCallbacks(arrowRepeat)
+                        arrowPress = null
                     }
                     if (p == holding) {
                         main.removeCallbacks(hold)
@@ -701,6 +742,8 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         listener.onPreview(null, null)
         main.removeCallbacks(repeat)
         repeating = null
+        main.removeCallbacks(arrowRepeat)
+        arrowPress = null
         main.removeCallbacks(hold)
         holding = null
     }
