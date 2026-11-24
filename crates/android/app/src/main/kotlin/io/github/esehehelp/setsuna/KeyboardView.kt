@@ -652,6 +652,9 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                     Type.LEFT, Type.RIGHT -> {
                         p.arrow = k.sym
                         arrowPress = p
+                        // the last arrow pressed repeats, one at a time (an
+                        // arrow held before stops: two would run together)
+                        main.removeCallbacks(arrowRepeat)
                         main.postDelayed(arrowRepeat, 400)
                     }
                     Type.GLOBE -> {
