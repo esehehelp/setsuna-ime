@@ -80,6 +80,20 @@ pub struct MixedParams {
     /// An English word going from two capitals to lowercase (`SCmo`: an
     /// acronym, then romaji).
     pub case_break: f64,
+    /// An English word the model does not know going from lowercase to one
+    /// capital and on in lowercase or digits (`kunoTsama`, `karintoG11`:
+    /// romaji, then an initial or a model name), each time; a word it knows
+    /// (`PayPay`, `iPhone`) or a name written so costs nothing.
+    pub camel: f64,
+    /// A number with a unit of two letters or more after it (`10cm`,
+    /// `53kg`, `1st`: `UNITS`) as a Latin word of this frequency (0: none),
+    /// so that the romaji after it starts after the unit (10cm + いじょう,
+    /// not 10c + みじょう). One-letter units are left out: `3gatsu` is 3がつ.
+    pub unit: f64,
+    /// A run of `w` after Japanese that ends the input or comes before a
+    /// non-letter (a laugh: `ねw`, `なあwww`) as Japanese, in place of
+    /// `leftover` for each (0: no laugh, its letters left over).
+    pub laugh: f64,
     /// The frequency of a name of the names dictionary of weight 1 among
     /// Latin words (its weight scales it).
     pub name: f64,
@@ -97,6 +111,10 @@ pub struct MixedParams {
     /// The frequency among Latin words such a word needs: a rarer one
     /// (`furq`, `chk`) is likelier a slip of the romaji around it.
     pub letter_word_floor: f64,
+    /// The frequency a two-letter word needs to be such a word (`ok` おk,
+    /// `id` いd, `up` うp), well above `letter_word_floor`: a vowel and a
+    /// slip's letter make one as easily (0: none).
+    pub letter_word_floor2: f64,
     /// With the reading lexicon: a Latin word the model knows that romaji
     /// reads wholly as kana (`issue` いっすえ) is English inside Japanese
     /// when its kana cost as Japanese (the lexicon's cheapest words over
@@ -108,6 +126,11 @@ pub struct MixedParams {
     /// The kana each side of the word the lexicon reads it with (0: the
     /// whole Japanese span).
     pub kana_word_window: f64,
+    /// Romaji still being typed that starts only a small kana's own
+    /// spelling (`x`, `l`: xa, ltu): how rarely a writer types one so (っ
+    /// is a doubled consonant), so that `max` being typed reads as English
+    /// while it is typed, as it does once typed (Enter keeps what showed).
+    pub pending_small: f64,
 }
 
 impl Default for MixedParams {
@@ -125,20 +148,25 @@ impl Default for MixedParams {
             symbol: 3.0,
             digit: 1.0,
             case_break: 8.0,
+            camel: 0.0,
+            unit: 0.0,
+            laugh: 0.0,
             name: 1e-4,
             sentence: 1.0,
             oov: 0.0,
             letter_word: 4.0,
             letter_word_floor: 4e-5,
+            letter_word_floor2: 0.0,
             kana_word: 8.0,
             kana_word_floor: 4e-5,
             kana_word_window: 4.0,
+            pending_small: 0.0,
         }
     }
 }
 
 impl MixedParams {
-    pub const NAMES: [&'static str; 20] = [
+    pub const NAMES: [&'static str; 25] = [
         "switch_in",
         "switch_out",
         "en_en",
@@ -151,14 +179,19 @@ impl MixedParams {
         "symbol",
         "digit",
         "case_break",
+        "camel",
+        "unit",
+        "laugh",
         "name",
         "sentence",
         "oov",
         "letter_word",
         "letter_word_floor",
+        "letter_word_floor2",
         "kana_word",
         "kana_word_floor",
         "kana_word_window",
+        "pending_small",
     ];
 
     pub fn field(&mut self, name: &str) -> Option<&mut f64> {
@@ -175,14 +208,19 @@ impl MixedParams {
             "symbol" => &mut self.symbol,
             "digit" => &mut self.digit,
             "case_break" => &mut self.case_break,
+            "camel" => &mut self.camel,
+            "unit" => &mut self.unit,
+            "laugh" => &mut self.laugh,
             "name" => &mut self.name,
             "sentence" => &mut self.sentence,
             "oov" => &mut self.oov,
             "letter_word" => &mut self.letter_word,
             "letter_word_floor" => &mut self.letter_word_floor,
+            "letter_word_floor2" => &mut self.letter_word_floor2,
             "kana_word" => &mut self.kana_word,
             "kana_word_floor" => &mut self.kana_word_floor,
             "kana_word_window" => &mut self.kana_word_window,
+            "pending_small" => &mut self.pending_small,
             _ => return None,
         })
     }
@@ -679,19 +717,26 @@ impl MixedModel {
                         UnitKind::Kana(_) => false,
                     })
                     .map(|u| span.start + u.start)
+                    // a laugh after Japanese (`ねw`, `だよww`), not the end
+                    // of a word (`new`): no English word ends so after kana
+                    .filter(|&l| !trailing_laugh(&chars, span.start, l))
                     .collect();
+                let two = self.params.letter_word_floor2 > 0.0;
                 for &l in &left {
                     for a in l.saturating_sub(14).max(span.start)..=l {
-                        for b in (a + 3).max(l + 1)..=(a + 15).min(span.end) {
+                        let shortest = if two { 2 } else { 3 };
+                        for b in (a + shortest).max(l + 1)..=(a + 15).min(span.end) {
                             if !chars[a..b].iter().all(|c| c.is_ascii_alphabetic()) {
                                 break;
                             }
                             let word: String =
                                 chars[a..b].iter().map(|c| c.to_ascii_lowercase()).collect();
-                            if !self
-                                .known(&word)
-                                .is_some_and(|f| f >= self.params.letter_word_floor)
-                            {
+                            let floor = if b - a == 2 {
+                                self.params.letter_word_floor2
+                            } else {
+                                self.params.letter_word_floor
+                            };
+                            if !self.known(&word).is_some_and(|f| f >= floor) {
                                 continue;
                             }
                             let mut mask = vec![None; chars.len()];
@@ -865,12 +910,15 @@ impl MixedModel {
                 };
                 let part = &chars[start..seg_end];
                 let costs: &Vec<(usize, f64, f64)> = match read {
-                    1 => {
-                        after_latin.get_or_insert_with(|| self.ja_costs(part, seg_fin, ['@', '@']))
-                    }
-                    2 => after_context
-                        .get_or_insert_with(|| self.ja_costs(part, seg_fin, context_kana)),
-                    _ => fresh.get_or_insert_with(|| self.ja_costs(part, seg_fin, ['^', '^'])),
+                    1 => after_latin.get_or_insert_with(|| {
+                        self.ja_costs(part, seg_fin, seg_end == n, ['@', '@'])
+                    }),
+                    2 => after_context.get_or_insert_with(|| {
+                        self.ja_costs(part, seg_fin, seg_end == n, context_kana)
+                    }),
+                    _ => fresh.get_or_insert_with(|| {
+                        self.ja_costs(part, seg_fin, seg_end == n, ['^', '^'])
+                    }),
                 };
                 for &(len, cost, to_latin) in costs {
                     let end = start + len;
@@ -1168,7 +1216,14 @@ impl MixedModel {
     /// For every `end` (1..=len): the cost of `chars[..end]` as Japanese,
     /// and of a Latin word right after it. The kana are read on from `ctx`
     /// (`^` a reading's start, `@` a Latin word).
-    fn ja_costs(&self, chars: &[char], fin: bool, ctx: [char; 2]) -> Vec<(usize, f64, f64)> {
+    /// `last`: `chars` runs to the end of the input (not to a space).
+    fn ja_costs(
+        &self,
+        chars: &[char],
+        fin: bool,
+        last: bool,
+        ctx: [char; 2],
+    ) -> Vec<(usize, f64, f64)> {
         let p = &self.params;
         let units = romaji_units(chars, fin);
         let mut out = Vec::with_capacity(chars.len());
@@ -1176,6 +1231,9 @@ impl MixedModel {
         let mut cost = 0.0;
         let mut pos = 0;
         let mut left_over = 0usize;
+        // kana read so far: a lone `w` is a laugh after a word or more of
+        // them (けどねw), not after one (`how`: ほ + w)
+        let mut kana_seen = 0usize;
         for unit in units {
             let to_latin = self.tables.kana_cost(ctx[0], ctx[1], '@');
             // An end inside this unit leaves its letters unread.
@@ -1188,7 +1246,27 @@ impl MixedModel {
                 step
             };
             cost += match unit.kind {
-                UnitKind::Kana(kana) => kana.chars().map(&mut add).sum(),
+                UnitKind::Kana(kana) => {
+                    kana_seen += kana.chars().count();
+                    kana.chars().map(&mut add).sum()
+                }
+                // a laugh after Japanese (`ねw`, `なあwww`, whose first w
+                // reads っ): one cost for the run, as typed
+                _ if p.laugh > 0.0
+                    && (fin || unit.end < chars.len())
+                    && chars[unit.start].eq_ignore_ascii_case(&'w')
+                    && trailing_laugh(chars, 0, unit.start)
+                    && laugh_ends(chars, unit.start, last)
+                    && (kana_seen >= 2 || laugh_run(chars, unit.start) >= 2) =>
+                {
+                    let first =
+                        unit.start == 0 || !chars[unit.start - 1].eq_ignore_ascii_case(&'w');
+                    if first {
+                        p.laugh
+                    } else {
+                        0.0
+                    }
+                }
                 UnitKind::Char(c) if c.is_ascii_alphabetic() => {
                     left_over += 1;
                     p.leftover + p.leftover_more * (left_over - 1) as f64
@@ -1215,7 +1293,8 @@ impl MixedModel {
                         .into_iter()
                         .map(|k| (-self.tables.kana_cost(ctx[0], ctx[1], k)).exp())
                         .sum();
-                    -odds.max(f64::MIN_POSITIVE).ln()
+                    let small = typed.starts_with(['x', 'l', 'X', 'L']);
+                    -odds.max(f64::MIN_POSITIVE).ln() + if small { p.pending_small } else { 0.0 }
                 }
             };
             out.push((unit.end, cost, self.tables.kana_cost(ctx[0], ctx[1], '@')));
@@ -1308,12 +1387,12 @@ impl MixedModel {
             .names
             .get(&piece.lower)
             .is_some_and(|(name, _, _)| *name == piece.typed);
-        let breaks = if written {
-            0.0
-        } else {
-            p.case_break * piece.breaks as f64
-        };
         if piece.digits {
+            let breaks = if written {
+                0.0
+            } else {
+                p.case_break * piece.breaks as f64
+            };
             return breaks + p.digit * piece.lower.len() as f64;
         }
         let (known, letters) = if prefix {
@@ -1322,13 +1401,40 @@ impl MixedModel {
             let end = self.tables.letters_cost(piece.ctx[0], piece.ctx[1], '$');
             (self.known(&piece.lower).unwrap_or(0.0), piece.letters + end)
         };
+        let known = if p.unit > 0.0 && number_unit(&piece.typed, prefix) {
+            known.max(p.unit)
+        } else {
+            known
+        };
         let prob = p.known * known + (1.0 - p.known) * (-letters).exp();
         let oov = if known == 0.0 && !piece.typed.chars().any(|c| c.is_ascii_uppercase()) {
             p.oov
         } else {
             0.0
         };
-        breaks + oov - prob.max(f64::MIN_POSITIVE).ln()
+        // A word as it is written (a name of the names dictionary) has no
+        // case break: those count against romaji and an acronym run
+        // together (`gaDJ`, `kunoTsama`). Nor has a word the model knows
+        // written as `iOS`, `eSIM` (an `i` or `e` before capitals: another
+        // known word typed so, `toSS` for toss, is romaji and an acronym), or
+        // camel-cased (`PayPay`, `iPhone`).
+        let typed = piece.typed.as_bytes();
+        let ie =
+            typed.len() >= 3 && matches!(typed[0], b'i' | b'e') && typed[1].is_ascii_uppercase();
+        let breaks = if written || known > 0.0 && ie {
+            0.0
+        } else {
+            p.case_break * piece.breaks as f64
+        };
+        let camel = if written || known > 0.0 {
+            0.0
+        } else {
+            // a capital ending the word after lowercase (`kunoT` + さま)
+            let end =
+                !prefix && piece.last[0].is_ascii_lowercase() && piece.last[1].is_ascii_uppercase();
+            p.camel * (piece.camel + usize::from(end)) as f64
+        };
+        breaks + camel + oov - prob.max(f64::MIN_POSITIVE).ln()
     }
 
     /// The frequency of the words starting with `prefix` (lowercase).
@@ -1623,6 +1729,8 @@ struct Piece {
     last: [char; 2],
     breaks: usize,
     s_break: bool,
+    /// Lowercase, a capital, then lowercase or a digit (`oTs`, `oG1`).
+    camel: usize,
 }
 
 impl Piece {
@@ -1657,6 +1765,12 @@ impl Piece {
             && c.is_ascii_uppercase()
         {
             self.breaks += 1;
+        }
+        if self.last[0].is_ascii_lowercase()
+            && self.last[1].is_ascii_uppercase()
+            && (c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            self.camel += 1;
         }
         self.last = [self.last[1], c];
         self.digits &= c.is_ascii_digit();
@@ -2200,6 +2314,72 @@ pub fn render_parts(
     (text, pending)
 }
 
+/// Units a number is written with, of two letters or more (lowercase).
+const UNITS: &[&str] = &[
+    "cm", "mm", "km", "nm", "kg", "mg", "ml", "dl", "kb", "mb", "gb", "tb", "kbps", "mbps", "gbps",
+    "hz", "khz", "mhz", "ghz", "kw", "kwh", "mah", "px", "pt", "dpi", "fps", "st", "nd", "rd",
+    "th", "kcal", "ppm", "db", "lb", "lbs", "oz", "ft", "mph", "ms", "sec", "min",
+];
+
+/// Units written otherwise than in lowercase.
+const CASED_UNITS: &[&str] = &[
+    "KB", "MB", "GB", "TB", "Hz", "kHz", "MHz", "GHz", "kWh", "mAh", "dB",
+];
+
+/// Whether `word` (as typed) is digits and then one of `UNITS` in lowercase
+/// or one of `CASED_UNITS` as written (or, being typed, the start of one):
+/// `10cm`, `1st`, `16GB`, `53k` on the way to `53kg`; not `11Ms` (an
+/// initial, then romaji) nor `2Db`.
+fn number_unit(word: &str, prefix: bool) -> bool {
+    let letters = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    if letters.len() == word.len() || letters.is_empty() {
+        return false;
+    }
+    let fits =
+        |u: &str| u == letters || prefix && u.len() > letters.len() && u.starts_with(letters);
+    UNITS.iter().any(|u| fits(u)) || CASED_UNITS.iter().any(|u| fits(u))
+}
+
+/// Whether the letter at `at` is in a run of `w` that ends the input or comes
+/// before a non-letter (a laugh: no romaji goes on from it), after Japanese
+/// romaji of the span starting at `start`.
+fn trailing_laugh(chars: &[char], start: usize, at: usize) -> bool {
+    let is_w = |c: &char| c.eq_ignore_ascii_case(&'w');
+    if !is_w(&chars[at]) {
+        return false;
+    }
+    let end = (at..chars.len())
+        .find(|&j| !is_w(&chars[j]))
+        .unwrap_or(chars.len());
+    let first = (start..=at)
+        .rev()
+        .take_while(|&i| is_w(&chars[i]))
+        .last()
+        .unwrap_or(at);
+    first > start && chars.get(end).is_none_or(|c| !c.is_ascii_alphabetic())
+}
+
+/// The length of the run of `w` the letter at `at` is in.
+fn laugh_run(chars: &[char], at: usize) -> usize {
+    let is_w = |j: &usize| chars[*j].eq_ignore_ascii_case(&'w');
+    let end = (at..chars.len()).find(|j| !is_w(j)).unwrap_or(chars.len());
+    let start = (0..=at).rev().take_while(is_w).last().unwrap_or(at);
+    end - start
+}
+
+/// Whether the run of `w` at `at` ends the input (`chars` being its `last`
+/// part) or a sentence's part (`,` `.` `!` `?`): a laugh there, where before
+/// a space English goes on (`How are you`).
+fn laugh_ends(chars: &[char], at: usize, last: bool) -> bool {
+    let end = (at..chars.len())
+        .find(|&j| !chars[j].eq_ignore_ascii_case(&'w'))
+        .unwrap_or(chars.len());
+    match chars.get(end) {
+        None => last,
+        Some(c) => matches!(c, ',' | '.' | '!' | '?'),
+    }
+}
+
 /// The chars of `part` in a laugh: two `w` or more that no romaji goes on
 /// from (the end, a space, a symbol after them), as typed (`ww`, not っw);
 /// a vowel typed after makes them romaji again (`wwa`, っわ).
@@ -2346,7 +2526,7 @@ pub(crate) mod tests {
     fn a_sentence_after_another_starts_over() {
         let m = model();
         let cost = |s: &str| {
-            m.ja_costs(&s.chars().collect::<Vec<_>>(), true, ['^', '^'])
+            m.ja_costs(&s.chars().collect::<Vec<_>>(), true, true, ['^', '^'])
                 .last()
                 .unwrap()
                 .1
@@ -2374,7 +2554,7 @@ pub(crate) mod tests {
     fn kana_after_an_english_word_read_on_from_it() {
         let m = model();
         let cost = |s: &str, ctx: [char; 2]| {
-            m.ja_costs(&s.chars().collect::<Vec<_>>(), true, ctx)
+            m.ja_costs(&s.chars().collect::<Vec<_>>(), true, true, ctx)
                 .last()
                 .unwrap()
                 .1
@@ -2691,6 +2871,46 @@ pub(crate) mod tests {
         let mut off = MixedModel::load(&dir).unwrap();
         off.params.letter_word = 0.0;
         assert_eq!(cased(&off, "sorehabugdesu", None), "それはぶgです");
+        // a laugh after Japanese is no word's last letter (ね + w, not new)
+        assert_eq!(
+            cased(&m, "hanasenaindesukedonew", None),
+            "はなせないんですけどねw"
+        );
+    }
+
+    /// The shipped model's weights of 2026-11-24: a two-letter word a slip
+    /// would leave a letter of, a number's unit, romaji and an initial run
+    /// together, a laugh, a word written `iOS`; and `max` read as English
+    /// while it is typed, as Enter reads it.
+    #[test]
+    fn the_shipped_model_reads_units_short_words_initials_and_laughs() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/mixed");
+        let m = MixedModel::load(&dir).unwrap();
+        for (typed, want) in [
+            ("ryouupmoshi", "りょうupもし"),
+            ("itametejunbiokdesu", "いためてじゅんびOKです"),
+            ("10cmijou", "10cmいじょう"),
+            ("53kgattatte", "53kgあったって"),
+            ("1starubamu", "1stあるばむ"),
+            ("kunoTsama", "くのTさま"),
+            ("mangaMee", "まんがMee"),
+            ("karintoG11", "かりんとG11"),
+            ("appude-tohaiOSbann", "あっぷでーとはiOSばん"),
+            ("tanaawww", "たなあwww"),
+            // an initial and romaji, not a unit (`ms`)
+            ("11Mshiha", "11Mしは"),
+        ] {
+            assert_eq!(cased(&m, typed, None), want, "{typed}");
+        }
+        // a lone w after one kana stays a word's (`how`)
+        assert_eq!(cased(&m, "how are you", None), "How are you");
+        // `max` being typed: English already, as Enter reads it
+        let (spans, _) = m.segment_masked("zokudomax", None, false, None);
+        assert_eq!(
+            spans.last().map(|s| (s.lang, s.start, s.end)),
+            Some((Lang::En, 6, 9)),
+            "{spans:?}"
+        );
     }
 
     /// A word romaji reads wholly as kana is English where the lexicon
