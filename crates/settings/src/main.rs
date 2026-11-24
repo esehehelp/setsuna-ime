@@ -66,9 +66,14 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
 /// their downloads) and its crash dumps, 120 MB on a PC where nothing turned
 /// them off. Gone before the webview starts (one settings window at a time:
 /// no browser process of ours has them open); the profile and the shader
-/// cache stay.
+/// cache stay. Not when elevated: the folder is the user's to write, and a
+/// link put in it would take the delete elsewhere with an administrator's
+/// rights.
 #[cfg(windows)]
 fn prune_webview_data(dir: &std::path::Path) {
+    if setsuna_core::config::process_is_elevated() {
+        return;
+    }
     let web = dir.join("EBWebView");
     for sub in [
         "Crashpad",

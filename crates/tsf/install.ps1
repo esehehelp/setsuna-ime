@@ -594,7 +594,7 @@ function Remove-StaleFiles {
 
     # a file this install keeps that an install before left to be deleted at
     # the restart (in use then; the same build installed again has its name)
-    $pendingDeletes = if (Test-IsAdmin) { Undo-RestartDeletes $keepSet } else { $null }
+    $pendingDeletes = if (Test-IsAdmin) { Undo-RestartDeletes $keepSet $InstallDir } else { $null }
 
     $stale = @(Get-ChildItem -LiteralPath $InstallDir -File | Where-Object {
         $_.Name -match '^(setsuna_tsf|setsuna_tsf_shim|setsuna-tsf-check|setsuna-engine|setsuna-rewrite|onnxruntime)_[0-9a-f]{12}\.(dll|exe)$' -or
@@ -647,10 +647,13 @@ function Remove-StaleFiles {
 
 # The deletes at the restart (`Remove-AtRestart`: PendingFileRenameOperations,
 # pairs of a path and where it goes, nothing for a delete) of the files in
-# $Keep taken back; every other pair stays as it is. The paths still to be
-# deleted (a set), so that none is put in twice.
-function Undo-RestartDeletes($Keep) {
+# $Keep under $Dir taken back (only there: a path config.toml names is the
+# user's to write, and another program's delete is not this install's to take
+# back); every other pair stays as it is. The paths still to be deleted (a
+# set), so that none is put in twice.
+function Undo-RestartDeletes($Keep, [string]$Dir) {
     $pending = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $under = [IO.Path]::GetFullPath($Dir).TrimEnd('\') + '\'
     $key = 'SYSTEM\CurrentControlSet\Control\Session Manager'
     $name = 'PendingFileRenameOperations'
     $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($key, $true)
@@ -663,7 +666,7 @@ function Undo-RestartDeletes($Keep) {
         for ($i = 0; $i -lt $ops.Count; $i += 2) {
             $path = $ops[$i] -replace '^\\\?\?\\', ''
             $delete = $ops[$i + 1] -eq '' -and $ops[$i].StartsWith('\??\')
-            if ($delete -and $Keep.Contains($path)) {
+            if ($delete -and $Keep.Contains($path) -and $path.StartsWith($under, [StringComparison]::OrdinalIgnoreCase)) {
                 $undone += $path
                 continue
             }
@@ -1477,6 +1480,9 @@ if (-not $NoElevate) {
 $InstalledFiles = @($CoreInstalled, $ShimInstalled, $CheckInstalled, $EngineInstalled, $RewriteInstalled, $RerankInstalled,
                     $RerankManifestInstalled, $InstalledManifest, $LexiconInstalled, $AnalyzerInstalled, $NamesInstalled,
                     $CorrectorInstalled)
+# the install's own files too: an uninstall before left the settings GUI it
+# found open to be deleted at the restart, which would take the new one
+$InstalledFiles += @($SettingsExe, 'uninstall.ps1', 'core.txt', 'installed.toml' | ForEach-Object { Join-Path $InstallDir $_ })
 $InstalledFiles += @($ArtifactFiles | ForEach-Object { Join-Path $ModelDstDir $_ })
 # the reading corrector's files, one by one (an earlier package's other file beside them goes)
 if ($CorrectorInstalled) {
