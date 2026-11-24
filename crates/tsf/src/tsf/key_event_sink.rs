@@ -900,8 +900,10 @@ pub(crate) struct Field {
     /// Marked private: no context, no rewrite, nothing learned.
     pub private: bool,
     /// Starts with the IME off, as Mozc's `tip_input_mode_manager` does
-    /// (a URL, an e-mail address, a number, a phone number, a time,
-    /// half-width alphanumerics): the user may turn it on there.
+    /// (an e-mail address, a number, a phone number, a time, half-width
+    /// alphanumerics): the user may turn it on there. Not a URL's, a field
+    /// like any other: a browser's address bar is one (Firefox's for an
+    /// input method it does not know), where a search is typed in Japanese.
     pub starts_off: bool,
     /// A password or a PIN: the IME never composes there (it starts off
     /// too, and keys go to the app even when the user turns it on).
@@ -919,8 +921,7 @@ fn field_of(scopes: &[InputScope]) -> Field {
         || scopes.iter().any(|s| {
             matches!(
                 *s,
-                IS_URL
-                    | IS_EMAIL_USERNAME
+                IS_EMAIL_USERNAME
                     | IS_EMAIL_SMTPEMAILADDRESS
                     | IS_NUMBER
                     | IS_DIGITS
@@ -1125,9 +1126,11 @@ mod tests {
     }
 
     #[test]
-    fn a_url_field_starts_off_a_password_field_never_composes() {
-        let url = field_of(&[IS_URL]);
-        assert!(url.starts_off && !url.secret && !url.private);
+    fn a_url_field_is_any_other_a_password_field_never_composes() {
+        // a browser's address bar
+        assert_eq!(field_of(&[IS_URL]), Field::default());
+        let email = field_of(&[IS_EMAIL_SMTPEMAILADDRESS]);
+        assert!(email.starts_off && !email.secret && !email.private);
         let password = field_of(&[IS_PASSWORD]);
         assert!(password.starts_off && password.secret && password.private);
         let pin = field_of(&[IS_DEFAULT, IS_NUMERIC_PIN]);

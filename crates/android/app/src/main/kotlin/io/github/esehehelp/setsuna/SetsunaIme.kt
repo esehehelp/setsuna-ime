@@ -95,6 +95,9 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
 
     /** The IME is on (the session's view says). */
     private var enabled = true
+
+    /** The IME was turned off by the field focused ([startField]), not by the user. */
+    private var autoOff = false
     private var root: LinearLayout? = null
     private var preview: KeyPreview? = null
 
@@ -197,8 +200,9 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         selStart = selectionStart(attribute.initialSelStart, attribute.initialSelEnd).coerceAtLeast(0)
         editorInfo = attribute
         field = fieldOf(attribute)
-        // a field of no personalized learning is one whatever its kind (an email field marked so is direct too)
-        secret = field == Native.FIELD_PRIVATE || isPassword(attribute) ||
+        // a field of no personalized learning is one whatever its kind (an email field marked so
+        // too); an e-mail address's, private to the IME, still offers the clipboard
+        secret = isPassword(attribute) ||
             (attribute.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
         // the field's text before the caret comes with it (API 30): nothing to ask the app;
         // never read from a password, a private field or another the IME leaves alone
@@ -211,6 +215,24 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         beforeAsked = -1
         fieldCount++
         if (h != 0L) timed("configure") { Native.configure(h, attribute.packageName ?: "") }
+        // the same field again (an app restarting its input) keeps what the user typed in
+        if (h != 0L && !restarting) startField(startsOff(attribute))
+    }
+
+    /**
+     * The IME off for a field that starts so ([startsOff]: an e-mail address), on again for the
+     * next that does not when it was this that turned it off; a switch the user makes meanwhile
+     * stands, as the TSF DLL does with a field's input scopes.
+     */
+    private fun startField(off: Boolean) {
+        val on = JSONObject(Native.view(h) ?: return).optBoolean("enabled", true)
+        if (off && on) {
+            Native.toggle(h)
+            autoOff = true
+        } else if (!off && autoOff) {
+            autoOff = false
+            if (!on) Native.toggle(h)
+        }
     }
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
@@ -396,6 +418,8 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
     override fun onMode(mode: KeyboardView.Mode) {
         if (h == 0L) return
         val on = mode != KeyboardView.Mode.EN
+        // the user's choice: leaving the field keeps it
+        autoOff = false
         if (enabled != on) {
             Native.toggle(h)
             render()
@@ -626,11 +650,6 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
         /** The chars of left context kept before the caret. */
         private const val BEFORE = 64
 
-        /**
-         * What a field is to the IME: a password, a URL, an e-mail address
-         * or a number takes keys as they are (as the input scopes do on
-         * Windows); one that asks for no learning gets none.
-         */
         /** Where a selection starts in the text: its anchor or its end, whichever comes first (-1 unknown). */
         fun selectionStart(start: Int, end: Int): Int = if (end in 0 until start) end else start
 
@@ -649,30 +668,39 @@ class SetsunaIme : InputMethodService(), Native.Listener, KeyboardView.Listener 
             }
         }
 
+        /**
+         * What a field is to the IME: a password, a number or a field of no
+         * type takes keys as they are; an e-mail address starts off and is not
+         * learned (as the input scopes do on Windows); one that asks for no
+         * learning gets none.
+         */
         fun fieldOf(info: EditorInfo): Int {
             val cls = info.inputType and InputType.TYPE_MASK_CLASS
-            val variation = info.inputType and InputType.TYPE_MASK_VARIATION
             if (cls == InputType.TYPE_NULL) return Native.FIELD_DIRECT
             if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE ||
                 cls == InputType.TYPE_CLASS_DATETIME
             ) {
                 return Native.FIELD_DIRECT
             }
-            if (cls == InputType.TYPE_CLASS_TEXT && variation in setOf(
-                    InputType.TYPE_TEXT_VARIATION_PASSWORD,
-                    InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
-                    InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD,
-                    InputType.TYPE_TEXT_VARIATION_URI,
-                    InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
-                    InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS,
-                )
-            ) {
-                return Native.FIELD_DIRECT
-            }
-            if ((info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0) {
+            if (isPassword(info)) return Native.FIELD_DIRECT
+            // an e-mail address starts off ([startsOff]), Japanese typed there when the user
+            // turns it on is not learned, as in the TSF DLL
+            if (startsOff(info) || (info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0) {
                 return Native.FIELD_PRIVATE
             }
+            // a URL's too is like any other: a browser's address bar is one (Chrome's,
+            // Firefox's), where a search is typed in Japanese
             return Native.FIELD_NORMAL
+        }
+
+        /** A field the IME starts off in, the user may turn it on there: an e-mail address. */
+        fun startsOff(info: EditorInfo): Boolean {
+            val cls = info.inputType and InputType.TYPE_MASK_CLASS
+            val variation = info.inputType and InputType.TYPE_MASK_VARIATION
+            return cls == InputType.TYPE_CLASS_TEXT && variation in setOf(
+                InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
+                InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS,
+            )
         }
     }
 }

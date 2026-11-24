@@ -66,7 +66,7 @@ pub enum Field {
     Normal,
     /// No context, no rewrite, nothing learned.
     Private,
-    /// Direct input: a URL, an e-mail address, a number, a password, ...
+    /// Direct input: an e-mail address, a number, a password, ...
     /// Keys go to the app.
     Direct,
 }

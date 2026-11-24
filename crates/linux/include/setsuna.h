@@ -79,7 +79,7 @@ int setsuna_session_configure_app(SetsunaSession *s, const char *program);
 /* What the field typed into is (setsuna_session_key's `field`). */
 #define SETSUNA_FIELD_NORMAL 0u
 #define SETSUNA_FIELD_PRIVATE 1u /* no context, no rewrite, nothing learned */
-#define SETSUNA_FIELD_DIRECT 2u  /* a URL, a number, a password: keys go to the app */
+#define SETSUNA_FIELD_DIRECT 2u  /* an e-mail address, a number, a password: keys go to the app */
 
 /* A key press (X keysym, X keycode, SETSUNA_MOD_*) typed into `field`, with
  * `before_caret` the app's text before the caret (NULL when unknown): a key

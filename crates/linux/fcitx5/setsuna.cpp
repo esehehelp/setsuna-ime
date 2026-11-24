@@ -423,15 +423,16 @@ private:
     }
 
     /* What the field is, from the client's hints, as the TSF DLL reads input
-     * scopes (Mozc's list): a URL, an e-mail address, a number, a phone
-     * number, a date or time, alphanumerics or a password take direct input;
-     * a sensitive one (a private window) is private. */
+     * scopes (Mozc's list): an e-mail address, a number, a phone number, a
+     * date or time, alphanumerics or a password take direct input; a
+     * sensitive one (a private window) is private. A URL's is like any
+     * other: a browser's address bar is one, where a search is typed in
+     * Japanese. */
     static uint32_t field(InputContext *ic) {
         const auto caps = ic->capabilityFlags();
-        for (auto flag : {CapabilityFlag::Url, CapabilityFlag::Email, CapabilityFlag::Digit,
-                          CapabilityFlag::Number, CapabilityFlag::Dialable,
-                          CapabilityFlag::Date, CapabilityFlag::Time, CapabilityFlag::Alpha,
-                          CapabilityFlag::Password}) {
+        for (auto flag : {CapabilityFlag::Email, CapabilityFlag::Digit, CapabilityFlag::Number,
+                          CapabilityFlag::Dialable, CapabilityFlag::Date, CapabilityFlag::Time,
+                          CapabilityFlag::Alpha, CapabilityFlag::Password}) {
             if (caps.test(flag)) {
                 return SETSUNA_FIELD_DIRECT;
             }

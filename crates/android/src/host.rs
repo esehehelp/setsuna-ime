@@ -108,7 +108,7 @@ fn the_one(dir: &Path, pick: impl Fn(&Path) -> Option<PathBuf>) -> Option<PathBu
 pub const FIELD_NORMAL: i32 = 0;
 /// No context, no rewrite, nothing learned (`IME_FLAG_NO_PERSONALIZED_LEARNING`).
 pub const FIELD_PRIVATE: i32 = 1;
-/// Direct input (a password, a URL, an e-mail address, a number): keys that
+/// Direct input (a password, a number, a field of no type): keys that
 /// would start a composition go to the app.
 pub const FIELD_DIRECT: i32 = 2;
 
