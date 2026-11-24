@@ -1155,7 +1155,8 @@ mod tests {
         assert_eq!((r.reading.as_deref(), r.analyze), (Some("きょう"), None));
         // a manifest that is not there: loading, then its error
         let slot = AnalyzerSlot::new(PathBuf::from("no such analyzer.json"));
-        assert_eq!(slot.get().err().as_deref(), Some("analyzer loading"));
+        // loading, or failed already (the loader may be that quick)
+        assert!(slot.get().is_err());
         let t0 = Instant::now();
         while slot.get().err().as_deref() == Some("analyzer loading") {
             assert!(t0.elapsed() < Duration::from_secs(10));

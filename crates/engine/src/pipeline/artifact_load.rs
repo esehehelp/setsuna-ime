@@ -39,7 +39,7 @@ pub fn load(manifest: &CtcNatManifest) -> Result<(SharedCharTokenizer, Model)> {
         )
     })?;
     let encoder = NativeEncoder::load(path)?;
-    let c = &encoder.config;
+    let c = encoder.config();
     let ar = manifest
         .ar_decoder
         .as_ref()

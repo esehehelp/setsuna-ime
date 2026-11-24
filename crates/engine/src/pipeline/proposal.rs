@@ -233,16 +233,21 @@ impl ProposalRunner {
         let is_peaked = reduce.lse == (crate::pipeline::lse::peaked as fn(&[f32]) -> f32);
         if is_peaked {
             let (mut ids, mask, actual) = encoded;
+            anyhow::ensure!(
+                ids.len() >= actual,
+                "{} ids for an input of {actual}",
+                ids.len()
+            );
             ids.truncate(actual);
             anyhow::ensure!(
                 mask.len() >= actual && mask[..actual].iter().all(|&m| m == 1),
                 "the native encoder takes a row without padding"
             );
             anyhow::ensure!(
-                self.encoder.config.vocab == vocab && self.encoder.logit_width() == Some(vocab),
+                self.encoder.config().vocab == vocab && self.encoder.logit_width() == Some(vocab),
                 "native encoder logits {:?} wide over {} tokens, the tokenizer's vocabulary {} (columns {vocab})",
                 self.encoder.logit_width(),
-                self.encoder.config.vocab,
+                self.encoder.config().vocab,
                 vocab
             );
             anyhow::ensure!(
@@ -453,10 +458,10 @@ impl ProposalRunner {
         );
         // the logits a column a vocabulary id, or (a head cut to `logit_ids`) a column an id of those
         anyhow::ensure!(
-            enc.config.vocab == tokenizer.vocab_size() && enc.logit_width() == Some(width),
+            enc.config().vocab == tokenizer.vocab_size() && enc.logit_width() == Some(width),
             "native encoder logits {:?} wide over {} tokens, the tokenizer's vocabulary {} (columns {width})",
             enc.logit_width(),
-            enc.config.vocab,
+            enc.config().vocab,
             tokenizer.vocab_size()
         );
         anyhow::ensure!(

@@ -888,7 +888,9 @@ fn lap(p: &mut Option<Profile>, part: usize) {
 
 /// The encoder's weights, prepacked.
 pub struct NativeEncoder {
-    pub config: EncoderConfig,
+    /// Read only ([`NativeEncoder::config`]): the kernels index the weights
+    /// by the sizes checked against them when loaded.
+    config: EncoderConfig,
     profile: Option<Profile>,
     isa: Isa,
     /// the input rows: the token embedding, or the tied head's rows
@@ -913,6 +915,11 @@ pub fn read(path: &Path) -> Result<(EncoderConfig, Weights)> {
 }
 
 impl NativeEncoder {
+    /// The config the weights were loaded and checked by.
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let (config, weights) = read(path)?;
         Self::new(config, &weights).with_context(|| format!("native encoder {}", path.display()))
@@ -1043,6 +1050,16 @@ impl NativeEncoder {
                     && ple.projs.iter().all(|p| (p.k(), p.n()) == (ple.c.dim, d)),
                 "the PLE gates are not ({d}, {d}) or its projections ({}, {d})",
                 ple.c.dim
+            );
+            // the lookup is quantized once for every projection (`encode_q4g`):
+            // in groups of one size
+            let groups = |l: &Linear| match l {
+                Linear::Q4g(q) => Some(q.w.g()),
+                _ => None,
+            };
+            anyhow::ensure!(
+                ple.projs.iter().all(|p| groups(p) == groups(&ple.projs[0])),
+                "the PLE projections are not quantized in groups of one size"
             );
         }
         let output = match (&c.decoder, &c.ar) {
