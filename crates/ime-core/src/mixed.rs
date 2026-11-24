@@ -1690,7 +1690,8 @@ fn lone_i(chars: &[char], spans: &mut [Span]) {
 /// The ranges of `chars` never read as romaji (Meltype's protected spans, as
 /// an idea): a URL (`https://…`, `www.…`), an e-mail address, a `@mention`,
 /// a path (`C:\…`, `C:/…`, `\\host`, `~/…`, `./…`, `../…`, `/a/b`) with a
-/// letter or digit in it, each from a word's start to the next space.
+/// letter or digit in it (of any script), each from a word's start to the
+/// next space.
 pub fn protected_ranges(chars: &[char]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1733,7 +1734,7 @@ pub fn protected_ranges(chars: &[char]) -> Vec<(usize, usize)> {
         // a path names something: slashes alone (`///`, the slash key
         // typing ・ three times) are Japanese symbols
         let path = drive
-            || word.chars().any(|c| c.is_ascii_alphanumeric())
+            || word.chars().any(char::is_alphanumeric)
                 && (word.starts_with("\\\\")
                     || word.starts_with("~/")
                     || word.starts_with("./")
@@ -2803,6 +2804,10 @@ pub(crate) mod tests {
         assert_eq!(shown(&m, "///", None), "／／／");
         assert_eq!(shown(&m, "/a/b", None), "/a/b");
         assert_eq!(shown(&m, "../a", None), "../a");
+        for typed in ["/資料/メモ", "./あい"] {
+            let chars: Vec<char> = typed.chars().collect();
+            assert_eq!(protected_ranges(&chars), vec![(0, chars.len())], "{typed}");
+        }
     }
 
     #[test]

@@ -259,16 +259,19 @@ pub(crate) struct Tables {
     en_total: f64,
 }
 
+/// The u32 at `o`; 0 past the end (a block changed since it was checked
+/// gives wrong costs, never a panic).
 fn u32_at(b: &[u8], o: usize) -> u32 {
-    let mut a = [0; 4];
-    a.copy_from_slice(&b[o..o + 4]);
-    u32::from_le_bytes(a)
+    o.checked_add(4)
+        .and_then(|e| b.get(o..e))
+        .map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap_or_default()))
 }
 
+/// The u64 at `o`; 0 past the end (as `u32_at`).
 fn u64_at(b: &[u8], o: usize) -> u64 {
-    let mut a = [0; 8];
-    a.copy_from_slice(&b[o..o + 8]);
-    u64::from_le_bytes(a)
+    o.checked_add(8)
+        .and_then(|e| b.get(o..e))
+        .map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap_or_default()))
 }
 
 /// `at` plus `n` items of `size` bytes, where it stays within `len`.
@@ -427,7 +430,10 @@ impl Tables {
         let w = self.words;
         let from = u32_at(&self.bytes, w.offsets + 4 * i) as usize;
         let to = u32_at(&self.bytes, w.offsets + 4 * i + 4) as usize;
-        &self.bytes[w.text + from..w.text + to]
+        // none where the offsets are not what they were checked to be
+        self.bytes
+            .get(w.text + from..w.text + to)
+            .unwrap_or_default()
     }
 
     /// The first word index in `from..to` where `pred` turns false.
@@ -463,9 +469,10 @@ impl Tables {
         let from = self.partition_point(0, w.n, |x| x < p);
         let to = self.partition_point(from, w.n, |x| x.starts_with(p));
         let run = |at: usize, i: usize| u64_at(&self.bytes, at + 8 * i);
+        // running totals that fall (a damaged block) count none
         (
-            run(w.run_ja, to) - run(w.run_ja, from),
-            run(w.run_en, to) - run(w.run_en, from),
+            run(w.run_ja, to).saturating_sub(run(w.run_ja, from)),
+            run(w.run_en, to).saturating_sub(run(w.run_en, from)),
         )
     }
 
@@ -703,6 +710,17 @@ mod tests {
         let mut bad = block.clone();
         bad[0] ^= 1;
         assert!(Tables::from_vec(bad).is_err());
+        // what the check does not read: running totals that fall count
+        // none (the English ones last in the block)
+        let mut fallen = write(
+            &counts(&[("あ", 1)]),
+            &counts(&[]),
+            words(&[("a", 1, 1), ("b", 1, 1)]),
+        );
+        let end = fallen.len();
+        fallen[end - 8..].fill(0);
+        let t = Tables::from_vec(fallen).unwrap();
+        assert_eq!(t.prefix_counts("b"), (1, 0));
     }
 
     #[test]
