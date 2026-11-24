@@ -976,6 +976,83 @@ fn live(cases: &[Case], frontend: &setsuna_core::config::FrontendCfg, show: usiz
             100.0 * *p as f64 / *t as f64
         );
     }
+    enter_keeps(cases, frontend, show);
+}
+
+/// Whether Enter commits what typing showed last: the preedit before Enter
+/// but its trailing letters (romaji still being typed, or the English word
+/// being typed) is how the commit starts, case aside. `zokudomax` showing
+/// ぞくどまx and committing ぞくどmax does not (the shown ま went); かn
+/// committing かん does.
+fn enter_keeps(cases: &[Case], frontend: &setsuna_core::config::FrontendCfg, show: usize) {
+    let mut by_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut shown = 0;
+    for case in cases {
+        if case.typed.contains(' ') {
+            continue;
+        }
+        let mut bridge = new_bridge(frontend);
+        bridge.set_app_context(case.before.as_deref());
+        let mut last = String::new();
+        let mut committed = String::new();
+        for c in case.typed.chars() {
+            let outcome = match c {
+                'A'..='Z' => bridge.handle_shifted_alpha(c),
+                'a'..='z' | '0'..='9' | '-' => bridge.handle_char(c),
+                _ => {
+                    let kana = setsuna_core::config::SYMBOL_CHARS
+                        .iter()
+                        .find(|(_, ch)| *ch == c)
+                        .and_then(|(name, _)| frontend.symbols.get(*name).cloned())
+                        .unwrap_or_else(|| full_width(c).to_string());
+                    bridge.handle_punctuation(&kana)
+                }
+            };
+            for a in outcome.actions {
+                match a {
+                    Action::UpdatePreedit { text } => last = text,
+                    Action::Commit { text } => {
+                        committed.push_str(&text);
+                        last.clear();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let shown_before = committed.clone() + &last;
+        for a in bridge.handle_enter().actions {
+            if let Action::Commit { text } = a {
+                committed.push_str(&text);
+            }
+        }
+        let body = shown_before.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let keeps = committed.to_lowercase().starts_with(&body.to_lowercase());
+        let e = by_cat.entry(case.cat.as_str()).or_default();
+        e.1 += 1;
+        if keeps {
+            e.0 += 1;
+        } else if shown < show {
+            println!(
+                "  [{}] {}: {shown_before} → {committed}",
+                case.cat, case.typed
+            );
+            shown += 1;
+        }
+    }
+    let (mut p, mut t) = (0, 0);
+    for (cat, (kp, kt)) in &by_cat {
+        println!(
+            "{cat:<22} {kp:>5}/{kt:<5} {:>6.1}% committed as shown",
+            100.0 * *kp as f64 / *kt as f64
+        );
+        p += kp;
+        t += kt;
+    }
+    println!(
+        "{:<22} {p:>5}/{t:<5} {:>6.1}% committed as shown",
+        "all",
+        100.0 * p as f64 / t.max(1) as f64
+    );
 }
 
 /// The language of each typed char as `expected` reads it: the letters of
