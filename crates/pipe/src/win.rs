@@ -35,7 +35,8 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    GetLogicalProcessorInformationEx, RelationCache, CACHE_RELATIONSHIP,
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetCurrentThread, GetExitCodeProcess,
@@ -261,19 +262,30 @@ fn l3_caches() -> Vec<(u32, usize)> {
     if unsafe { GetLogicalProcessorInformationEx(RelationCache, base.cast(), &mut len) } == 0 {
         return Vec::new();
     }
+    l3_of(unsafe { std::slice::from_raw_parts(base, (len as usize).min(buf.len() * 8)) })
+}
+
+/// `l3_caches` of the records `GetLogicalProcessorInformationEx` wrote: each
+/// one as long as its `Size` says, which for a cache is shorter than the
+/// struct (whose union holds longer relations), so that one at the end of
+/// the buffer is read too.
+fn l3_of(buf: &[u8]) -> Vec<(u32, usize)> {
+    use std::mem::{offset_of, size_of};
+    type Ex = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+    let head = offset_of!(Ex, Anonymous);
+    let word = |at: usize| <[u8; 4]>::try_from(&buf[at..at + 4]).unwrap();
     let mut out = Vec::new();
     let mut at = 0usize;
-    while at + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= len as usize {
-        let rec = unsafe {
-            &*base
-                .add(at)
-                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
-        };
-        if rec.Size == 0 {
+    while at + head <= buf.len() {
+        let relationship = i32::from_ne_bytes(word(at + offset_of!(Ex, Relationship)));
+        let size = u32::from_ne_bytes(word(at + offset_of!(Ex, Size))) as usize;
+        if size < head || size > buf.len() - at {
             break;
         }
-        if rec.Relationship == RelationCache {
-            let cache = unsafe { &rec.Anonymous.Cache };
+        if relationship == RelationCache && size >= head + size_of::<CACHE_RELATIONSHIP>() {
+            // within the record, at no alignment the slice promises
+            let cache: CACHE_RELATIONSHIP =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at + head).cast()) };
             if cache.Level == 3 {
                 let mask = unsafe { cache.Anonymous.GroupMask };
                 if cache.GroupCount > 1 || mask.Group != 0 {
@@ -282,7 +294,7 @@ fn l3_caches() -> Vec<(u32, usize)> {
                 out.push((cache.CacheSize, mask.Mask));
             }
         }
-        at += rec.Size as usize;
+        at += size;
     }
     out
 }
@@ -691,6 +703,52 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         )
+    }
+
+    /// A cache's record as Windows writes it: as long as its relation.
+    fn cache_record(level: u8, size: u32, mask: usize) -> Vec<u8> {
+        use std::mem::{offset_of, size_of};
+        type Ex = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+        let head = offset_of!(Ex, Anonymous);
+        let mut cache: CACHE_RELATIONSHIP = unsafe { std::mem::zeroed() };
+        cache.Level = level;
+        cache.CacheSize = size;
+        cache.GroupCount = 1;
+        cache.Anonymous.GroupMask.Mask = mask;
+        let total = head + size_of::<CACHE_RELATIONSHIP>();
+        let mut out = vec![0u8; total];
+        let at = offset_of!(Ex, Relationship);
+        out[at..at + 4].copy_from_slice(&RelationCache.to_ne_bytes());
+        let at = offset_of!(Ex, Size);
+        out[at..at + 4].copy_from_slice(&(total as u32).to_ne_bytes());
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&cache as *const CACHE_RELATIONSHIP).cast::<u8>(),
+                size_of::<CACHE_RELATIONSHIP>(),
+            )
+        };
+        out[head..].copy_from_slice(bytes);
+        out
+    }
+
+    #[test]
+    fn every_l3_record_is_read_the_last_one_too() {
+        assert!(
+            cache_record(3, 1, 1).len()
+                < std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+        );
+        let mut buf = cache_record(2, 1 << 20, 0x3);
+        buf.extend(cache_record(3, 96 << 20, 0xFFFF));
+        buf.extend(cache_record(3, 32 << 20, 0xFFFF_0000));
+        assert_eq!(
+            l3_of(&buf),
+            vec![(96 << 20, 0xFFFF), (32 << 20, 0xFFFF_0000)]
+        );
+        // a record cut short ends the reading
+        buf.truncate(buf.len() - 1);
+        assert_eq!(l3_of(&buf), vec![(96 << 20, 0xFFFF)]);
+        // this machine's, read whole
+        let _ = l3_caches();
     }
 
     #[test]
