@@ -1689,8 +1689,8 @@ fn lone_i(chars: &[char], spans: &mut [Span]) {
 
 /// The ranges of `chars` never read as romaji (Meltype's protected spans, as
 /// an idea): a URL (`https://…`, `www.…`), an e-mail address, a `@mention`,
-/// a path (`C:\…`, `C:/…`, `\\host`, `~/…`, `./…`, `../…`, `/a/b`), each
-/// from a word's start to the next space.
+/// a path (`C:\…`, `C:/…`, `\\host`, `~/…`, `./…`, `../…`, `/a/b`) with a
+/// letter or digit in it, each from a word's start to the next space.
 pub fn protected_ranges(chars: &[char]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1730,12 +1730,15 @@ pub fn protected_ranges(chars: &[char]) -> Vec<(usize, usize)> {
             && b[0].is_ascii_alphabetic()
             && b[1] == b':'
             && matches!(b[2], b'\\' | b'/');
+        // a path names something: slashes alone (`///`, the slash key
+        // typing ・ three times) are Japanese symbols
         let path = drive
-            || word.starts_with("\\\\")
-            || word.starts_with("~/")
-            || word.starts_with("./")
-            || word.starts_with("../")
-            || (word.starts_with('/') && word[1..].contains('/'));
+            || word.chars().any(|c| c.is_ascii_alphanumeric())
+                && (word.starts_with("\\\\")
+                    || word.starts_with("~/")
+                    || word.starts_with("./")
+                    || word.starts_with("../")
+                    || (word.starts_with('/') && word[1..].contains('/')));
         if lower.starts_with("www.") || email || mention || path {
             out.push((i, end));
         }
@@ -2790,6 +2793,16 @@ pub(crate) mod tests {
             protected_ranges(&"kasano".chars().collect::<Vec<_>>()),
             vec![]
         );
+        // slashes alone name nothing: the slash key's symbols, read as
+        // Japanese (Space converts them, no space typed after English)
+        for typed in ["///", "//", "~/", "./", "../", "\\\\"] {
+            let chars: Vec<char> = typed.chars().collect();
+            assert_eq!(protected_ranges(&chars), vec![], "{typed}");
+        }
+        // (the default table's ／, or the ・ a config gives the slash key)
+        assert_eq!(shown(&m, "///", None), "／／／");
+        assert_eq!(shown(&m, "/a/b", None), "/a/b");
+        assert_eq!(shown(&m, "../a", None), "../a");
     }
 
     #[test]
