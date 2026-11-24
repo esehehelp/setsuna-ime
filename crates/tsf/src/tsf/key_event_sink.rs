@@ -507,9 +507,18 @@ fn win_down() -> bool {
 
 /// A key's actions and those of the conversion it asked for, taken in while
 /// it was handled (`settle_live`): the conversion's preedit stands for the
-/// key's, so the text is edited once; what the key committed before it
-/// stays.
+/// key's, and the last of the conversions' for those before it (a prefix's
+/// and the whole reading's both came), so the text is edited once; what the
+/// key committed before it stays.
 fn merge_settled(mut actions: Vec<Action>, settled: Vec<Action>) -> Vec<Action> {
+    let mut settled_once: Vec<Action> = Vec::with_capacity(settled.len());
+    for a in settled {
+        if matches!(a, Action::UpdatePreedit { .. }) {
+            settled_once.retain(|b| !matches!(b, Action::UpdatePreedit { .. }));
+        }
+        settled_once.push(a);
+    }
+    let settled = settled_once;
     if settled
         .iter()
         .any(|a| matches!(a, Action::UpdatePreedit { .. }))
@@ -1091,6 +1100,11 @@ mod tests {
         assert_eq!(
             merge_settled(vec![pre("きしゃ")], vec![]),
             vec![pre("きしゃ")]
+        );
+        // a prefix's conversion and the whole reading's: the last one
+        assert_eq!(
+            merge_settled(vec![pre("きしゃの")], vec![pre("記者の"), pre("汽車の")]),
+            vec![pre("汽車の")]
         );
     }
 

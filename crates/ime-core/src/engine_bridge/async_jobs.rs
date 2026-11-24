@@ -209,6 +209,11 @@ impl EngineBridge {
             selected: sel,
             seg: None,
         };
+        // Space opened the sentence before its list came, where it opens the
+        // last segment's: that now, unless another candidate was chosen
+        if std::mem::take(&mut self.comp.last_segment_due) && sel == 0 && self.ensure_segmented() {
+            return self.focus_last_segment();
+        }
         vec![
             Action::UpdatePreedit { text },
             Action::ShowCandidates {

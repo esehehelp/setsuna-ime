@@ -430,6 +430,9 @@ fn on_async_done(svc: &SetsunaTextService_Impl) {
     };
     if actions.is_empty() {
         setsuna_core::diagnostics::log("on_async_done no actions");
+        // a key took the result as it came (`settle_live`): what it left for
+        // later (the whole list, a rerank's deadline) still comes in time
+        arm_deferred(svc);
         return;
     }
     setsuna_core::diagnostics::log(if setsuna_core::diagnostics::log_typed_text() {

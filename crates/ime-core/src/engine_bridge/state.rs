@@ -244,6 +244,10 @@ pub(super) struct CompositionState {
     /// The reading the last live conversion was asked for (`dispatch_live`):
     /// what `settle_live` waits for.
     pub(super) live_out: Option<String>,
+    /// Space opened the whole sentence's list before the engine's list of
+    /// it came, where it opens the last segment's (`on_last_segment`): it
+    /// does so once the list comes.
+    pub(super) last_segment_due: bool,
 }
 
 impl CompositionState {

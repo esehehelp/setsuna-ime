@@ -55,6 +55,12 @@ impl EngineBridge {
             return consumed(vec![Action::Status {
                 text: "この候補は非表示にできません".to_string(),
             }]);
+        } else if self.ctx.private_field {
+            // a field that asks for no learning keeps no history, the
+            // candidates hidden there neither
+            return consumed(vec![Action::Status {
+                text: "この欄では候補を非表示にできません".to_string(),
+            }]);
         } else {
             match self.hidden.as_mut().map(|h| h.hide(&reading, &cand)) {
                 Some(Ok(())) => "候補を非表示にしました",
@@ -363,31 +369,30 @@ impl EngineBridge {
 
     pub fn handle_space(&mut self) -> KeyOutcome {
         let composing = matches!(self.phase, Phase::Composing { .. });
-        let out = self.space_convert();
-        if composing && self.cfg.space_last_segment {
+        let last = composing && self.cfg.space_last_segment;
+        let out = self.convert_typed(true, last);
+        if last {
             return self.on_last_segment(out);
         }
         out
     }
 
-    /// `out`, the whole sentence converted (`space_convert`), as segment
+    /// `out`, the whole sentence converted (`convert_typed`), as segment
     /// editing on its last segment: the segments before it stay as
     /// converted, the list is that segment's. `out` as it is when the
     /// conversion cannot be cut (no list of its reading yet).
     fn on_last_segment(&mut self, out: KeyOutcome) -> KeyOutcome {
-        if !out.consumed
-            || !matches!(self.phase, Phase::Converting { seg: None, .. })
-            || !self.ensure_segmented()
-        {
+        if !out.consumed || !matches!(self.phase, Phase::Converting { seg: None, .. }) {
             return out;
         }
-        if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
-            s.focus = s.segs.len().saturating_sub(1);
+        if !self.ensure_segmented() {
+            // the engine's list of the reading not in yet: cut once it is
+            self.comp.last_segment_due = !self.comp.covers_typed;
+            return out;
         }
-        self.query_focused_segment();
         // the sentence's preedit and list give way to the segments'; what
-        // else the conversion did (a rewrite asked for) stays
-        let mut actions = self.segment_actions();
+        // else the conversion did stays
+        let mut actions = self.focus_last_segment();
         actions.extend(out.actions.into_iter().filter(|a| {
             !matches!(
                 a,
@@ -395,6 +400,16 @@ impl EngineBridge {
             )
         }));
         consumed(actions)
+    }
+
+    /// Segment editing on the last segment of the conversion cut, its list
+    /// asked for: the segments' preedit and list.
+    pub(super) fn focus_last_segment(&mut self) -> Vec<Action> {
+        if let Phase::Converting { seg: Some(s), .. } = &mut self.phase {
+            s.focus = s.segs.len().saturating_sub(1);
+        }
+        self.query_focused_segment();
+        self.segment_actions()
     }
 
     /// Live conversion shows the conversion of all that is typed (not the
@@ -409,9 +424,14 @@ impl EngineBridge {
             && self.comp.cached_prefix_reading == self.composing.live_reading()
     }
 
-    /// Space: convert the reading typed (the whole sentence's list), or
-    /// the next candidate of a conversion open.
-    fn space_convert(&mut self) -> KeyOutcome {
+    /// Convert the reading typed (the whole sentence's list), or the next
+    /// candidate of a conversion open: by Space (`space`: after English it
+    /// types a space), by ← on the conversion live conversion shows or by a
+    /// suggestion clicked (no space: the English ones among the segments or
+    /// the sentence). `segments`: the conversion opens on its segments
+    /// (`on_last_segment`), where a rewrite of the sentence would not show:
+    /// none is asked for.
+    fn convert_typed(&mut self, space: bool, segments: bool) -> KeyOutcome {
         // the list the preview went without, whole for this key
         self.finish_list_now(true);
         // a command's name ends
@@ -427,7 +447,8 @@ impl EngineBridge {
         // Mixed input: Space after an English word, or a lone `i` (`i
         // think`), types a space (`Hello world`); Space again, or after
         // Japanese, converts.
-        if self.composing.is_mixed()
+        if space
+            && self.composing.is_mixed()
             && matches!(self.phase, Phase::Composing { .. })
             && self.composing.cursor_at_end()
         {
@@ -440,6 +461,12 @@ impl EngineBridge {
         let mut previous_dates = Vec::new();
         if matches!(self.phase, Phase::Composing { .. }) {
             self.comp.alt = self.alt_for_space();
+            if !space {
+                // the top with a space after the English is Space's offer
+                if let Some(alt) = self.comp.alt.as_mut() {
+                    alt.ends_english = false;
+                }
+            }
             if self.cfg.date_time_enabled {
                 previous_dates = self
                     .cfg
@@ -539,7 +566,9 @@ impl EngineBridge {
                         Action::UpdatePreedit { text: first },
                         Action::ShowCandidates { list, selected: 0 },
                     ];
-                    actions.extend(self.start_rewrite(&reading, &source));
+                    if !segments {
+                        actions.extend(self.start_rewrite(&reading, &source));
+                    }
                     return consumed(actions);
                 }
                 if dynamic && self.comp.cached_prefix_reading == reading {
@@ -572,7 +601,9 @@ impl EngineBridge {
                         selected: 0,
                     },
                 ];
-                actions.extend(self.start_rewrite(&reading, &source));
+                if !segments {
+                    actions.extend(self.start_rewrite(&reading, &source));
+                }
                 consumed(actions)
             }
         }
@@ -804,7 +835,7 @@ impl EngineBridge {
         if delta < 0 && self.shows_whole_conversion() {
             // the segments of the conversion shown, a noun end held too
             self.comp.end_held = None;
-            let out = self.space_convert();
+            let out = self.convert_typed(false, true);
             return self.on_last_segment(out);
         }
         match &self.phase {
@@ -1027,6 +1058,7 @@ impl EngineBridge {
         // words of letters typed
         let predicted =
             self.comp.prediction.take().is_some() | std::mem::take(&mut self.comp.covers_typed);
+        self.comp.last_segment_due = false;
         if predicted {
             self.comp.list_reading.clear();
         }
@@ -1145,10 +1177,11 @@ impl EngineBridge {
         self.finish_list_now(true);
         if matches!(self.phase, Phase::Composing { .. }) {
             if let Some(want) = self.suggestions().get(index).cloned() {
-                // the suggestion picked, where the list Space opens has it
-                // (mixed input's puts the other reading's in: it is not the
-                // suggestions' order)
-                let mut actions = self.handle_space().actions;
+                // the suggestion picked, where the whole sentence's list has
+                // it (mixed input's puts the other reading's in: it is not
+                // the suggestions' order); a sentence, not the last segment
+                // Space may open, nor a space after English
+                let mut actions = self.convert_typed(false, false).actions;
                 let at = match &self.phase {
                     Phase::Converting {
                         candidates,

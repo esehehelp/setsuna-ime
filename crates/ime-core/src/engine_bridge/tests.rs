@@ -354,6 +354,25 @@ fn the_conversion_key_asks_for_a_rewrite_that_comes_first() {
 }
 
 #[test]
+fn a_conversion_opened_on_its_segments_asks_for_no_rewrite() {
+    // Space on the last segment
+    let (mut bridge, mock, rewriter) = rewriting_bridge();
+    bridge.cfg.space_last_segment = true;
+    let pos: &[u32] = &[0, 2];
+    mock.set_aligned("かさの", &["傘の", "笠の"], &[pos, pos]);
+    bridge.apply_async_result();
+    let out = bridge.handle_space();
+    assert_eq!(status(&out.actions), None, "{:?}", out.actions);
+    assert!(rewriter.state.dispatched.borrow().is_empty());
+    // ← on the live conversion
+    let (mut bridge, _mock, rewriter) = rewriting_bridge();
+    let out = bridge.handle_move_cursor(-1);
+    assert!(bridge.is_converting());
+    assert_eq!(status(&out.actions), None, "{:?}", out.actions);
+    assert!(rewriter.state.dispatched.borrow().is_empty());
+}
+
+#[test]
 fn a_rewrite_keeps_a_selection_off_the_top() {
     let (mut bridge, _mock, rewriter) = rewriting_bridge();
     bridge.handle_space();
@@ -501,6 +520,30 @@ fn ctrl_delete_forgets_a_learned_candidate_or_hides_it() {
     }
     let out = bridge.handle_forget_candidate();
     assert_eq!(status(&out.actions), Some("この候補は非表示にできません"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_private_field_hides_no_candidate() {
+    let dir = std::env::temp_dir().join(format!(
+        "setsuna-bridge-hide-private-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut bridge, mock) = bridge_with_mock();
+    bridge.set_hidden(Some(crate::hidden::Hidden::at(dir.join("hidden.jsonl"))));
+    bridge.set_private_field(true);
+    type_str(&mut bridge, "kasano");
+    mock.set_result("かさの", &["傘の", "笠の", "嵩の"]);
+    bridge.apply_async_result();
+    bridge.handle_space();
+    bridge.handle_down();
+    let out = bridge.handle_forget_candidate();
+    assert_eq!(
+        status(&out.actions),
+        Some("この欄では候補を非表示にできません")
+    );
+    assert!(!dir.join("hidden.jsonl").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1075,6 +1118,26 @@ fn mixed_punctuation_follows_the_sentence() {
         "hello, world.",
         "hello、world。"
     ));
+}
+
+#[test]
+fn left_on_a_live_conversion_ending_in_english_types_no_space() {
+    let (mut bridge, mock) = mixed_bridge();
+    type_str(&mut bridge, "kyouhagoogle");
+    mock.set_result("きょうはgoogle", &["今日はgoogle", "きょうはgoogle"]);
+    bridge.apply_async_result();
+    let out = bridge.handle_move_cursor(-1);
+    assert!(out.consumed);
+    // the conversion's segments to edit, no space after the English (as
+    // Space there types)
+    assert!(bridge.is_converting(), "{:?}", out.actions);
+    assert!(
+        !out.actions
+            .iter()
+            .any(|a| matches!(a, Action::UpdatePreedit { text } if text.ends_with(' '))),
+        "{:?}",
+        out.actions
+    );
 }
 
 #[test]
@@ -2232,6 +2295,22 @@ fn space_can_open_the_last_segments_list_only() {
 }
 
 #[test]
+fn space_before_the_list_came_opens_the_last_segment_once_it_comes() {
+    let (mut bridge, mock) = bridge_with_mock();
+    bridge.cfg.space_last_segment = true;
+    type_str(&mut bridge, "kishanokisha");
+    bridge.handle_space();
+    let pos: &[u32] = &[0, 2, 3, 4, 6];
+    mock.set_aligned(
+        "きしゃのきしゃ",
+        &["記者の記者", "汽車の記者", "記者の汽車"],
+        &[pos, pos, pos],
+    );
+    let out = bridge.apply_async_result();
+    assert_eq!(segments_shown(&out), (v(&["記者の", "記者"]), 1), "{out:?}");
+}
+
+#[test]
 fn left_on_a_live_conversion_edits_its_segments_instead_of_bringing_the_kana_back() {
     let (mut bridge, _mock) = live_kisha();
     let out = bridge.handle_move_cursor(-1);
@@ -2354,6 +2433,26 @@ fn select_picks_a_candidate_of_the_open_list() {
     // nothing to pick without a list
     let (mut idle, _mock) = bridge_with_mock();
     assert!(!idle.handle_select(0).consumed);
+}
+
+#[test]
+fn a_suggestion_clicked_is_the_whole_sentence_with_space_on_the_last_segment() {
+    let (mut bridge, _mock) = live_kisha();
+    bridge.cfg.live_conversion = false;
+    bridge.cfg.space_last_segment = true;
+    let at = bridge
+        .suggestions()
+        .iter()
+        .position(|c| c == "汽車の記者")
+        .unwrap();
+    let out = bridge.handle_select(at);
+    assert!(out.consumed);
+    assert_eq!(
+        commits(&bridge.handle_enter().actions),
+        vec!["汽車の記者"],
+        "{:?}",
+        out.actions
+    );
 }
 
 #[test]
@@ -4114,6 +4213,7 @@ fn composition_state_clear_resets_all_transient_fields() {
         }),
         end_held: Some(("きょう".into(), "今日".into())),
         live_out: Some("きょう".into()),
+        last_segment_due: true,
     };
     comp.clear();
     assert!(comp.last_applied_reading.is_empty());
@@ -4137,4 +4237,5 @@ fn composition_state_clear_resets_all_transient_fields() {
     assert!(comp.unfinished.is_none());
     assert!(comp.end_held.is_none());
     assert!(comp.live_out.is_none());
+    assert!(!comp.last_segment_due);
 }
