@@ -31,12 +31,20 @@
 //! Each choice also yields word-level choices (`words`): the words the two
 //! surfaces differ in, with their reading and up to two reading chars on
 //! each side (きしゃ: 記者 -> 貴社, before にれ). A word choice applies wherever
-//! its reading recurs next to the same context on one side, however
-//! different the rest of the reading is, and adds ±w to the candidates
-//! that write the chosen / rejected word at that place of the reading, when
-//! one of the list writes the rejected word there (`word_bonuses`). A
-//! candidate list is reranked when a sentence-level or a word-level choice
-//! applies.
+//! its reading recurs next to the same context on one side (a reading of six
+//! chars or more anywhere), however different the rest of the reading is,
+//! and adds +w / -w to the candidates that write the chosen word / another
+//! one (the rejected one, or any other word) at that place of the reading,
+//! when one of the list writes another there (`word_bonuses`). A candidate
+//! list is reranked when a sentence-level or a word-level choice applies.
+//!
+//! What a choice put up need not be in the next list: a sentence put
+//! together segment by segment is no candidate of the whole reading's, nor
+//! is the chosen word where the engine writes another in every candidate.
+//! So the list gets them first (`with_learned_forms`): the chosen sentence
+//! of a choice of the same reading, and the first candidate that writes
+//! another word where a word choice applies, with its chosen form written
+//! there.
 //!
 //! Choices are appended to `learning.jsonl` in the config directory, one
 //! JSON object per line. Every process that loads the IME appends to the
@@ -154,6 +162,10 @@ const HEAD: usize = 64;
 struct Entry {
     /// Times this choice was made; 0 once the opposite choice cancelled it.
     count: u32,
+    /// The reading and the chosen sentence as they are, for a list of the
+    /// same reading that lacks it (`with_learned_forms`).
+    reading_text: String,
+    chosen_text: String,
     reading: Vector,
     chosen: Vector,
     rejected: Vector,
@@ -452,6 +464,8 @@ impl Learning {
         }
         self.entries.push(Entry {
             count: n,
+            reading_text: key.0.clone(),
+            chosen_text: key.1.clone(),
             reading,
             chosen,
             rejected,
@@ -554,9 +568,22 @@ impl Learning {
         Ok(())
     }
 
-    /// Reorder `candidates` (best first) for `reading` by the learned choices.
-    /// Without an applicable choice the order is kept.
+    /// Reorder `candidates` (best first) for `reading` by the learned choices,
+    /// with the forms they put up that the list lacks (`with_learned_forms`).
+    /// Without an applicable choice the list is kept as it is.
     pub fn rerank(&mut self, reading: &str, candidates: Vec<String>) -> Vec<String> {
+        self.rerank_with(reading, candidates, |_| true)
+    }
+
+    /// `rerank`, the forms put up only where `fits` says they may go (a
+    /// segment's list: the sentences that keep the other segments as they
+    /// are).
+    pub fn rerank_with(
+        &mut self,
+        reading: &str,
+        candidates: Vec<String>,
+        fits: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
         self.sync();
         if candidates.len() < 2
             || (self.entries.is_empty() && self.words.is_empty())
@@ -591,6 +618,13 @@ impl Learning {
         if hits.is_empty() && word_hits.is_empty() {
             return candidates;
         }
+        let exact: Vec<&str> = hits
+            .iter()
+            .map(|&(i, _)| &self.entries[i])
+            .filter(|e| e.reading_text == reading)
+            .map(|e| e.chosen_text.as_str())
+            .collect();
+        let candidates = with_learned_forms(&reading_chars, candidates, &exact, &word_hits, fits);
         let word_bonus = word_bonuses(&reading_chars, &candidates, &word_hits);
         let n = candidates.len() as f32;
         let learned: Vec<f32> = candidates
@@ -626,10 +660,78 @@ impl Learning {
     }
 }
 
+/// Whether `surface` is `reading` itself in kana (either script).
+fn spells_reading(surface: &[char], reading: &[char]) -> bool {
+    surface.len() == reading.len()
+        && surface.iter().zip(reading).all(|(&c, &r)| {
+            c == r || (crate::reading_align::is_kana(c) && crate::reading_align::to_hira(c) == r)
+        })
+}
+
+/// `candidates` with what the learned choices put up that it lacks: the
+/// chosen sentence of each choice of this very reading (`exact`), after the
+/// first candidate; and the first candidate that writes another word than
+/// the chosen one of a word choice where it applies (`hits`), with the
+/// chosen forms written there instead, right after it; each only where
+/// `fits` lets it. Reranking only reorders what the list holds, and the
+/// engine's list may hold no candidate with the chosen form at all
+/// (第三正規形 put together segment by segment, where every candidate
+/// writes 第三世紀形 or 第三世紀系): the choice would never come back. The
+/// reading in kana gives no form: it writes every kana word.
+fn with_learned_forms(
+    reading: &[char],
+    mut candidates: Vec<String>,
+    exact: &[&str],
+    hits: &[(&WordEntry, Vec<usize>)],
+    fits: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if !hits.is_empty() {
+        for k in 0..candidates.len() {
+            let s: Vec<char> = candidates[k].chars().collect();
+            if spells_reading(&s, reading) {
+                continue;
+            }
+            let Some(ranges) = crate::reading_align::align(&s, reading) else {
+                continue;
+            };
+            let forms: Vec<(usize, usize, &str)> = hits
+                .iter()
+                .flat_map(|(w, places)| {
+                    let n = w.word.span.chars().count();
+                    let (s, ranges) = (&s, &ranges);
+                    places
+                        .iter()
+                        .filter(move |&&p| {
+                            words::form_at(s, ranges, p, p + n).is_some_and(|f| f != w.word.chosen)
+                        })
+                        .map(move |&p| (p, p + n, w.word.chosen.as_str()))
+                })
+                .collect();
+            if forms.is_empty() {
+                continue;
+            }
+            match words::write_forms(&s, &ranges, &forms) {
+                Some(form) if !fits(&form) => continue,
+                Some(form) if !candidates.contains(&form) => candidates.insert(k + 1, form),
+                _ => {}
+            }
+            break;
+        }
+    }
+    for &chosen in exact {
+        if fits(chosen) && !candidates.iter().any(|c| c == chosen) {
+            let at = candidates.len().min(1);
+            candidates.insert(at, chosen.to_string());
+        }
+    }
+    candidates
+}
+
 /// The word choices' bonus of each candidate: ±w where a word choice
 /// applies (`hits`, with the places of its reading) and the candidate
-/// writes its chosen / rejected form at that place of the reading
-/// (`words::writes`). Only where the list offers the rejected form there:
+/// writes its chosen form / another at that place of the reading
+/// (`words::writes`; another: the rejected form, or any other word of it
+/// there, `words::form_at`). Only where the list offers another form there:
 /// otherwise the choice is not in question (までは chosen over 迄は is no
 /// reason to touch いまでは, which nothing writes with 迄). And never for the
 /// reading itself in kana, which the list always holds and which writes
@@ -654,14 +756,7 @@ fn word_bonuses(
         .collect();
     let spelled: Vec<bool> = aligned
         .iter()
-        .map(|(s, _)| {
-            s.len() == reading.len()
-                && s.iter().zip(reading).all(|(&c, &r)| {
-                    c == r
-                        || (crate::reading_align::is_kana(c)
-                            && crate::reading_align::to_hira(c) == r)
-                })
-        })
+        .map(|(s, _)| spells_reading(s, reading))
         .collect();
     for (w, places) in hits {
         let weight = 1.0 + (w.count as f32).ln();
@@ -670,17 +765,26 @@ fn word_bonuses(
             let (s, r) = &aligned[k];
             words::writes(s, r.as_deref(), p, p + n, form)
         };
+        // the rejected form there, or another word than the chosen one
+        // (第三世紀系 where 第三正規形 was chosen over 第三世紀形)
+        let other = |k: usize, p: usize| {
+            let (s, r) = &aligned[k];
+            writes(k, p, &w.word.rejected)
+                || r.as_deref()
+                    .and_then(|r| words::form_at(s, r, p, p + n))
+                    .is_some_and(|f| f != w.word.chosen)
+        };
         let contested: Vec<usize> = places
             .iter()
             .copied()
-            .filter(|&p| (0..aligned.len()).any(|k| !spelled[k] && writes(k, p, &w.word.rejected)))
+            .filter(|&p| (0..aligned.len()).any(|k| !spelled[k] && other(k, p)))
             .collect();
         if contested.is_empty() {
             continue;
         }
         for k in (0..aligned.len()).filter(|&k| !spelled[k]) {
             let chosen = contested.iter().any(|&p| writes(k, p, &w.word.chosen));
-            let rejected = contested.iter().any(|&p| writes(k, p, &w.word.rejected));
+            let rejected = contested.iter().any(|&p| other(k, p));
             out[k] += weight * (f32::from(u8::from(chosen)) - f32::from(u8::from(rejected)));
         }
     }
@@ -890,13 +994,61 @@ mod tests {
     #[test]
     fn a_word_choice_counts_where_its_reading_is_written() {
         // 紙 over 髪 learned before をき: 紙 elsewhere in a candidate is no
-        // reason to put it up
+        // reason to put it up; written where its reading is, it is
         let t = TempFile::new("word-place");
         let mut l = Learning::at(t.0.clone(), &cfg());
         l.record("かみをきる", "紙を切る", "髪を切る").unwrap();
         let cands = list(&["髪を切ってから神", "髪を切ってから紙"]);
         let got = l.rerank("かみをきってからかみ", cands);
-        assert_eq!(got[0], "髪を切ってから神");
+        assert_eq!(
+            got,
+            list(&["紙を切ってから神", "髪を切ってから神", "髪を切ってから紙"])
+        );
+    }
+
+    #[test]
+    fn a_choice_the_list_lacks_is_put_into_it() {
+        // 第三正規形 put together segment by segment: no candidate of the
+        // engine's writes 正規形, and the choice still comes first
+        let t = TempFile::new("lacking");
+        let mut l = Learning::at(t.0.clone(), &cfg());
+        let cands = list(&[
+            "第三世紀形ではない。",
+            "第三世紀系ではない。",
+            "だいさんせいきけいではない。",
+        ]);
+        l.record(
+            "だいさんせいきけいではない。",
+            "第三正規形ではない。",
+            &cands[0],
+        )
+        .unwrap();
+        let got = l.rerank("だいさんせいきけいではない。", cands.clone());
+        assert_eq!(got[0], "第三正規形ではない。");
+        assert_eq!(got[1..], cands[..]);
+        // the word in another sentence, a reading long enough to need no
+        // context
+        let got = l.rerank(
+            "このかんけいはだいさんせいきけいにする。",
+            list(&[
+                "この関係は第三世紀系にする。",
+                "この関係は第三世紀形にする。",
+                "このかんけいはだいさんせいきけいにする。",
+            ]),
+        );
+        assert_eq!(got[0], "この関係は第三正規形にする。");
+        // a short one only next to its context: 紙 before をき, not before が
+        l.record("かみをきる", "紙を切る", "髪を切る").unwrap();
+        let other = list(&["髪が長い", "かみがながい"]);
+        assert_eq!(l.rerank("かみがながい", other.clone()), other);
+        let got = l.rerank(
+            "あかいかみをきざむ",
+            list(&["赤い髪を刻む", "赤い神を刻む"]),
+        );
+        assert_eq!(got[0], "赤い紙を刻む");
+        // the reading in kana is no source of a form
+        let kana = list(&["かみをきっておく"]);
+        assert_eq!(l.rerank("かみをきっておく", kana.clone()), kana);
     }
 
     #[test]

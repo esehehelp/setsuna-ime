@@ -145,29 +145,47 @@ impl EngineBridge {
         let Some(learning) = self.learning.as_mut() else {
             return;
         };
+        // a form the choices put up (`Learning::rerank`) goes in as this
+        // segment's, the others kept as they are
+        let piece = |c: &str| {
+            c.strip_prefix(before.as_str())
+                .and_then(|c| c.strip_suffix(after.as_str()))
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+        };
         let Some(top) = learning
-            .rerank(&reading, sentences.clone())
+            .rerank_with(&reading, sentences.clone(), |c| piece(c).is_some())
             .into_iter()
             .next()
         else {
             return;
         };
-        let Some(best) = sentences.iter().position(|c| *c == top).filter(|&b| b > 0) else {
+        let best = sentences.iter().position(|c| *c == top);
+        if best == Some(0) {
             return;
-        };
+        }
         let Phase::Converting { seg: Some(s), .. } = &mut self.phase else {
             return;
         };
         let seg = &mut s.segs[k];
-        let at = order[best];
-        let c = seg.cands.remove(at);
+        let c = match best {
+            Some(best) => {
+                let at = order[best];
+                let c = seg.cands.remove(at);
+                if at < seg.selected {
+                    seg.selected -= 1;
+                }
+                c
+            }
+            None => match piece(&top) {
+                Some(c) => c,
+                None => return,
+            },
+        };
         if fresh {
             seg.cands.insert(0, c);
             seg.selected = 0;
         } else {
-            if at < seg.selected {
-                seg.selected -= 1;
-            }
             seg.cands.insert(seg.selected + 1, c);
         }
     }

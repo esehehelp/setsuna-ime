@@ -2769,7 +2769,9 @@ fn a_live_preview_goes_without_the_lexicons_costs_until_the_idle_makes_the_list(
 }
 
 #[test]
-fn a_lexicon_conversion_learned_first_comes_in_at_the_idle_or_waits_behind_the_one_shown() {
+fn a_lexicon_conversion_learned_first_shows_at_once() {
+    // the learned sentence goes into the list itself: the preview need not
+    // wait for the lexicon's conversions at the idle
     let table =
         "大島村\tおおしまむら\t10.0\tnoun\n大島\tおおしま\t8.0\tnoun\n村\tむら\t6.0\tnoun\n";
     let dir = std::env::temp_dir().join(format!(
@@ -2793,28 +2795,29 @@ fn a_lexicon_conversion_learned_first_comes_in_at_the_idle_or_waits_behind_the_o
         });
         bridge.set_learning(Some(learning));
         type_str(&mut bridge, "oosimamura");
-        // the engine gave no 大島村: the lexicon's conversion adds it
+        // the engine gave no 大島村
         answer_scored(&mock, &["おおしま村", "大しま村"], &[-0.5, -1.0]);
         let actions = bridge.apply_async_result();
         assert!(
-            matches!(actions.last(), Some(Action::UpdatePreedit { text }) if text == "おおしま村"),
+            matches!(actions.last(), Some(Action::UpdatePreedit { text }) if text == "大島村"),
             "{actions:?}"
         );
         bridge
     };
-    // at the idle, the learned conversion takes the preview
+    // the idle leaves it
     let mut bridge = convert(Learning::at(dir.join("learning.jsonl"), &cfg));
     let actions = bridge.tick();
     assert!(
-        matches!(actions.last(), Some(Action::UpdatePreedit { text }) if text == "大島村"),
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::UpdatePreedit { text } if text != "大島村")),
         "{actions:?}"
     );
-    // Space before the idle: the conversion on screen stays first, the
-    // learned one listed
+    // Space before the idle: the conversion on screen first
     let mut bridge = convert(learning);
     let (list, _) = shown(&bridge.handle_space().actions).unwrap();
-    assert_eq!(list[0], "おおしま村");
-    assert!(list.contains(&"大島村".to_string()), "{list:?}");
+    assert_eq!(list[0], "大島村");
+    assert!(list.contains(&"おおしま村".to_string()), "{list:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3120,6 +3123,18 @@ fn a_segments_list_offers_what_the_user_chose_before() {
     assert_eq!(segments_shown(&out).0, v(&["記者の", "記者"]));
     bridge.handle_down();
     assert_eq!(commits(&bridge.handle_enter().actions), vec!["記者の帰社"]);
+    // one its own conversion lacks goes in all the same
+    let (mut bridge, mock) = converting_kisha();
+    bridge.set_learning(Some(learned("記者の帰社", "lacking")));
+    bridge.handle_move_cursor(1);
+    bridge.handle_move_cursor(1);
+    mock.answer_last(&["記者の"]);
+    bridge.apply_async_result();
+    mock.answer_last(&["記者", "汽車"]);
+    let out = bridge.apply_async_result();
+    let (list, selected, _) = segment_list(&out);
+    assert_eq!(list[..3], v(&["記者", "帰社", "汽車"])[..]);
+    assert_eq!(selected, 0);
     // a resized segment's new list takes it first
     let (mut bridge, mock) = converting_kisha();
     bridge.set_learning(Some(learned("帰社の記者", "fresh")));

@@ -116,9 +116,15 @@ pub(super) fn derive(reading: &str, chosen: &str, rejected: &str) -> Vec<Word> {
     out
 }
 
+/// A span of this many reading chars or more applies with no context: a
+/// reading that long is one word or compound wherever it recurs (第三正規形
+/// for だいさんせいきけい, chosen before では, is the one before にする too).
+const CONTEXT_FREE: usize = 6;
+
 /// Where `w` applies in `reading`: the starts of its span where it occurs
 /// with the same context on at least one side (both sides for a one-char
-/// span, which would otherwise match almost anywhere).
+/// span, which would otherwise match almost anywhere; none for a span of
+/// `CONTEXT_FREE` chars or more).
 pub(super) fn places(w: &Word, reading: &[char]) -> Vec<usize> {
     let span: Vec<char> = w.span.chars().collect();
     let n = span.len();
@@ -134,30 +140,73 @@ pub(super) fn places(w: &Word, reading: &[char]) -> Vec<usize> {
             }
             let left = !left.is_empty() && reading[..p].ends_with(&left);
             let right = !right.is_empty() && reading[p + n..].starts_with(&right);
-            (n >= 2 && (left || right)) || (left && right)
+            n >= CONTEXT_FREE || (n >= 2 && (left || right)) || (left && right)
         })
         .collect()
 }
 
-/// What `surface`, aligned to the reading as `ranges` (`align`), writes
-/// for the reading chars `p..e`; `None` when a char of it reads across `p`
-/// or `e`: the reading there is no word of that surface (今 of 今では
-/// reads across まで of いまでは).
-fn form_at(surface: &[char], ranges: &[(usize, usize)], p: usize, e: usize) -> Option<String> {
-    let mut out = String::new();
+/// The chars of `surface` (aligned to the reading as `ranges`) that write
+/// the reading chars `p..e`, as a range of its chars; `None` where a char
+/// reads across `p` or `e` or nothing is written there (`form_at`).
+fn chars_at(ranges: &[(usize, usize)], p: usize, e: usize) -> Option<(usize, usize)> {
+    let mut at: Option<(usize, usize)> = None;
     let (mut lo, mut hi) = (usize::MAX, 0);
-    for (&c, &(s, t)) in surface.iter().zip(ranges) {
+    for (i, &(s, t)) in ranges.iter().enumerate() {
         if t <= p || s >= e {
             continue;
         }
         if s < p || t > e {
             return None;
         }
-        out.push(c);
+        at = Some(at.map_or((i, i + 1), |(a, _)| (a, i + 1)));
         lo = lo.min(s);
         hi = hi.max(t);
     }
-    (lo == p && hi == e).then_some(out)
+    at.filter(|_| lo == p && hi == e)
+}
+
+/// `surface` with each of `forms` ((p, e, form): the reading chars `p..e`
+/// and what to write for them) written in place of what it writes there,
+/// where that is a word of it (`chars_at`); `None` when none is. Forms
+/// whose reading overlaps one written already are left out.
+pub(super) fn write_forms(
+    surface: &[char],
+    ranges: &[(usize, usize)],
+    forms: &[(usize, usize, &str)],
+) -> Option<String> {
+    let mut at: Vec<(usize, usize, &str)> = Vec::new();
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    for &(p, e, form) in forms {
+        if taken.iter().any(|&(a, b)| p < b && a < e) {
+            continue;
+        }
+        if let Some((i, j)) = chars_at(ranges, p, e) {
+            taken.push((p, e));
+            at.push((i, j, form));
+        }
+    }
+    if at.is_empty() {
+        return None;
+    }
+    at.sort_unstable_by_key(|&(i, _, _)| std::cmp::Reverse(i));
+    let mut out = surface.to_vec();
+    for (i, j, form) in at {
+        out.splice(i..j, form.chars());
+    }
+    Some(out.into_iter().collect())
+}
+
+/// What `surface`, aligned to the reading as `ranges` (`align`), writes
+/// for the reading chars `p..e`; `None` when a char of it reads across `p`
+/// or `e`: the reading there is no word of that surface (今 of 今では
+/// reads across まで of いまでは).
+pub(super) fn form_at(
+    surface: &[char],
+    ranges: &[(usize, usize)],
+    p: usize,
+    e: usize,
+) -> Option<String> {
+    chars_at(ranges, p, e).map(|(i, j)| surface[i..j].iter().collect())
 }
 
 /// Whether `surface` writes `form` for the reading chars `p..e`: what it
