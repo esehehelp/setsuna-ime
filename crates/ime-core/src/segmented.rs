@@ -48,6 +48,20 @@ pub(crate) struct Segmented {
     pub initial: String,
 }
 
+/// Whether `piece`, a slice for a segment read `seg_reading` of the
+/// reading `reading`, has more letters or digits than the segment's reading
+/// while the reading has some as typed: those are another segment's (the ID
+/// of {農園ID for {のうえん of {のうえんID}). Letters the model wrote for kana
+/// (候補Key for こうほきー) are another matter, where nothing was typed so.
+fn takes_typed_letters(reading: &str, seg_reading: &str, piece: &str) -> bool {
+    let typed = |s: &str| {
+        s.chars()
+            .filter(|&c| crate::postprocess::to_half(c).is_ascii_alphanumeric())
+            .count()
+    };
+    typed(reading) > 0 && typed(piece) > typed(seg_reading)
+}
+
 impl Segmented {
     /// Cut `list[selected]` into segments. `starts` gives the reading start
     /// of each char of a candidate (`segments::char_starts`); candidates
@@ -97,9 +111,14 @@ impl Segmented {
             };
             for (k, piece) in segments::slice(c, s, &ranges).into_iter().enumerate() {
                 let seg_reading: String = reading_chars[ranges[k].0..ranges[k].1].iter().collect();
+                // with the segment's letters as typed: a piece cut off the
+                // ID of {のうえんID} (`}`) or with the next one's ({農園ID) is
+                // none of it
                 if !piece.is_empty()
                     && !cands[k].contains(&piece)
                     && segments::fits(&seg_reading, &cands[k][0], &piece)
+                    && crate::mixed::keeps_latin(&seg_reading, &piece)
+                    && !takes_typed_letters(reading, &seg_reading, &piece)
                 {
                     cands[k].push(piece);
                 }

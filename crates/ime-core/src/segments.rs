@@ -37,6 +37,7 @@ pub fn char_starts(reading: &str, text: &str, engine_pos: Option<&[u32]>) -> Opt
     let Some(pos) = usable else {
         return align(&t, &r).map(|ranges| ranges.iter().map(|&(a, _)| a).collect());
     };
+    let typed = crate::reading_align::typed_chars(&t, &r);
     let mut starts = Vec::with_capacity(t.len());
     // chars that spell their own reading char: kana, and the punctuation,
     // digits and latin the reading carries as they are
@@ -47,10 +48,17 @@ pub fn char_starts(reading: &str, text: &str, engine_pos: Option<&[u32]>) -> Opt
         // the emitting frame can be a char or two off the char it spells
         // (、 of 場合、運び at the い of ばあい、)
         let near = [Some(q), Some(q + 1), q.checked_sub(1), Some(q + 2)];
-        let found = near
-            .into_iter()
-            .flatten()
-            .find(|&j| j >= lo && j < r.len() && spells(c, r[j]));
+        // a letter or digit as typed is that char of the reading however
+        // far the frame is (the D of 農園ID at the え of のうえんID)
+        let found = typed
+            .as_ref()
+            .and_then(|t| t[i])
+            .filter(|&j| j >= lo)
+            .or_else(|| {
+                near.into_iter()
+                    .flatten()
+                    .find(|&j| j >= lo && j < r.len() && spells(c, r[j]))
+            });
         if let Some(j) = found {
             q = j;
         }
@@ -78,7 +86,7 @@ fn spells(c: char, rc: char) -> bool {
     if is_kana(c) {
         to_hira(c) == to_hira(rc)
     } else {
-        c == rc
+        crate::postprocess::to_half(c) == rc
     }
 }
 
@@ -285,6 +293,16 @@ mod tests {
             texts(t, r, &segment(t, &starts, 8)),
             pairs(&[("方式を", "ほうしきを"), ("使う", "つかう")])
         );
+    }
+
+    #[test]
+    fn letters_typed_are_snapped_however_early_the_engine_emits_them() {
+        // Cymbidium-v1.2-xsmall-like: I and D at the う and え of のうえん
+        let (r, t) = ("{のうえんID}に", "{農園ID}に");
+        let starts = char_starts(r, t, Some(&[0, 1, 2, 2, 3, 7, 8])).unwrap();
+        assert_eq!(starts, [0, 1, 2, 5, 6, 7, 8]);
+        let ranges = [(0, 5), (5, 9)];
+        assert_eq!(slice(t, &starts, &ranges), ["{農園", "ID}に"]);
     }
 
     #[test]

@@ -3,7 +3,10 @@
 //!
 //! A kana (either script) must match its reading char, a symbol matches any
 //! reading symbol, and a run of other characters (kanji, digits, latin)
-//! takes 1 to 4 reading chars per character.
+//! takes 1 to 4 reading chars per character. A letter or digit the reading
+//! has as typed is that char of it, where the surface fits so (`literals`):
+//! the ID of 農園ID is the ID of のうえんID, not part of a run that reads
+//! のうえんID as a whole.
 
 /// Reading chars a run of `n` free characters may take at most.
 const MAX_READING_PER_CHAR: usize = 4;
@@ -51,8 +54,29 @@ struct Aligner {
     choice: Vec<usize>,
 }
 
+/// For each surface char, whether it is a letter or digit typed in the
+/// reading (`to_half` of it the same char there): each one matched to the
+/// next such char of the reading, in order; `None` when none is.
+fn literals(s: &[char], r: &[char]) -> Option<Vec<bool>> {
+    let mut out = vec![false; s.len()];
+    let mut j = 0;
+    for (i, &c) in s.iter().enumerate() {
+        let c = crate::postprocess::to_half(c);
+        if !c.is_ascii_alphanumeric() {
+            continue;
+        }
+        if let Some(k) = (j..r.len()).find(|&k| r[k] == c) {
+            out[i] = true;
+            j = k + 1;
+        }
+    }
+    out.contains(&true).then_some(out)
+}
+
 impl Aligner {
-    fn new(s: &[char], r: &[char]) -> Option<Self> {
+    /// `lit`: the surface chars that are their reading char as typed
+    /// (`literals`), anchors rather than free.
+    fn new(s: &[char], r: &[char], lit: &[bool]) -> Option<Self> {
         let width = r.len() + 1;
         let cells = (s.len() + 1).checked_mul(width)?;
         if cells > MAX_CELLS {
@@ -64,19 +88,24 @@ impl Aligner {
             choice: vec![0; cells],
         };
         a.ok[s.len() * width + r.len()] = true;
+        let free = |i: usize| is_free(s[i]) && !lit[i];
         // where the free run at each char ends
         let mut run_end = vec![s.len(); s.len() + 1];
         for i in (0..s.len()).rev() {
-            run_end[i] = if is_free(s[i]) { run_end[i + 1] } else { i };
+            run_end[i] = if free(i) { run_end[i + 1] } else { i };
         }
         for i in (0..s.len()).rev() {
             // only a free run's start is asked about
-            if is_free(s[i]) && i > 0 && is_free(s[i - 1]) {
+            if free(i) && i > 0 && free(i - 1) {
                 continue;
             }
             for j in 0..=r.len() {
                 let at = a.idx(i, j);
-                if !is_free(s[i]) {
+                if lit[i] {
+                    a.ok[at] = j < r.len()
+                        && crate::postprocess::to_half(s[i]) == r[j]
+                        && a.ok[a.idx(i + 1, j + 1)];
+                } else if !free(i) {
                     a.ok[at] =
                         j < r.len() && anchor_matches(s[i], r[j]) && a.ok[a.idx(i + 1, j + 1)];
                 } else {
@@ -108,19 +137,44 @@ pub(crate) fn spells_out(text: &str, reading: &[char]) -> bool {
 }
 
 pub(crate) fn align(s: &[char], r: &[char]) -> Option<Vec<(usize, usize)>> {
-    let a = Aligner::new(s, r)?;
+    if let Some(lit) = literals(s, r) {
+        if let Some(out) = align_with(s, r, &lit) {
+            return Some(out);
+        }
+    }
+    align_with(s, r, &vec![false; s.len()])
+}
+
+/// For each surface char, the reading char it is where it is a letter or
+/// digit typed in the reading (`literals`) and the surface aligns so; `None`
+/// when it does not.
+pub(crate) fn typed_chars(s: &[char], r: &[char]) -> Option<Vec<Option<usize>>> {
+    let lit = literals(s, r)?;
+    let ranges = align_with(s, r, &lit)?;
+    Some(
+        lit.iter()
+            .zip(&ranges)
+            .map(|(&l, &(a, _))| l.then_some(a))
+            .collect(),
+    )
+}
+
+/// `align`, the chars `lit` says as their reading chars.
+fn align_with(s: &[char], r: &[char], lit: &[bool]) -> Option<Vec<(usize, usize)>> {
+    let a = Aligner::new(s, r, lit)?;
     if !a.ok[0] {
         return None;
     }
+    let free = |i: usize| is_free(s[i]) && !lit[i];
     let mut out = Vec::with_capacity(s.len());
     let (mut i, mut j) = (0, 0);
     while i < s.len() {
-        if !is_free(s[i]) {
+        if !free(i) {
             out.push((j, j + 1));
             i += 1;
             j += 1;
         } else {
-            let k = (i..s.len()).find(|&k| !is_free(s[k])).unwrap_or(s.len());
+            let k = (i..s.len()).find(|&k| !free(k)).unwrap_or(s.len());
             let l = a.choice[a.idx(i, j)];
             out.extend(std::iter::repeat_n((j, l), k - i));
             i = k;
@@ -147,6 +201,23 @@ mod tests {
         assert!(spells("2ヶ月", "2かげつ"));
         assert!(spells("鎌ヶ谷", "かまがや"));
         assert!(spells("栗ケ沢", "くりがさわ"));
+    }
+
+    #[test]
+    fn letters_and_digits_typed_are_their_own_reading_chars() {
+        let r: Vec<char> = "{のうえんID}に".chars().collect();
+        let s: Vec<char> = "{農園ID}に".chars().collect();
+        // 農園 reads のうえん, I and D themselves, not one run over のうえんID
+        assert_eq!(
+            align(&s, &r).unwrap(),
+            [(0, 1), (1, 5), (1, 5), (5, 6), (6, 7), (7, 8), (8, 9)]
+        );
+        // in full width too
+        let s: Vec<char> = "{農園ＩＤ}に".chars().collect();
+        assert_eq!(align(&s, &r).unwrap()[3..5], [(5, 6), (6, 7)]);
+        // a digit the model wrote for kana is no typed one: 2 for に
+        let r: Vec<char> = "にこと2こ".chars().collect();
+        assert!(align(&"2個と2個".chars().collect::<Vec<_>>(), &r).is_some());
     }
 
     #[test]
